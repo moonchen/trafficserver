@@ -630,6 +630,7 @@ struct OverridableHttpConfigParams {
   MgmtInt sock_option_flag_out      = 0;
   MgmtInt sock_packet_mark_out      = 0;
   MgmtInt sock_packet_tos_out       = 0;
+  MgmtInt sock_packet_notsent_lowat = 0;
 
   ///////////////
   // Hdr Limit //
@@ -864,6 +865,8 @@ public:
 class HttpConfig
 {
 public:
+  using scoped_config = ConfigProcessor::scoped_config<HttpConfig, HttpConfigParams>;
+
   static void startup();
 
   static void reconfigure();

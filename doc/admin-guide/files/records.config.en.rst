@@ -3775,6 +3775,18 @@ SSL Termination
 
    See :ref:`admin-performance-timeouts` for more discussion on |TS| timeouts.
 
+.. ts:cv:: CONFIG proxy.config.ssl.keylog_file STRING NULL
+   :reloadable:
+
+   If configured, TLS session keys for TLS connections will be logged to the
+   specified file. This file is formatted in such a way that it can be
+   conveniently imported into tools such as Wireshark to decrypt packet
+   captures.  This should only be used for debugging purposes since the data in
+   the keylog file can be used to decrypt the otherwise encrypted traffic. A
+   NULL value for this disables the feature.
+
+   This feature is disabled by default.
+
 Client-Related Configuration
 ----------------------------
 
@@ -3948,6 +3960,30 @@ SNI Routing
 
    Frequency of checking the activity of SNI Routing Tunnel. Set to ``0`` to disable monitoring of the activity of the SNI tunnels.
    The feature is disabled by default.
+
+.. ts:cv:: CONFIG proxy.config.tunnel.prewarm INT 0
+
+   Enable :ref:`pre-warming-tls-tunnel`. The feature is disabled by default.
+
+.. ts:cv:: CONFIG proxy.config.tunnel.prewarm.max_stats_size INT 100
+
+   Max size of :ref:`dynamic stats for Pre-warming TLS Tunnel <pre-warming-tls-tunnel-stats>`.
+
+.. ts:cv:: CONFIG proxy.config.tunnel.prewarm.algorithm INT 2
+
+   Version of pre-warming algorithm.
+
+   ===== ======================================================================
+   Value Description
+   ===== ======================================================================
+   ``1`` Periodical pre-warming only
+   ``2`` Event based pre-warming + Periodical pre-warming
+   ===== ======================================================================
+
+.. ts:cv:: CONFIG proxy.config.tunnel.prewarm.event_period INT 1000
+   :units: milliseconds
+
+   Frequency of periodical pre-warming in milli-seconds.
 
 OCSP Stapling Configuration
 ===========================
@@ -4233,12 +4269,6 @@ removed in the future without prior notice.
    Only available for :program:`traffic_quic`.
    If specified, TLS session data will be stored to the file, and will be used
    for resuming a session.
-
-.. ts:cv:: CONFIG proxy.config.quic.client.keylog_file STRING ""
-   :reloadable:
-
-   Only available for :program:`traffic_quic`.
-   If specified, key information will be stored to the file.
 
 .. ts:cv:: CONFIG proxy.config.quic.no_activity_timeout_in INT 30000
    :reloadable:
@@ -4557,6 +4587,7 @@ Sockets
         TCP_FASTOPEN (8)
         PACKET_MARK (16)
         PACKET_TOS (32)
+        TCP_NOTSENT_LOWAT (64)
 
 .. note::
 
@@ -4591,6 +4622,7 @@ Sockets
         TCP_FASTOPEN (8)
         PACKET_MARK (16)
         PACKET_TOS (32)
+        TCP_NOTSENT_LOWAT (64)
 
 .. note::
 
@@ -4641,6 +4673,11 @@ Sockets
    (the packets that make up an origin request).
 
    .. seealso:: `Traffic Shaping`_
+
+.. ts:cv:: CONFIG proxy.config.net.sock_notsent_lowat INT 16384
+   :overridable:
+
+   Set socket option TCP_NOTSENT_LOWAT to specified value for a connection
 
 .. ts:cv:: CONFIG proxy.config.net.poll_timeout INT 10 (or 30 on Solaris)
 
