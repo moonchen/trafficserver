@@ -164,6 +164,7 @@ const char *MIME_VALUE_CLOSE;
 const char *MIME_VALUE_COMPRESS;
 const char *MIME_VALUE_DEFLATE;
 const char *MIME_VALUE_GZIP;
+const char *MIME_VALUE_BROTLI;
 const char *MIME_VALUE_IDENTITY;
 const char *MIME_VALUE_KEEP_ALIVE;
 const char *MIME_VALUE_MAX_AGE;
@@ -557,7 +558,7 @@ checksum_block(const char *s, int len)
   return sum;
 }
 
-#ifdef DEBUG
+#ifdef ENABLE_MIME_SANITY_CHECK
 void
 mime_hdr_sanity_check(MIMEHdrImpl *mh)
 {
@@ -919,6 +920,7 @@ mime_init()
     MIME_VALUE_COMPRESS             = hdrtoken_string_to_wks("compress");
     MIME_VALUE_DEFLATE              = hdrtoken_string_to_wks("deflate");
     MIME_VALUE_GZIP                 = hdrtoken_string_to_wks("gzip");
+    MIME_VALUE_BROTLI               = hdrtoken_string_to_wks("br");
     MIME_VALUE_IDENTITY             = hdrtoken_string_to_wks("identity");
     MIME_VALUE_KEEP_ALIVE           = hdrtoken_string_to_wks("keep-alive");
     MIME_VALUE_MAX_AGE              = hdrtoken_string_to_wks("max-age");
@@ -2579,6 +2581,8 @@ mime_parser_parse(MIMEParser *parser, HdrHeap *heap, MIMEHdrImpl *mh, const char
         return PARSE_RESULT_ERROR;
       }
       field_name.rtrim_if(&ParseRules::is_ws);
+      raw_print_field = false;
+    } else if (parsed.suffix(2) != "\r\n") {
       raw_print_field = false;
     }
 

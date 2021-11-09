@@ -25,6 +25,7 @@
 #include "../ProxyTransaction.h"
 #include "HttpSM.h"
 #include "HttpTransact.h"
+#include "HttpBodyFactory.h"
 #include "HttpTransactHeaders.h"
 #include "ProxyConfig.h"
 #include "Http1ServerSession.h"
@@ -78,6 +79,8 @@
 #define USE_NEW_EMPTY_MIOBUFFER
 
 extern int cache_config_read_while_writer;
+
+extern HttpBodyFactory *body_factory;
 
 // We have a debugging list that can use to find stuck
 //  state machines
@@ -5032,7 +5035,7 @@ HttpSM::do_http_server_open(bool raw)
              t_state.req_flavor == HttpTransact::REQ_FLAVOR_REVPROXY);
 
   ink_assert(pending_action.is_empty());
-  ink_assert(t_state.current.server->dst_addr.port() != 0);
+  ink_assert(t_state.current.server->dst_addr.network_order_port() != 0);
 
   char addrbuf[INET6_ADDRPORTSTRLEN];
   SMDebug("http", "[%" PRId64 "] open connection to %s: %s", sm_id, t_state.current.server->name,
@@ -6589,7 +6592,8 @@ HttpSM::setup_100_continue_transfer()
 void
 HttpSM::setup_error_transfer()
 {
-  if (t_state.internal_msg_buffer || is_response_body_precluded(t_state.http_return_code)) {
+  if (body_factory->is_response_suppressed(&t_state) || t_state.internal_msg_buffer ||
+      is_response_body_precluded(t_state.http_return_code)) {
     // Since we need to send the error message, call the API
     //   function
     ink_assert(t_state.internal_msg_buffer_size > 0 || is_response_body_precluded(t_state.http_return_code));

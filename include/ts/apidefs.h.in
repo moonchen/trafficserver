@@ -866,6 +866,7 @@ typedef enum {
   TS_CONFIG_PLUGIN_VC_DEFAULT_BUFFER_INDEX,
   TS_CONFIG_PLUGIN_VC_DEFAULT_BUFFER_WATER_MARK,
   TS_CONFIG_NET_SOCK_NOTSENT_LOWAT,
+  TS_CONFIG_BODY_FACTORY_RESPONSE_SUPPRESSION_MODE,
   TS_CONFIG_LAST_ENTRY
 } TSOverridableConfigKey;
 
@@ -1281,6 +1282,7 @@ extern tsapi const char *TS_HTTP_VALUE_CLOSE;
 extern tsapi const char *TS_HTTP_VALUE_COMPRESS;
 extern tsapi const char *TS_HTTP_VALUE_DEFLATE;
 extern tsapi const char *TS_HTTP_VALUE_GZIP;
+extern tsapi const char *TS_HTTP_VALUE_BROTLI;
 extern tsapi const char *TS_HTTP_VALUE_IDENTITY;
 extern tsapi const char *TS_HTTP_VALUE_KEEP_ALIVE;
 extern tsapi const char *TS_HTTP_VALUE_MAX_AGE;
@@ -1304,6 +1306,7 @@ extern tsapi int TS_HTTP_LEN_CLOSE;
 extern tsapi int TS_HTTP_LEN_COMPRESS;
 extern tsapi int TS_HTTP_LEN_DEFLATE;
 extern tsapi int TS_HTTP_LEN_GZIP;
+extern tsapi int TS_HTTP_LEN_BROTLI;
 extern tsapi int TS_HTTP_LEN_IDENTITY;
 extern tsapi int TS_HTTP_LEN_KEEP_ALIVE;
 extern tsapi int TS_HTTP_LEN_MAX_AGE;
@@ -1425,6 +1428,17 @@ typedef enum {
 #define TS_UUID_STRING_LEN 36
 #define TS_CRUUID_STRING_LEN (TS_UUID_STRING_LEN + 19 + 1) /* UUID-len + len(uint64_t) + '-' */
 typedef struct tsapi_uuid *TSUuid;
+
+/* Various HTTP "control" modes */
+typedef enum {
+  TS_HTTP_CNTL_LOGGING_MODE,
+  TS_HTTP_CNTL_INTERCEPT_RETRY_MODE,
+  TS_HTTP_CNTL_RESPONSE_CACHEABLE,
+  TS_HTTP_CNTL_REQUEST_CACHEABLE,
+  TS_HTTP_CNTL_SERVER_NO_STORE,
+  TS_HTTP_CNTL_TXN_DEBUG,
+  TS_HTTP_CNTL_SKIP_REMAPPING
+} TSHttpCntlType;
 
 #ifdef __cplusplus
 namespace ts

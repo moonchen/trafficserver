@@ -38,6 +38,8 @@ build/ltsugar.m4
 build/ltversion.m4
 build/lt~obsolete.m4
 
+BUILD
+
 Makefile
 Makefile-pl
 config.cache
@@ -203,6 +205,8 @@ RELEASE
 tests/env-test/
 tests/proxy-verifier
 tests/Pipfile.lock
+tests/gold_tests/bigobj/check_ramp
+tests/gold_tests/bigobj/push_request
 tests/gold_tests/chunked_encoding/smuggle-client
 tests/gold_tests/tls/ssl-post
 

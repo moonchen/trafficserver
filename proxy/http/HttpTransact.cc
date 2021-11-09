@@ -1709,8 +1709,8 @@ HttpTransact::setup_plugin_request_intercept(State *s)
   s->server_info.http_version                = HTTP_1_0;
   s->server_info.keep_alive                  = HTTP_NO_KEEPALIVE;
   s->host_db_info.app.http_data.http_version = HTTP_1_0;
-  s->server_info.dst_addr.setToAnyAddr(AF_INET);                                 // must set an address or we can't set the port.
-  s->server_info.dst_addr.port() = htons(s->hdr_info.client_request.port_get()); // this is the info that matters.
+  s->server_info.dst_addr.setToAnyAddr(AF_INET); // must set an address or we can't set the port.
+  s->server_info.dst_addr.network_order_port() = htons(s->hdr_info.client_request.port_get()); // this is the info that matters.
 
   // Build the request to the server
   build_request(s, &s->hdr_info.client_request, &s->hdr_info.server_request, s->client_info.http_version);
@@ -1832,7 +1832,7 @@ HttpTransact::PPDNSLookup(State *s)
   } else {
     // lookup succeeded, open connection to p.p.
     ats_ip_copy(&s->parent_info.dst_addr, s->host_db_info.ip());
-    s->parent_info.dst_addr.port() = htons(s->parent_result.port);
+    s->parent_info.dst_addr.network_order_port() = htons(s->parent_result.port);
     get_ka_info_from_host_db(s, &s->parent_info, &s->client_info, &s->host_db_info);
 
     char addrbuf[INET6_ADDRSTRLEN];
@@ -1892,7 +1892,7 @@ HttpTransact::ReDNSRoundRobin(State *s)
     ink_assert(s->current.server->dst_addr.isValid() && 0 != server_port);
 
     ats_ip_copy(&s->server_info.dst_addr, s->host_db_info.ip());
-    s->server_info.dst_addr.port() = htons(server_port);
+    s->server_info.dst_addr.network_order_port() = htons(server_port);
     ats_ip_copy(&s->request_data.dest_ip, &s->server_info.dst_addr);
     get_ka_info_from_host_db(s, &s->server_info, &s->client_info, &s->host_db_info);
 
@@ -2014,9 +2014,9 @@ HttpTransact::OSDNSLookup(State *s)
   ats_ip_copy(&s->server_info.dst_addr, s->host_db_info.ip());
   // If the SRV response has a port number, we should honor it. Otherwise we do the port defined in remap
   if (s->dns_info.srv_lookup_success) {
-    s->server_info.dst_addr.port() = htons(s->dns_info.srv_port);
+    s->server_info.dst_addr.network_order_port() = htons(s->dns_info.srv_port);
   } else if (!s->api_server_addr_set) {
-    s->server_info.dst_addr.port() = htons(s->hdr_info.client_request.port_get()); // now we can set the port.
+    s->server_info.dst_addr.network_order_port() = htons(s->hdr_info.client_request.port_get()); // now we can set the port.
   }
   ats_ip_copy(&s->request_data.dest_ip, &s->server_info.dst_addr);
   get_ka_info_from_host_db(s, &s->server_info, &s->client_info, &s->host_db_info);
@@ -2936,7 +2936,7 @@ HttpTransact::HandleCacheOpenReadHit(State *s)
     // a parent lookup could come back as PARENT_FAIL if in parent.config, go_direct == false and
     // there are no available parents (all down).
     else if (s->current.request_to == HOST_NONE && s->parent_result.result == PARENT_FAIL) {
-      if (is_server_negative_cached(s) && response_returnable == true && is_stale_cache_response_returnable(s) == true) {
+      if (response_returnable == true && is_stale_cache_response_returnable(s) == true) {
         server_up = false;
         update_current_info(&s->current, nullptr, UNDEFINED_LOOKUP, 0);
         TxnDebug("http_trans", "CacheOpenReadHit - server_down, returning stale document");
@@ -3763,7 +3763,9 @@ HttpTransact::handle_response_from_parent(State *s)
     return CallOSDNSLookup(s);
     break;
   case HOST_NONE:
-    handle_parent_died(s);
+    // Check if content can be served from cache
+    s->current.request_to = PARENT_PROXY;
+    handle_server_connection_not_open(s);
     break;
   default:
     // This handles:
@@ -4052,7 +4054,17 @@ HttpTransact::handle_server_connection_not_open(State *s)
     TxnDebug("http_trans", "[hscno] serving stale doc to client");
     build_response_from_cache(s, HTTP_WARNING_CODE_REVALIDATION_FAILED);
   } else {
-    handle_server_died(s);
+    switch (s->current.request_to) {
+    case PARENT_PROXY:
+      handle_parent_died(s);
+      break;
+    case ORIGIN_SERVER:
+      handle_server_died(s);
+      break;
+    default:
+      ink_assert(!("s->current.request_to is not P.P. or O.S. - hmmm."));
+      break;
+    }
     s->next_action = SM_ACTION_SEND_ERROR_CACHE_NOOP;
   }
 
@@ -5447,6 +5459,17 @@ HttpTransact::check_request_validity(State *s, HTTPHdr *incoming_hdr)
     if ((method == HTTP_WKSIDX_CONNECT) && !s->transparent_passthrough &&
         (!is_port_in_range(incoming_hdr->url_get()->port_get(), s->http_config_param->connect_ports))) {
       return BAD_CONNECT_PORT;
+    }
+
+    if (s->client_info.transfer_encoding == CHUNKED_ENCODING && incoming_hdr->version_get() < HTTP_1_1) {
+      // Per spec, Transfer-Encoding is only supported in HTTP/1.1. For earlier
+      // versions, we must reject Transfer-Encoding rather than interpret it
+      // since downstream proxies may ignore the chunk header and rely upon the
+      // Content-Length, or interpret the body some other way. These
+      // differences in interpretation may open up the door to compatibility
+      // issues. To protect against this, we reply with a 4xx if the client
+      // uses Transfer-Encoding with HTTP versions that do not support it.
+      return UNACCEPTABLE_TE_REQUIRED;
     }
 
     // Require Content-Length/Transfer-Encoding for POST/PUSH/PUT
