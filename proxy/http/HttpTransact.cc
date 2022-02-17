@@ -214,6 +214,18 @@ markParentDown(HttpTransact::State *s)
   HTTP_INCREMENT_DYN_STAT(http_total_parent_marked_down_count);
   url_mapping *mp = s->url_map.getMapping();
 
+  TxnDebug("http_trans", "sm_id[%" PRId64 "] enable_parent_timeout_markdowns: %d, disable_parent_markdowns: %d",
+           s->state_machine->sm_id, s->txn_conf->enable_parent_timeout_markdowns, s->txn_conf->disable_parent_markdowns);
+
+  if (s->txn_conf->disable_parent_markdowns == 1) {
+    TxnDebug("http_trans", "parent markdowns are disabled for this request");
+    return;
+  }
+
+  if (s->current.state == HttpTransact::INACTIVE_TIMEOUT && s->txn_conf->enable_parent_timeout_markdowns == 0) {
+    return;
+  }
+
   if (s->response_action.handled) {
     // Do nothing. If a plugin handled the response, let it handle markdown.
   } else if (mp && mp->strategy) {
@@ -3658,9 +3670,16 @@ HttpTransact::handle_response_from_parent(State *s)
     }
     // the next hop strategy is configured not
     // to cache a response from a next hop peer.
-    if (s->parent_result.do_not_cache_response) {
-      TxnDebug("http_trans", "response is from a next hop peer, do not cache.");
-      s->cache_info.action = CACHE_DO_NO_ACTION;
+    if (s->response_action.handled) {
+      if (s->response_action.action.no_cache) {
+        TxnDebug("http_trans", "plugin set response_action.no_cache, do not cache.");
+        s->cache_info.action = CACHE_DO_NO_ACTION;
+      }
+    } else {
+      if (s->parent_result.do_not_cache_response) {
+        TxnDebug("http_trans", "response is from a next hop peer, do not cache.");
+        s->cache_info.action = CACHE_DO_NO_ACTION;
+      }
     }
     handle_forward_server_connection_open(s);
     break;
@@ -3720,7 +3739,7 @@ HttpTransact::handle_response_from_parent(State *s)
         // Only mark the parent down if we failed to connect
         //  to the parent otherwise slow origin servers cause
         //  us to mark the parent down
-        if (s->current.state == CONNECTION_ERROR) {
+        if (s->current.state == CONNECTION_ERROR || s->current.state == INACTIVE_TIMEOUT) {
           markParentDown(s);
         }
         // We are done so look for another parent if any
@@ -3731,7 +3750,7 @@ HttpTransact::handle_response_from_parent(State *s)
       //   appropriate
       HTTP_INCREMENT_DYN_STAT(http_total_parent_retries_exhausted_stat);
       TxnDebug("http_trans", "[handle_response_from_parent] Error. No more retries.");
-      if (s->current.state == CONNECTION_ERROR) {
+      if (s->current.state == CONNECTION_ERROR || s->current.state == INACTIVE_TIMEOUT) {
         markParentDown(s);
       }
       s->parent_result.result = PARENT_FAIL;

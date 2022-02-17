@@ -51,6 +51,7 @@ struct StrategyTxn {
   size_t prev_host_len;
   in_port_t prev_port;
   bool prev_is_retry;
+  bool prev_no_cache;
 };
 
 int
@@ -81,11 +82,12 @@ handle_send_request(TSHttpTxn txnp, StrategyTxn *strategyTxn)
   strategyTxn->prev_host_len = ra.hostname_len;
   strategyTxn->prev_port     = ra.port;
   strategyTxn->prev_is_retry = ra.is_retry;
+  strategyTxn->prev_no_cache = ra.no_cache;
 
   strategy->next(txnp, strategyTxn->txn, ra.hostname, ra.hostname_len, ra.port, &ra.hostname, &ra.hostname_len, &ra.port,
-                 &ra.is_retry);
+                 &ra.is_retry, &ra.no_cache);
 
-  ra.nextHopExists = strategy->nextHopExists(txnp);
+  ra.nextHopExists = ra.hostname_len != 0;
   ra.fail = !ra.nextHopExists; // failed is whether to fail and return to the client. failed=false means to retry the parent we set
                                // in the response_action
 
@@ -121,6 +123,7 @@ mark_response(TSHttpTxn txnp, StrategyTxn *strategyTxn, TSHttpStatus status)
     ra.hostname_len = strategyTxn->prev_host_len;
     ra.port         = strategyTxn->prev_port;
     ra.is_retry     = strategyTxn->prev_is_retry;
+    ra.no_cache     = strategyTxn->prev_no_cache;
     TSDebug(PLUGIN_NAME, "mark_response using prev %.*s:%d", int(ra.hostname_len), ra.hostname, ra.port);
   } else {
     TSHttpTxnResponseActionGet(txnp, &ra);
@@ -201,6 +204,7 @@ handle_read_response(TSHttpTxn txnp, StrategyTxn *strategyTxn)
   strategyTxn->prev_host_len = 0;
   strategyTxn->prev_port     = 0;
   strategyTxn->prev_is_retry = false;
+  strategyTxn->prev_no_cache = false;
 
   TSHandleMLocRelease(resp, TS_NULL_MLOC, resp_hdr);
   TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
@@ -235,6 +239,7 @@ handle_os_dns(TSHttpTxn txnp, StrategyTxn *strategyTxn)
     strategyTxn->prev_host     = nullptr;
     strategyTxn->prev_port     = 0;
     strategyTxn->prev_is_retry = false;
+    strategyTxn->prev_no_cache = false;
     TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
     return TS_SUCCESS;
   }
@@ -247,11 +252,11 @@ handle_os_dns(TSHttpTxn txnp, StrategyTxn *strategyTxn)
   const size_t exclude_host_len  = 0;
   const in_port_t exclude_port   = 0;
   strategy->next(txnp, strategyTxn->txn, exclude_host, exclude_host_len, exclude_port, &ra.hostname, &ra.hostname_len, &ra.port,
-                 &ra.is_retry);
+                 &ra.is_retry, &ra.no_cache);
 
   ra.fail = ra.hostname == nullptr; // failed is whether to immediately fail and return the client a 502. In this case: whether or
                                     // not we found another parent.
-  ra.nextHopExists       = strategy->nextHopExists(txnp);
+  ra.nextHopExists       = ra.hostname_len != 0;
   ra.responseIsRetryable = strategy->responseIsRetryable(strategyTxn->request_count, STATUS_CONNECTION_FAILURE);
   ra.goDirect            = strategy->goDirect();
   ra.parentIsProxy       = strategy->parentIsProxy();
@@ -371,18 +376,8 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuff, int errbuff
   TSDebug(PLUGIN_NAME, "'%s' '%s' successfully created strategies in file %s num %d", remap_from, remap_to, config_file_path,
           int(file_strategies.size()));
 
-  std::unique_ptr<TSNextHopSelectionStrategy> new_strategy;
-
-  for (auto &[name, strategy] : file_strategies) {
-    TSDebug(PLUGIN_NAME, "'%s' '%s' TSRemapNewInstance strategy file had strategy named '%s'", remap_from, remap_to, name.c_str());
-    if (strncmp(strategy_name, name.c_str(), strlen(strategy_name)) != 0) {
-      continue;
-    }
-    TSDebug(PLUGIN_NAME, "'%s' '%s' TSRemapNewInstance using '%s'", remap_from, remap_to, name.c_str());
-    new_strategy = std::move(strategy);
-  }
-
-  if (new_strategy.get() == nullptr) {
+  auto new_strategy = file_strategies.find(strategy_name);
+  if (new_strategy == file_strategies.end()) {
     TSDebug(PLUGIN_NAME, "'%s' '%s' TSRemapNewInstance strategy '%s' not found in file '%s'", remap_from, remap_to, strategy_name,
             config_file_path);
     return TS_ERROR;
@@ -390,7 +385,12 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuff, int errbuff
 
   TSDebug(PLUGIN_NAME, "'%s' '%s' TSRemapNewInstance successfully loaded strategy '%s' from '%s'.", remap_from, remap_to,
           strategy_name, config_file_path);
-  *ih = static_cast<void *>(new_strategy.release());
+
+  // created a raw pointer _to_ a shared_ptr, because ih needs a raw pointer.
+  // The raw pointer in ih will be deleted in TSRemapDeleteInstance,
+  // which will destruct the shared_ptr,
+  // destroying the strategy if this is the last remap rule using it.
+  *ih = static_cast<void *>(new std::shared_ptr<TSNextHopSelectionStrategy>(new_strategy->second));
 
   // Associate our config file with remap.config to be able to initiate reloads
   TSMgmtString result;
@@ -406,7 +406,8 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
 {
   TSDebug(PLUGIN_NAME, "TSRemapDoRemap calling");
 
-  auto strategy = static_cast<TSNextHopSelectionStrategy *>(ih);
+  auto strategy_ptr = static_cast<std::shared_ptr<TSNextHopSelectionStrategy> *>(ih);
+  auto strategy     = strategy_ptr->get();
 
   TSDebug(PLUGIN_NAME, "TSRemapDoRemap got strategy '%s'", strategy->name());
 
@@ -419,6 +420,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   strategyTxn->prev_host     = nullptr;
   strategyTxn->prev_port     = 0;
   strategyTxn->prev_is_retry = false;
+  strategyTxn->prev_no_cache = false;
   TSContDataSet(cont, (void *)strategyTxn);
 
   // TSHttpTxnHookAdd(txnp, TS_HTTP_READ_REQUEST_HDR_HOOK, cont);
@@ -434,9 +436,16 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   constexpr const size_t exclude_host_len  = 0;
   constexpr const in_port_t exclude_port   = 0;
   strategy->next(txnp, strategyTxn->txn, exclude_host, exclude_host_len, exclude_port, &ra.hostname, &ra.hostname_len, &ra.port,
-                 &ra.is_retry);
+                 &ra.is_retry, &ra.no_cache);
 
-  if (ra.hostname == nullptr) {
+  ra.nextHopExists = ra.hostname != nullptr;
+  ra.fail          = !ra.nextHopExists;
+  // The action here is used for the very first connection, not any retry. So of course we should try it.
+  ra.responseIsRetryable = true;
+  ra.goDirect            = strategy->goDirect();
+  ra.parentIsProxy       = strategy->parentIsProxy();
+
+  if (ra.fail && !ra.goDirect) {
     // TODO make configurable
     TSDebug(PLUGIN_NAME, "TSRemapDoRemap strategy '%s' next returned nil, returning 502!", strategy->name());
     TSHttpTxnStatusSet(txnp, TS_HTTP_STATUS_BAD_GATEWAY);
@@ -444,12 +453,6 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     return TSREMAP_DID_REMAP;
   }
 
-  ra.fail          = false;
-  ra.nextHopExists = true;
-  ra.responseIsRetryable =
-    true; // The action here is used for the very first connection, not any retry. So of course we should try it.
-  ra.goDirect      = strategy->goDirect();
-  ra.parentIsProxy = strategy->parentIsProxy();
   TSDebug(PLUGIN_NAME, "TSRemapDoRemap setting response_action hostname '%.*s' port %d direct %d proxy %d", int(ra.hostname_len),
           ra.hostname, ra.port, ra.goDirect, ra.parentIsProxy);
   TSHttpTxnResponseActionSet(txnp, &ra);
@@ -461,6 +464,14 @@ extern "C" tsapi void
 TSRemapDeleteInstance(void *ih)
 {
   TSDebug(PLUGIN_NAME, "TSRemapDeleteInstance calling");
-  auto strategy = static_cast<TSNextHopSelectionStrategy *>(ih);
-  delete strategy;
+  auto strategy_ptr = static_cast<std::shared_ptr<TSNextHopSelectionStrategy> *>(ih);
+  delete strategy_ptr;
+  TSDebug(PLUGIN_NAME, "TSRemapDeleteInstance deleted strategy pointer");
+}
+
+void
+TSRemapPreConfigReload(void)
+{
+  TSDebug(PLUGIN_NAME, "TSRemapPreConfigReload clearing strategies cache");
+  clearStrategiesCache();
 }
