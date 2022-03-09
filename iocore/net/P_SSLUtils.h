@@ -72,10 +72,10 @@ public:
     std::vector<std::string> cert_names_list, key_list, ca_list, ocsp_list;
     std::vector<SSLCertContextType> cert_type_list;
   };
-  SSLMultiCertConfigLoader(const SSLConfigParams *p) : _params(p) {}
-  virtual ~SSLMultiCertConfigLoader(){};
+  SSLMultiCertConfigLoader(const SSLConfigParams *p) : _params(p) { ink_mutex_init(&m_mutex); }
+  virtual ~SSLMultiCertConfigLoader() { ink_mutex_destroy(&m_mutex); };
 
-  bool load(SSLCertLookup *lookup);
+  bool load(SSLCertLookup *lookup, bool firstLoad);
 
   virtual SSL_CTX *default_server_ssl_ctx();
 
@@ -108,10 +108,14 @@ protected:
                              SSLCertContextType ctx_type, std::set<std::string> &names);
 
 private:
-  virtual const char *_debug_tag() const;
+  using SSLConfigLines = std::vector<std::tuple<char *, unsigned>>;
+
   virtual bool _store_ssl_ctx(SSLCertLookup *lookup, shared_SSLMultiCertConfigParams ssl_multi_cert_params);
   bool _prep_ssl_ctx(const shared_SSLMultiCertConfigParams &sslMultCertSettings, SSLMultiCertConfigLoader::CertLoadData &data,
                      std::set<std::string> &common_names, std::unordered_map<int, std::set<std::string>> &unique_names);
+  bool _load_lines(SSLCertLookup *lookup, SSLConfigLines::const_iterator begin, SSLConfigLines::const_iterator end);
+
+  virtual const char *_debug_tag() const;
   virtual void _set_handshake_callbacks(SSL_CTX *ctx);
   virtual bool _setup_session_cache(SSL_CTX *ctx);
   virtual bool _setup_dialog(SSL_CTX *ctx, const SSLMultiCertConfigParams *sslMultCertSettings);
@@ -125,6 +129,8 @@ private:
   virtual bool _set_npn_callback(SSL_CTX *ctx);
   virtual bool _set_alpn_callback(SSL_CTX *ctx);
   virtual bool _set_keylog_callback(SSL_CTX *ctx);
+
+  ink_mutex m_mutex; // Mutex around concurrent loading / reloading of multicert configurations
 };
 
 // Create a new SSL server context fully configured (cert and keys are optional).
