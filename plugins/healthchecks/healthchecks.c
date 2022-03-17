@@ -43,12 +43,6 @@ static const char SEPARATORS[]  = " \t\n";
 #define MAX_BODY_LEN 16384
 #define FREELIST_TIMEOUT 300
 
-static inline void *
-ink_atomic_swap_ptr(void *mem, void *value)
-{
-  return __sync_lock_test_and_set((void **)mem, value);
-}
-
 /* Directories that we are watching for inotify IN_CREATE events. */
 typedef struct HCDirEntry_t {
   char dname[MAX_PATH_LEN];   /* Directory name */
@@ -65,7 +59,8 @@ typedef struct HCFileData_t {
   struct HCFileData_t *_next; /* Only used when these guys end up on the freelist */
 } HCFileData;
 
-/* The only thing that should change in this struct is data, atomically swapping ptrs */
+/* This structure is passed to continuations.  It should never be freed. */
+/* The only field that should be changed after initialization is data. */
 typedef struct HCFileInfo_t {
   char fname[MAX_PATH_LEN];   /* Filename */
   char *basename;             /* The "basename" of the file */
@@ -76,6 +71,7 @@ typedef struct HCFileInfo_t {
   const char *miss;           /* Header for miss results */
   int m_len;                  /* Length of miss header */
   HCFileData *data;           /* Holds the current data for this health check file */
+  TSMutex data_mutex;         /* Lock this before reading/writing data */
   int wd;                     /* Watch descriptor */
   HCDirEntry *dir;            /* Reference to the directory this file resides in */
   struct HCFileInfo_t *_next; /* Linked list */
@@ -96,9 +92,7 @@ typedef struct HCState_t {
 
   int output_bytes;
 
-  /* We actually need both here, so that our lock free switches works safely */
   HCFileInfo *info;
-  HCFileData *data;
 } HCState;
 
 /* Read / check the status files */
@@ -241,7 +235,10 @@ hc_thread(void *data ATS_UNUSED)
           memset(new_data, 0, sizeof(HCFileData));
           reload_status_file(finfo, new_data);
           TSDebug(PLUGIN_NAME, "Reloaded %s, len == %d, exists == %d", finfo->fname, new_data->b_len, new_data->exists);
-          old_data = ink_atomic_swap_ptr(&(finfo->data), new_data);
+          TSMutexLock(finfo->data_mutex);
+          old_data    = finfo->data;
+          finfo->data = new_data;
+          TSMutexUnlock(finfo->data_mutex);
 
           /* Add the old data to the head of the freelist */
           old_data->remove = now.tv_sec + FREELIST_TIMEOUT;
@@ -357,6 +354,7 @@ parse_configs(const char *fname)
         finfo->miss = gen_header(miss, mime, &finfo->m_len);
         finfo->data = TSmalloc(sizeof(HCFileData));
         memset(finfo->data, 0, sizeof(HCFileData));
+        finfo->data_mutex = TSMutexCreate();
         reload_status_file(finfo, finfo->data);
 
         /* Add it the linked list */
@@ -409,13 +407,15 @@ static void
 hc_process_read(TSCont contp, TSEvent event, HCState *my_state)
 {
   if (event == TS_EVENT_VCONN_READ_READY) {
-    if (my_state->data->exists) {
+    TSMutexLock(my_state->info->data_mutex);
+    if (my_state->info->data->exists) {
       TSDebug(PLUGIN_NAME, "Setting OK response header");
       my_state->output_bytes = add_data_to_resp(my_state->info->ok, my_state->info->o_len, my_state);
     } else {
       TSDebug(PLUGIN_NAME, "Setting MISS response header");
       my_state->output_bytes = add_data_to_resp(my_state->info->miss, my_state->info->m_len, my_state);
     }
+    TSMutexUnlock(my_state->info->data_mutex);
     TSVConnShutdown(my_state->net_vc, 1, 0);
     my_state->write_vio = TSVConnWrite(my_state->net_vc, contp, my_state->resp_reader, INT64_MAX);
   } else if (event == TS_EVENT_ERROR) {
@@ -438,13 +438,15 @@ hc_process_write(TSCont contp, TSEvent event, HCState *my_state)
     char buf[48];
     int len;
 
-    len = snprintf(buf, sizeof(buf), "Content-Length: %d\r\n\r\n", my_state->data->b_len);
+    TSMutexLock(my_state->info->data_mutex);
+    len = snprintf(buf, sizeof(buf), "Content-Length: %d\r\n\r\n", my_state->info->data->b_len);
     my_state->output_bytes += add_data_to_resp(buf, len, my_state);
-    if (my_state->data->b_len > 0) {
-      my_state->output_bytes += add_data_to_resp(my_state->data->body, my_state->data->b_len, my_state);
+    if (my_state->info->data->b_len > 0) {
+      my_state->output_bytes += add_data_to_resp(my_state->info->data->body, my_state->info->data->b_len, my_state);
     } else {
       my_state->output_bytes += add_data_to_resp("\r\n", 2, my_state);
     }
+    TSMutexUnlock(my_state->info->data_mutex);
     TSVIONBytesSet(my_state->write_vio, my_state->output_bytes);
     TSVIOReenable(my_state->write_vio);
   } else if (event == TS_EVENT_VCONN_WRITE_COMPLETE) {
@@ -525,7 +527,6 @@ health_check_origin(TSCont contp ATS_UNUSED, TSEvent event ATS_UNUSED, void *eda
     my_state = (HCState *)TSmalloc(sizeof(*my_state));
     memset(my_state, 0, sizeof(*my_state));
     my_state->info = info;
-    my_state->data = info->data;
     TSContDataSet(icontp, my_state);
     TSHttpTxnIntercept(icontp, txnp);
   }
