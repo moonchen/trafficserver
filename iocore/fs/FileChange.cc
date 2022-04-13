@@ -26,19 +26,40 @@
 
 // Globals
 FileChangeManager fileChangeManager;
+static constexpr int EPOLL_EVENTS_MAX = 1000;
 
+#if TS_USE_EPOLL
 static void
-poll_thread_run()
+epoll_thread(int epoll_fd)
 {
-  using namespace std::chrono_literals;
+  struct epoll_event events[EPOLL_EVENTS_MAX];
   for (;;) {
-    Debug("FileChange", "sleeping...");
-    std::this_thread::sleep_for(1000ms);
+    int rc = epoll_wait(epoll_fd, events, EPOLL_EVENTS_MAX, -1);
+    if (rc == -1) {
+      Error("File change notify thread epoll error: %d", errno);
+      if (errno != EINTR) {
+        break;
+      }
+    }
+    for (int i = 0; i < rc; i++) {
+      struct epoll_event *event = &events[i];
+      // TODO: process event
+    }
   }
 }
+#else
+// Implement this
+#endif
 
 void
 FileChangeManager::init()
 {
-  poll_thread = std::thread(poll_thread_run);
+#if TS_USE_EPOLL
+  epoll_fd    = epoll_create1(FD_CLOEXEC);
+  poll_thread = std::thread(epoll_thread, epoll_fd);
+  poll_thread.detach();
+#else
+  // Implement this
+  Warning("File change notification is not supported for this OS".);
+#endif
 }

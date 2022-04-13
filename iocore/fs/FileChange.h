@@ -22,8 +22,17 @@
  */
 
 #pragma once
+#include "tscore/ink_config.h"
+
 #include <thread>
 #include <chrono>
+#include <sys/inotify.h>
+
+#if TS_USE_EPOLL
+#include <sys/epoll.h>
+#else
+// implement this
+#endif
 
 class FileChangeManager
 {
@@ -32,6 +41,12 @@ public:
 
 private:
   std::thread poll_thread;
+  int inotify_fd;
+#if TS_USE_EPOLL
+  int epoll_fd;
+#else
+  // implement this
+#endif
 };
 
 extern FileChangeManager fileChangeManager;
