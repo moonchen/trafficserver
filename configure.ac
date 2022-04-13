@@ -2249,7 +2249,8 @@ iocore_include_dirs="\
 -I\$(abs_top_srcdir)/iocore/hostdb \
 -I\$(abs_top_srcdir)/iocore/cache \
 -I\$(abs_top_srcdir)/iocore/utils \
--I\$(abs_top_srcdir)/iocore/dns"
+-I\$(abs_top_srcdir)/iocore/dns \
+-I\$(abs_top_srcdir)/iocore/fs"
 
 AC_SUBST([AM_CPPFLAGS])
 AC_SUBST([AM_CFLAGS])
@@ -2297,6 +2298,7 @@ AC_CONFIG_FILES([
   iocore/cache/Makefile
   iocore/dns/Makefile
   iocore/eventsystem/Makefile
+  iocore/fs/Makefile
   iocore/hostdb/Makefile
   iocore/net/Makefile
   iocore/net/quic/Makefile

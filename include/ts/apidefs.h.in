@@ -1454,6 +1454,8 @@ namespace ts
 }
 #endif
 
+typedef int TSWatchDescriptor;
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

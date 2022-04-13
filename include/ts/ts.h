@@ -2720,6 +2720,12 @@ tsapi void TSHostStatusSet(const char *hostname, const size_t hostname_len, TSHo
 tsapi bool TSHttpTxnCntlGet(TSHttpTxn txnp, TSHttpCntlType ctrl);
 tsapi TSReturnCode TSHttpTxnCntlSet(TSHttpTxn txnp, TSHttpCntlType ctrl, bool data);
 
+/*
+ * Get notified for file system events
+ */
+tsapi TSWatchDescriptor TSFileEventRegister(const char *filename, TSCont contp);
+tsapi void TSFileEventUnRegister(int wd);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

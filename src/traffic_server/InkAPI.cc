@@ -28,6 +28,10 @@
 #include <unordered_map>
 #include <string_view>
 
+#if defined(__linux__)
+#include <sys/inotify.h>
+#endif
+
 #include "tscore/ink_platform.h"
 #include "tscore/ink_base64.h"
 #include "tscore/PluginUserArgs.h"
@@ -10428,4 +10432,20 @@ TSHttpTxnPostBufferReaderGet(TSHttpTxn txnp)
   sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
   HttpSM *sm = (HttpSM *)txnp;
   return (TSIOBufferReader)sm->get_postbuf_clone_reader();
+}
+
+tsapi TSWatchDescriptor
+TSFileEventRegister(const char *filename, TSCont contp)
+{
+#if defined(__linux__)
+
+#else
+  TSWarning("TSFileEventRegister: not supported on this platform.");
+  return 0;
+#endif
+}
+
+tsapi void
+TSFileEventUnRegister(TSWatchDescriptor wd)
+{
 }
