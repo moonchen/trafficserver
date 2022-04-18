@@ -26,24 +26,47 @@
 
 #include <thread>
 #include <chrono>
-#include <sys/inotify.h>
+#include <filesystem>
+#include <set>
+#include <map>
+#include <vector>
+#include "P_EventSystem.h"
 
-#if TS_USE_EPOLL
-#include <sys/epoll.h>
+// TODO: detect this with autotools
+#define TS_USE_INOTIFY 1
+
+#if TS_USE_INOTIFY
+#include <sys/inotify.h>
 #else
 // implement this
 #endif
+
+// File watch info
+struct file_info {
+  std::filesystem::path path;
+  Continuation *contp;
+};
+
+// Directory watch info, for files that don't exist yet
+struct dir_info {
+  std::filesystem::path dname;
+  std::map<const std::string, Continuation *> files;
+};
 
 class FileChangeManager
 {
 public:
   void init();
+  int add(const std::filesystem::path &path, Continuation *contp);
 
 private:
   std::thread poll_thread;
+
+  int add_directory_watch(const std::filesystem::path &file_path, Continuation *contp);
+#if TS_USE_INOTIFY
+  std::map<int, struct file_info> file_watches;
+  std::map<int, struct dir_info> dir_watches;
   int inotify_fd;
-#if TS_USE_EPOLL
-  int epoll_fd;
 #else
   // implement this
 #endif

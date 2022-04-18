@@ -17,6 +17,7 @@
 #  limitations under the License.
 
 AM_CPPFLAGS += \
+	$(iocore_include_dirs) \
 	-I$(abs_top_srcdir)/include \
 	-I$(abs_top_srcdir)/lib \
 	$(TS_INCLUDES)
