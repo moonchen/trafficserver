@@ -106,9 +106,12 @@ private:
   std::thread poll_thread;
 
   int add_directory_watch(const std::filesystem::path &file_path, Continuation *contp);
+  void process_dir_event(struct inotify_event *event);
+  void process_file_event(struct inotify_event *event);
 
-  std::shared_mutex watch_handle_mutex;
+  std::shared_mutex watch_handles_mutex;
   std::unordered_map<int, struct watch_handle_info> watch_handles;
+  std::mutex free_handles_mutex;
   std::vector<int> free_handles;
 #if TS_USE_INOTIFY
   std::shared_mutex file_watches_mutex;

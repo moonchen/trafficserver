@@ -35,9 +35,10 @@ static constexpr size_t INOTIFY_BUF_SIZE = 4096;
 
 #if TS_USE_INOTIFY
 
-static void
-process_file_event(struct inotify_event *event, int inotify_fd, std::unordered_map<int, struct file_info> &file_watches)
+void
+FileChangeManager::process_file_event(struct inotify_event *event)
 {
+  std::shared_lock file_watches_read_lock(file_watches_mutex);
   auto finfo_it = file_watches.find(event->wd);
   if (finfo_it != file_watches.end()) {
     const struct file_info &finfo = finfo_it->second;
@@ -51,16 +52,16 @@ process_file_event(struct inotify_event *event, int inotify_fd, std::unordered_m
         Error("Failed to remove inotify watch on %s: %s (%d)", finfo.path.c_str(), strerror(errno), errno);
       }
       eventProcessor.schedule_imm(finfo.contp, ET_TASK);
+      std::unique_lock file_watches_write_lock(file_watches_mutex);
       file_watches.erase(event->wd);
     }
   }
 }
 
-static void
-process_dir_event(struct inotify_event *event, int inotify_fd, std::unordered_map<int, struct file_info> &file_watches,
-                  std::unordered_map<int, struct dir_info> &dir_watches,
-                  std::unordered_map<int, struct watch_handle_info> watch_handles)
+void
+FileChangeManager::process_dir_event(struct inotify_event *event)
 {
+  std::shared_lock dir_watches_read_lock(dir_watches_mutex);
   auto dinfo_it = dir_watches.find(event->wd);
   if (dinfo_it != dir_watches.end()) {
     const struct dir_info &dinfo = dinfo_it->second;
@@ -76,8 +77,10 @@ process_dir_event(struct inotify_event *event, int inotify_fd, std::unordered_ma
           if (wd == -1) {
             Error("Failed to add inotify watch on %s: %s (%d)", full_path.c_str(), strerror(errno), errno);
           } else {
+            std::unique_lock watch_handles_write_lock(watch_handles_mutex);
             watch_handles[watch_handle].file_wd = wd;
-            file_watches[wd]                    = finfo;
+            std::unique_lock file_watches_write_lock(file_watches_mutex);
+            file_watches[wd] = finfo;
           }
           eventProcessor.schedule_imm(finfo.contp, ET_TASK);
         }
@@ -85,41 +88,6 @@ process_dir_event(struct inotify_event *event, int inotify_fd, std::unordered_ma
     }
   }
 }
-
-static void
-inotify_thread(int inotify_fd, std::unordered_map<int, struct file_info> &file_watches,
-               std::unordered_map<int, struct dir_info> &dir_watches,
-               std::unordered_map<int, struct watch_handle_info> watch_handles)
-{
-  for (;;) {
-    char inotify_buf[INOTIFY_BUF_SIZE];
-
-    // blocking read
-    int rc = read(inotify_fd, inotify_buf, sizeof inotify_buf);
-
-    if (rc == -1) {
-      Error("Failed to read inotify: %s (%d)", strerror(errno), errno);
-      if (errno == EINTR) {
-        continue;
-      } else {
-        break;
-      }
-    }
-
-    while (rc > 0) {
-      struct inotify_event *event = reinterpret_cast<struct inotify_event *>(inotify_buf);
-
-      // Process file events
-      process_file_event(event, inotify_fd, file_watches);
-
-      // Process directory events
-      process_dir_event(event, inotify_fd, file_watches, dir_watches, watch_handles);
-    }
-  }
-}
-#else
-// Implement this
-#endif
 
 void
 FileChangeManager::init()
@@ -131,12 +99,43 @@ FileChangeManager::init()
     Error("Failed to init inotify: %s (%d)", strerror(errno), errno);
     return;
   }
+  auto inotify_thread =
+    [manager = this]() mutable {
+      for (;;) {
+        char inotify_buf[INOTIFY_BUF_SIZE];
 
-  poll_thread = std::thread(inotify_thread, inotify_fd, std::ref(file_watches), std::ref(dir_watches), std::ref(watch_handles));
+        // blocking read
+        int rc = read(manager->inotify_fd, inotify_buf, sizeof inotify_buf);
+
+        if (rc == -1) {
+          Error("Failed to read inotify: %s (%d)", strerror(errno), errno);
+          if (errno == EINTR) {
+            continue;
+          } else {
+            break;
+          }
+        }
+
+        while (rc > 0) {
+          struct inotify_event *event = reinterpret_cast<struct inotify_event *>(inotify_buf);
+
+          // Process file events
+          manager->process_file_event(event);
+
+          // Process directory events
+          manager->process_dir_event(event);
+        }
+      }
+    };
+#else
+// Implement this
+#endif
+
+  poll_thread = std::thread(inotify_thread);
   poll_thread.detach();
 #else
-  // Implement this
-  Warning("File change notification is not supported for this OS".);
+// Implement this
+Warning("File change notification is not supported for this OS".);
 #endif
 }
 
@@ -146,9 +145,12 @@ FileChangeManager::add_directory_watch(const std::filesystem::path &file_path, C
 {
 #if TS_USE_INOTIFY
   auto dname = file_path.parent_path();
-  for (const auto &[wd, dinfo] : dir_watches) {
-    if (dinfo.dname == dname) {
-      return wd;
+  {
+    std::shared_lock dir_watches_read_lock(dir_watches_mutex);
+    for (const auto &[wd, dinfo] : dir_watches) {
+      if (dinfo.dname == dname) {
+        return wd;
+      }
     }
   }
   auto new_wd = inotify_add_watch(inotify_fd, dname.c_str(), IN_CREATE | IN_MOVED_TO);
@@ -156,6 +158,7 @@ FileChangeManager::add_directory_watch(const std::filesystem::path &file_path, C
     Error("Failed to add directory watch to %s: %s, (%d)", file_path.c_str(), strerror(errno), errno);
   }
 
+  std::unique_lock dir_watches_write_lock(dir_watches_mutex);
   dir_watches[new_wd] = {dname, {{file_path.filename(), {{new_wd, {file_path, contp}}}}}};
   return new_wd;
 #else
@@ -167,6 +170,7 @@ int
 FileChangeManager::add(const std::filesystem::path &path, Continuation *contp)
 {
   Debug(TAG, "Adding a watch on %s", path.c_str());
+  std::lock_guard free_handles_lock(free_handles_mutex);
   if (free_handles.empty()) {
     Error("Maximum number of file watches reached.");
     return -1;
@@ -189,11 +193,13 @@ FileChangeManager::add(const std::filesystem::path &path, Continuation *contp)
       return -1;
     }
   } else {
+    std::unique_lock file_watches_write_lock(file_watches_mutex);
     file_watches[wd] = {path, contp};
   }
 
   auto new_handle = free_handles.back();
   free_handles.pop_back();
+  std::unique_lock watch_handles_write_lock(watch_handles_mutex);
   watch_handles[new_handle] = {.file_wd = wd, .dir_wd = dir_wd};
   return new_handle;
 #else
@@ -205,6 +211,7 @@ void
 FileChangeManager::remove(int watch_handle)
 {
   Debug(TAG, "Removing watch handle %d", watch_handle);
+  std::shared_lock watch_handles_read_lock(watch_handles_mutex);
   if (watch_handles.find(watch_handle) == watch_handles.end()) {
     Debug(TAG, "Tried to remove non-existant watch handle: %d", watch_handle);
     return;
@@ -212,20 +219,25 @@ FileChangeManager::remove(int watch_handle)
 
   const auto &whinfo = watch_handles[watch_handle];
 
-  assert(file_watches.find(whinfo.file_wd) != file_watches.end());
-  if (whinfo.file_wd != -1) {
-    if (inotify_rm_watch(inotify_fd, whinfo.file_wd) == -1) {
-      Error("Failed to remove watch on %s: %s (%d)", file_watches[whinfo.file_wd].path.c_str(), strerror(errno), errno);
+  {
+    std::unique_lock file_watches_write_lock(file_watches_mutex);
+    assert(file_watches.find(whinfo.file_wd) != file_watches.end());
+    if (whinfo.file_wd != -1) {
+      if (inotify_rm_watch(inotify_fd, whinfo.file_wd) == -1) {
+        Error("Failed to remove watch on %s: %s (%d)", file_watches[whinfo.file_wd].path.c_str(), strerror(errno), errno);
+      }
     }
+    file_watches.erase(whinfo.file_wd);
   }
-  file_watches.erase(whinfo.file_wd);
 
+  std::shared_lock dir_watches_read_lock(dir_watches_mutex);
   assert(dir_watches.find(whinfo.dir_wd) != dir_watches.end());
   auto &dir_info = dir_watches[whinfo.dir_wd];
   // Navigate the watches under this directory to find the correct one
   for (auto &[filename, finfos] : dir_info.files) {
     auto kv = finfos.find(watch_handle);
     if (kv != finfos.end()) {
+      std::unique_lock dir_watches_write_lock(dir_watches_mutex);
       if (finfos.size() == 1) {
         // We are the last one to remove this dir watch
         if (inotify_rm_watch(inotify_fd, whinfo.dir_wd) == -1) {
@@ -238,4 +250,7 @@ FileChangeManager::remove(int watch_handle)
       }
     }
   }
+
+  std::lock_guard watch_handles_write_lock(watch_handles_mutex);
+  watch_handles.erase(watch_handle);
 }
