@@ -2723,7 +2723,7 @@ tsapi TSReturnCode TSHttpTxnCntlSet(TSHttpTxn txnp, TSHttpCntlType ctrl, bool da
 /*
  * Get notified for file system events
  */
-tsapi TSWatchDescriptor TSFileEventRegister(const char *filename, TSCont contp);
+tsapi TSWatchDescriptor TSFileEventRegister(const char *filename, TSFileWatchKind kind, TSCont contp);
 tsapi void TSFileEventUnRegister(int wd);
 
 #ifdef __cplusplus

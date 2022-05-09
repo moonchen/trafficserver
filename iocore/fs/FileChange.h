@@ -50,43 +50,12 @@ struct file_info {
   Continuation *contp;
 };
 
-// A map of watched files under a directory:
-//
-//  filename:
-//    watch_handle:
-//      path
-//      continuation
-//    watch_handle:
-//      path
-//      conttinuation
-//
-// 1. A file can have multiple watch handles.
-// 2. Different watch handles can have the same or different continuations.
-// 3. Multiple files can be watched under one directory.
-using DirectoryWatchMap = std::unordered_map<std::string, std::unordered_map<watch_handle_t, struct file_info>>;
-
-// Directory watch info, for files that don't exist yet
-struct dir_info {
-  std::filesystem::path dname;
-  DirectoryWatchMap files; // All of the watched files in this directory
-};
-
-struct watch_handle_info {
-  int file_wd; // can be -1 or a real wd
-  int dir_wd;  // can only be a real wd
-};
-
 constexpr int MAX_WATCHES = 10000;
 
 class FileChangeManager
 {
 public:
-  FileChangeManager()
-  {
-    for (int i = 0; i < MAX_WATCHES; i++) {
-      free_handles.push_back(i);
-    }
-  }
+  FileChangeManager() {}
 
   void init();
 
@@ -95,29 +64,20 @@ public:
 
     @return a watch handle, or -1 on error
   */
-  int add(const std::filesystem::path &path, Continuation *contp);
+  watch_handle_t add(const std::filesystem::path &path, TSFileWatchKind kind, Continuation *contp);
 
   /**
     Remove a file watch
   */
-  void remove(int watch_handle);
+  void remove(watch_handle_t watch_handle);
 
 private:
   std::thread poll_thread;
 
-  int add_directory_watch(const std::filesystem::path &file_path, Continuation *contp);
-  void process_dir_event(struct inotify_event *event);
-  void process_file_event(struct inotify_event *event);
-
-  std::shared_mutex watch_handles_mutex;
-  std::unordered_map<int, struct watch_handle_info> watch_handles;
-  std::mutex free_handles_mutex;
-  std::vector<int> free_handles;
 #if TS_USE_INOTIFY
+  void process_file_event(struct inotify_event *event);
   std::shared_mutex file_watches_mutex;
-  std::unordered_map<int, struct file_info> file_watches;
-  std::shared_mutex dir_watches_mutex;
-  std::unordered_map<int, struct dir_info> dir_watches;
+  std::unordered_map<watch_handle_t, struct file_info> file_watches;
   int inotify_fd;
 #else
   // implement this

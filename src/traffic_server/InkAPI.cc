@@ -79,6 +79,7 @@
 #include "I_Machine.h"
 #include "HttpProxyServerMain.h"
 #include "shared/overridable_txn_vars.h"
+#include "FileChange.h"
 
 #include "ts/ts.h"
 
@@ -10435,17 +10436,16 @@ TSHttpTxnPostBufferReaderGet(TSHttpTxn txnp)
 }
 
 tsapi TSWatchDescriptor
-TSFileEventRegister(const char *filename, TSCont contp)
+TSFileEventRegister(const char *filename, TSFileWatchKind kind, TSCont contp)
 {
-#if defined(__linux__)
+  sdk_assert(sdk_sanity_check_iocore_structure(contp) == TS_SUCCESS);
 
-#else
-  TSWarning("TSFileEventRegister: not supported on this platform.");
-  return 0;
-#endif
+  Continuation *pCont = (Continuation *)contp;
+  return fileChangeManager.add({filename}, kind, pCont);
 }
 
 tsapi void
 TSFileEventUnRegister(TSWatchDescriptor wd)
 {
+  fileChangeManager.remove(wd);
 }
