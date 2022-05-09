@@ -42,6 +42,7 @@
 #include <thread>
 #include <mutex>
 #include <shared_mutex>
+#include <optional>
 
 #include <ts/ts.h>
 #include <ts/remap.h>
@@ -161,6 +162,7 @@ private:
     // never indicate config is fresh when it isn't.
     std::atomic<S3Config *> config;
     std::atomic<time_t> load_time;
+    std::atomic<int> ttl = 60;
 
     _ConfigData() {}
 
@@ -175,7 +177,6 @@ private:
   };
 
   std::unordered_map<std::string, _ConfigData> _cache;
-  static const int _ttl = 60;
 };
 
 ConfigCache gConfCache;
@@ -302,6 +303,8 @@ public:
       TSfree(_conf_fname);
       _conf_fname = TSstrdup(src->_conf_fname);
     }
+
+    _watch_config = src->_watch_config;
   }
 
   // Getters
@@ -381,6 +384,18 @@ public:
   conf_fname() const
   {
     return _conf_fname;
+  }
+
+  bool
+  watch_config() const
+  {
+    return _watch_config;
+  }
+
+  int
+  ttl() const
+  {
+    return _ttl;
   }
 
   int
@@ -464,6 +479,18 @@ public:
   }
 
   void
+  set_watch_config()
+  {
+    _watch_config = true;
+  }
+
+  void
+  set_ttl(int ttl)
+  {
+    _ttl = ttl;
+  }
+
+  void
   reset_conf_reload_count()
   {
     _conf_reload_count = 0;
@@ -487,6 +514,22 @@ public:
       TSActionCancel(_conf_rld_act);
     }
     _conf_rld_act = TSContScheduleOnPool(_conf_rld, delay * 1000, TS_THREAD_POOL_NET);
+  }
+
+  void
+  start_watch_config()
+  {
+    if (!_watch_config_wd) {
+      _watch_config_wd = TSFileEventRegister(_conf_fname, TS_WATCH_MODIFY, _conf_rld);
+    }
+  }
+
+  void
+  stop_watch_config()
+  {
+    if (_watch_config_wd) {
+      TSFileEventUnRegister(_watch_config_wd.value());
+    }
   }
 
   ts::shared_mutex reload_mutex;
@@ -514,6 +557,9 @@ private:
   long _expiration          = 0;
   char *_conf_fname         = nullptr;
   int _conf_reload_count    = 0;
+  bool _watch_config        = false;
+  std::optional<TSWatchDescriptor> _watch_config_wd;
+  int _ttl = 60;
 };
 
 bool
@@ -572,6 +618,8 @@ S3Config::parse_config(const std::string &config_fname)
         set_region_map(pos2 + 14);
       } else if (0 == strncasecmp(pos2, "expiration=", 11)) {
         set_expiration(pos2 + 11);
+      } else if (0 == strncasecmp(pos2, "watch-config", 12)) {
+        set_watch_config();
       } else {
         // ToDo: warnings?
       }
@@ -606,7 +654,7 @@ ConfigCache::get(const char *fname)
 
   if (it != _cache.end()) {
     unsigned update_status = it->second.update_status;
-    if (tv.tv_sec > (it->second.load_time + _ttl)) {
+    if (tv.tv_sec > (it->second.load_time + it->second.ttl)) {
       if (!(update_status & 1) && it->second.update_status.compare_exchange_strong(update_status, update_status + 1)) {
         TSDebug(PLUGIN_NAME, "Configuration from %s is stale, reloading", config_fname.c_str());
         s3 = new S3Config(false); // false == this config does not get the continuation
@@ -623,6 +671,7 @@ ConfigCache::get(const char *fname)
         delete it->second.config;
         it->second.config    = s3;
         it->second.load_time = tv.tv_sec;
+        it->second.ttl       = s3->ttl();
 
         // Update is complete.
         ++it->second.update_status;
@@ -1119,6 +1168,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf ATS_UNUSE
     {const_cast<char *>("v4-exclude-headers"), required_argument, nullptr, 'e'},
     {const_cast<char *>("v4-region-map"), required_argument, nullptr, 'm'},
     {const_cast<char *>("session_token"), required_argument, nullptr, 't'},
+    {const_cast<char *>("watch-config"), no_argument, nullptr, 'w'},
     {nullptr, no_argument, nullptr, '\0'},
   };
 
@@ -1166,6 +1216,9 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf ATS_UNUSE
     case 'm':
       s3->set_region_map(optarg);
       break;
+    case 'w':
+      s3->set_watch_config();
+      break;
     }
 
     if (opt == -1) {
@@ -1200,6 +1253,12 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf ATS_UNUSE
       TSDebug(PLUGIN_NAME, "config expiration time is in the past, re-checking in 1 minute");
       s3->schedule_conf_reload(60);
     }
+  }
+
+  if (s3->watch_config()) {
+    s3->start_watch_config();
+  } else {
+    s3->stop_watch_config();
   }
 
   *ih = static_cast<void *>(s3);
