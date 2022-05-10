@@ -73,7 +73,7 @@ FileChangeManager::init()
       char inotify_buf[INOTIFY_BUF_SIZE];
 
       // blocking read
-      int rc = read(manager->inotify_fd, inotify_buf, sizeof inotify_buf);
+      ssize_t rc = read(manager->inotify_fd, inotify_buf, sizeof inotify_buf);
 
       if (rc == -1) {
         Error("Failed to read inotify: %s (%d)", strerror(errno), errno);
@@ -84,11 +84,13 @@ FileChangeManager::init()
         }
       }
 
-      while (rc > 0) {
-        struct inotify_event *event = reinterpret_cast<struct inotify_event *>(inotify_buf);
+      ssize_t offset = 0;
+      while (offset < rc) {
+        struct inotify_event *event = reinterpret_cast<struct inotify_event *>(inotify_buf + offset);
 
         // Process file events
         manager->process_file_event(event);
+        offset += sizeof(struct inotify_event) + event->len;
       }
     }
   };

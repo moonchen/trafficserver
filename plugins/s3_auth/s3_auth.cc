@@ -520,7 +520,8 @@ public:
   start_watch_config()
   {
     if (!_watch_config_wd) {
-      _watch_config_wd = TSFileEventRegister(_conf_fname, TS_WATCH_MODIFY, _conf_rld);
+      auto fname       = makeConfigPath(_conf_fname);
+      _watch_config_wd = TSFileEventRegister(fname.c_str(), TS_WATCH_MODIFY, _conf_rld);
     }
   }
 
