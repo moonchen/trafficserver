@@ -27,6 +27,7 @@
 
 #include <cassert>
 #include <functional>
+#include <mutex>
 
 // Globals
 FileChangeManager fileChangeManager;
@@ -122,7 +123,7 @@ FileChangeManager::add(const std::filesystem::path &path, TSFileWatchKind kind, 
   } else if (kind == TS_WATCH_MODIFY) {
     mask = IN_CLOSE_WRITE | IN_ATTRIB;
   }
-  wd = inotify_add_watch(inotify_fd, path.c_str(), IN_DELETE_SELF | IN_CLOSE_WRITE | IN_ATTRIB);
+  wd = inotify_add_watch(inotify_fd, path.c_str(), mask);
   if (wd == -1) {
     Error("Failed to add file watch on %s: %s (%d)", path.c_str(), strerror(errno), errno);
     return -1;
