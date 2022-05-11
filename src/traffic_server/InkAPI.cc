@@ -10440,7 +10440,18 @@ TSFileEventRegister(const char *filename, TSFileWatchKind kind, TSCont contp)
 {
   sdk_assert(sdk_sanity_check_iocore_structure(contp) == TS_SUCCESS);
 
-  Continuation *pCont = (Continuation *)contp;
+  /* ensure we are on a EThread */
+  sdk_assert(sdk_sanity_check_null_ptr((void *)this_ethread()) == TS_SUCCESS);
+
+  FORCE_PLUGIN_SCOPED_MUTEX(contp);
+
+  INKContInternal *i = reinterpret_cast<INKContInternal *>(contp);
+
+  if (ink_atomic_increment(static_cast<int *>(&i->m_event_count), 1) < 0) {
+    ink_assert(!"not reached");
+  }
+
+  Continuation *pCont = reinterpret_cast<Continuation *>(contp);
   return fileChangeManager.add({filename}, kind, pCont);
 }
 
