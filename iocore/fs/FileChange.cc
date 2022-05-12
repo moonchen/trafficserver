@@ -43,18 +43,18 @@ FileChangeManager::process_file_event(struct inotify_event *event)
   auto finfo_it = file_watches.find(event->wd);
   if (finfo_it != file_watches.end()) {
     const struct file_info &finfo = finfo_it->second;
-    if (event->mask & (IN_CLOSE_WRITE | IN_ATTRIB)) {
-      Debug(TAG, "Modify file event (%d) on %s", event->mask, finfo.path.c_str());
-      eventProcessor.schedule_imm(finfo.contp, ET_TASK);
-    } else if (event->mask & (IN_DELETE_SELF | IN_MOVED_FROM)) {
+    if (event->mask & (IN_DELETE_SELF | IN_MOVED_FROM)) {
       Debug(TAG, "Delete file event (%d) on %s", event->mask, finfo.path.c_str());
       int rc2 = inotify_rm_watch(inotify_fd, event->wd);
       if (rc2 == -1) {
         Error("Failed to remove inotify watch on %s: %s (%d)", finfo.path.c_str(), strerror(errno), errno);
       }
-      eventProcessor.schedule_imm(finfo.contp, ET_TASK);
+      eventProcessor.schedule_imm(new Continuation(*finfo.contp), ET_TASK);
       std::unique_lock file_watches_write_lock(file_watches_mutex);
       file_watches.erase(event->wd);
+    } else {
+      Debug(TAG, "Create/Modify file event (%d) on %s", event->mask, finfo.path.c_str());
+      eventProcessor.schedule_imm(new Continuation(*finfo.contp), ET_TASK);
     }
   }
 }
