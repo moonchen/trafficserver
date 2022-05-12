@@ -1454,8 +1454,8 @@ namespace ts
 }
 #endif
 
-using TSWatchDescriptor = int;
-using TSFileWatchKind   = enum { TS_WATCH_CREATE, TS_WATCH_DELETE, TS_WATCH_MODIFY };
+typedef int TSWatchDescriptor;
+typedef enum { TS_WATCH_CREATE, TS_WATCH_DELETE, TS_WATCH_MODIFY } TSFileWatchKind;
 
 #ifdef __cplusplus
 }
