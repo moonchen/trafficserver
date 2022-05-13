@@ -28,13 +28,62 @@
 #include <cassert>
 #include <functional>
 #include <mutex>
+#include <optional>
 
 // Globals
 FileChangeManager fileChangeManager;
 static constexpr auto TAG                = "FileChange";
 static constexpr size_t INOTIFY_BUF_SIZE = 4096;
 
+// Wrap a continuation
+class FileChangeCallback : public Continuation
+{
+public:
+  explicit FileChangeCallback(Continuation *contp, TSEvent event) : Continuation(contp->mutex.get()), m_cont(contp), m_event(event)
+  {
+    SET_HANDLER(&FileChangeCallback::event_handler);
+  }
+
+  int
+  event_handler(int, void *eventp)
+  {
+    Event *e = reinterpret_cast<Event *>(eventp);
+    if (m_cont->mutex) {
+      MUTEX_TRY_LOCK(trylock, m_cont->mutex, this_ethread());
+      if (!trylock.is_locked()) {
+        eventProcessor.schedule_in(this, HRTIME_MSECONDS(10), ET_TASK);
+      } else {
+        m_cont->handleEvent(m_event, e->cookie);
+        delete this;
+      }
+    } else {
+      m_cont->handleEvent(m_event, e->cookie);
+      delete this;
+    }
+
+    return 0;
+  }
+
+  std::string filename; // File name if the event is a file creation event.
+
+private:
+  Continuation *m_cont;
+  TSEvent m_event;
+};
+
 #if TS_USE_INOTIFY
+
+static void
+invoke(Continuation *contp, TSEvent event_type, std::optional<std::string> name)
+{
+  FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
+  void *cookie           = nullptr;
+  if (name) {
+    cb->filename = name.value();
+    cookie       = static_cast<void *>(&cb->filename);
+  }
+  eventProcessor.schedule_imm(cb, ET_TASK, EVENT_IMMEDIATE, cookie);
+}
 
 void
 FileChangeManager::process_file_event(struct inotify_event *event)
@@ -42,19 +91,42 @@ FileChangeManager::process_file_event(struct inotify_event *event)
   std::shared_lock file_watches_read_lock(file_watches_mutex);
   auto finfo_it = file_watches.find(event->wd);
   if (finfo_it != file_watches.end()) {
+    TSEvent event_type            = TS_EVENT_NONE;
     const struct file_info &finfo = finfo_it->second;
+    Continuation *contp           = finfo.contp;
+    std::optional<std::string> name;
+
     if (event->mask & (IN_DELETE_SELF | IN_MOVED_FROM)) {
       Debug(TAG, "Delete file event (%d) on %s", event->mask, finfo.path.c_str());
       int rc2 = inotify_rm_watch(inotify_fd, event->wd);
       if (rc2 == -1) {
         Error("Failed to remove inotify watch on %s: %s (%d)", finfo.path.c_str(), strerror(errno), errno);
       }
-      eventProcessor.schedule_imm(new Continuation(*finfo.contp), ET_TASK);
+      event_type = TS_EVENT_FILE_DELETED;
       std::unique_lock file_watches_write_lock(file_watches_mutex);
       file_watches.erase(event->wd);
-    } else {
-      Debug(TAG, "Create/Modify file event (%d) on %s", event->mask, finfo.path.c_str());
-      eventProcessor.schedule_imm(new Continuation(*finfo.contp), ET_TASK);
+      invoke(contp, event_type, name);
+    }
+
+    if (event->mask & (IN_CREATE | IN_MOVED_TO)) {
+      // Name may be padded with nul characters.  Trim them.
+      auto len = strnlen(event->name, event->len);
+      name.emplace(event->name, len);
+      Debug(TAG, "Create file event (%d) on %s: %s", event->mask, finfo.path.c_str(), name->c_str());
+      event_type = TS_EVENT_FILE_CREATED;
+      invoke(contp, event_type, name);
+    }
+
+    if (event->mask & (IN_MODIFY | IN_ATTRIB)) {
+      Debug(TAG, "Modify file event (%d) on %s", event->mask, finfo.path.c_str());
+      event_type = TS_EVENT_FILE_UPDATED;
+      invoke(contp, event_type, name);
+    }
+
+    if (event->mask & (IN_IGNORED)) {
+      Debug(TAG, "Ignored file event (%d) on %s", event->mask, finfo.path.c_str());
+      event_type = TS_EVENT_FILE_IGNORED;
+      invoke(contp, event_type, name);
     }
   }
 }

@@ -186,6 +186,8 @@ ConfigCache gConfCache;
 //
 int event_handler(TSCont, TSEvent, void *); // Forward declaration
 int config_reloader(TSCont, TSEvent, void *);
+int config_dir_watch(TSCont, TSEvent, void *);
+int config_watch(TSCont, TSEvent, void *);
 
 class S3Config
 {
@@ -198,6 +200,12 @@ public:
 
       _conf_rld = TSContCreate(config_reloader, TSMutexCreate());
       TSContDataSet(_conf_rld, static_cast<void *>(this));
+
+      _dir_watch = TSContCreate(config_dir_watch, TSMutexCreate());
+      TSContDataSet(_dir_watch, static_cast<void *>(this));
+
+      _conf_watch = TSContCreate(config_watch, TSMutexCreate());
+      TSContDataSet(_conf_watch, static_cast<void *>(this));
     }
   }
 
@@ -485,9 +493,9 @@ public:
   }
 
   void
-  set_ttl(int ttl)
+  set_ttl(const char *s)
   {
-    _ttl = ttl;
+    _ttl = strtol(s, nullptr, 10);
   }
 
   void
@@ -519,21 +527,67 @@ public:
   void
   start_watch_config()
   {
-    if (!_watch_config_wd) {
-      auto fname       = makeConfigPath(_conf_fname);
-      _watch_config_wd = TSFileEventRegister(fname.c_str(), TS_WATCH_MODIFY, _conf_rld);
+    std::unique_lock lock(wd_mutex);
+    std::filesystem::path fname{makeConfigPath(_conf_fname)};
+    if (!_config_file_wd) {
+      _config_file_wd = TSFileEventRegister(fname.c_str(), TS_WATCH_MODIFY, _conf_watch);
+      if (_config_file_wd == -1) {
+        _config_file_wd.reset();
+        TSDebug(PLUGIN_NAME, "Waiting for config file to be created: %s", fname.c_str());
+      } else {
+        TSDebug(PLUGIN_NAME, "Watching config file: %s (%d)", fname.c_str(), _config_file_wd.value());
+      }
+    }
+
+    if (!_config_dir_wd) {
+      auto parent_dir = fname.parent_path();
+      _config_dir_wd  = TSFileEventRegister(parent_dir.c_str(), TS_WATCH_CREATE, _dir_watch);
+      if (_config_dir_wd == -1) {
+        _config_dir_wd.reset();
+        TSError("s3_auth: failed to watch config file directory: %s", parent_dir.c_str());
+      } else {
+        TSDebug(PLUGIN_NAME, "Watching config file directory: %s (%d)", parent_dir.c_str(), _config_file_wd.value());
+      }
     }
   }
 
   void
   stop_watch_config()
   {
-    if (_watch_config_wd) {
-      TSFileEventUnRegister(_watch_config_wd.value());
+    std::unique_lock lock(wd_mutex);
+    if (_config_file_wd) {
+      TSFileEventUnRegister(_config_file_wd.value());
+      _config_file_wd.reset();
+    }
+
+    if (_config_dir_wd) {
+      TSFileEventUnRegister(_config_dir_wd.value());
+      _config_dir_wd.reset();
+    }
+  }
+
+  void
+  config_file_watch_ignored()
+  {
+    std::unique_lock lock(wd_mutex);
+    if (_config_file_wd) {
+      TSFileEventUnRegister(_config_file_wd.value());
+      _config_file_wd.reset();
+    }
+  }
+
+  void
+  config_dir_watch_ignored()
+  {
+    std::unique_lock lock(wd_mutex);
+    if (_config_dir_wd) {
+      TSFileEventUnRegister(_config_dir_wd.value());
+      _config_dir_wd.reset();
     }
   }
 
   ts::shared_mutex reload_mutex;
+  ts::shared_mutex wd_mutex;
 
 private:
   char *_secret            = nullptr;
@@ -548,6 +602,8 @@ private:
   bool _virt_host_modified = false;
   TSCont _cont             = nullptr;
   TSCont _conf_rld         = nullptr;
+  TSCont _conf_watch       = nullptr;
+  TSCont _dir_watch        = nullptr;
   TSAction _conf_rld_act   = nullptr;
   StringSet _v4includeHeaders;
   bool _v4includeHeaders_modified = false;
@@ -559,7 +615,8 @@ private:
   char *_conf_fname         = nullptr;
   int _conf_reload_count    = 0;
   bool _watch_config        = false;
-  std::optional<TSWatchDescriptor> _watch_config_wd;
+  std::optional<TSWatchDescriptor> _config_file_wd;
+  std::optional<TSWatchDescriptor> _config_dir_wd;
   int _ttl = 60;
 };
 
@@ -619,6 +676,8 @@ S3Config::parse_config(const std::string &config_fname)
         set_region_map(pos2 + 14);
       } else if (0 == strncasecmp(pos2, "expiration=", 11)) {
         set_expiration(pos2 + 11);
+      } else if (0 == strncasecmp(pos2, "ttl=", 4)) {
+        set_ttl(pos2 + 4);
       } else if (0 == strncasecmp(pos2, "watch-config", 12)) {
         set_watch_config();
       } else {
@@ -1093,6 +1152,49 @@ cal_reload_delay(long time_diff)
 }
 
 int
+config_dir_watch(TSCont cont, TSEvent event, void *edata)
+{
+  TSDebug(PLUGIN_NAME, "config directory watch handler");
+  S3Config *s3 = static_cast<S3Config *>(TSContDataGet(cont));
+
+  if (event == TS_EVENT_FILE_IGNORED) {
+    TSDebug(PLUGIN_NAME, "Config directory lost.  No longer watching for config changes.");
+    // Lost the config file's directory.  We currently can't deal with this.  Just stop watching for file changes.
+    s3->config_dir_watch_ignored();
+    return TS_SUCCESS;
+  }
+
+  TSAssert(event == TS_EVENT_FILE_CREATED);
+  TSAssert(edata != nullptr);
+  const String &filename = *reinterpret_cast<std::string *>(edata);
+  TSDebug(PLUGIN_NAME, "File created: %s", filename.c_str());
+  if (filename == s3->conf_fname()) {
+    TSDebug(PLUGIN_NAME, "config file created");
+    config_reloader(cont, event, edata);
+  }
+
+  return TS_SUCCESS;
+}
+
+int
+config_watch(TSCont cont, TSEvent event, void *edata)
+{
+  TSDebug(PLUGIN_NAME, "config watch handler");
+
+  S3Config *s3 = static_cast<S3Config *>(TSContDataGet(cont));
+  if (event == TS_EVENT_FILE_IGNORED) {
+    TSDebug(PLUGIN_NAME, "Config file watch lost.");
+    // Probably deleted.  Directory watch will see if it's re-created.
+    s3->config_file_watch_ignored();
+    return TS_SUCCESS;
+  }
+
+  config_reloader(cont, event, edata);
+
+  return TS_SUCCESS;
+}
+
+int
 config_reloader(TSCont cont, TSEvent event, void *edata)
 {
   TSDebug(PLUGIN_NAME, "reloading configs");
@@ -1127,6 +1229,12 @@ config_reloader(TSCont cont, TSEvent event, void *edata)
       }
       s3->schedule_conf_reload(60);
     }
+  }
+
+  if (s3->watch_config()) {
+    s3->start_watch_config();
+  } else {
+    s3->stop_watch_config();
   }
 
   return TS_SUCCESS;
