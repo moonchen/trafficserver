@@ -64,7 +64,8 @@ public:
     return 0;
   }
 
-  std::string filename; // File name if the event is a file creation event.
+  std::string filename; // File name if the event is a file creation event.  This is used in the cookie for a create event.
+  TSFileWatchData data;
 
 private:
   Continuation *m_cont;
@@ -74,15 +75,10 @@ private:
 #if TS_USE_INOTIFY
 
 static void
-invoke(Continuation *contp, TSEvent event_type, std::optional<std::string> name)
+invoke(FileChangeCallback *cb)
 {
-  FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
-  void *cookie           = nullptr;
-  if (name) {
-    cb->filename = name.value();
-    cookie       = static_cast<void *>(&cb->filename);
-  }
-  eventProcessor.schedule_imm(cb, ET_TASK, EVENT_IMMEDIATE, cookie);
+  void *cookie = static_cast<void *>(&cb->data);
+  eventProcessor.schedule_imm(cb, ET_TASK, 1, cookie);
 }
 
 void
@@ -94,7 +90,6 @@ FileChangeManager::process_file_event(struct inotify_event *event)
     TSEvent event_type            = TS_EVENT_NONE;
     const struct file_info &finfo = finfo_it->second;
     Continuation *contp           = finfo.contp;
-    std::optional<std::string> name;
 
     if (event->mask & (IN_DELETE_SELF | IN_MOVED_FROM)) {
       Debug(TAG, "Delete file event (%d) on %s", event->mask, finfo.path.c_str());
@@ -102,31 +97,43 @@ FileChangeManager::process_file_event(struct inotify_event *event)
       if (rc2 == -1) {
         Error("Failed to remove inotify watch on %s: %s (%d)", finfo.path.c_str(), strerror(errno), errno);
       }
-      event_type = TS_EVENT_FILE_DELETED;
-      std::unique_lock file_watches_write_lock(file_watches_mutex);
-      file_watches.erase(event->wd);
-      invoke(contp, event_type, name);
+      event_type             = TS_EVENT_FILE_DELETED;
+      FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
+      cb->data.wd            = event->wd;
+      cb->data.name          = nullptr;
+      invoke(cb);
     }
 
     if (event->mask & (IN_CREATE | IN_MOVED_TO)) {
       // Name may be padded with nul characters.  Trim them.
       auto len = strnlen(event->name, event->len);
-      name.emplace(event->name, len);
-      Debug(TAG, "Create file event (%d) on %s: %s", event->mask, finfo.path.c_str(), name->c_str());
+      std::string name{event->name, len};
+      Debug(TAG, "Create file event (%d) on %s (wd = %d): %s", event->mask, finfo.path.c_str(), event->wd, name.c_str());
       event_type = TS_EVENT_FILE_CREATED;
-      invoke(contp, event_type, name);
+
+      FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
+      cb->filename           = name;
+      cb->data.wd            = event->wd;
+      cb->data.name          = cb->filename.c_str();
+      invoke(cb);
     }
 
     if (event->mask & (IN_MODIFY | IN_ATTRIB)) {
-      Debug(TAG, "Modify file event (%d) on %s", event->mask, finfo.path.c_str());
-      event_type = TS_EVENT_FILE_UPDATED;
-      invoke(contp, event_type, name);
+      Debug(TAG, "Modify file event (%d) on %s (wd = %d)", event->mask, finfo.path.c_str(), event->wd);
+      event_type             = TS_EVENT_FILE_UPDATED;
+      FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
+      cb->data.wd            = event->wd;
+      cb->data.name          = nullptr;
+      invoke(cb);
     }
 
     if (event->mask & (IN_IGNORED)) {
-      Debug(TAG, "Ignored file event (%d) on %s", event->mask, finfo.path.c_str());
-      event_type = TS_EVENT_FILE_IGNORED;
-      invoke(contp, event_type, name);
+      Debug(TAG, "Ignored file event (%d) on %s (wd = %d)", event->mask, finfo.path.c_str(), event->wd);
+      event_type             = TS_EVENT_FILE_IGNORED;
+      FileChangeCallback *cb = new FileChangeCallback(contp, event_type);
+      cb->data.wd            = event->wd;
+      cb->data.name          = nullptr;
+      invoke(cb);
     }
   }
 }
@@ -189,7 +196,7 @@ FileChangeManager::add(const std::filesystem::path &path, TSFileWatchKind kind, 
   // Let the OS handle multiple watches on one file.
   uint32_t mask = 0;
   if (kind == TS_WATCH_CREATE) {
-    mask = IN_CREATE | IN_MOVED_TO;
+    mask = IN_CREATE | IN_MOVED_TO | IN_ONLYDIR;
   } else if (kind == TS_WATCH_DELETE) {
     mask = IN_DELETE_SELF | IN_MOVED_FROM;
   } else if (kind == TS_WATCH_MODIFY) {

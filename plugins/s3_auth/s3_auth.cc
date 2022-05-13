@@ -567,20 +567,20 @@ public:
   }
 
   void
-  config_file_watch_ignored()
+  config_file_watch_ignored(TSWatchDescriptor wd)
   {
     std::unique_lock lock(wd_mutex);
-    if (_config_file_wd) {
+    if (_config_file_wd == wd) {
       TSFileEventUnRegister(_config_file_wd.value());
       _config_file_wd.reset();
     }
   }
 
   void
-  config_dir_watch_ignored()
+  config_dir_watch_ignored(TSWatchDescriptor wd)
   {
     std::unique_lock lock(wd_mutex);
-    if (_config_dir_wd) {
+    if (_config_dir_wd == wd) {
       TSFileEventUnRegister(_config_dir_wd.value());
       _config_dir_wd.reset();
     }
@@ -727,11 +727,14 @@ ConfigCache::get(const char *fname)
           s3 = nullptr;
           TSAssert(!"Configuration parsing / caching failed");
         }
+        TSDebug(PLUGIN_NAME, "Updated rule: access_key=%s, virtual_host=%s, version=%d", s3->keyid(),
+                s3->virt_host() ? "yes" : "no", s3->version());
 
         delete it->second.config;
         it->second.config    = s3;
         it->second.load_time = tv.tv_sec;
         it->second.ttl       = s3->ttl();
+        TSDebug(PLUGIN_NAME, "Config ttl updated to %d seconds", it->second.ttl.load());
 
         // Update is complete.
         ++it->second.update_status;
@@ -757,6 +760,8 @@ ConfigCache::get(const char *fname)
     if (s3->parse_config(config_fname)) {
       s3->set_conf_fname(fname);
       _cache.emplace(config_fname, _ConfigData(s3, tv.tv_sec));
+      _cache[config_fname].ttl = s3->ttl();
+      TSDebug(PLUGIN_NAME, "Config ttl set to %d seconds", _cache[config_fname].ttl.load());
     } else {
       delete s3;
       s3 = nullptr;
@@ -1156,19 +1161,19 @@ config_dir_watch(TSCont cont, TSEvent event, void *edata)
 {
   TSDebug(PLUGIN_NAME, "config directory watch handler");
   S3Config *s3 = static_cast<S3Config *>(TSContDataGet(cont));
+  TSAssert(edata != nullptr);
+  TSFileWatchData *fwd = reinterpret_cast<TSFileWatchData *>(edata);
 
   if (event == TS_EVENT_FILE_IGNORED) {
     TSDebug(PLUGIN_NAME, "Config directory lost.  No longer watching for config changes.");
     // Lost the config file's directory.  We currently can't deal with this.  Just stop watching for file changes.
-    s3->config_dir_watch_ignored();
+    s3->config_dir_watch_ignored(fwd->wd);
     return TS_SUCCESS;
   }
 
   TSAssert(event == TS_EVENT_FILE_CREATED);
-  TSAssert(edata != nullptr);
-  const String &filename = *reinterpret_cast<std::string *>(edata);
-  TSDebug(PLUGIN_NAME, "File created: %s", filename.c_str());
-  if (filename == s3->conf_fname()) {
+  TSDebug(PLUGIN_NAME, "File created: %s", fwd->name);
+  if (strncmp(s3->conf_fname(), fwd->name, strlen(s3->conf_fname())) == 0) {
     TSDebug(PLUGIN_NAME, "config file created");
     config_reloader(cont, event, edata);
   }
@@ -1180,12 +1185,14 @@ int
 config_watch(TSCont cont, TSEvent event, void *edata)
 {
   TSDebug(PLUGIN_NAME, "config watch handler");
+  TSAssert(edata != nullptr);
+  TSFileWatchData *fwd = reinterpret_cast<TSFileWatchData *>(edata);
 
   S3Config *s3 = static_cast<S3Config *>(TSContDataGet(cont));
   if (event == TS_EVENT_FILE_IGNORED) {
     TSDebug(PLUGIN_NAME, "Config file watch lost.");
     // Probably deleted.  Directory watch will see if it's re-created.
-    s3->config_file_watch_ignored();
+    s3->config_file_watch_ignored(fwd->wd);
     return TS_SUCCESS;
   }
 
