@@ -33,9 +33,6 @@
 #include "tscore/ts_file.h"
 #include "P_EventSystem.h"
 
-// TODO: detect this with autotools
-#define TS_USE_INOTIFY 1
-
 #if TS_USE_INOTIFY
 #include <sys/inotify.h>
 #else

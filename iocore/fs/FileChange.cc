@@ -32,8 +32,7 @@
 
 // Globals
 FileChangeManager fileChangeManager;
-static constexpr auto TAG                = "FileChange";
-static constexpr size_t INOTIFY_BUF_SIZE = 4096;
+static constexpr auto TAG ATS_UNUSED = "FileChange";
 
 // Wrap a continuation
 class FileChangeCallback : public Continuation
@@ -73,6 +72,7 @@ private:
 };
 
 #if TS_USE_INOTIFY
+static constexpr size_t INOTIFY_BUF_SIZE = 4096;
 
 static void
 invoke(FileChangeCallback *cb)
@@ -137,6 +137,7 @@ FileChangeManager::process_file_event(struct inotify_event *event)
     }
   }
 }
+#endif
 
 void
 FileChangeManager::init()
@@ -174,25 +175,20 @@ FileChangeManager::init()
       }
     }
   };
-#else
-// Implement this
-#endif
-
   poll_thread = std::thread(inotify_thread);
   poll_thread.detach();
 #else
-// Implement this
-Warning("File change notification is not supported for this OS".);
+  // Implement this
 #endif
 }
 
 watch_handle_t
 FileChangeManager::add(const ts::file::path &path, TSFileWatchKind kind, Continuation *contp)
 {
+#if TS_USE_INOTIFY
   Debug(TAG, "Adding a watch on %s", path.c_str());
   watch_handle_t wd = 0;
 
-#if TS_USE_INOTIFY
   // Let the OS handle multiple watches on one file.
   uint32_t mask = 0;
   if (kind == TS_WATCH_CREATE) {
@@ -211,18 +207,21 @@ FileChangeManager::add(const ts::file::path &path, TSFileWatchKind kind, Continu
     file_watches[wd] = {path, contp};
   }
 
-#endif
   Debug(TAG, "Watch handle = %d", wd);
   return wd;
+#else
+  Warning("File change notification is not supported on this OS.");
+  return 0;
+#endif
 }
 
 void
 FileChangeManager::remove(watch_handle_t watch_handle)
 {
-  Debug(TAG, "Deleting watch %d", watch_handle);
 #if TS_USE_INOTIFY
+  Debug(TAG, "Deleting watch %d", watch_handle);
   inotify_rm_watch(inotify_fd, watch_handle);
-#endif
   std::unique_lock file_watches_write_lock(file_watches_mutex);
   file_watches.erase(watch_handle);
+#endif
 }
