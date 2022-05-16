@@ -1805,8 +1805,8 @@ AC_LANG_POP([C++])
 # Right now, the healthcheck plugins requires inotify_init (and friends)
 AM_CONDITIONAL([BUILD_HEALTHCHECK_PLUGIN], [ test "$ac_cv_func_inotify_init" = "yes" ])
 
-use_inotify=no
-AS_IF([test "x$ac_cv_func_inotify_init" = "yes"], [use_inotify=yes])
+use_inotify=0
+AS_IF([test "x$ac_cv_func_inotify_init" = "xyes"], [use_inotify=1])
 AC_SUBST(use_inotify)
 
 #
