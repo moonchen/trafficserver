@@ -187,7 +187,7 @@ Warning("File change notification is not supported for this OS".);
 }
 
 watch_handle_t
-FileChangeManager::add(const std::filesystem::path &path, TSFileWatchKind kind, Continuation *contp)
+FileChangeManager::add(const ts::file::path &path, TSFileWatchKind kind, Continuation *contp)
 {
   Debug(TAG, "Adding a watch on %s", path.c_str());
   watch_handle_t wd = 0;

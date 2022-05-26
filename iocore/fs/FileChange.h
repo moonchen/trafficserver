@@ -26,11 +26,11 @@
 
 #include <thread>
 #include <chrono>
-#include <filesystem>
 #include <set>
 #include <unordered_map>
 #include <vector>
 #include <shared_mutex>
+#include "tscore/ts_file.h"
 #include "P_EventSystem.h"
 
 // TODO: detect this with autotools
@@ -46,7 +46,7 @@ using watch_handle_t = int;
 
 // File watch info
 struct file_info {
-  std::filesystem::path path;
+  ts::file::path path;
   Continuation *contp;
 };
 
@@ -64,7 +64,7 @@ public:
 
     @return a watch handle, or -1 on error
   */
-  watch_handle_t add(const std::filesystem::path &path, TSFileWatchKind kind, Continuation *contp);
+  watch_handle_t add(const ts::file::path &path, TSFileWatchKind kind, Continuation *contp);
 
   /**
     Remove a file watch

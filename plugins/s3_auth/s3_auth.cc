@@ -48,6 +48,7 @@
 #include <ts/remap.h>
 #include <tscpp/util/TsSharedMutex.h>
 #include "tscore/ink_config.h"
+#include "tscore/ts_file.h"
 
 #include "aws_auth_v4.h"
 
@@ -528,7 +529,7 @@ public:
   start_watch_config()
   {
     std::unique_lock lock(wd_mutex);
-    std::filesystem::path fname{makeConfigPath(_conf_fname)};
+    ts::file::path fname{makeConfigPath(_conf_fname)};
     if (!_config_file_wd) {
       _config_file_wd = TSFileEventRegister(fname.c_str(), TS_WATCH_MODIFY, _conf_watch);
       if (_config_file_wd == -1) {
