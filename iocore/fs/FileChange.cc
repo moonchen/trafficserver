@@ -118,7 +118,7 @@ FileChangeManager::process_file_event(struct inotify_event *event)
       invoke(cb);
     }
 
-    if (event->mask & (IN_MODIFY | IN_ATTRIB)) {
+    if (event->mask & (IN_CLOSE_WRITE | IN_ATTRIB)) {
       Debug(TAG, "Modify file event (%d) on %s (wd = %d)", event->mask, finfo.path.c_str(), event->wd);
       event_type             = TS_EVENT_FILE_UPDATED;
       FileChangeCallback *cb = new FileChangeCallback(contp, event_type);

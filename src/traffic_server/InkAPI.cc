@@ -10442,8 +10442,7 @@ TSFileEventRegister(const char *filename, TSFileWatchKind kind, TSCont contp)
   sdk_assert(sdk_sanity_check_null_ptr((void *)this_ethread()) == TS_SUCCESS);
 
   Continuation *pCont = reinterpret_cast<Continuation *>(contp);
-  ts::file::path filepath{filename};
-  return fileChangeManager.add(filepath, kind, pCont);
+  return fileChangeManager.add(ts::file::path{filename}, kind, pCont);
 }
 
 tsapi void
