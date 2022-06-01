@@ -167,13 +167,14 @@ private:
 
     _ConfigData() {}
 
-    _ConfigData(S3Config *config_, time_t load_time_) : config(config_), load_time(load_time_) {}
+    _ConfigData(S3Config *config_, time_t load_time_, int ttl_) : config(config_), load_time(load_time_), ttl(ttl_) {}
 
     _ConfigData(_ConfigData &&lhs)
     {
       update_status = lhs.update_status.load();
       config        = lhs.config.load();
       load_time     = lhs.load_time.load();
+      ttl           = lhs.ttl.load();
     }
   };
 
@@ -760,7 +761,7 @@ ConfigCache::get(const char *fname)
     TSDebug(PLUGIN_NAME, "Parsing and caching configuration from %s, version:%d", config_fname.c_str(), s3->version());
     if (s3->parse_config(config_fname)) {
       s3->set_conf_fname(fname);
-      _cache.emplace(config_fname, _ConfigData(s3, tv.tv_sec));
+      _cache.emplace(config_fname, _ConfigData(s3, tv.tv_sec, s3->ttl()));
       _cache[config_fname].ttl = s3->ttl();
       TSDebug(PLUGIN_NAME, "Config ttl set to %d seconds", _cache[config_fname].ttl.load());
     } else {
