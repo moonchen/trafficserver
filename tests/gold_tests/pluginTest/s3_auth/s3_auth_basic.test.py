@@ -21,7 +21,7 @@ Test.ContinueOnFail = True
 ts = Test.MakeATSProcess("ts")
 server = Test.MakeOriginServer("server")
 
-Test.testName = "s3_auth: basic"
+Test.testName = "s3_auth: watch config"
 
 # define the request header and the desired response header
 request_header = {
@@ -46,6 +46,7 @@ ts.Disk.records_config.update({
 })
 
 ts.Setup.CopyAs('rules/v4.conf', Test.RunDirectory)
+ts.Setup.CopyAs('rules/v4-modified.conf', Test.RunDirectory)
 ts.Setup.CopyAs('rules/region_map.conf', Test.RunDirectory)
 
 ts.Disk.remap_config.AddLine(
@@ -53,29 +54,29 @@ ts.Disk.remap_config.AddLine(
         @plugin=s3_auth.so \
             @pparam=--config @pparam={1}/v4.conf \
             @pparam=--v4-region-map @pparam={1}/region_map.conf \
-    '.format(server.Variables.Port, Test.RunDirectory)
-)
-ts.Disk.remap_config.AddLine(
-    'map / http://127.0.0.1:{0}'.format(server.Variables.Port)
+            @pparam=--watch-config \
+            '
+    .format(server.Variables.Port, Test.RunDirectory)
 )
 
 # Commands to get the following response headers
-# 1. miss (empty cache)
-# 2. hit-fresh (content served within 10s cache)
-# 3. hit-stale (waited 15s, after 10s cache)
-# 2. hit-fresh (content served within 10s cache)
+# 1. make a request
+# 2. modify the config
+# 3. make another request
 curlRequest = (
     'curl -s -v -H "Host: www.example.com" http://127.0.0.1:{0};'
-    #'curl -v -H "Host: www.example.com" http://127.0.0.1:{0};'
-    #'sleep 15; curl -s -v -H "Host: www.example.com" http://127.0.0.1:{0};'
-    #'curl -s -v -H "Host: www.example.com" http://127.0.0.1:{0}'
+    'sleep 1; cp {1}/v4-modified.conf {1}/v4.conf;'
+    'sleep 1; curl -s -v -H "Host: www.example.com" http://127.0.0.1:{0};'
 )
 
 # Test Case
 tr = Test.AddTestRun()
-tr.Processes.Default.Command = curlRequest.format(ts.Variables.port)
+tr.Processes.Default.Command = curlRequest.format(ts.Variables.port, Test.RunDirectory)
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.StartBefore(server)
 tr.Processes.Default.StartBefore(ts)
 tr.Processes.Default.Streams.stderr = "gold/s3_auth_basic.gold"
 tr.StillRunningAfter = server
+
+ts.Streams.stderr = "gold/traffic_server.gold"
+ts.ReturnCode = 0

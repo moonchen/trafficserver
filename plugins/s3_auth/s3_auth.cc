@@ -314,7 +314,9 @@ public:
       _conf_fname = TSstrdup(src->_conf_fname);
     }
 
-    _watch_config = src->_watch_config;
+    if (src->_watch_config) {
+      _watch_config = src->_watch_config;
+    }
   }
 
   // Getters
@@ -758,7 +760,7 @@ ConfigCache::get(const char *fname)
     // Create a new cached file.
     s3 = new S3Config(false); // false == this config does not get the continuation
 
-    TSDebug(PLUGIN_NAME, "Parsing and caching configuration from %s, version:%d", config_fname.c_str(), s3->version());
+    TSDebug(PLUGIN_NAME, "Parsing and caching configuration from %s", config_fname.c_str());
     if (s3->parse_config(config_fname)) {
       s3->set_conf_fname(fname);
       _cache.emplace(config_fname, _ConfigData(s3, tv.tv_sec, s3->ttl()));
@@ -1287,6 +1289,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf ATS_UNUSE
     {const_cast<char *>("v4-region-map"), required_argument, nullptr, 'm'},
     {const_cast<char *>("session_token"), required_argument, nullptr, 't'},
     {const_cast<char *>("watch-config"), no_argument, nullptr, 'w'},
+    {const_cast<char *>("ttl"), no_argument, nullptr, 'T'},
     {nullptr, no_argument, nullptr, '\0'},
   };
 
@@ -1336,6 +1339,9 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf ATS_UNUSE
       break;
     case 'w':
       s3->set_watch_config();
+      break;
+    case 'T':
+      s3->set_ttl(optarg);
       break;
     }
 
