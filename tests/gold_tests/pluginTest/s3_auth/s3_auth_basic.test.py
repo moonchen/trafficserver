@@ -18,6 +18,11 @@ Test basic s3_auth function
 #  limitations under the License.
 
 Test.ContinueOnFail = True
+
+Test.SkipUnless(
+    Condition.HasATSFeature('TS_USE_INOTIFY'),
+)
+
 ts = Test.MakeATSProcess("ts")
 server = Test.MakeOriginServer("server")
 
