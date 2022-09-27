@@ -31,6 +31,7 @@
  ****************************************************************************/
 
 #include "tscore/ink_resolver.h"
+#include "ts/sdt.h"
 #include "Http1ClientSession.h"
 #include "Http1Transaction.h"
 #include "HttpSM.h"
@@ -47,6 +48,7 @@
   do {                                                                                                  \
     /*ink_assert (magic == HTTP_SM_MAGIC_ALIVE);  REMEMBER (event, NULL, reentrancy_count); */          \
     HttpSsnDebug("[%" PRId64 "] [%s, %s]", con_id, #state_name, HttpDebugNames::get_event_name(event)); \
+    ATS_PROBE2(h1clientssn, state_name, con_id, event);                                                 \
   } while (0)
 
 #ifdef USE_HTTP_DEBUG_LISTS
@@ -280,7 +282,7 @@ Http1ClientSession::do_io_close(int alerrno)
 int
 Http1ClientSession::state_wait_for_close(int event, void *data)
 {
-  STATE_ENTER(&Http1ClientSession::state_wait_for_close, event, data);
+  STATE_ENTER(Http1ClientSession::state_wait_for_close, event, data);
 
   ink_assert(data == ka_vio);
   ink_assert(read_state == HCS_HALF_CLOSED);
@@ -314,7 +316,7 @@ Http1ClientSession::state_wait_for_close(int event, void *data)
 int
 Http1ClientSession::state_slave_keep_alive(int event, void *data)
 {
-  STATE_ENTER(&Http1ClientSession::state_slave_keep_alive, event, data);
+  STATE_ENTER(Http1ClientSession::state_slave_keep_alive, event, data);
 
   ink_assert(data == slave_ka_vio);
 
@@ -372,7 +374,7 @@ Http1ClientSession::state_keep_alive(int event, void *data)
     schedule_event = nullptr;
   }
 
-  STATE_ENTER(&Http1ClientSession::state_keep_alive, event, data);
+  STATE_ENTER(Http1ClientSession::state_keep_alive, event, data);
 
   switch (event) {
   case VC_EVENT_READ_READY:
@@ -481,6 +483,7 @@ Http1ClientSession::attach_server_session(PoolableSession *ssession, bool transa
     ssession->state = PoolableSession::KA_RESERVED;
     bound_ss        = ssession;
     HttpSsnDebug("[%" PRId64 "] attaching server session [%" PRId64 "] as slave", con_id, ssession->connection_id());
+    ATS_PROBE2(h1client, attach_server_session, con_id, ssession->connection_id());
     ink_assert(ssession->get_netvc() != this->get_netvc());
 
     // handling potential keep-alive here

@@ -23,6 +23,7 @@
 
 #include "http/HttpSM.h"
 #include "Plugin.h"
+#include "ts/sdt.h"
 
 #define HttpTxnDebug(fmt, ...) SsnDebug(this, "http_txn", fmt, __VA_ARGS__)
 
@@ -49,6 +50,7 @@ ProxyTransaction::new_transaction(bool from_early_data)
   _sm->init(from_early_data);
   HttpTxnDebug("[%" PRId64 "] Starting transaction %d using sm [%" PRId64 "]", _proxy_ssn->connection_id(),
                _proxy_ssn->get_transact_count(), _sm->sm_id);
+  ATS_PROBE2(Txn, new_transaction, _proxy_ssn->connection_id(), _sm->sm_id);
 
   // PI tag valid only for internal requests
   if (this->get_netvc()->get_is_internal_request()) {

@@ -36,6 +36,7 @@
 #include "InkAPIInternal.h"
 
 #include "tscore/hugepages.h"
+#include "ts/sdt.h"
 
 #include <atomic>
 

@@ -33,6 +33,7 @@
 #include "HttpCacheSM.h"
 #include "HttpSM.h"
 #include "HttpDebugNames.h"
+#include "ts/sdt.h"
 
 #define SM_REMEMBER(sm, e, r)                          \
   {                                                    \
@@ -42,6 +43,7 @@
 #define STATE_ENTER(state_name, event)                                                                                   \
   {                                                                                                                      \
     SM_REMEMBER(master_sm, event, NO_REENTRANT);                                                                         \
+    ATS_PROBE2(cachesm_state, state_name, master_sm->sm_id, event);                                                      \
     Debug("http_cache", "[%" PRId64 "] [%s, %s]", master_sm->sm_id, #state_name, HttpDebugNames::get_event_name(event)); \
   }
 
@@ -97,7 +99,7 @@ HttpCacheSM::HttpCacheSM()
 int
 HttpCacheSM::state_cache_open_read(int event, void *data)
 {
-  STATE_ENTER(&HttpCacheSM::state_cache_open_read, event);
+  STATE_ENTER(HttpCacheSM::state_cache_open_read, event);
   ink_assert(captive_action.cancelled == 0);
   pending_action = nullptr;
 
@@ -175,7 +177,7 @@ HttpCacheSM::write_retry_done() const
 int
 HttpCacheSM::state_cache_open_write(int event, void *data)
 {
-  STATE_ENTER(&HttpCacheSM::state_cache_open_write, event);
+  STATE_ENTER(HttpCacheSM::state_cache_open_write, event);
   ink_assert(captive_action.cancelled == 0);
   pending_action = nullptr;
 
@@ -328,6 +330,7 @@ HttpCacheSM::open_read(const HttpCacheKey *key, URL *url, HTTPHdr *hdr, const Ov
   read_pin_in_cache = pin_in_cache;
   ink_assert(pending_action == nullptr);
   SET_HANDLER(&HttpCacheSM::state_cache_open_read);
+  ATS_PROBE1(cachesm, open_read, master_sm->sm_id);
 
   lookup_max_recursive++;
   current_lookup_level++;

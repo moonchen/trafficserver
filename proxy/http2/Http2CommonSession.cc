@@ -183,7 +183,7 @@ Http2CommonSession::state_read_connection_preface(int event, void *edata)
 {
   VIO *vio = static_cast<VIO *>(edata);
 
-  STATE_ENTER(&Http2CommonSession::state_read_connection_preface, event);
+  STATE_ENTER(Http2CommonSession::state_read_connection_preface, event);
   ink_assert(event == VC_EVENT_READ_COMPLETE || event == VC_EVENT_READ_READY);
 
   if (this->_read_buffer_reader->read_avail() >= static_cast<int64_t>(HTTP2_CONNECTION_PREFACE_LEN)) {
@@ -233,7 +233,7 @@ Http2CommonSession::state_start_frame_read(int event, void *edata)
 {
   VIO *vio = static_cast<VIO *>(edata);
 
-  STATE_ENTER(&Http2CommonSession::state_start_frame_read, event);
+  STATE_ENTER(Http2CommonSession::state_start_frame_read, event);
   ink_assert(event == VC_EVENT_READ_COMPLETE || event == VC_EVENT_READ_READY);
   return do_process_frame_read(event, vio, false);
 }
@@ -294,7 +294,7 @@ int
 Http2CommonSession::state_complete_frame_read(int event, void *edata)
 {
   VIO *vio = static_cast<VIO *>(edata);
-  STATE_ENTER(&Http2CommonSession::state_complete_frame_read, event);
+  STATE_ENTER(Http2CommonSession::state_complete_frame_read, event);
   ink_assert(event == VC_EVENT_READ_COMPLETE || event == VC_EVENT_READ_READY);
   if (this->_read_buffer_reader->read_avail() < this->current_hdr.length) {
     if (this->_should_do_something_else()) {

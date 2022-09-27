@@ -281,6 +281,7 @@ HttpVCTable::cleanup_all()
   {                                                                                    \
     /*ink_assert (magic == HTTP_SM_MAGIC_ALIVE); */ REMEMBER(event, reentrancy_count); \
     SMDebug("http", "[%s, %s]", #state_name, HttpDebugNames::get_event_name(event));   \
+    ATS_PROBE2(httpsm_state, state_name, sm_id, event);                                \
   }
 
 #define HTTP_SM_SET_DEFAULT_HANDLER(_h)   \
@@ -437,7 +438,7 @@ HttpSM::state_add_to_list(int event, void * /* data ATS_UNUSED */)
   //   The config variable exists mostly to allow us to
   //   measure an performance drop during benchmark runs
   if (t_state.http_config_param->enable_http_info) {
-    STATE_ENTER(&HttpSM::state_add_to_list, event);
+    STATE_ENTER(state_add_to_list, event);
     ink_assert(event == EVENT_NONE || event == EVENT_INTERVAL);
 
     int bucket = (static_cast<unsigned int>(sm_id) % HTTP_LIST_BUCKETS);
@@ -474,7 +475,7 @@ HttpSM::state_remove_from_list(int event, void * /* data ATS_UNUSED */)
   //   whether we need to strip ourselves off of the
   //   state page list
   if (t_state.http_config_param->enable_http_info) {
-    STATE_ENTER(&HttpSM::state_remove_from_list, event);
+    STATE_ENTER(state_remove_from_list, event);
     ink_assert(event == EVENT_NONE || event == EVENT_INTERVAL);
 
     int bucket = (static_cast<unsigned int>(sm_id) % HTTP_LIST_BUCKETS);
@@ -688,7 +689,7 @@ HttpSM::setup_blind_tunnel_port()
 int
 HttpSM::state_read_client_request_header(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_read_client_request_header, event);
+  STATE_ENTER(state_read_client_request_header, event);
 
   ink_assert(ua_entry->read_vio == (VIO *)data);
   ink_assert(server_entry == nullptr);
@@ -802,6 +803,11 @@ HttpSM::state_read_client_request_header(int event, void *data)
     milestones[TS_MILESTONE_UA_READ_HEADER_DONE] = Thread::get_hrtime();
   }
 
+  int host_len;
+  const char *host;
+  int path_len;
+  const char *path;
+
   switch (state) {
   case PARSE_RESULT_ERROR:
     SMDebug("http", "error parsing client request header");
@@ -846,6 +852,10 @@ HttpSM::state_read_client_request_header(int event, void *data)
     }
   case PARSE_RESULT_DONE:
     SMDebug("http", "done parsing client request header");
+
+    host = t_state.hdr_info.client_request.host_get(&host_len);
+    path = t_state.hdr_info.client_request.path_get(&path_len);
+    ATS_PROBE5(httpsm, parse_result_done, host, host_len, path, path_len, sm_id);
 
     if (!t_state.hdr_info.client_request.check_hdr_implements()) {
       t_state.http_return_code = HTTP_STATUS_NOT_IMPLEMENTED;
@@ -987,7 +997,7 @@ HttpSM::wait_for_full_body()
 int
 HttpSM::state_watch_for_client_abort(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_watch_for_client_abort, event);
+  STATE_ENTER(state_watch_for_client_abort, event);
 
   ink_assert(ua_entry->read_vio == (VIO *)data || ua_entry->write_vio == (VIO *)data);
   ink_assert(ua_entry->vc == ua_txn);
@@ -1122,7 +1132,7 @@ HttpSM::setup_push_read_response_header()
 int
 HttpSM::state_read_push_response_header(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_read_push_response_header, event);
+  STATE_ENTER(state_read_push_response_header, event);
   ink_assert(ua_entry->read_vio == (VIO *)data);
   ink_assert(t_state.current.server == nullptr);
 
@@ -1217,7 +1227,7 @@ HttpSM::state_read_push_response_header(int event, void *data)
 int
 HttpSM::state_raw_http_server_open(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_raw_http_server_open, event);
+  STATE_ENTER(state_raw_http_server_open, event);
   ink_assert(server_entry == nullptr);
   milestones[TS_MILESTONE_SERVER_CONNECT_END] = Thread::get_hrtime();
   NetVConnection *netvc                       = nullptr;
@@ -1276,7 +1286,7 @@ HttpSM::state_raw_http_server_open(int event, void *data)
 int
 HttpSM::state_request_wait_for_transform_read(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_request_wait_for_transform_read, event);
+  STATE_ENTER(state_request_wait_for_transform_read, event);
   int64_t size;
 
   switch (event) {
@@ -1316,7 +1326,7 @@ HttpSM::state_request_wait_for_transform_read(int event, void *data)
 int
 HttpSM::state_response_wait_for_transform_read(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_response_wait_for_transform_read, event);
+  STATE_ENTER(state_response_wait_for_transform_read, event);
   int64_t size = *(static_cast<int64_t *>(data));
 
   switch (event) {
@@ -1346,7 +1356,7 @@ HttpSM::state_response_wait_for_transform_read(int event, void *data)
 int
 HttpSM::state_common_wait_for_transform_read(HttpTransformInfo *t_info, HttpSMHandler tunnel_handler, int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_common_wait_for_transform_read, event);
+  STATE_ENTER(state_common_wait_for_transform_read, event);
   HttpTunnelConsumer *c = nullptr;
 
   switch (event) {
@@ -1444,7 +1454,7 @@ HttpSM::state_api_callback(int event, void *data)
 
   this->milestone_update_api_time();
 
-  STATE_ENTER(&HttpSM::state_api_callback, event);
+  STATE_ENTER(state_api_callback, event);
 
   state_api_callout(event, data);
 
@@ -1484,7 +1494,7 @@ HttpSM::state_api_callout(int event, void *data)
   AfterApiReturn_t api_next = API_RETURN_UNKNOWN;
 
   if (event != EVENT_NONE) {
-    STATE_ENTER(&HttpSM::state_api_callout, event);
+    STATE_ENTER(state_api_callout, event);
   }
 
   if (api_timer < 0) {
@@ -1665,7 +1675,7 @@ plugins required to work with sni_routing.
   return 0;
 }
 
-// void HttpSM::handle_api_return()
+// void HttpSM::handle_api_return)
 //
 //   Figures out what to do after calling api callouts
 //    have finished.  This messy and I would like
@@ -1832,7 +1842,7 @@ HttpSM::create_server_session(NetVConnection *netvc)
 
   retval->attach_hostname(s.current.server->name);
 
-  ATS_PROBE1(new_origin_server_connection, s.current.server->name);
+  ATS_PROBE1(httpsm, new_origin_server_connection, s.current.server->name);
   retval->set_active();
 
   if (netvc) {
@@ -1872,7 +1882,7 @@ int
 HttpSM::state_http_server_open(int event, void *data)
 {
   SMDebug("http_track", "entered inside state_http_server_open: %s", HttpDebugNames::get_event_name(event));
-  STATE_ENTER(&HttpSM::state_http_server_open, event);
+  STATE_ENTER(state_http_server_open, event);
   ink_release_assert(event == EVENT_INTERVAL || event == NET_EVENT_OPEN || event == NET_EVENT_OPEN_FAILED ||
                      pending_action.empty());
   if (event != NET_EVENT_OPEN) {
@@ -1997,7 +2007,7 @@ HttpSM::state_http_server_open(int event, void *data)
 int
 HttpSM::state_read_server_response_header(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_read_server_response_header, event);
+  STATE_ENTER(state_read_server_response_header, event);
   // If we had already received EOS, just go away. We would sometimes see
   // a WRITE event appear after receiving EOS from the server connection
   if (server_entry->eos) {
@@ -2169,7 +2179,7 @@ HttpSM::state_send_server_request_header(int event, void *data)
   ink_assert(server_entry != nullptr);
   ink_assert(server_entry->eos == false);
   ink_assert(server_entry->write_vio == (VIO *)data);
-  STATE_ENTER(&HttpSM::state_send_server_request_header, event);
+  STATE_ENTER(state_send_server_request_header, event);
 
   int method;
 
@@ -2330,7 +2340,7 @@ HttpSM::process_hostdb_info(HostDBRecord *record)
 int
 HttpSM::state_pre_resolve(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_hostdb_lookup, event);
+  STATE_ENTER(state_hostdb_lookup, event);
   return 0;
 }
 
@@ -2342,7 +2352,7 @@ HttpSM::state_pre_resolve(int event, void *data)
 int
 HttpSM::state_hostdb_lookup(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_hostdb_lookup, event);
+  STATE_ENTER(state_hostdb_lookup, event);
   //    ink_assert (m_origin_server_vc == 0);
   // REQ_FLAVOR_SCHEDULED_UPDATE can be transformed into
   // REQ_FLAVOR_REVPROXY
@@ -2385,7 +2395,7 @@ HttpSM::state_hostdb_lookup(int event, void *data)
 int
 HttpSM::state_hostdb_reverse_lookup(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_hostdb_reverse_lookup, event);
+  STATE_ENTER(state_hostdb_reverse_lookup, event);
 
   // REQ_FLAVOR_SCHEDULED_UPDATE can be transformed into
   // REQ_FLAVOR_REVPROXY
@@ -2417,7 +2427,7 @@ HttpSM::state_hostdb_reverse_lookup(int event, void *data)
 int
 HttpSM::state_mark_os_down(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_mark_os_down, event);
+  STATE_ENTER(state_mark_os_down, event);
 
   if (event == EVENT_HOST_DB_LOOKUP && data) {
     auto r = static_cast<HostDBRecord *>(data);
@@ -2442,7 +2452,7 @@ HttpSM::state_mark_os_down(int event, void *data)
 int
 HttpSM::state_handle_stat_page(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_handle_stat_page, event);
+  STATE_ENTER(state_handle_stat_page, event);
   switch (event) {
   case STAT_PAGE_SUCCESS:
     pending_action = nullptr;
@@ -2486,7 +2496,7 @@ HttpSM::state_handle_stat_page(int event, void *data)
 int
 HttpSM::state_cache_open_write(int event, void *data)
 {
-  STATE_ENTER(&HttpSM : state_cache_open_write, event);
+  STATE_ENTER(state_cache_open_write, event);
 
   // Make sure we are on the "right" thread
   if (ua_txn) {
@@ -2607,7 +2617,7 @@ HttpSM::setup_cache_lookup_complete_api()
 int
 HttpSM::state_cache_open_read(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::state_cache_open_read, event);
+  STATE_ENTER(state_cache_open_read, event);
 
   pending_action.clear_if_action_is(reinterpret_cast<Action *>(data));
 
@@ -2780,7 +2790,7 @@ HttpSM::tunnel_handler_post_or_put(HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_post(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_post, event);
+  STATE_ENTER(tunnel_handler_post, event);
 
   HttpTunnelProducer *p = ua_txn != nullptr ? tunnel.get_producer(ua_txn) : tunnel.get_producer(HT_HTTP_CLIENT);
   if (!p) {
@@ -2875,7 +2885,7 @@ HttpSM::tunnel_handler_post(int event, void *data)
 int
 HttpSM::tunnel_handler_cache_fill(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_cache_fill, event);
+  STATE_ENTER(tunnel_handler_cache_fill, event);
 
   ink_assert(event == HTTP_TUNNEL_EVENT_DONE);
   ink_assert(data == &tunnel);
@@ -2895,7 +2905,7 @@ HttpSM::tunnel_handler_cache_fill(int event, void *data)
 int
 HttpSM::tunnel_handler_100_continue(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_100_continue, event);
+  STATE_ENTER(tunnel_handler_100_continue, event);
 
   ink_assert(event == HTTP_TUNNEL_EVENT_DONE);
   ink_assert(data == &tunnel);
@@ -2937,7 +2947,7 @@ HttpSM::tunnel_handler_100_continue(int event, void *data)
 int
 HttpSM::tunnel_handler_push(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_push, event);
+  STATE_ENTER(tunnel_handler_push, event);
 
   ink_assert(event == HTTP_TUNNEL_EVENT_DONE);
   ink_assert(data == &tunnel);
@@ -2974,7 +2984,7 @@ HttpSM::tunnel_handler_push(int event, void *data)
 int
 HttpSM::tunnel_handler(int event, void *data)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler, event);
+  STATE_ENTER(tunnel_handler, event);
 
   ink_assert(event == HTTP_TUNNEL_EVENT_DONE);
   // The tunnel calls this when it is done
@@ -3025,7 +3035,7 @@ HttpSM::is_http_server_eos_truncation(HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_server(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_server, event);
+  STATE_ENTER(tunnel_handler_server, event);
 
   // An intercept handler may not set TS_MILESTONE_SERVER_CONNECT
   // by default. Therefore we only set TS_MILESTONE_SERVER_CLOSE if
@@ -3223,7 +3233,7 @@ HttpSM::tunnel_handler_server(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_100_continue_ua(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_100_continue_ua, event);
+  STATE_ENTER(tunnel_handler_100_continue_ua, event);
 
   ink_assert(c->vc == ua_txn);
 
@@ -3304,7 +3314,7 @@ HttpSM::tunnel_handler_ua(int event, HttpTunnelConsumer *c)
   HttpTunnelProducer *p     = nullptr;
   HttpTunnelConsumer *selfc = nullptr;
 
-  STATE_ENTER(&HttpSM::tunnel_handler_ua, event);
+  STATE_ENTER(tunnel_handler_ua, event);
   ink_assert(c->vc == ua_txn);
   milestones[TS_MILESTONE_UA_CLOSE] = Thread::get_hrtime();
 
@@ -3434,7 +3444,7 @@ HttpSM::tunnel_handler_ua(int event, HttpTunnelConsumer *c)
 int
 HttpSM::tunnel_handler_ua_push(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_ua_push, event);
+  STATE_ENTER(tunnel_handler_ua_push, event);
 
   pushed_response_body_bytes += p->bytes_read;
   client_request_body_bytes += p->bytes_read;
@@ -3474,7 +3484,7 @@ HttpSM::tunnel_handler_ua_push(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_cache_read(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_cache_read, event);
+  STATE_ENTER(tunnel_handler_cache_read, event);
 
   switch (event) {
   case VC_EVENT_ERROR:
@@ -3514,7 +3524,7 @@ HttpSM::tunnel_handler_cache_read(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_cache_write(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_cache_write, event);
+  STATE_ENTER(tunnel_handler_cache_write, event);
   SMDebug("http", "handling cache event: %s", HttpDebugNames::get_event_name(event));
 
   HttpTransact::CacheWriteStatus_t *status_ptr =
@@ -3569,7 +3579,7 @@ HttpSM::tunnel_handler_cache_write(int event, HttpTunnelConsumer *c)
 int
 HttpSM::tunnel_handler_post_ua(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_post_ua, event);
+  STATE_ENTER(tunnel_handler_post_ua, event);
   client_request_body_bytes = p->init_bytes_done + p->bytes_read;
 
   switch (event) {
@@ -3654,7 +3664,7 @@ HttpSM::tunnel_handler_post_ua(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_for_partial_post(int event, void * /* data ATS_UNUSED */)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_for_partial_post, event);
+  STATE_ENTER(tunnel_handler_for_partial_post, event);
   tunnel.deallocate_buffers();
   tunnel.reset();
 
@@ -3674,7 +3684,7 @@ HttpSM::tunnel_handler_for_partial_post(int event, void * /* data ATS_UNUSED */)
 int
 HttpSM::tunnel_handler_post_server(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_post_server, event);
+  STATE_ENTER(tunnel_handler_post_server, event);
 
   server_request_body_bytes = c->bytes_written;
 
@@ -3788,7 +3798,7 @@ HttpSM::tunnel_handler_post_server(int event, HttpTunnelConsumer *c)
 int
 HttpSM::tunnel_handler_ssl_producer(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_ssl_producer, event);
+  STATE_ENTER(tunnel_handler_ssl_producer, event);
 
   switch (event) {
   case VC_EVENT_EOS:
@@ -3851,7 +3861,7 @@ HttpSM::tunnel_handler_ssl_producer(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_ssl_consumer(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_ssl_consumer, event);
+  STATE_ENTER(tunnel_handler_ssl_consumer, event);
 
   switch (event) {
   case VC_EVENT_ERROR:
@@ -3918,7 +3928,7 @@ HttpSM::tunnel_handler_ssl_consumer(int event, HttpTunnelConsumer *c)
 int
 HttpSM::tunnel_handler_transform_write(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_transform_write, event);
+  STATE_ENTER(tunnel_handler_transform_write, event);
 
   HttpTransformInfo *i;
 
@@ -4004,7 +4014,7 @@ HttpSM::tunnel_handler_transform_write(int event, HttpTunnelConsumer *c)
 int
 HttpSM::tunnel_handler_transform_read(int event, HttpTunnelProducer *p)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_transform_read, event);
+  STATE_ENTER(tunnel_handler_transform_read, event);
 
   ink_assert(p->vc == transform_info.vc || p->vc == post_transform_info.vc);
 
@@ -4048,7 +4058,7 @@ HttpSM::tunnel_handler_transform_read(int event, HttpTunnelProducer *p)
 int
 HttpSM::tunnel_handler_plugin_agent(int event, HttpTunnelConsumer *c)
 {
-  STATE_ENTER(&HttpSM::tunnel_handler_plugin_client, event);
+  STATE_ENTER(tunnel_handler_plugin_client, event);
 
   switch (event) {
   case VC_EVENT_ERROR:
@@ -4077,7 +4087,7 @@ HttpSM::tunnel_handler_plugin_agent(int event, HttpTunnelConsumer *c)
 int
 HttpSM::state_remap_request(int event, void * /* data ATS_UNUSED */)
 {
-  STATE_ENTER(&HttpSM::state_remap_request, event);
+  STATE_ENTER(state_remap_request, event);
 
   switch (event) {
   case EVENT_REMAP_ERROR: {
@@ -5630,7 +5640,7 @@ HttpSM::release_server_session(bool serve_from_cache)
 void
 HttpSM::handle_post_failure()
 {
-  STATE_ENTER(&HttpSM::handle_post_failure, VC_EVENT_NONE);
+  STATE_ENTER(handle_post_failure, VC_EVENT_NONE);
 
   ink_assert(ua_entry->vc == ua_txn);
   ink_assert(is_waiting_for_full_body || server_entry->eos == true);
@@ -5727,7 +5737,7 @@ HttpSM::handle_server_setup_error(int event, void *data)
   VIO *vio = static_cast<VIO *>(data);
   ink_assert(vio != nullptr);
 
-  STATE_ENTER(&HttpSM::handle_server_setup_error, event);
+  STATE_ENTER(handle_server_setup_error, event);
 
   // If there is POST or PUT tunnel wait for the tunnel
   //  to figure out that things have gone to hell
