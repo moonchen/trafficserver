@@ -200,3 +200,11 @@ help:
 	@echo 'rel-candidate    recreate a signed relelease candidate source package and a signed git tag'
 	@echo 'release          recreate a signed release source package and a signed git tag'
 	@echo 'autopep8         run autopep8 over python files'
+
+if ENABLE_SYSTEMTAP
+%.h: %.d
+	$(DTRACE) -C -h -s $< -o $@
+
+%.o: %.d
+	$(DTRACE) -C -G -s $< -o $@
+endif
