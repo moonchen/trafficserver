@@ -1842,7 +1842,7 @@ HttpSM::create_server_session(NetVConnection *netvc)
 
   retval->attach_hostname(s.current.server->name);
 
-  ATS_PROBE1(httpsm, new_origin_server_connection, s.current.server->name);
+  ATS_PROBE2(httpsm, new_origin_server_connection, sm_id, s.current.server->name);
   retval->set_active();
 
   if (netvc) {
