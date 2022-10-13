@@ -224,6 +224,15 @@ libinknet_a_SOURCES += \
   QUICNextProtocolAccept.cc
 endif
 
+# TODO: if ENABLE_IOURING_NET
+libinknet_a_SOURCES += \
+	P_IOUringNet.h \
+	IOUringNet.cc \
+	P_IOUringNetProcessor.h \
+	IOUringNetProcessor.cc \
+	P_IOUringNetVConnection.h \
+	IOUringNetVConnection.cc
+
 if BUILD_TESTS
 libinknet_a_SOURCES += \
 	NetVCTest.cc \
