@@ -26,6 +26,8 @@
 #include <bitset>
 
 #include "tscore/ink_platform.h"
+#include "I_EThread.h"
+#include "I_Continuation.h"
 
 #define USE_EDGE_TRIGGER_EPOLL 1
 #define USE_EDGE_TRIGGER_KQUEUE 1
@@ -74,7 +76,7 @@
 #endif
 
 struct PollDescriptor;
-typedef PollDescriptor *EventLoop;
+using EventLoop = PollDescriptor *;
 
 class NetEvent;
 class UnixUDPConnection;
@@ -149,8 +151,7 @@ struct EventIO {
 
 class NetEvent;
 class NetHandler;
-typedef int (NetHandler::*NetContHandler)(int, void *);
-typedef unsigned int uint32;
+using NetContHandler = int (NetHandler::*)(int, void *);
 
 extern ink_hrtime last_throttle_warning;
 extern ink_hrtime last_shedding_warning;
@@ -397,12 +398,12 @@ private:
 static inline NetHandler *
 get_NetHandler(EThread *t)
 {
-  return (NetHandler *)ETHREAD_GET_PTR(t, unix_netProcessor.netHandler_offset);
+  return static_cast<NetHandler *>(ETHREAD_GET_PTR(t, unix_netProcessor.netHandler_offset));
 }
 static inline PollCont *
 get_PollCont(EThread *t)
 {
-  return (PollCont *)ETHREAD_GET_PTR(t, unix_netProcessor.pollCont_offset);
+  return static_cast<PollCont *>(ETHREAD_GET_PTR(t, unix_netProcessor.pollCont_offset));
 }
 static inline PollDescriptor *
 get_PollDescriptor(EThread *t)
@@ -423,11 +424,12 @@ net_connections_to_throttle(ThrottleType t)
   int64_t sval    = 0;
 
   NET_READ_GLOBAL_DYN_SUM(net_connections_currently_open_stat, sval);
-  int currently_open = (int)sval;
+  int currently_open = static_cast<int>(sval);
   // deal with race if we got to multiple net threads
-  if (currently_open < 0)
+  if (currently_open < 0) {
     currently_open = 0;
-  return (int)(currently_open * headroom);
+  }
+  return static_cast<int>(currently_open * headroom);
 }
 
 TS_INLINE void
@@ -445,8 +447,9 @@ check_net_throttle(ThrottleType t)
 {
   int connections = net_connections_to_throttle(t);
 
-  if (net_connections_throttle != 0 && connections >= net_connections_throttle)
+  if (net_connections_throttle != 0 && connections >= net_connections_throttle) {
     return true;
+  }
 
   return false;
 }
@@ -478,8 +481,9 @@ change_net_connections_throttle(const char *token, RecDataT data_type, RecData v
     net_connections_throttle = throttle;
   } else {
     net_connections_throttle = fds_throttle;
-    if (net_connections_throttle > throttle)
+    if (net_connections_throttle > throttle) {
       net_connections_throttle = throttle;
+    }
   }
   return 0;
 }
@@ -535,8 +539,9 @@ check_transient_accept_error(int res)
     last_transient_accept_error = t;
     Warning("accept thread received transient error: errno = %d", -res);
 #if defined(linux)
-    if (res == -ENOBUFS || res == -ENFILE)
+    if (res == -ENOBUFS || res == -ENFILE) {
       Warning("errno : %d consider a memory upgrade", -res);
+    }
 #endif
   }
 }
@@ -550,7 +555,7 @@ check_transient_accept_error(int res)
      - Remove the @c epoll READ flag.
      - Take @a ne out of the read ready list.
 */
-static inline void
+[[maybe_unused]] static inline void
 read_disable(NetHandler *nh, NetEvent *ne)
 {
   if (!ne->write.enabled) {
@@ -573,7 +578,7 @@ read_disable(NetHandler *nh, NetEvent *ne)
      - Remove the @c epoll WRITE flag.
      - Take @a ne out of the write ready list.
 */
-static inline void
+[[maybe_unused]] static inline void
 write_disable(NetHandler *nh, NetEvent *ne)
 {
   if (!ne->read.enabled) {
