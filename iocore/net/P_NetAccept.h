@@ -41,6 +41,7 @@
 #include <vector>
 #include "tscore/ink_platform.h"
 #include "P_Connection.h"
+#include "P_UnixNet.h"
 
 struct NetAccept;
 class Event;
@@ -50,8 +51,8 @@ class SSLNextProtocolAccept;
 //   Accepts as many connections as possible, returning the number accepted
 //   or -1 to stop accepting.
 //
-typedef int(AcceptFunction)(NetAccept *na, void *e, bool blockable);
-typedef AcceptFunction *AcceptFunctionPtr;
+using AcceptFunction    = int(NetAccept *, void *, bool);
+using AcceptFunctionPtr = AcceptFunction *;
 AcceptFunction net_accept;
 
 class UnixNetVConnection;

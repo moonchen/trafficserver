@@ -25,6 +25,7 @@
 
 #include "tscore/ink_platform.h"
 #include "tscore/Diags.h"
+#include "tscore/Allocator.h"
 #include "I_Thread.h"
 
 #define MAX_LOCK_TIME HRTIME_MSECONDS(200)
@@ -123,7 +124,7 @@
 /////////////////////////////////////
 
 class EThread;
-typedef EThread *EThreadPtr;
+using EThreadPtr = EThread *;
 
 #if DEBUG
 extern void lock_waiting(const SourceLocation &, const char *handler);
@@ -363,8 +364,9 @@ Mutex_unlock(ProxyMutex *m, EThread *t)
     m->nthread_holding--;
     if (!m->nthread_holding) {
 #ifdef DEBUG
-      if (Thread::get_hrtime() - m->hold_time > MAX_LOCK_TIME)
+      if (Thread::get_hrtime() - m->hold_time > MAX_LOCK_TIME) {
         lock_holding(m->srcloc, m->handler);
+      }
 #ifdef MAX_LOCK_TAKEN
       if (m->taken > MAX_LOCK_TAKEN)
         lock_taken(m->srcloc, m->handler);
