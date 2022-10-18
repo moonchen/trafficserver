@@ -133,7 +133,7 @@ struct AIOVec : public Continuation {
   int mainEvent(int event, Event *e);
 };
 
-struct DiskHandler : public Continuation {
+struct DiskHandler : public Continuation, EventIOUser {
   Event *trigger_event;
   io_context_t ctx;
   ink_io_event_t events[MAX_AIO_EVENTS];
@@ -150,6 +150,8 @@ struct DiskHandler : public Continuation {
       Debug("aio", "io_setup error: %s (%d)", strerror(-ret), -ret);
     }
   }
+
+  // TODO: EventIOUser
 };
 #endif
 

@@ -39,9 +39,9 @@
 #pragma once
 
 #include <vector>
+#include "P_EventIO.h"
 #include "tscore/ink_platform.h"
 #include "P_Connection.h"
-#include "P_UnixNet.h"
 
 struct NetAccept;
 class Event;
@@ -81,7 +81,7 @@ struct NetAcceptAction : public Action, public RefCountObj {
 // NetAccept
 // Handles accepting connections.
 //
-struct NetAccept : public Continuation {
+struct NetAccept : public Continuation, EventIOUser {
   ink_hrtime period = 0;
   Server server;
   AcceptFunctionPtr accept_fn = nullptr;
@@ -114,6 +114,24 @@ struct NetAccept : public Continuation {
 
   explicit NetAccept(const NetProcessor::AcceptOptions &);
   ~NetAccept() override { action_ = nullptr; }
+
+  int
+  get_fd() override
+  {
+    return server.fd;
+  }
+
+  EventIO::eventIO_types
+  eventIO_type() override
+  {
+    return EventIO::EVENTIO_NETACCEPT;
+  }
+
+  int
+  eventIO_close() override
+  {
+    return server.close();
+  }
 };
 
 extern Ptr<ProxyMutex> naVecMutex;

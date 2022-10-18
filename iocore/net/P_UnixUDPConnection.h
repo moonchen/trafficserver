@@ -33,7 +33,7 @@
 #include "P_UDPConnection.h"
 #include "P_UDPPacket.h"
 
-class UnixUDPConnection : public UDPConnectionInternal
+class UnixUDPConnection : public UDPConnectionInternal, public EventIOUser
 {
 public:
   void init(int the_fd);
@@ -53,6 +53,26 @@ public:
 
   UnixUDPConnection(int the_fd);
   ~UnixUDPConnection() override;
+
+  // EventIOUser
+  int
+  get_fd() override
+  {
+    return fd;
+  }
+
+  EventIO::eventIO_types
+  eventIO_type() override
+  {
+    return EventIO::EVENTIO_UDP_CONNECTION;
+  }
+
+  int
+  eventIO_close() override
+  {
+    ink_release_assert(false);
+    return -1;
+  }
 
 private:
   int m_errno = 0;

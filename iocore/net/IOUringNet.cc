@@ -22,11 +22,13 @@
  */
 #include "P_IOUringNet.h"
 #include "tscore/ink_assert.h"
+#include <optional>
 #include <liburing.h>
 
 constexpr auto TAG = "io_uring";
 
-thread_local IOUringNetHandler *inh = nullptr;
+// Only has value on net threads
+thread_local std::optional<IOUringNetHandler> inh;
 
 void
 IOUringNetHandler::signalActivity()
@@ -57,9 +59,9 @@ IOUringNetHandler::waitForActivity(ink_hrtime timeout)
 void
 initialize_thread_for_iouring(EThread *thread)
 {
-  ink_release_assert(inh == nullptr);
-  inh = new IOUringNetHandler();
-  ink_release_assert(inh != nullptr);
+  ink_release_assert(!inh);
+  inh.emplace();
+  ink_release_assert(inh);
 
   // TODO: replace placeholder values
   const int queue_depth = 1024;
@@ -73,5 +75,5 @@ initialize_thread_for_iouring(EThread *thread)
     return;
   }
 
-  thread->set_tail_handler(inh);
+  thread->set_tail_handler(&inh.value());
 }

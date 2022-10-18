@@ -36,8 +36,6 @@ class UnixNetVConnection;
 //////////////////////////////////////////////////////////////////
 struct UnixNetProcessor : public NetProcessor {
 public:
-  virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
-
   Action *connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *options = nullptr);
   Action *connect(Continuation *cont, UnixNetVConnection **vc, sockaddr const *target, NetVCOptions *opt = nullptr);
 
@@ -56,6 +54,9 @@ public:
   // we probably won't need these members
   int n_netthreads;
   EThread **netthreads;
+
+private:
+  Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt) override;
 };
 
 TS_INLINE Action *

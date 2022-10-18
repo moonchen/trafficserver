@@ -65,10 +65,6 @@ std::mutex etUdpMutex;
 std::condition_variable etUdpCheck;
 bool et_udp_threads_ready = false;
 
-std::mutex iouringInitMutex;
-std::condition_variable iouringCheck;
-bool et_iouring_threads_ready = false;
-
 extern int num_of_net_threads;
 extern int num_accept_threads;
 
@@ -348,15 +344,6 @@ init_HttpProxyServer()
     etUdpCheck.notify_one();
   }
 #endif
-
-#if TS_USE_LINUX_IO_URING
-  if (eventProcessor.has_tg_started(ET_IOURING)) {
-    std::unique_lock<std::mutex> lock(iouringInitMutex);
-    et_iouring_threads_ready = true;
-    lock.unlock();
-    iouringCheck.notify_one();
-  }
-#endif
 }
 
 void
@@ -386,15 +373,9 @@ start_HttpProxyServer()
       }
 #endif
     } else if (!port.isPlugin()) {
-#if TS_USE_LINUX_IO_URING
-      if (nullptr == ioUringNetProcessor.main_accept(acceptor._accept, port.m_fd, acceptor._net_opt)) {
-        return;
-      }
-#else
       if (nullptr == netProcessor.main_accept(acceptor._accept, port.m_fd, acceptor._net_opt)) {
         return;
       }
-#endif
     }
 
     // XXX although we make a good pretence here, I don't believe that NetProcessor::main_accept() ever actually returns

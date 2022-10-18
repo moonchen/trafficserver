@@ -94,7 +94,7 @@ initialize_thread_for_udp_net(EThread *thread)
   thread->set_tail_handler(nh);
   thread->ep = static_cast<EventIO *>(ats_malloc(sizeof(EventIO)));
   new (thread->ep) EventIO();
-  thread->ep->type = EVENTIO_ASYNC_SIGNAL;
+  thread->ep->type = EventIO::EVENTIO_ASYNC_SIGNAL;
 #if HAVE_EVENTFD
   thread->ep->start(upd, thread->evfd, nullptr, EVENTIO_READ);
 #else
@@ -1092,10 +1092,10 @@ UDPNetHandler::waitForActivity(ink_hrtime timeout)
   EventIO *epd = nullptr;
   for (i = 0; i < pc->pollDescriptor->result; i++) {
     epd = static_cast<EventIO *> get_ev_data(pc->pollDescriptor, i);
-    if (epd->type == EVENTIO_UDP_CONNECTION) {
+    if (epd->type == EventIO::EVENTIO_UDP_CONNECTION) {
       // TODO: handle EVENTIO_ERROR
       if (get_ev_events(pc->pollDescriptor, i) & EVENTIO_READ) {
-        uc = epd->data.uc;
+        uc = static_cast<UnixUDPConnection *>(epd->_user);
         ink_assert(uc && uc->mutex && uc->continuation);
         ink_assert(uc->refcount >= 1);
         open_list.in_or_enqueue(uc); // due to the above race
@@ -1108,15 +1108,15 @@ UDPNetHandler::waitForActivity(ink_hrtime timeout)
       } else {
         Debug("iocore_udp_main", "Unhandled epoll event: 0x%04x", get_ev_events(pc->pollDescriptor, i));
       }
-    } else if (epd->type == EVENTIO_DNS_CONNECTION) {
+    } else if (epd->type == EventIO::EVENTIO_DNS_CONNECTION) {
       // TODO: handle DNS conn if there is ET_UDP
-      if (epd->data.dnscon != nullptr) {
-        epd->data.dnscon->trigger();
+      if (epd->_user != nullptr) {
+        static_cast<DNSConnection *>(epd->_user)->trigger();
 #if defined(USE_EDGE_TRIGGER)
         epd->refresh(EVENTIO_READ);
 #endif
       }
-    } else if (epd->type == EVENTIO_ASYNC_SIGNAL) {
+    } else if (epd->type == EventIO::EVENTIO_ASYNC_SIGNAL) {
       net_signal_hook_callback(this->thread);
     }
   } // end for

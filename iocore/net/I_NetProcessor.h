@@ -235,6 +235,9 @@ private:
     ink_release_assert(!"NetProcessor::stop not implemented");
     return 1;
   }
+
+  // implementation of accept()
+  virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt) = 0;
 };
 
 /**

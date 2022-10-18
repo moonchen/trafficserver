@@ -23,12 +23,13 @@
 
 #include "I_Continuation.h"
 #include "I_EThread.h"
+#include "P_UnixNet.h"
 #include <liburing.h>
 
-class IOUringNetHandler : public Continuation, public EThread::LoopTailHandler
+class IOUringNetHandler : public NetHandler
 {
 public:
-  IOUringNetHandler() : Continuation(nullptr) {}
+  IOUringNetHandler() {}
   // EThread::LoopTailHandler
   void signalActivity() override;
   int waitForActivity(ink_hrtime timeout) override;

@@ -25,6 +25,8 @@
 #include "I_Net.h"
 #include "I_NetProcessor.h"
 #include "I_SessionAccept.h"
+#include "P_NetAccept.h"
+#include "P_UnixNetProcessor.h"
 #include "tscore/ink_config.h"
 
 //////////////////////////////////////////////////////////////////
@@ -32,21 +34,18 @@
 //  class IOUringNetProcessor
 //
 //////////////////////////////////////////////////////////////////
-struct IOUringNetProcessor : public NetProcessor {
+struct IOUringNetProcessor : public UnixNetProcessor {
 public:
   IOUringNetProcessor();
   ~IOUringNetProcessor() override;
 
   // NetProcessor
   void init() override;
-  void init_socks() override;
-  Action *accept(Continuation *cont, AcceptOptions const &opt = DEFAULT_ACCEPT_OPTIONS) override;
-  Action *main_accept(Continuation *cont, SOCKET listen_socket_in, AcceptOptions const &opt = DEFAULT_ACCEPT_OPTIONS) override;
-  void stop_accept() override;
-  NetVConnection *allocate_vc(EThread *) override;
 
-  // Processor
-  int start(int threads, size_t stacksize) override;
+  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts);
+
+  NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
+  NetVConnection *allocate_vc(EThread *) override;
 
 private:
   int stop() override;
@@ -54,5 +53,3 @@ private:
 
 // Singleton
 extern IOUringNetProcessor ioUringNetProcessor;
-
-extern int ET_IOURING;
