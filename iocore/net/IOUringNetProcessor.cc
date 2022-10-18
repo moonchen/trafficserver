@@ -26,10 +26,14 @@
 #include "P_IOUringNetProcessor.h"
 #include "P_IOUringNetVConnection.h"
 #include "P_Socks.h"
+#include "StatPages.h"
 
 constexpr auto TAG = "io_uring";
-int ET_IOURING;
 IOUringNetProcessor ioUringNetProcessor;
+
+#if TS_USE_LINUX_IO_URING
+NetProcessor &netProcessor = ioUringNetProcessor;
+#endif
 
 IOUringNetProcessor::IOUringNetProcessor() {}
 
@@ -38,67 +42,29 @@ IOUringNetProcessor::~IOUringNetProcessor() {}
 void
 IOUringNetProcessor::init()
 {
-  // TODO: accept_mss
+  EventType etype = ET_NET;
 
-  // TODO: Similar to NetHandler::init_for_process(), read configs
-
-  // TODO: change_net_connections_throttle
-
-  // TODO: stats
-  ET_IOURING = eventProcessor.register_event_type("ET_IOURING");
-}
-
-int
-IOUringNetProcessor::start(int threads, size_t stacksize)
-{
-  if (threads <= 0) {
-    return 0;
+  if (0 == accept_mss) {
+    REC_ReadConfigInteger(accept_mss, "proxy.config.net.sock_mss_in");
   }
 
-  // TODO: should we set NetHandler::active_thread_types[ET_IOURING] = true ?
+  // NetHandler - do the global configuration initialization and then
+  // schedule per thread start up logic. Global init is done only here.
+  NetHandler::init_for_process();
+  NetHandler::active_thread_types[ET_NET] = true;
+  eventProcessor.schedule_spawn(&initialize_thread_for_iouring, etype);
 
-  eventProcessor.schedule_spawn(initialize_thread_for_iouring, ET_IOURING);
-  eventProcessor.spawn_event_threads(ET_IOURING, threads, stacksize);
-  return 0;
-}
+  RecData d;
+  d.rec_int = 0;
+  change_net_connections_throttle(nullptr, RECD_INT, d, nullptr);
 
-void
-IOUringNetProcessor::init_socks()
-{
-  if (!netProcessor.socks_conf_stuff) {
-    socks_conf_stuff = new socks_conf_struct;
-    loadSocksConfiguration(socks_conf_stuff);
-    if (!socks_conf_stuff->socks_needed && socks_conf_stuff->accept_enabled) {
-      Warning("We can not have accept_enabled and socks_needed turned off"
-              " disabling Socks accept\n");
-      socks_conf_stuff->accept_enabled = 0;
-    } else {
-      // this is sslNetprocessor
-      socks_conf_stuff = netProcessor.socks_conf_stuff;
-    }
+  /*
+   * Stat pages
+   */
+  extern Action *register_ShowNet(Continuation * c, HTTPHdr * h);
+  if (etype == ET_NET) {
+    statPagesManager.register_http("net", register_ShowNet);
   }
-}
-
-Action *
-IOUringNetProcessor::accept(Continuation *cont, NetProcessor::AcceptOptions const &opt)
-{
-  Debug(TAG, "accept()");
-  return nullptr;
-}
-
-Action *
-IOUringNetProcessor::main_accept(Continuation *cont, SOCKET listen_socket_in, NetProcessor::AcceptOptions const &opt)
-{
-  Debug(TAG, "main_accept()");
-  // TODO: can't return nullptr here or caller goes crazy
-
-  return nullptr;
-}
-
-void
-IOUringNetProcessor::stop_accept()
-{
-  Debug(TAG, "stop_accept()");
 }
 
 NetVConnection *
@@ -113,4 +79,11 @@ IOUringNetProcessor::stop()
 {
   Debug(TAG, "stop()");
   return 0;
+}
+
+NetAccept *
+IOUringNetProcessor::createNetAccept(NetProcessor::AcceptOptions const &opt)
+{
+  // TODO:
+  return new NetAccept(opt);
 }

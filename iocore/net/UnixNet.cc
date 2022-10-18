@@ -256,11 +256,12 @@ initialize_thread_for_net(EThread *thread)
   thread->set_tail_handler(nh);
   thread->ep = static_cast<EventIO *>(ats_malloc(sizeof(EventIO)));
   new (thread->ep) EventIO();
-  thread->ep->type = EVENTIO_ASYNC_SIGNAL;
+  thread->ep->type = EventIO::EVENTIO_ASYNC_SIGNAL;
 #if HAVE_EVENTFD
   thread->ep->start(pd, thread->evfd, nullptr, EVENTIO_READ);
 #if TS_USE_LINUX_IO_URING
-  thread->ep->start(pd, DiskHandler::local_context());
+  // TODO:
+  // thread->ep->start(pd, DiskHandler::local_context());
 #endif
 #else
   thread->ep->start(pd, thread->evpipe[0], nullptr, EVENTIO_READ);
@@ -513,8 +514,8 @@ NetHandler::waitForActivity(ink_hrtime timeout)
   NetEvent *ne       = nullptr;
   for (int x = 0; x < pd->result; x++) {
     epd = static_cast<EventIO *> get_ev_data(pd, x);
-    if (epd->type == EVENTIO_READWRITE_VC) {
-      ne = epd->data.ne;
+    if (epd->type == EventIO::EVENTIO_READWRITE_VC) {
+      ne = static_cast<NetEvent *>(epd->_user);
       // Remove triggered NetEvent from cop_list because it won't be timeout before next InactivityCop runs.
       if (cop_list.in(ne)) {
         cop_list.remove(ne);
@@ -544,19 +545,19 @@ NetHandler::waitForActivity(ink_hrtime timeout)
           write_ready_list.enqueue(ne);
         }
       }
-    } else if (epd->type == EVENTIO_DNS_CONNECTION) {
-      if (epd->data.dnscon != nullptr) {
-        epd->data.dnscon->trigger(); // Make sure the DNSHandler for this con knows we triggered
+    } else if (epd->type == EventIO::EVENTIO_DNS_CONNECTION) {
+      if (epd->_user != nullptr) {
+        static_cast<DNSConnection *>(epd->_user)->trigger(); // Make sure the DNSHandler for this con knows we triggered
 #if defined(USE_EDGE_TRIGGER)
         epd->refresh(EVENTIO_READ);
 #endif
       }
-    } else if (epd->type == EVENTIO_ASYNC_SIGNAL) {
+    } else if (epd->type == EventIO::EVENTIO_ASYNC_SIGNAL) {
       net_signal_hook_callback(this->thread);
-    } else if (epd->type == EVENTIO_NETACCEPT) {
-      this->thread->schedule_imm(epd->data.na);
+    } else if (epd->type == EventIO::EVENTIO_NETACCEPT) {
+      this->thread->schedule_imm(reinterpret_cast<Continuation *>(epd->_user));
 #if AIO_MODE == AIO_MODE_IO_URING
-    } else if (epd->type == EVENTIO_DISK) {
+    } else if (epd->type == EventIO::EVENTIO_DISK) {
       servicedh = true;
 #endif
     }
@@ -803,17 +804,4 @@ NetHandler::remove_from_active_queue(NetEvent *ne)
     active_queue.remove(ne);
     --active_queue_size;
   }
-}
-
-int
-EventIO::start(EventLoop l, DiskHandler *dh)
-{
-#if AIO_MODE == AIO_MODE_IO_URING
-  data.dh = dh;
-  int fd  = dh->register_eventfd();
-  type    = EVENTIO_DISK;
-  return start_common(l, fd, EVENTIO_READ);
-#else
-  return 1;
-#endif
 }

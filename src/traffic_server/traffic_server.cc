@@ -2019,8 +2019,6 @@ main(int /* argc ATS_UNUSED */, const char **argv)
   DiskHandler::set_main_queue(main_aio);
   auto [bounded, unbounded] = main_aio->get_wq_max_workers();
   Note("io_uring: WQ workers - bounded = %d, unbounded = %d", bounded, unbounded);
-
-  ioUringNetProcessor.init();
 #endif
 
   // !! ET_NET threads start here !!
@@ -2131,12 +2129,6 @@ main(int /* argc ATS_UNUSED */, const char **argv)
       eventProcessor.thread_group[ET_UDP]._afterStartCallback = init_HttpProxyServer;
     }
 
-    constexpr int num_of_iouring_threads = 4;
-    if (num_of_iouring_threads) {
-      ioUringNetProcessor.start(num_of_iouring_threads, stacksize);
-      eventProcessor.thread_group[ET_IOURING]._afterStartCallback = init_HttpProxyServer;
-    }
-
     // Initialize Response Body Factory
     body_factory = new HttpBodyFactory;
 
@@ -2179,13 +2171,6 @@ main(int /* argc ATS_UNUSED */, const char **argv)
       }
 #endif
 
-#if TS_USE_LINUX_IO_URING
-      if (num_of_iouring_threads) {
-        std::unique_lock<std::mutex> lock(iouringInitMutex);
-        iouringCheck.wait(lock, [] { return et_iouring_threads_ready; });
-      }
-      Debug("io_uring", "io_uring thread init complete.");
-#endif
       // Delay only if config value set and flag value is zero
       // (-1 => cache already initialized)
       if (delay_p && ink_atomic_cas(&delay_listen_for_cache, 0, 1)) {

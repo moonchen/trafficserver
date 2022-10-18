@@ -24,13 +24,14 @@
 #pragma once
 
 #include "I_EventSystem.h"
+#include "P_EventIO.h"
 
 class NetHandler;
 
 // this class is used to NetHandler to hide some detail of NetEvent.
 // To combine the `UDPConenction` and `NetEvent`. NetHandler should
 // callback to net_read_io or net_write_io when net event happen.
-class NetEvent
+class NetEvent : public EventIOUser
 {
 public:
   NetEvent() = default;
@@ -58,8 +59,6 @@ public:
   bool has_error() const;
   void set_error_from_socket();
 
-  // get fd
-  virtual int get_fd()                   = 0;
   virtual Ptr<ProxyMutex> &get_mutex()   = 0;
   virtual ContFlags &get_control_flags() = 0;
 
@@ -99,6 +98,21 @@ public:
       unsigned int shutdown : 2;
     } f;
   };
+
+  // EventIOUser
+  int get_fd() override = 0;
+
+  EventIO::eventIO_types
+  eventIO_type() override
+  {
+    return EventIO::EVENTIO_READWRITE_VC;
+  }
+
+  int
+  eventIO_close() override
+  {
+    return close();
+  }
 };
 
 inline bool
