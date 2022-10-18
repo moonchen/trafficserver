@@ -26,6 +26,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include "I_NetProcessor.h"
 
 struct HttpProxyPort;
 
@@ -56,3 +57,7 @@ extern bool et_net_threads_ready;
 extern std::mutex etUdpMutex;
 extern std::condition_variable etUdpCheck;
 extern bool et_udp_threads_ready;
+
+extern std::mutex iouringInitMutex;
+extern std::condition_variable iouringCheck;
+extern bool et_iouring_threads_ready;
