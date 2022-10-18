@@ -54,3 +54,5 @@ private:
 
 // Singleton
 extern IOUringNetProcessor ioUringNetProcessor;
+
+extern int ET_IOURING;

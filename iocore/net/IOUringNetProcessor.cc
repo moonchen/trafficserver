@@ -28,6 +28,8 @@
 #include "P_Socks.h"
 
 constexpr auto TAG = "io_uring";
+int ET_IOURING;
+IOUringNetProcessor ioUringNetProcessor;
 
 IOUringNetProcessor::IOUringNetProcessor() {}
 
@@ -43,6 +45,7 @@ IOUringNetProcessor::init()
   // TODO: change_net_connections_throttle
 
   // TODO: stats
+  ET_IOURING = eventProcessor.register_event_type("ET_IOURING");
 }
 
 int
@@ -52,8 +55,7 @@ IOUringNetProcessor::start(int threads, size_t stacksize)
     return 0;
   }
 
-  auto ET_IOURING = eventProcessor.register_event_type("ET_IOURING");
-  // TODO: NetHandler::active_thread_types[ET_IOURING] = true;
+  // TODO: should we set NetHandler::active_thread_types[ET_IOURING] = true ?
 
   eventProcessor.schedule_spawn(initialize_thread_for_iouring, ET_IOURING);
   eventProcessor.spawn_event_threads(ET_IOURING, threads, stacksize);
@@ -88,6 +90,8 @@ Action *
 IOUringNetProcessor::main_accept(Continuation *cont, SOCKET listen_socket_in, NetProcessor::AcceptOptions const &opt)
 {
   Debug(TAG, "main_accept()");
+  // TODO: can't return nullptr here or caller goes crazy
+
   return nullptr;
 }
 
@@ -110,5 +114,3 @@ IOUringNetProcessor::stop()
   Debug(TAG, "stop()");
   return 0;
 }
-
-IOUringNetProcessor ioUringNetProcessor;

@@ -38,22 +38,17 @@ IOUringNetHandler::waitForActivity(ink_hrtime timeout)
 {
   struct io_uring_cqe *cqe;
 
-  if (pending <= 0) {
-    Debug(TAG, "sleeping");
-    sleep(1);
-  }
-
-  while (pending > 0) {
-    // No timeout because we're not stealing work from other threads
-    Debug(TAG, "waiting for cqe");
-    auto ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      Warning("io_uring_wait_cqe failed: %s", strerror(-ret));
-    } else {
-      pending--;
-      // TODO: handle completed I/O
-      // TODO: break here if new events are scheduled by I/O completion handlers
-    }
+  // In the case when the work queue is empty, an incoming event should
+  // send a notification to the ring via eventfd to wake the thread up
+  // from this sleep.
+  Debug(TAG, "waiting for cqe");
+  auto ret = io_uring_wait_cqe(&ring, &cqe);
+  if (ret < 0) {
+    Warning("io_uring_wait_cqe failed: %s", strerror(-ret));
+  } else {
+    pending--;
+    // TODO: handle completed I/O
+    // TODO: break here if new events are scheduled by I/O completion handlers
   }
 
   return 0;
