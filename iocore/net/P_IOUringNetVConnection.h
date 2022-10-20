@@ -55,4 +55,7 @@ public:
   void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
   void set_mptcp_state() override;
+
+private:
+  int startEvent(int event, Event *e);
 };

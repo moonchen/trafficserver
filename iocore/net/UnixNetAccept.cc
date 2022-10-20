@@ -28,6 +28,7 @@
 
 using NetAcceptHandler = int (NetAccept::*)(int, void *);
 int accept_till_done   = 1;
+static std::atomic<int> next_id{0};
 
 // we need to protect naVec since it might be accessed
 // in different threads at the same time
@@ -563,7 +564,11 @@ NetAccept::acceptLoopEvent(int event, Event *e)
 //
 //
 
-NetAccept::NetAccept(const NetProcessor::AcceptOptions &_opt) : Continuation(nullptr), opt(_opt) {}
+NetAccept::NetAccept(const NetProcessor::AcceptOptions &_opt) : Continuation(nullptr), opt(_opt)
+{
+  id = next_id;
+  next_id++;
+}
 
 //
 // Stop listening.  When the next poll takes place, an error will result.

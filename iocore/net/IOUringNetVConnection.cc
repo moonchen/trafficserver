@@ -23,8 +23,14 @@
 
 #include "I_NetVConnection.h"
 #include "P_IOUringNetVConnection.h"
+#include "liburing.h"
 
-IOUringNetVConnection::IOUringNetVConnection() {}
+constexpr auto TAG = "iouring";
+
+IOUringNetVConnection::IOUringNetVConnection()
+{
+  SET_HANDLER(&IOUringNetVConnection::startEvent);
+}
 
 IOUringNetVConnection::~IOUringNetVConnection() {}
 
@@ -154,4 +160,11 @@ IOUringNetVConnection::set_remote_addr(const sockaddr *)
 void
 IOUringNetVConnection::set_mptcp_state()
 {
+}
+
+int
+IOUringNetVConnection::startEvent(int event, Event *e)
+{
+  Debug(TAG, "startEvent");
+  return EVENT_DONE;
 }

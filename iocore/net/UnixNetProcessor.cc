@@ -30,7 +30,6 @@
 // For Stat Pages
 #include "StatPages.h"
 
-int net_accept_number = 0;
 NetProcessor::AcceptOptions const NetProcessor::DEFAULT_ACCEPT_OPTIONS;
 
 NetProcessor::AcceptOptions &
@@ -94,7 +93,6 @@ UnixNetProcessor::accept_internal(Continuation *cont, int fd, AcceptOptions cons
   int listen_per_thread = 0;
 
   NetAccept *na = createNetAccept(opt);
-  na->id        = ink_atomic_increment(&net_accept_number, 1);
   Debug("iocore_net_accept", "creating new net accept number %d", na->id);
 
   // Fill in accept thread from configuration if necessary.
