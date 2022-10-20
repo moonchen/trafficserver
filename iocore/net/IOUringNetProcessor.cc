@@ -27,6 +27,7 @@
 #include "P_IOUringNetVConnection.h"
 #include "P_Socks.h"
 #include "StatPages.h"
+#include "IOUringNetAccept.h"
 
 constexpr auto TAG = "io_uring";
 IOUringNetProcessor ioUringNetProcessor;
@@ -85,5 +86,6 @@ NetAccept *
 IOUringNetProcessor::createNetAccept(NetProcessor::AcceptOptions const &opt)
 {
   // TODO:
-  return new NetAccept(opt);
+  Debug(TAG, "createNetAccept()");
+  return new IOUringNetAccept(opt);
 }

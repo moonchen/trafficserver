@@ -42,6 +42,7 @@
 #include "P_EventIO.h"
 #include "tscore/ink_platform.h"
 #include "P_Connection.h"
+#include "records/I_RecHttp.h"
 
 struct NetAccept;
 class Event;
@@ -97,14 +98,10 @@ struct NetAccept : public Continuation, EventIOUser {
   virtual NetProcessor *getNetProcessor() const;
 
   virtual void init_accept(EThread *t = nullptr);
-  void init_accept_loop();
-  void init_accept_per_thread();
+  virtual void init_accept_loop();
+  virtual void init_accept_per_thread();
   virtual void stop_accept();
   virtual NetAccept *clone() const;
-
-  // 0 == success
-  int do_listen(bool non_blocking);
-  int do_blocking_accept(EThread *t);
 
   virtual int acceptEvent(int event, void *e);
   virtual int acceptFastEvent(int event, void *e);
@@ -132,6 +129,13 @@ struct NetAccept : public Continuation, EventIOUser {
   {
     return server.close();
   }
+
+protected:
+  virtual int do_listen(bool non_blocking);
+
+private:
+  // 0 == success
+  virtual int do_blocking_accept(EThread *t);
 };
 
 extern Ptr<ProxyMutex> naVecMutex;
