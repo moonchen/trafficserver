@@ -21,6 +21,7 @@
   limitations under the License.
  */
 
+#include <cstdint>
 #include <tscore/TSSystemState.h>
 #include <tscore/ink_defs.h>
 
@@ -34,8 +35,8 @@ static std::atomic<int> next_id{0};
 // in different threads at the same time
 Ptr<ProxyMutex> naVecMutex;
 std::vector<NetAccept *> naVec;
-static void
-safe_delay(int msec)
+void
+NetAccept::safe_delay(int msec)
 {
   SocketManager::poll(nullptr, 0, msec);
 }
@@ -282,100 +283,99 @@ NetAccept::do_listen(bool non_blocking)
   return res;
 }
 
-int
-NetAccept::do_blocking_accept(EThread *t)
+void
+NetAccept::initialize_vc(NetVConnection *_vc, Connection &con, EThread *localt)
 {
-  int res                = 0;
-  int loop               = accept_till_done;
-  UnixNetVConnection *vc = nullptr;
-  Connection con;
-  con.sock_type = SOCK_STREAM;
+  UnixNetVConnection *vc = dynamic_cast<UnixNetVConnection *>(_vc);
+  ink_release_assert(vc != nullptr);
 
-  // do-while for accepting all the connections
-  // added by YTS Team, yamsat
-  do {
-    if ((res = server.accept(&con)) < 0) {
-      int seriousness = accept_error_seriousness(res);
-      switch (seriousness) {
-      case 0:
-        // bad enough to warn about
-        check_transient_accept_error(res);
-        safe_delay(net_throttle_delay);
-        return 0;
-      case 1:
-        // not so bad but needs delay
-        safe_delay(net_throttle_delay);
-        return 0;
-      case 2:
-        // ignore
-        return 0;
-      case -1:
-        [[fallthrough]];
-      default:
-        if (!action_->cancelled) {
-          SCOPED_MUTEX_LOCK(lock, action_->mutex ? action_->mutex : t->mutex, t);
-          action_->continuation->handleEvent(EVENT_ERROR, (void *)static_cast<intptr_t>(res));
-          Warning("accept thread received fatal error: errno = %d", errno);
-        }
-        return -1;
-      }
-    }
-    // check for throttle
-    if (check_net_throttle(ACCEPT)) {
-      check_throttle_warning(ACCEPT);
-      // close the connection as we are in throttle state
-      con.close();
-      NET_SUM_DYN_STAT(net_connections_throttled_in_stat, 1);
-      continue;
-    }
-
-    if (TSSystemState::is_event_system_shut_down()) {
-      return -1;
-    }
-
-    NET_SUM_GLOBAL_DYN_STAT(net_tcp_accept_stat, 1);
-
-    // Use 'nullptr' to Bypass thread allocator
-    vc = (UnixNetVConnection *)this->getNetProcessor()->allocate_vc(nullptr);
-    if (unlikely(!vc)) {
-      return -1;
-    }
-
-    NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
-    vc->id = net_next_connection_number();
-    vc->con.move(con);
-    vc->set_remote_addr(con.addr);
-    vc->submit_time = Thread::get_hrtime();
-    vc->action_     = *action_;
-    vc->set_is_transparent(opt.f_inbound_transparent);
-    vc->set_is_proxy_protocol(opt.f_proxy_protocol);
-    vc->options.sockopt_flags        = opt.sockopt_flags;
-    vc->options.packet_mark          = opt.packet_mark;
-    vc->options.packet_tos           = opt.packet_tos;
-    vc->options.packet_notsent_lowat = opt.packet_notsent_lowat;
-    vc->options.ip_family            = opt.ip_family;
-    vc->apply_options();
-    vc->set_context(NET_VCONNECTION_IN);
-    if (opt.f_mptcp) {
-      vc->set_mptcp_state(); // Try to get the MPTCP state, and update accordingly
-    }
-    vc->accept_object = this;
+  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
+  vc->id = net_next_connection_number();
+  vc->con.move(con);
+  vc->set_remote_addr(con.addr);
+  vc->submit_time = Thread::get_hrtime();
+  vc->action_     = *action_;
+  vc->set_is_transparent(opt.f_inbound_transparent);
+  vc->set_is_proxy_protocol(opt.f_proxy_protocol);
+  vc->options.sockopt_flags        = opt.sockopt_flags;
+  vc->options.packet_mark          = opt.packet_mark;
+  vc->options.packet_tos           = opt.packet_tos;
+  vc->options.packet_notsent_lowat = opt.packet_notsent_lowat;
+  vc->options.ip_family            = opt.ip_family;
+  vc->apply_options();
+  vc->set_context(NET_VCONNECTION_IN);
+  if (opt.f_mptcp) {
+    vc->set_mptcp_state(); // Try to get the MPTCP state, and update accordingly
+  }
+  vc->accept_object = this;
 #ifdef USE_EDGE_TRIGGER
-    // Set the vc as triggered and place it in the read ready queue later in case there is already data on the socket.
-    if (server.http_accept_filter) {
-      vc->read.triggered = 1;
-    }
+  // Set the vc as triggered and place it in the read ready queue later in case there is already data on the socket.
+  if (server.http_accept_filter) {
+    vc->read.triggered = 1;
+  }
 #endif
-    SET_CONTINUATION_HANDLER(vc, &UnixNetVConnection::acceptEvent);
+  SET_CONTINUATION_HANDLER(vc, &UnixNetVConnection::acceptEvent);
 
-    EThread *localt = eventProcessor.assign_thread(opt.etype);
-    NetHandler *h   = get_NetHandler(localt);
-    // Assign NetHandler->mutex to NetVC
-    vc->mutex = h->mutex;
-    localt->schedule_imm(vc);
-  } while (loop);
+  NetHandler *h = get_NetHandler(localt);
+  // Assign NetHandler->mutex to NetVC
+  vc->mutex = h->mutex;
+}
 
-  return 1;
+bool
+NetAccept::process_accept(int res, EThread *t, Connection &con)
+{
+  NetVConnection *vc = nullptr;
+  if (res < 0) {
+    int seriousness = accept_error_seriousness(res);
+    switch (seriousness) {
+    case 0:
+      // bad enough to warn about
+      check_transient_accept_error(res);
+      safe_delay(net_throttle_delay);
+      return false;
+    case 1:
+      // not so bad but needs delay
+      safe_delay(net_throttle_delay);
+      return false;
+    case 2:
+      // ignore
+      return false;
+    case -1:
+      [[fallthrough]];
+    default:
+      if (!action_->cancelled) {
+        SCOPED_MUTEX_LOCK(lock, action_->mutex ? action_->mutex : t->mutex, t);
+        action_->continuation->handleEvent(EVENT_ERROR, reinterpret_cast<void *>(res));
+        Warning("accept thread received fatal error: errno = %d", errno);
+      }
+      return true;
+    }
+  }
+  // check for throttle
+  if (check_net_throttle(ACCEPT)) {
+    check_throttle_warning(ACCEPT);
+    // close the connection as we are in throttle state
+    con.close();
+    NET_SUM_DYN_STAT(net_connections_throttled_in_stat, 1);
+    return false;
+  }
+
+  if (TSSystemState::is_event_system_shut_down()) {
+    return true;
+  }
+
+  NET_SUM_GLOBAL_DYN_STAT(net_tcp_accept_stat, 1);
+
+  // Use 'nullptr' to Bypass thread allocator
+  vc = this->getNetProcessor()->allocate_vc(nullptr);
+  if (unlikely(!vc)) {
+    return true;
+  }
+
+  EThread *localt = eventProcessor.assign_thread(opt.etype);
+  initialize_vc(vc, con, localt);
+  localt->schedule_imm(vc);
+  return false;
 }
 
 int
@@ -548,10 +548,18 @@ NetAccept::acceptLoopEvent(int event, Event *e)
   (void)event;
   (void)e;
   EThread *t = this_ethread();
+  int res    = 0;
+  int loop   = accept_till_done;
+  bool stop  = false;
+  Connection con;
+  con.sock_type = SOCK_STREAM;
 
-  while (do_blocking_accept(t) >= 0) {
-    ;
-  }
+  // do-while for accepting all the connections
+  // added by YTS Team, yamsat
+  do {
+    res  = server.accept(&con);
+    stop = process_accept(res, t, con);
+  } while (loop && !stop);
 
   // Don't think this ever happens ...
   NET_DECREMENT_DYN_STAT(net_accepts_currently_open_stat);

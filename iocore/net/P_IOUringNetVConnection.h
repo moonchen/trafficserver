@@ -24,6 +24,8 @@
 #pragma once
 
 #include "I_NetVConnection.h"
+#include "P_Connection.h"
+#include "IOUringNetAccept.h"
 
 class IOUringNetVConnection : public NetVConnection
 {
@@ -56,6 +58,16 @@ public:
   void set_remote_addr(const sockaddr *) override;
   void set_mptcp_state() override;
 
+  const int id;
+  Connection con;
+  Action action_;
+  int recursion                   = 0;
+  bool from_accept_thread         = false;
+  IOUringNetAccept *accept_object = nullptr;
+
+  int acceptEvent(int event, Event *e);
+
 private:
   int startEvent(int event, Event *e);
+  int mainEvent(int event, Event *e);
 };
