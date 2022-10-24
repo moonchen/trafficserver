@@ -39,6 +39,7 @@
 #pragma once
 
 #include <vector>
+#include <tuple>
 #include "P_EventIO.h"
 #include "tscore/ink_platform.h"
 #include "P_Connection.h"
@@ -132,10 +133,9 @@ struct NetAccept : public Continuation, EventIOUser {
 
 protected:
   virtual int do_listen(bool non_blocking);
-
-private:
-  // 0 == success
-  virtual int do_blocking_accept(EThread *t);
+  bool process_accept(int res, EThread *, Connection &con);
+  virtual void safe_delay(int msec);
+  virtual void initialize_vc(NetVConnection *_vc, Connection &con, EThread *localt);
 };
 
 extern Ptr<ProxyMutex> naVecMutex;

@@ -26,8 +26,14 @@
 #include "liburing.h"
 
 constexpr auto TAG = "iouring";
+static std::atomic<int> next_connection_id{0};
+static int
+get_next_connection_id()
+{
+  return (next_connection_id++);
+}
 
-IOUringNetVConnection::IOUringNetVConnection()
+IOUringNetVConnection::IOUringNetVConnection() : id(get_next_connection_id())
 {
   SET_HANDLER(&IOUringNetVConnection::startEvent);
 }
@@ -163,8 +169,39 @@ IOUringNetVConnection::set_mptcp_state()
 }
 
 int
+IOUringNetVConnection::acceptEvent(int event, Event *e)
+{
+  EThread *t = (e == nullptr) ? this_ethread() : e->ethread;
+  thread     = t;
+
+  // TODO: queue io_uring for reading and writing
+
+  // Setup a timeout callback handler.
+  SET_HANDLER(&IOUringNetVConnection::mainEvent);
+
+  ink_release_assert(action_.continuation);
+  if (action_.continuation->mutex != nullptr) {
+    MUTEX_TRY_LOCK(lock3, action_.continuation->mutex, t);
+    if (!lock3.is_locked()) {
+      ink_release_assert(0);
+    }
+    action_.continuation->handleEvent(NET_EVENT_ACCEPT, this);
+  } else {
+    action_.continuation->handleEvent(NET_EVENT_ACCEPT, this);
+  }
+  return EVENT_DONE;
+}
+
+int
 IOUringNetVConnection::startEvent(int event, Event *e)
 {
   Debug(TAG, "startEvent");
+  return EVENT_DONE;
+}
+
+int
+IOUringNetVConnection::mainEvent(int event, Event *e)
+{
+  Debug(TAG, "mainEvent");
   return EVENT_DONE;
 }

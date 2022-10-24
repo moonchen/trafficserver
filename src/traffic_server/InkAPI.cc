@@ -7200,7 +7200,8 @@ TSVConnFdCreate(int fd)
     return nullptr;
   }
 
-  vc = (UnixNetVConnection *)netProcessor.allocate_vc(t);
+  // TODO: fix this for io_uring
+  vc = dynamic_cast<UnixNetVConnection *>(netProcessor.allocate_vc(t));
   if (vc == nullptr) {
     return nullptr;
   }

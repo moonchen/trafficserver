@@ -41,9 +41,13 @@ public:
     return &ioUringNetProcessor;
   }
 
+protected:
+  void safe_delay(int msec) override;
+  void initialize_vc(NetVConnection *_vc, Connection &con, EThread *localt) override;
+
 private:
   // Runfunc for an accept thread
-  int acceptLoop(int event, void *ep);
+  int acceptLoopEvent(int event, void *ep);
 
   // Handler for per-thread accepts
   int acceptEvent(int event, void *ep) override;
