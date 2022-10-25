@@ -29,7 +29,6 @@
 
 using NetAcceptHandler = int (NetAccept::*)(int, void *);
 int accept_till_done   = 1;
-static std::atomic<int> next_id{0};
 
 // we need to protect naVec since it might be accessed
 // in different threads at the same time
@@ -572,10 +571,30 @@ NetAccept::acceptLoopEvent(int event, Event *e)
 //
 //
 
-NetAccept::NetAccept(const NetProcessor::AcceptOptions &_opt) : Continuation(nullptr), opt(_opt)
+static int
+get_next_accept_id()
 {
-  id = next_id;
-  next_id++;
+  static std::atomic<int> next_id{0};
+  return next_id++;
+}
+
+NetAccept::NetAccept(const NetProcessor::AcceptOptions &_opt) : Continuation(nullptr), id(get_next_accept_id()), opt(_opt) {}
+
+NetAccept &
+NetAccept::operator=(const NetAccept &other)
+{
+  Continuation::operator=(other);
+  EventIOUser::operator =(other);
+  period                = other.period;
+  server                = other.server;
+  accept_fn             = other.accept_fn;
+  ifd                   = other.ifd;
+  action_               = other.action_;
+  snpa                  = other.snpa;
+  ep                    = other.ep;
+  proxyPort             = other.proxyPort;
+  opt                   = other.opt;
+  return *this;
 }
 
 //
