@@ -88,7 +88,7 @@ struct NetAccept : public Continuation, EventIOUser {
   Server server;
   AcceptFunctionPtr accept_fn = nullptr;
   int ifd                     = NO_FD;
-  int id                      = -1;
+  const int id;
   Ptr<NetAcceptAction> action_;
   SSLNextProtocolAccept *snpa = nullptr;
   EventIO ep;
@@ -111,6 +111,7 @@ struct NetAccept : public Continuation, EventIOUser {
   void cancel();
 
   explicit NetAccept(const NetProcessor::AcceptOptions &);
+  NetAccept &operator=(const NetAccept &other);
   ~NetAccept() override { action_ = nullptr; }
 
   int
