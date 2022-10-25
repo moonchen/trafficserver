@@ -21,16 +21,19 @@
   limitations under the License.
  */
 
+#include "I_Continuation.h"
 #include "I_NetVConnection.h"
+#include "P_IOUringNet.h"
 #include "P_IOUringNetVConnection.h"
 #include "liburing.h"
+#include "tscore/ink_assert.h"
 
 constexpr auto TAG = "iouring";
-static std::atomic<int> next_connection_id{0};
 static int
 get_next_connection_id()
 {
-  return (next_connection_id++);
+  static std::atomic<int> next_connection_id{0};
+  return next_connection_id++;
 }
 
 IOUringNetVConnection::IOUringNetVConnection() : id(get_next_connection_id())
@@ -174,7 +177,16 @@ IOUringNetVConnection::acceptEvent(int event, Event *e)
   EThread *t = (e == nullptr) ? this_ethread() : e->ethread;
   thread     = t;
 
+  // Should only be called from the local thread
+  ink_assert(this_ethread()->is_event_type(ET_NET));
+
   // TODO: queue io_uring for reading and writing
+  auto sqe = io_uring_get_sqe(&IOUringNetHandler::get_NetHandler().ring);
+  if (sqe == nullptr) {
+    Fatal("ring size is too small!");
+    return EVENT_ERROR;
+  }
+  // io_uring_prep_read(sqe, fd, buf, nbytes, offset);
 
   // Setup a timeout callback handler.
   SET_HANDLER(&IOUringNetVConnection::mainEvent);

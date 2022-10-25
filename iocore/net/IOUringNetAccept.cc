@@ -31,9 +31,12 @@
 
 static constexpr auto TAG = "io_uring_accept";
 
+// Number of sq entries for accept threads
 static constexpr int queue_depth = 8;
-thread_local std::optional<io_uring> ring;
-thread_local std::vector<Connection> cons{queue_depth};
+// Ring for accept threads
+static thread_local std::optional<io_uring> ring;
+// Connection buffers for accept thread
+static thread_local std::vector<Connection> cons{queue_depth};
 
 IOUringNetAccept::IOUringNetAccept(NetProcessor::AcceptOptions const &opt) : NetAccept(opt) {}
 

@@ -38,6 +38,8 @@ public:
   IOUringNetHandler(const IOUringNetHandler &) = delete;
   IOUringNetHandler &operator=(const IOUringNetHandler &) = delete;
 
+  static IOUringNetHandler &get_NetHandler();
+
   struct io_uring ring;
   // number of submissions pending completion
   int pending = 0;

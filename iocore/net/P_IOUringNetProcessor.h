@@ -45,7 +45,7 @@ public:
   Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts);
 
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
-  NetVConnection *allocate_vc(EThread *) override;
+  NetVConnection *allocate_vc(EThread *) const override;
 
 private:
   int stop() override;

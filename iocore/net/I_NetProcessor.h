@@ -193,7 +193,7 @@ public:
 
   virtual void init_socks() = 0;
 
-  virtual NetVConnection *allocate_vc(EThread *) = 0;
+  virtual NetVConnection *allocate_vc(EThread *) const = 0;
 
   /** Private constructor. */
   NetProcessor(){};

@@ -323,7 +323,7 @@ UnixNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 }
 
 NetVConnection *
-UnixNetProcessor::allocate_vc(EThread *t)
+UnixNetProcessor::allocate_vc(EThread *t) const
 {
   UnixNetVConnection *vc;
 

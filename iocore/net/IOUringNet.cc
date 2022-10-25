@@ -30,6 +30,12 @@ constexpr auto TAG = "io_uring";
 // Only has value on net threads
 thread_local std::optional<IOUringNetHandler> inh;
 
+IOUringNetHandler &
+IOUringNetHandler::get_NetHandler()
+{
+  return inh.value();
+}
+
 void
 IOUringNetHandler::signalActivity()
 {
