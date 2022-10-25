@@ -65,7 +65,7 @@ public:
   //
 
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
-  NetVConnection *allocate_vc(EThread *t) override;
+  NetVConnection *allocate_vc(EThread *t) const override;
 
   // noncopyable
   SSLNetProcessor(const SSLNetProcessor &) = delete;

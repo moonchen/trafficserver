@@ -28,6 +28,7 @@
 #include "P_Socks.h"
 #include "StatPages.h"
 #include "IOUringNetAccept.h"
+#include "tscore/ink_assert.h"
 
 constexpr auto TAG = "io_uring";
 IOUringNetProcessor ioUringNetProcessor;
@@ -69,10 +70,12 @@ IOUringNetProcessor::init()
 }
 
 NetVConnection *
-IOUringNetProcessor::allocate_vc(EThread *)
+IOUringNetProcessor::allocate_vc(EThread *) const
 {
   Debug(TAG, "allocate_vc()");
-  return new IOUringNetVConnection();
+  auto vc                = new IOUringNetVConnection();
+  vc->from_accept_thread = true;
+  return vc;
 }
 
 int

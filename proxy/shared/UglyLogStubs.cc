@@ -168,7 +168,7 @@ UnixNetProcessor::accept_internal(Continuation * /* cont ATS_UNUSED */, int /* f
 }
 
 NetVConnection *
-UnixNetProcessor::allocate_vc(EThread *)
+UnixNetProcessor::allocate_vc(EThread *) const
 {
   ink_release_assert(false);
   return nullptr;

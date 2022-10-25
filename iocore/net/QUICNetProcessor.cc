@@ -86,7 +86,7 @@ QUICNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 }
 
 NetVConnection *
-QUICNetProcessor::allocate_vc(EThread *t)
+QUICNetProcessor::allocate_vc(EThread *t) const
 {
   QUICNetVConnection *vc;
 

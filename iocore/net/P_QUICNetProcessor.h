@@ -63,7 +63,7 @@ public:
   Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts);
 
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
-  NetVConnection *allocate_vc(EThread *t) override;
+  NetVConnection *allocate_vc(EThread *t) const override;
 
   Action *main_accept(Continuation *cont, SOCKET fd, AcceptOptions const &opt) override;
 

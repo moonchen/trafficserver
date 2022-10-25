@@ -40,7 +40,7 @@ public:
   Action *connect(Continuation *cont, UnixNetVConnection **vc, sockaddr const *target, NetVCOptions *opt = nullptr);
 
   virtual NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt);
-  NetVConnection *allocate_vc(EThread *t) override;
+  NetVConnection *allocate_vc(EThread *t) const override;
 
   void init() override;
   void init_socks() override;

@@ -100,7 +100,7 @@ SSLNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 }
 
 NetVConnection *
-SSLNetProcessor::allocate_vc(EThread *t)
+SSLNetProcessor::allocate_vc(EThread *t) const
 {
   SSLNetVConnection *vc;
 
