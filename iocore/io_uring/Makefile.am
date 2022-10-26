@@ -1,4 +1,4 @@
-# Makefile.am for traffic/iocore
+# Makefile.am for traffic/iocore/io_uring
 #
 #  Licensed to the Apache Software Foundation (ASF) under one
 #  or more contributor license agreements.  See the NOTICE file
@@ -16,7 +16,15 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-SUBDIRS = eventsystem net aio dns hostdb utils cache
-if ENABLE_IO_URING
-SUBDIRS += io_uring
-endif
+AM_CPPFLAGS += \
+	-I$(abs_top_srcdir)/iocore/eventsystem \
+	-I$(abs_top_srcdir)/include \
+	-I$(abs_top_srcdir)/lib \
+	$(TS_INCLUDES)
+
+noinst_LIBRARIES = libinkuring.a
+
+libinkuring_a_SOURCES = \
+	io_uring.cc \
+	I_IO_URING.h \
+	P_IO_URING.h
