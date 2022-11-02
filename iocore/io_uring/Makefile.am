@@ -28,3 +28,26 @@ libinkuring_a_SOURCES = \
 	io_uring.cc \
 	I_IO_URING.h \
 	P_IO_URING.h
+
+
+check_PROGRAMS = test_diskIO
+
+test_LD_FLAGS = \
+	@AM_LDFLAGS@ \
+	@OPENSSL_LDFLAGS@
+
+test_CPP_FLAGS = \
+	$(AM_CPPFLAGS) \
+	$(iocore_include_dirs) \
+	-I$(abs_top_srcdir)/tests/include
+
+test_LD_ADD = \
+	$(top_builddir)/src/tscore/libtscore.la \
+	$(top_builddir)/iocore/io_uring/libinkuring.a \
+	@HWLOC_LIBS@
+
+
+test_diskIO_SOURCES = unit_tests/test_diskIO.cc
+test_diskIO_CPPFLAGS = $(test_CPP_FLAGS)
+test_diskIO_LDFLAGS = $(test_LD_FLAGS)
+test_diskIO_LDADD = $(test_LD_ADD)

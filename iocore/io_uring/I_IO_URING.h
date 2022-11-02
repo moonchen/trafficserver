@@ -46,6 +46,8 @@ public:
   IOUringContext();
   ~IOUringContext();
 
+  IOUringContext(const IOUringContext &) = delete;
+
   io_uring_sqe *
   next_sqe(IOUringCompletionHandler *handler)
   {
@@ -72,7 +74,8 @@ public:
   static int get_main_queue_fd();
 
 private:
-  io_uring ring;
+  io_uring ring = {};
+  int evfd      = -1;
 
   void handle_cqe(io_uring_cqe *);
   static IOUringConfig config;
