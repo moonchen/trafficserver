@@ -86,7 +86,7 @@ struct EventIO {
     EVENTIO_DNS_CONNECTION = 3,
     EVENTIO_UDP_CONNECTION = 4,
     EVENTIO_ASYNC_SIGNAL   = 5,
-    EVENTIO_DISK           = 6
+    EVENTIO_IO_URING       = 6
   };
 
   /** The start methods all logically Setup a class to be called

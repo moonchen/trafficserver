@@ -24,6 +24,7 @@
 #include "P_IOUringNetVConnection.h"
 #include "tscore/Diags.h"
 #include "tscore/ink_assert.h"
+#include "I_IO_URING.h"
 #include <optional>
 #include <liburing.h>
 
@@ -84,36 +85,9 @@ prep_eventfd_read(struct io_uring *ring, EThread *thread)
 int
 IOUringNetHandler::waitForActivity(ink_hrtime timeout)
 {
-  struct io_uring_cqe *cqe;
-  ink_release_assert(this_thread() == thread);
+  IOUringContext *ur = IOUringContext::local_context();
 
-  // In the case when the work queue is empty, an incoming event should
-  // send a notification to the ring via eventfd to wake the thread up
-  // from this sleep.
-  Debug(TAG, "waiting for cqe");
-  auto ret = io_uring_submit(&ring);
-  if (ret < 0) {
-    Warning("Failed to io_uring_submit: %s", strerror(-ret));
-  }
-  ret = io_uring_wait_cqe(&ring, &cqe);
-  if (ret < 0) {
-    Warning("io_uring_wait_cqe failed: %s", strerror(-ret));
-  } else {
-    // pending--;
-    // TODO: handle completed I/O
-    // TODO: break here if new events are scheduled by I/O completion handlers
-    Debug(TAG, "processing cqes");
-    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
-      Debug(TAG, "cqe->res = %d", cqe->res);
-      if (io_uring_cqe_get_data64(cqe) == 0) {
-        // eventfd
-        Debug(TAG, "Read from eventfd:");
-        prep_eventfd_read(&ring, thread);
-      }
-      io_uring_cqe_seen(&ring, cqe);
-    }
-  }
-
+  ur->submit_and_wait(timeout);
   return 0;
 }
 
@@ -123,20 +97,6 @@ initialize_thread_for_iouring(EThread *thread)
   ink_release_assert(!inh);
   inh.emplace();
   ink_release_assert(inh);
-
-  // TODO: replace placeholder values
-  const int queue_depth = 1024;
-  io_uring_params p{};
-
-  Debug(TAG, "Started io_uring thread");
-
-  auto ret = io_uring_queue_init_params(queue_depth, &inh->ring, &p);
-  if (ret < 0) {
-    Fatal("Failed to initialize io_uring: %s", strerror(-ret));
-    return;
-  }
-  inh->thread = thread;
-  prep_eventfd_read(&inh->ring, thread);
 
   thread->set_tail_handler(&inh.value());
 }

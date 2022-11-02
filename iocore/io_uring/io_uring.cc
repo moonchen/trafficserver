@@ -35,6 +35,12 @@ std::atomic<uint64_t> io_uring_completions = 0;
 
 IOUringConfig IOUringContext::config;
 
+void
+IOUringContext::set_config(const IOUringConfig &cfg)
+{
+  config = cfg;
+}
+
 IOUringContext::IOUringContext()
 {
   io_uring_params p{};
@@ -69,6 +75,10 @@ IOUringContext::IOUringContext()
 
 IOUringContext::~IOUringContext()
 {
+  if (evfd != -1) {
+    close(evfd);
+    evfd = -1;
+  }
   io_uring_queue_exit(&ring);
 }
 
@@ -155,11 +165,12 @@ IOUringContext::submit_and_wait(int ms)
 int
 IOUringContext::register_eventfd()
 {
-  int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (evfd == -1) {
+    evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
-  io_uring_register_eventfd(&ring, fd);
-
-  return fd;
+    io_uring_register_eventfd(&ring, evfd);
+  }
+  return evfd;
 }
 
 IOUringContext *
