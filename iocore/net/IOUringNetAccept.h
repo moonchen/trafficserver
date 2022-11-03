@@ -50,6 +50,8 @@ public:
     return *this;
   }
 
+  void prep_accept(IOUringContext *ctx, NetAccept *pna);
+
   Connection conn;
   NetAccept *na;
 };

@@ -61,10 +61,12 @@ void
 IOUringNetHandler::signalActivity()
 {
   static uint64_t counter = 1;
-  auto ret                = write(thread->evfd, &counter, sizeof counter);
-  Debug(TAG, "signalActivity on fd=%d returned %zu", thread->evfd, ret);
-  if (ret < 0) {
-    Warning("io_uring: failed to write to event fd");
+  if (thread != nullptr && thread->evfd != ts::NO_FD) {
+    auto ret = write(thread->evfd, &counter, sizeof counter);
+    Debug(TAG, "signalActivity on fd=%d returned %zu", thread->evfd, ret);
+    if (ret < 0) {
+      Warning("io_uring: failed to write to event fd");
+    }
   }
 }
 
