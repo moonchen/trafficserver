@@ -28,6 +28,7 @@
 #include <liburing.h>
 #include <optional>
 #include <unordered_set>
+#include "I_IO_URING.h"
 
 static constexpr auto TAG = "io_uring_accept";
 
@@ -38,7 +39,7 @@ static thread_local std::optional<io_uring> ring;
 // Connection buffers for accept thread
 static thread_local std::vector<Connection> cons{queue_depth};
 
-IOUringNetAccept::IOUringNetAccept(NetProcessor::AcceptOptions const &opt) : NetAccept(opt) {}
+IOUringNetAccept::IOUringNetAccept(NetProcessor::AcceptOptions const &opt) : NetAccept(opt), connections(queue_depth) {}
 
 void
 IOUringNetAccept::init_accept_loop()
@@ -156,9 +157,43 @@ IOUringNetAccept::acceptLoopEvent(int event, void *ep)
   return EVENT_DONE;
 }
 
+int
+IOUringNetAccept::accept_startup(int, void *)
+{
+  IOUringContext *ctx = IOUringContext::local_context();
+  if (do_listen(BLOCKING)) {
+    return 1;
+  }
+
+  for (auto &con : connections) {
+    con.conn.addrlen = sizeof(con.conn.addr);
+    auto *sqe        = ctx->next_sqe(&con);
+
+    ink_release_assert(sqe != nullptr);
+    io_uring_prep_accept(sqe, server.fd, &con.conn.addr.sa, &con.conn.addrlen, SOCK_CLOEXEC);
+  }
+  return 0;
+}
+
 void
 IOUringNetAccept::init_accept_per_thread()
 {
+  int i, n;
+
+  SET_HANDLER(&IOUringNetAccept::accept_startup);
+  n = eventProcessor.thread_group[opt.etype]._count;
+
+  for (i = 0; i < n; i++) {
+    IOUringNetAccept *na;
+    na  = new IOUringNetAccept(opt);
+    *na = *this;
+    SET_CONTINUATION_HANDLER(na, &IOUringNetAccept::accept_startup);
+
+    EThread *t = eventProcessor.thread_group[opt.etype]._thread[i];
+    // shouldnt need a mutex for
+    // a->mutex     = get_NetHandler(t)->mutex;
+    t->schedule_imm(na);
+  }
 }
 
 int
@@ -194,4 +229,16 @@ IOUringNetAccept::initialize_vc(NetVConnection *_vc, Connection &con, EThread *l
   SET_CONTINUATION_HANDLER(vc, &IOUringNetVConnection::acceptEvent);
 
   // TODO: Does vc need the mutex from its NetProcessor?
+}
+void
+IOUringNetAccept::handle_complete(io_uring_cqe *sqe)
+{
+}
+void
+IOUringAcceptConnection::handle_complete(io_uring_cqe *cqe)
+{
+  char buf[INET6_ADDRSTRLEN];
+  ats_ip_ntop(conn.addr, buf, sizeof buf);
+  conn.fd = cqe->res;
+  Debug(TAG, "Accepted a connection %s:%u with fd %d.", buf, conn.addr.host_order_port(), conn.fd);
 }
