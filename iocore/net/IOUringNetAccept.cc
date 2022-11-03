@@ -167,6 +167,7 @@ IOUringNetAccept::accept_startup(int, void *)
 
   for (auto &con : connections) {
     con.conn.addrlen = sizeof(con.conn.addr);
+    con.na           = this;
     auto *sqe        = ctx->next_sqe(&con);
 
     ink_release_assert(sqe != nullptr);
@@ -237,8 +238,17 @@ IOUringNetAccept::handle_complete(io_uring_cqe *sqe)
 void
 IOUringAcceptConnection::handle_complete(io_uring_cqe *cqe)
 {
+  IOUringContext *ctx = IOUringContext::local_context();
+
   char buf[INET6_ADDRSTRLEN];
   ats_ip_ntop(conn.addr, buf, sizeof buf);
-  conn.fd = cqe->res;
   Debug(TAG, "Accepted a connection %s:%u with fd %d.", buf, conn.addr.host_order_port(), conn.fd);
+
+  auto stop = na->process_accept(cqe->res, this_ethread(), conn);
+
+  if (!stop) {
+    auto *sqe = ctx->next_sqe(this);
+    ink_release_assert(sqe != nullptr);
+    io_uring_prep_accept(sqe, na->server.fd, &conn.addr.sa, &conn.addrlen, SOCK_CLOEXEC);
+  }
 }
