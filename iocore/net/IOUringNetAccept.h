@@ -27,8 +27,33 @@
 #include "P_IOUringNetProcessor.h"
 #include "I_EThread.h"
 #include "liburing.h"
+#include "I_IO_URING.h"
 
-class IOUringNetAccept : public NetAccept
+class IOUringAcceptConnection : public IOUringCompletionHandler
+{
+public:
+  IOUringAcceptConnection() = default;
+  IOUringAcceptConnection(const IOUringAcceptConnection &other)
+  {
+    conn.addr    = other.conn.addr;
+    conn.addrlen = other.conn.addrlen;
+  }
+  virtual ~IOUringAcceptConnection() = default;
+
+  void handle_complete(io_uring_cqe *) override;
+
+  IOUringAcceptConnection &
+  operator=(const IOUringAcceptConnection &other)
+  {
+    conn.addr    = other.conn.addr;
+    conn.addrlen = other.conn.addrlen;
+    return *this;
+  }
+
+  Connection conn;
+};
+
+class IOUringNetAccept : public NetAccept, public IOUringCompletionHandler
 {
 public:
   IOUringNetAccept(NetProcessor::AcceptOptions const &opt);
@@ -41,6 +66,10 @@ public:
     return &ioUringNetProcessor;
   }
 
+  int accept_startup(int, void *);
+
+  void handle_complete(io_uring_cqe *) override;
+
 protected:
   void safe_delay(int msec) override;
   void initialize_vc(NetVConnection *_vc, Connection &con, EThread *localt) override;
@@ -51,4 +80,6 @@ private:
 
   // Handler for per-thread accepts
   int acceptEvent(int event, void *ep) override;
+
+  std::vector<IOUringAcceptConnection> connections;
 };
