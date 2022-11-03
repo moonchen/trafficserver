@@ -79,7 +79,11 @@ EThread::EThread(ThreadType att, int anid) : id(anid), tt(att)
 {
   memset(thread_private, 0, PER_THREAD_DATA);
 #if HAVE_EVENTFD
+#if TS_USE_LINUX_IO_URING
+  evfd = eventfd(0, EFD_CLOEXEC);
+#else
   evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#endif
   if (evfd < 0) {
     if (errno == EINVAL) { // flags invalid for kernel <= 2.6.26
       evfd = eventfd(0, 0);

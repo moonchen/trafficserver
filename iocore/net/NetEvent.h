@@ -25,6 +25,7 @@
 
 #include "I_EventSystem.h"
 #include "P_EventIO.h"
+#include "P_UnixNetState.h"
 
 class NetHandler;
 

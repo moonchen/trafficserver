@@ -23,6 +23,7 @@
 
 #include "I_Continuation.h"
 #include "I_EThread.h"
+#include "P_IOUringNetVConnection.h"
 #include "P_UnixNet.h"
 #include <liburing.h>
 
@@ -30,6 +31,10 @@ class IOUringNetHandler : public NetHandler
 {
 public:
   IOUringNetHandler() {}
+
+  // Start reading on this vc
+  int startRead(IOUringNetVConnection *vc);
+
   // EThread::LoopTailHandler
   void signalActivity() override;
   int waitForActivity(ink_hrtime timeout) override;
@@ -39,6 +44,7 @@ public:
   IOUringNetHandler &operator=(const IOUringNetHandler &) = delete;
 
   static IOUringNetHandler &get_NetHandler();
+  static struct io_uring *get_ring();
 
   struct io_uring ring;
   // number of submissions pending completion

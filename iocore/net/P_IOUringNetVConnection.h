@@ -70,4 +70,9 @@ public:
 private:
   int startEvent(int event, Event *e);
   int mainEvent(int event, Event *e);
+  int prep_read(int event, Event *e);
+
+  bool closed;
+  VIO read_vio;
+  VIO write_vio;
 };

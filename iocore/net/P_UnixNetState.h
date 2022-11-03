@@ -39,7 +39,6 @@
 #include "tscore/List.h"
 #include "I_VIO.h"
 
-class Event;
 class NetEvent;
 
 struct NetState {
