@@ -25,6 +25,9 @@
 
 #include "tscore/ink_platform.h"
 #include "tscore/ink_resource.h"
+#include "tscore/ink_memory.h"
+#include "I_IOBuffer.h"
+#include "P_Thread.h"
 
 // TODO: I think we're overly aggressive here on making MIOBuffer 64-bit
 // but not sure it's worthwhile changing anything to 32-bit honestly.

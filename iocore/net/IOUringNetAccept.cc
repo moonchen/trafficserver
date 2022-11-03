@@ -32,7 +32,7 @@
 static constexpr auto TAG = "io_uring_accept";
 
 // Number of sq entries for accept threads
-static constexpr int queue_depth = 8;
+static constexpr int queue_depth = 1;
 // Ring for accept threads
 static thread_local std::optional<io_uring> ring;
 // Connection buffers for accept thread
@@ -131,7 +131,10 @@ IOUringNetAccept::acceptLoopEvent(int event, void *ep)
     io_uring_cqe *pcqe = nullptr;
     io_uring_cqe cqe;
     ret = io_uring_wait_cqe(&ring.value(), &pcqe);
-    if (ret < 0) {
+    if (ret == -EINTR) {
+      Debug(TAG, "accept: iouring_wait_cqe interrupted by signal.");
+      continue;
+    } else if (ret < 0) {
       Fatal("accept: io_uring_wait_cqe failed: %s", strerror(-ret));
       return EVENT_ERROR;
     }
