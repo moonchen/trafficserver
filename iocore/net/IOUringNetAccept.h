@@ -51,6 +51,7 @@ public:
   }
 
   Connection conn;
+  NetAccept *na;
 };
 
 class IOUringNetAccept : public NetAccept, public IOUringCompletionHandler

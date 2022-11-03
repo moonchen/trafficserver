@@ -132,9 +132,11 @@ struct NetAccept : public Continuation, EventIOUser {
     return server.close();
   }
 
+  // TODO(cmcfarlen): I moved this from protected
+  bool process_accept(int res, EThread *, Connection &con);
+
 protected:
   virtual int do_listen(bool non_blocking);
-  bool process_accept(int res, EThread *, Connection &con);
   virtual void safe_delay(int msec);
   virtual void initialize_vc(NetVConnection *_vc, Connection &con, EThread *localt);
 };
