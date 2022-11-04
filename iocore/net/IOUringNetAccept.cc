@@ -103,6 +103,7 @@ IOUringNetAccept::accept_startup(int, void *)
   if (do_listen(BLOCKING)) {
     return 1;
   }
+  Debug(TAG, "accept startup");
 
   for (auto &con : connections) {
     con.prep_accept(ctx, this);
@@ -165,10 +166,6 @@ IOUringNetAccept::initialize_vc(NetVConnection *_vc, Connection &con, EThread *l
 
   // TODO: Does vc need the mutex from its NetProcessor?
 }
-void
-IOUringNetAccept::handle_complete(io_uring_cqe *sqe)
-{
-}
 
 void
 IOUringAcceptConnection::handle_complete(io_uring_cqe *cqe)
@@ -179,6 +176,8 @@ IOUringAcceptConnection::handle_complete(io_uring_cqe *cqe)
   ats_ip_ntop(conn.addr, buf, sizeof buf);
   Debug(TAG, "Accepted a connection %s:%u with fd %d.", buf, conn.addr.host_order_port(), conn.fd);
 
+  // process_accepts seems to assume the fd is already set.
+  conn.fd   = cqe->res;
   auto stop = na->process_accept(cqe->res, this_ethread(), conn);
 
   if (!stop) {

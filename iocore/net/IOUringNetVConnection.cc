@@ -48,7 +48,7 @@ int
 IOUringNetVConnection::prep_read(int event, Event *e)
 {
   ink_assert(thread == this_ethread());
-  MUTEX_TRY_LOCK(lock, read_vio.mutex, thread);
+  MUTEX_TRY_LOCK(lock, read_vio.vio.mutex, thread);
   if (!lock.is_locked()) {
     // Reschedule
     SET_HANDLER(&IOUringNetVConnection::prep_read);
@@ -57,11 +57,11 @@ IOUringNetVConnection::prep_read(int event, Event *e)
   }
 
   io_uring_sqe *sqe      = io_uring_get_sqe(IOUringNetHandler::get_ring());
-  MIOBufferAccessor &buf = read_vio.buffer;
+  MIOBufferAccessor &buf = read_vio.vio.buffer;
   ink_assert(buf.writer());
 
   // if there is nothing to do, do nothing
-  int64_t ntodo = read_vio.ntodo();
+  int64_t ntodo = read_vio.vio.ntodo();
   if (ntodo <= 0) {
     return EVENT_DONE;
   }
@@ -124,21 +124,21 @@ IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *bu
   Debug(TAG, "%s", __FUNCTION__);
   ink_assert(thread == this_ethread());
 
-  read_vio.op        = VIO::READ;
-  read_vio.mutex     = c ? c->mutex : this->mutex;
-  read_vio.cont      = c;
-  read_vio.nbytes    = nbytes;
-  read_vio.ndone     = 0;
-  read_vio.vc_server = this;
+  read_vio.vio.op        = VIO::READ;
+  read_vio.vio.mutex     = c ? c->mutex : this->mutex;
+  read_vio.vio.cont      = c;
+  read_vio.vio.nbytes    = nbytes;
+  read_vio.vio.ndone     = 0;
+  read_vio.vio.vc_server = this;
 
   if (buf) {
-    read_vio.buffer.writer_for(buf);
+    read_vio.vio.buffer.writer_for(buf);
   } else {
     // TODO: caller wants to cancel, but read might still be in progress
-    read_vio.buffer.clear();
+    read_vio.vio.buffer.clear();
   }
 
-  return &read_vio;
+  return &read_vio.vio;
 }
 
 VIO *
@@ -240,6 +240,17 @@ void
 IOUringNetVConnection::reenable(VIO *vio)
 {
   Debug(TAG, "%s", __FUNCTION__);
+  auto *ctx = IOUringContext::local_context();
+
+  if (vio == &read_vio.vio) {
+    io_uring_sqe *sqe = ctx->next_sqe(&read_vio);
+    char *buf         = vio->buffer.writer()->start() + vio->ndone;
+    io_uring_prep_recv(sqe, con.fd, buf, vio->nbytes - vio->ndone, 0);
+  } else {
+    io_uring_sqe *sqe = ctx->next_sqe(&write_vio);
+    char *buf         = vio->buffer.reader()->start() + vio->ndone;
+    io_uring_prep_send(sqe, con.fd, buf, vio->nbytes - vio->ndone, 0);
+  }
 }
 
 void
@@ -266,18 +277,28 @@ void
 IOUringNetVConnection::set_local_addr()
 {
   Debug(TAG, "%s", __FUNCTION__);
+  int local_sa_size = sizeof(local_addr);
+  // This call will fail if fd is closed already. That is ok, because the
+  // `local_addr` is checked within get_local_addr() and the `got_local_addr`
+  // is set only with a valid `local_addr`.
+  ATS_UNUSED_RETURN(safe_getsockname(con.fd, &local_addr.sa, &local_sa_size));
 }
 
 void
 IOUringNetVConnection::set_remote_addr()
 {
   Debug(TAG, "%s", __FUNCTION__);
+  ats_ip_copy(&remote_addr, &con.addr);
+  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
+  set_cont_flags(this->control_flags);
 }
 
 void
-IOUringNetVConnection::set_remote_addr(const sockaddr *)
+IOUringNetVConnection::set_remote_addr(const sockaddr *new_sa)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  ats_ip_copy(&remote_addr, new_sa);
+  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
+  set_cont_flags(this->control_flags);
 }
 
 void
@@ -295,7 +316,7 @@ IOUringNetVConnection::acceptEvent(int event, Event *e)
 
   // Should only be called from the local thread
   ink_assert(this_ethread()->is_event_type(ET_NET));
-  mutex = nullptr;
+  mutex = new_ProxyMutex();
 
   // Setup a timeout callback handler.
   SET_HANDLER(&IOUringNetVConnection::mainEvent);
@@ -326,4 +347,42 @@ IOUringNetVConnection::mainEvent(int event, Event *e)
 {
   Debug(TAG, "mainEvent");
   return EVENT_DONE;
+}
+
+void
+IOUringVIO::handle_complete(io_uring_cqe *cqe)
+{
+  int bc = cqe->res;
+
+  SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+
+  if (bc <= 0) {
+    Debug(TAG, "error vio: %d %s", bc, strerror(-bc));
+    if (!bc || bc == -ECONNRESET) {
+      vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+    } else {
+      vio.vc_server->lerrno = -bc;
+      vio.cont->handleEvent(VC_EVENT_ERROR, &vio);
+    }
+  } else {
+    vio.ndone += bc;
+    Debug(TAG, "vio complete: %d %ld/%ld", bc, vio.ndone, vio.nbytes);
+    if (vio.op == VIO::READ) {
+      vio.buffer.writer()->fill(bc);
+
+      if (vio.ntodo() <= 0) { // why <0?
+        vio.cont->handleEvent(VC_EVENT_READ_COMPLETE, &vio);
+      } else {
+        vio.cont->handleEvent(VC_EVENT_READ_READY, &vio);
+      }
+    } else {
+      vio.buffer.reader()->consume(bc);
+
+      if (vio.ntodo() <= 0) { // why <0?
+        vio.cont->handleEvent(VC_EVENT_WRITE_COMPLETE, &vio);
+      } else {
+        vio.cont->handleEvent(VC_EVENT_WRITE_READY, &vio);
+      }
+    }
+  }
 }

@@ -27,6 +27,13 @@
 #include "P_Connection.h"
 #include "IOUringNetAccept.h"
 
+class IOUringVIO : public IOUringCompletionHandler
+{
+public:
+  void handle_complete(io_uring_cqe *) override;
+  VIO vio;
+};
+
 class IOUringNetVConnection : public NetVConnection
 {
 public:
@@ -73,6 +80,6 @@ private:
   int prep_read(int event, Event *e);
 
   bool closed;
-  VIO read_vio;
-  VIO write_vio;
+  IOUringVIO read_vio;
+  IOUringVIO write_vio;
 };

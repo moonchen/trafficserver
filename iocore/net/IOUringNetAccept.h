@@ -56,7 +56,7 @@ public:
   NetAccept *na;
 };
 
-class IOUringNetAccept : public NetAccept, public IOUringCompletionHandler
+class IOUringNetAccept : public NetAccept
 {
 public:
   IOUringNetAccept(NetProcessor::AcceptOptions const &opt);
@@ -70,8 +70,6 @@ public:
   }
 
   int accept_startup(int, void *);
-
-  void handle_complete(io_uring_cqe *) override;
 
 protected:
   void safe_delay(int msec) override;
