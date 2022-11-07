@@ -39,24 +39,6 @@ IOUringNetHandler::get_NetHandler()
   return inh.value();
 }
 
-struct io_uring *
-IOUringNetHandler::get_ring()
-{
-  return &inh->ring;
-}
-
-int
-IOUringNetHandler::startRead(IOUringNetVConnection *vc)
-{
-  auto sqe = io_uring_get_sqe(&ring);
-  if (sqe == nullptr) {
-    Fatal("ring size is too small!");
-    return EVENT_ERROR;
-  }
-  // io_uring_prep_read(sqe, vc->con.fd, buf, nbytes, offset);
-  return 0;
-}
-
 void
 IOUringNetHandler::signalActivity()
 {
@@ -67,20 +49,8 @@ IOUringNetHandler::signalActivity()
     if (ret < 0) {
       Warning("io_uring: failed to write to event fd");
     }
-  }
-}
-
-static void
-prep_eventfd_read(struct io_uring *ring, EThread *thread)
-{
-  static thread_local uint64_t counter; // There is only one outstanding eventfd read per ring
-  auto sqe = io_uring_get_sqe(ring);
-  if (sqe) {
-    io_uring_prep_read(sqe, thread->evfd, &counter, sizeof counter, -1);
-    io_uring_sqe_set_data64(sqe, 0);
-    Debug(TAG, "reading eventfd, fd=%d", thread->evfd);
   } else {
-    Fatal("prep_eventfd_read: Could not get an SQE");
+    Debug(TAG, "signalActivity on %p, fd = %d", thread, thread ? thread->evfd : -1);
   }
 }
 
@@ -97,8 +67,29 @@ void
 initialize_thread_for_iouring(EThread *thread)
 {
   ink_release_assert(!inh);
-  inh.emplace();
+  inh.emplace(thread);
   ink_release_assert(inh);
 
   thread->set_tail_handler(&inh.value());
+}
+
+void
+IOUringWakeUpAlarm::prep_eventfd_read()
+{
+  static thread_local uint64_t counter; // There is only one outstanding eventfd read per ring
+  auto ctx = IOUringContext::local_context();
+  auto sqe = ctx->next_sqe(this);
+  if (sqe) {
+    io_uring_prep_read(sqe, _thread->evfd, &counter, sizeof counter, -1);
+    Debug(TAG, "reading eventfd, fd=%d", _thread->evfd);
+  } else {
+    Fatal("prep_eventfd_read: Could not get an SQE");
+  }
+}
+
+void
+IOUringWakeUpAlarm::handle_complete(io_uring_cqe *)
+{
+  Debug(TAG, "waking up io_uring");
+  prep_eventfd_read();
 }

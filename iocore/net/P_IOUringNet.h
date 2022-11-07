@@ -27,13 +27,22 @@
 #include "P_UnixNet.h"
 #include <liburing.h>
 
+class IOUringWakeUpAlarm : public IOUringCompletionHandler
+{
+public:
+  IOUringWakeUpAlarm(EThread *thread) : _thread(thread) { prep_eventfd_read(); }
+
+  void prep_eventfd_read();
+  void handle_complete(io_uring_cqe *) override;
+
+private:
+  const EThread *_thread;
+};
+
 class IOUringNetHandler : public NetHandler
 {
 public:
-  IOUringNetHandler() {}
-
-  // Start reading on this vc
-  int startRead(IOUringNetVConnection *vc);
+  IOUringNetHandler(EThread *thread) : _alarm{thread} { this->thread = thread; }
 
   // EThread::LoopTailHandler
   void signalActivity() override;
@@ -44,11 +53,9 @@ public:
   IOUringNetHandler &operator=(const IOUringNetHandler &) = delete;
 
   static IOUringNetHandler &get_NetHandler();
-  static struct io_uring *get_ring();
 
-  struct io_uring ring;
-  // number of submissions pending completion
-  int pending = 0;
+private:
+  IOUringWakeUpAlarm _alarm;
 };
 
 void initialize_thread_for_iouring(EThread *thread);
