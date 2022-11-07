@@ -174,10 +174,10 @@ IOUringAcceptConnection::handle_complete(io_uring_cqe *cqe)
 
   char buf[INET6_ADDRSTRLEN];
   ats_ip_ntop(conn.addr, buf, sizeof buf);
-  Debug(TAG, "Accepted a connection %s:%u with fd %d.", buf, conn.addr.host_order_port(), conn.fd);
 
   // process_accepts seems to assume the fd is already set.
-  conn.fd   = cqe->res;
+  conn.fd = cqe->res;
+  Debug(TAG, "Accepted a connection %s:%u with fd %d.", buf, conn.addr.host_order_port(), conn.fd);
   auto stop = na->process_accept(cqe->res, this_ethread(), conn);
 
   if (!stop) {

@@ -21,19 +21,23 @@ Linux io_uring helper library
   limitations under the License.
  */
 
+#include "tscore/Diags.h"
+#include "tscore/ink_hrtime.h"
+#include "I_IO_URING.h"
+
 #include <sys/eventfd.h>
 #include <atomic>
 #include <cstring>
 #include <stdexcept>
-
-#include "I_IO_URING.h"
-#include "tscore/ink_hrtime.h"
+#include <unistd.h>
 
 std::atomic<int> main_wq_fd;
 std::atomic<uint64_t> io_uring_submissions = 0;
 std::atomic<uint64_t> io_uring_completions = 0;
 
 IOUringConfig IOUringContext::config;
+
+static constexpr auto TAG = "io_uring";
 
 void
 IOUringContext::set_config(const IOUringConfig &cfg)
@@ -67,6 +71,8 @@ IOUringContext::IOUringContext()
   if (config.sq_poll_ms && !(p.features & IORING_FEAT_SQPOLL_NONFIXED)) {
     throw std::runtime_error("No SQPOLL sharing with nonfixed");
   }
+
+  Debug(TAG, "initialized ring fd = %d", ring.ring_fd);
 
   // assign this handler to the thread
   // TODO(cmcfarlen): Assign in thread somewhere else
@@ -151,14 +157,28 @@ IOUringContext::submit_and_wait(int ms)
   __kernel_timespec timeout = {ts.tv_sec, ts.tv_nsec};
   io_uring_cqe *cqe         = nullptr;
 
-  io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &timeout, nullptr);
-  while (cqe) {
+  // auto ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &timeout, nullptr);
+  int ret;
+  if (ms == -1) {
+    ret = io_uring_submit(&ring);
+  } else {
+    ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &timeout, nullptr);
+  }
+  if (ret < 0) {
+    switch (ret) {
+    case -ETIME:
+      break;
+    default:
+      Fatal("io_uring_submit error: %s", strerror(-ret));
+    }
+  }
+
+  while (io_uring_peek_cqe(&ring, &cqe) == 0 && cqe != nullptr) {
     handle_cqe(cqe);
     io_uring_completions++;
     io_uring_cqe_seen(&ring, cqe);
 
     cqe = nullptr;
-    io_uring_peek_cqe(&ring, &cqe);
   }
 }
 
