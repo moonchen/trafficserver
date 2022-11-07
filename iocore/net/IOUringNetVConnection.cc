@@ -47,6 +47,7 @@ IOUringNetVConnection::~IOUringNetVConnection() {}
 int
 IOUringNetVConnection::prep_read(int event, Event *e)
 {
+  /*
   ink_assert(thread == this_ethread());
   MUTEX_TRY_LOCK(lock, read_vio.vio.mutex, thread);
   if (!lock.is_locked()) {
@@ -56,7 +57,7 @@ IOUringNetVConnection::prep_read(int event, Event *e)
     return EVENT_DONE;
   }
 
-  io_uring_sqe *sqe      = io_uring_get_sqe(IOUringNetHandler::get_ring());
+  io_uring_sqe *sqe      = IOUringContext::local_context()->next_sqe(this);
   MIOBufferAccessor &buf = read_vio.vio.buffer;
   ink_assert(buf.writer());
 
@@ -114,7 +115,7 @@ IOUringNetVConnection::prep_read(int event, Event *e)
     total_read += rattempted;
   }
   // TODO: do we queue multiple reads?
-
+  */
   return EVENT_DONE;
 }
 
