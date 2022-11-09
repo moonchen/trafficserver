@@ -644,18 +644,18 @@ MIOBuffer::MIOBuffer(void *b, int64_t bufsize, int64_t aWater_mark)
 }
 
 TS_INLINE
-MIOBuffer::MIOBuffer(int64_t default_size_index)
+MIOBuffer::MIOBuffer(int64_t default_size_index) : water_mark(0), _writer(nullptr)
 {
-  clear();
+  init_readers();
   size_index = default_size_index;
   _location  = nullptr;
   return;
 }
 
 TS_INLINE
-MIOBuffer::MIOBuffer()
+MIOBuffer::MIOBuffer() : water_mark(0), _writer(nullptr)
 {
-  clear();
+  init_readers();
   _location = nullptr;
   return;
 }

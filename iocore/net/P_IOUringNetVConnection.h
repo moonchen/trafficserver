@@ -23,15 +23,29 @@
 
 #pragma once
 
+#include "I_IO_URING.h"
 #include "I_NetVConnection.h"
 #include "P_Connection.h"
 #include "IOUringNetAccept.h"
 
-class IOUringVIO : public IOUringCompletionHandler
+class IOUringNetVConnection;
+
+class IOUringReader : public IOUringCompletionHandler
 {
 public:
   void handle_complete(io_uring_cqe *) override;
   VIO vio;
+  bool enabled = false;
+  IOUringNetVConnection *vc;
+};
+
+class IOUringWriter : public IOUringCompletionHandler
+{
+public:
+  void handle_complete(io_uring_cqe *) override;
+  VIO vio;
+  bool enabled = false;
+  IOUringNetVConnection *vc;
 };
 
 class IOUringNetVConnection : public NetVConnection
@@ -74,12 +88,17 @@ public:
 
   int acceptEvent(int event, Event *e);
 
+  // Make progress on reads and writes
+  void prep_read();
+  void prep_write();
+
 private:
   int startEvent(int event, Event *e);
   int mainEvent(int event, Event *e);
-  int prep_read(int event, Event *e);
+  int write_signal_and_update(int event);
+  void load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf);
 
   bool closed;
-  IOUringVIO read_vio;
-  IOUringVIO write_vio;
+  IOUringReader read;
+  IOUringWriter write;
 };

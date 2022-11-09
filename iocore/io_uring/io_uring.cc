@@ -131,6 +131,7 @@ IOUringContext::handle_cqe(io_uring_cqe *cqe)
 {
   auto *op = reinterpret_cast<IOUringCompletionHandler *>(io_uring_cqe_get_data(cqe));
 
+  Debug(TAG, "Got cqe: res = %d, user_data = %p", cqe->res, op);
   op->handle_complete(cqe);
 }
 
@@ -157,7 +158,6 @@ IOUringContext::submit_and_wait(int ms)
   __kernel_timespec timeout = {ts.tv_sec, ts.tv_nsec};
   io_uring_cqe *cqe         = nullptr;
 
-  // auto ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &timeout, nullptr);
   int ret;
   if (ms == -1) {
     ret = io_uring_submit(&ring);
@@ -167,6 +167,8 @@ IOUringContext::submit_and_wait(int ms)
   if (ret < 0) {
     switch (ret) {
     case -ETIME:
+      break;
+    case -EAGAIN:
       break;
     default:
       Fatal("io_uring_submit error: %s", strerror(-ret));

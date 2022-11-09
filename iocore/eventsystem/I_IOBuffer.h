@@ -1197,21 +1197,6 @@ public:
     }
   }
 
-  void
-  dealloc()
-  {
-    _writer = nullptr;
-    dealloc_all_readers();
-  }
-
-  void
-  clear()
-  {
-    dealloc();
-    size_index = BUFFER_SIZE_NOT_ALLOCATED;
-    water_mark = 0;
-  }
-
   int64_t size_index;
 
   /**
