@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <sys/types.h>
 #include <dirent.h>
+#include <cstdint>
 
 #if HAVE_SYS_STATFS_H
 #include <sys/statfs.h>
