@@ -122,9 +122,6 @@ Http2Stream::~Http2Stream()
   _req_header.destroy();
   response_header.destroy();
 
-  // Drop references to all buffer data
-  this->_request_buffer.clear();
-
   // Free the mutexes in the VIO
   read_vio.mutex.clear();
   write_vio.mutex.clear();

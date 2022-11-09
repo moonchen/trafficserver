@@ -22,6 +22,7 @@
  */
 
 #include "I_Continuation.h"
+#include "I_IO_URING.h"
 #include "I_NetVConnection.h"
 #include "P_IOUringNet.h"
 #include "P_IOUringNetVConnection.h"
@@ -44,27 +45,35 @@ IOUringNetVConnection::IOUringNetVConnection() : id(get_next_connection_id()), c
 
 IOUringNetVConnection::~IOUringNetVConnection() {}
 
-int
-IOUringNetVConnection::prep_read(int event, Event *e)
+void
+IOUringNetVConnection::prep_read()
 {
-  /*
   ink_assert(thread == this_ethread());
-  MUTEX_TRY_LOCK(lock, read_vio.vio.mutex, thread);
+  if (!read.enabled) {
+    return;
+  }
+
+  /*
+  // TODO: is it necessary to hold the read.vio.mutex here?
+  // TODO(mo): If so, we need to figure out a way to reschedule this.
+  MUTEX_TRY_LOCK(lock, read.vio.mutex, thread);
   if (!lock.is_locked()) {
     // Reschedule
     SET_HANDLER(&IOUringNetVConnection::prep_read);
     this_ethread()->schedule_imm(this);
     return EVENT_DONE;
   }
+  */
 
-  io_uring_sqe *sqe      = IOUringContext::local_context()->next_sqe(this);
-  MIOBufferAccessor &buf = read_vio.vio.buffer;
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&read);
+  ink_assert(sqe != nullptr);
+  MIOBufferAccessor &buf = read.vio.buffer;
   ink_assert(buf.writer());
 
   // if there is nothing to do, do nothing
-  int64_t ntodo = read_vio.vio.ntodo();
+  int64_t ntodo = read.vio.ntodo();
   if (ntodo <= 0) {
-    return EVENT_DONE;
+    return;
   }
 
   int64_t toread = buf.writer()->write_avail();
@@ -108,45 +117,225 @@ IOUringNetVConnection::prep_read(int event, Event *e)
     msg.msg_iov     = &tiovec[0];
     msg.msg_iovlen  = niov;
 
+    // TODO(mo): retain buffer blocks
+
     io_uring_prep_recvmsg(sqe, con.fd, &msg, 0);
+    Debug(TAG, "prep_recvmsg, op = %p", &read);
 
     NET_INCREMENT_DYN_STAT(net_calls_to_read_stat);
 
     total_read += rattempted;
   }
-  // TODO: do we queue multiple reads?
-  */
-  return EVENT_DONE;
+}
+
+int
+IOUringNetVConnection::write_signal_and_update(int event)
+{
+  recursion++;
+  if (write.vio.cont && write.vio.mutex == write.vio.cont->mutex) {
+    write.vio.cont->handleEvent(event, &write.vio);
+  } else {
+    if (write.vio.cont) {
+      Note("write_signal_and_update: mutexes are different? vc=%p, event=%d", this, event);
+    }
+    switch (event) {
+    case VC_EVENT_EOS:
+    case VC_EVENT_ERROR:
+    case VC_EVENT_ACTIVE_TIMEOUT:
+    case VC_EVENT_INACTIVITY_TIMEOUT:
+      Debug("inactivity_cop", "event %d: null write.vio cont, closing vc %p", event, this);
+      closed = true;
+      break;
+    default:
+      Error("Unexpected event %d for vc %p", event, this);
+      ink_release_assert(0);
+      break;
+    }
+  }
+  if (!--recursion && closed) {
+    /* BZ  31932 */
+    ink_assert(thread == this_ethread());
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
+}
+
+void
+IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf)
+{
+  int64_t try_to_write       = 0;
+  IOBufferReader *tmp_reader = buf.reader()->clone();
+
+  IOVec tiovec[NET_MAX_IOV];
+  unsigned niov = 0;
+  try_to_write  = 0;
+
+  while (niov < NET_MAX_IOV) {
+    int64_t wavail = towrite - try_to_write;
+    int64_t len    = tmp_reader->block_read_avail();
+
+    // Check if we have done this block.
+    if (len <= 0) {
+      break;
+    }
+
+    // Check if the amount to write exceeds that in this buffer.
+    if (len > wavail) {
+      len = wavail;
+    }
+
+    if (len == 0) {
+      break;
+    }
+
+    // build an iov entry
+    tiovec[niov].iov_len  = len;
+    tiovec[niov].iov_base = tmp_reader->start();
+    niov++;
+
+    try_to_write += len;
+    tmp_reader->consume(len);
+  }
+
+  ink_assert(niov > 0);
+  ink_assert(niov <= countof(tiovec));
+
+  // If the platform doesn't support TCP Fast Open, verify that we
+  // correctly disabled support in the socket option configuration.
+  ink_assert(MSG_FASTOPEN != 0 || this->options.f_tcp_fastopen == false);
+  struct msghdr msg;
+
+  ink_zero(msg);
+  msg.msg_name    = const_cast<sockaddr *>(this->get_remote_addr());
+  msg.msg_namelen = ats_ip_size(this->get_remote_addr());
+  msg.msg_iov     = &tiovec[0];
+  msg.msg_iovlen  = niov;
+  int flags       = 0;
+
+  if (!this->con.is_connected && this->options.f_tcp_fastopen) {
+    NET_INCREMENT_DYN_STAT(net_fastopen_attempts_stat);
+    flags = MSG_FASTOPEN;
+  }
+  // r = SocketManager::sendmsg(con.fd, &msg, flags);
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&write);
+  ink_assert(sqe != nullptr);
+  io_uring_prep_sendmsg(sqe, con.fd, &msg, flags);
+
+  tmp_reader->dealloc();
+}
+
+// Either prep an SQE for more writing, or stop if writing is done.
+void
+IOUringNetVConnection::prep_write()
+{
+  if (!write.enabled) {
+    return;
+  }
+
+  // TODO(mo): do we need to hold the vio mutex?
+
+  // TODO: handle SSL handshake
+
+  // If there is nothing to do, disable
+  int64_t ntodo = write.vio.ntodo();
+  if (ntodo <= 0) {
+    write.enabled = false;
+    return;
+  }
+
+  MIOBufferAccessor &buf = write.vio.buffer;
+  ink_assert(buf.writer());
+
+  // Calculate the amount to write.
+  int64_t towrite = buf.reader()->read_avail();
+  if (towrite > ntodo) {
+    towrite = ntodo;
+  }
+
+  // signal write ready to allow user to fill the buffer
+  if (towrite != ntodo && !buf.writer()->high_water()) {
+    if (write_signal_and_update(VC_EVENT_WRITE_READY) != EVENT_CONT) {
+      return;
+    }
+
+    ntodo = write.vio.ntodo();
+    if (ntodo <= 0) {
+      write.enabled = false;
+      return;
+    }
+
+    // Recalculate amount to write
+    towrite = buf.reader()->read_avail();
+    if (towrite > ntodo) {
+      towrite = ntodo;
+    }
+  }
+
+  // if there is nothing to do, disable
+  ink_assert(towrite >= 0);
+  if (towrite <= 0) {
+    write.enabled = false;
+    return;
+  }
+
+  load_buffer_and_write(towrite, buf);
 }
 
 VIO *
 IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "%s(%p, %" PRId64 ", %p)", __FUNCTION__, c, nbytes, buf);
   ink_assert(thread == this_ethread());
 
-  read_vio.vio.op        = VIO::READ;
-  read_vio.vio.mutex     = c ? c->mutex : this->mutex;
-  read_vio.vio.cont      = c;
-  read_vio.vio.nbytes    = nbytes;
-  read_vio.vio.ndone     = 0;
-  read_vio.vio.vc_server = this;
+  read.vio.op        = VIO::READ;
+  read.vio.mutex     = c ? c->mutex : this->mutex;
+  read.vio.cont      = c;
+  read.vio.nbytes    = nbytes;
+  read.vio.ndone     = 0;
+  read.vio.vc_server = this;
+  read.vc            = this;
 
   if (buf) {
-    read_vio.vio.buffer.writer_for(buf);
+    read.vio.buffer.writer_for(buf);
+    if (!read.enabled) {
+      read.vio.reenable();
+    }
   } else {
     // TODO: caller wants to cancel, but read might still be in progress
-    read_vio.vio.buffer.clear();
+    read.vio.buffer.clear();
+    read.enabled = false;
   }
 
-  return &read_vio.vio;
+  return &read.vio;
 }
 
 VIO *
-IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner)
+IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner)
 {
-  Debug(TAG, "%s", __FUNCTION__);
-  return nullptr;
+  Debug(TAG, "%s(%p, %" PRId64 ", %p, %d)", __FUNCTION__, c, nbytes, reader, owner);
+  if (closed && !(c == nullptr && nbytes == 0 && reader == nullptr)) {
+    Error("do_io_write invoked on closed vc %p, cont %p, nbytes %" PRId64 ", reader %p", this, c, nbytes, reader);
+    return nullptr;
+  }
+  write.vio.op        = VIO::WRITE;
+  write.vio.mutex     = c ? c->mutex : this->mutex;
+  write.vio.cont      = c;
+  write.vio.nbytes    = nbytes;
+  write.vio.ndone     = 0;
+  write.vio.vc_server = this;
+  write.vc            = this;
+
+  if (reader) {
+    ink_assert(!owner);
+    write.vio.buffer.reader_for(reader);
+    if (nbytes && !write.enabled) {
+      write.vio.reenable();
+    }
+  } else {
+    write.enabled = false;
+  }
+  return &write.vio;
 }
 
 void
@@ -241,16 +430,13 @@ void
 IOUringNetVConnection::reenable(VIO *vio)
 {
   Debug(TAG, "%s", __FUNCTION__);
-  auto *ctx = IOUringContext::local_context();
 
-  if (vio == &read_vio.vio) {
-    io_uring_sqe *sqe = ctx->next_sqe(&read_vio);
-    char *buf         = vio->buffer.writer()->start() + vio->ndone;
-    io_uring_prep_recv(sqe, con.fd, buf, vio->nbytes - vio->ndone, 0);
-  } else {
-    io_uring_sqe *sqe = ctx->next_sqe(&write_vio);
-    char *buf         = vio->buffer.reader()->start() + vio->ndone;
-    io_uring_prep_send(sqe, con.fd, buf, vio->nbytes - vio->ndone, 0);
+  if (vio == &read.vio && !read.enabled) {
+    read.enabled = true;
+    prep_read();
+  } else if (vio == &write.vio && !write.enabled) {
+    write.enabled = true;
+    prep_write();
   }
 }
 
@@ -351,39 +537,83 @@ IOUringNetVConnection::mainEvent(int event, Event *e)
 }
 
 void
-IOUringVIO::handle_complete(io_uring_cqe *cqe)
+IOUringReader::handle_complete(io_uring_cqe *cqe)
 {
-  int bc = cqe->res;
+  int r = cqe->res;
+
+  Debug(TAG, "read.handle_complete r = %d", r);
 
   SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
 
-  if (bc <= 0) {
-    Debug(TAG, "error vio: %d %s", bc, strerror(-bc));
-    if (!bc || bc == -ECONNRESET) {
+  if (r <= 0) {
+    Debug(TAG, "read error vio: %d %s", r, strerror(-r));
+    if (!r || r == -ECONNRESET) {
       vio.cont->handleEvent(VC_EVENT_EOS, &vio);
     } else {
-      vio.vc_server->lerrno = -bc;
+      vio.vc_server->lerrno = -r;
       vio.cont->handleEvent(VC_EVENT_ERROR, &vio);
     }
   } else {
-    vio.ndone += bc;
-    Debug(TAG, "vio complete: %d %ld/%ld", bc, vio.ndone, vio.nbytes);
-    if (vio.op == VIO::READ) {
-      vio.buffer.writer()->fill(bc);
+    vio.ndone += r;
+    Debug(TAG, "vio complete: %d %ld/%ld", r, vio.ndone, vio.nbytes);
+    ink_assert(vio.op == VIO::READ);
+    vio.buffer.writer()->fill(r);
 
-      if (vio.ntodo() <= 0) { // why <0?
-        vio.cont->handleEvent(VC_EVENT_READ_COMPLETE, &vio);
-      } else {
-        vio.cont->handleEvent(VC_EVENT_READ_READY, &vio);
-      }
+    if (vio.ntodo() <= 0) { // why <0?
+      vio.cont->handleEvent(VC_EVENT_READ_COMPLETE, &vio);
     } else {
-      vio.buffer.reader()->consume(bc);
-
-      if (vio.ntodo() <= 0) { // why <0?
-        vio.cont->handleEvent(VC_EVENT_WRITE_COMPLETE, &vio);
-      } else {
-        vio.cont->handleEvent(VC_EVENT_WRITE_READY, &vio);
-      }
+      vio.cont->handleEvent(VC_EVENT_READ_READY, &vio);
+      vc->prep_read();
     }
   }
+
+  auto mutex = vio.mutex;
+  NET_SUM_DYN_STAT(net_read_bytes_stat, r);
+}
+
+void
+IOUringWriter::handle_complete(io_uring_cqe *cqe)
+{
+  auto r = cqe->res;
+
+  Debug(TAG, "write.handle_complete r = %d", r);
+
+  auto mutex = vio.mutex;
+  SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+
+  if (!vc->con.is_connected && vc->options.f_tcp_fastopen) {
+    if (r < 0) {
+      if (r == -EINPROGRESS || r == -EWOULDBLOCK) {
+        vc->con.is_connected = true;
+      }
+    } else {
+      // For NET_INCREMENT_DYN_STAT
+      NET_INCREMENT_DYN_STAT(net_fastopen_successes_stat);
+      vc->con.is_connected = true;
+    }
+  }
+
+  if (r <= 0) {
+    Debug(TAG, "write error vio: %d %s", r, strerror(-r));
+    if (!r || r == -ECONNRESET) {
+      vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+    } else {
+      vio.vc_server->lerrno = -r;
+      vio.cont->handleEvent(VC_EVENT_ERROR, &vio);
+    }
+  } else {
+    vio.buffer.reader()->consume(r);
+    NET_SUM_DYN_STAT(net_write_bytes_stat, r);
+    vio.ndone += r;
+    // TODO: net_activity to prevent inactivity
+
+    if (vio.ntodo() <= 0) {
+      vio.cont->handleEvent(VC_EVENT_WRITE_COMPLETE, &vio);
+    } else {
+      vio.cont->handleEvent(VC_EVENT_WRITE_READY, &vio);
+      vc->prep_write();
+    }
+  }
+
+  NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
 }
