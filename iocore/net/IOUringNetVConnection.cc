@@ -28,6 +28,7 @@
 #include "P_IOUringNetVConnection.h"
 #include "liburing.h"
 #include "tscore/ink_assert.h"
+#include "tscore/InkErrno.h"
 #include <liburing/io_uring.h>
 
 constexpr auto TAG = "io_uring";
@@ -65,10 +66,12 @@ IOUringNetVConnection::prep_read()
   }
   */
 
-  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&read);
-  ink_assert(sqe != nullptr);
   MIOBufferAccessor &buf = read.vio.buffer;
   ink_assert(buf.writer());
+  /*
+  if (buf.high_water()) {
+  }
+  */
 
   // if there is nothing to do, do nothing
   int64_t ntodo = read.vio.ntodo();
@@ -80,6 +83,9 @@ IOUringNetVConnection::prep_read()
   if (toread > ntodo) {
     toread = ntodo;
   }
+
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&read);
+  ink_assert(sqe != nullptr);
 
   // prepare an sqe to read data
   int64_t rattempted = 0, total_read = 0;
@@ -221,6 +227,7 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&write);
   ink_assert(sqe != nullptr);
   io_uring_prep_sendmsg(sqe, con.fd, &msg, flags);
+  Debug(TAG, "prep_sendmsg, op = %p", &write);
 
   tmp_reader->dealloc();
 }
@@ -429,12 +436,12 @@ IOUringNetVConnection::apply_options()
 void
 IOUringNetVConnection::reenable(VIO *vio)
 {
-  Debug(TAG, "%s", __FUNCTION__);
-
   if (vio == &read.vio && !read.enabled) {
+    Debug(TAG, "reenable read");
     read.enabled = true;
     prep_read();
   } else if (vio == &write.vio && !write.enabled) {
+    Debug(TAG, "reenable write");
     write.enabled = true;
     prep_write();
   }
@@ -526,6 +533,8 @@ int
 IOUringNetVConnection::startEvent(int event, Event *e)
 {
   Debug(TAG, "startEvent");
+  // TODO: continue to open a connection
+
   return EVENT_DONE;
 }
 
@@ -616,4 +625,80 @@ IOUringWriter::handle_complete(io_uring_cqe *cqe)
   }
 
   NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+}
+
+void
+IOUringNetVConnection::_close()
+{
+  // TODO: cancel in-flight ops
+}
+
+int
+IOUringNetVConnection::connectUp(EThread *t, int fd)
+{
+  Debug(TAG, "%s", __FUNCTION__);
+  int res;
+
+  auto fail = [this, fd](int res) {
+    lerrno = -res;
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    if (fd != NO_FD) {
+      con.fd = NO_FD;
+    }
+  };
+
+  thread = t;
+  if (check_net_throttle(CONNECT)) {
+    check_throttle_warning(CONNECT);
+    res = -ENET_THROTTLING;
+    NET_INCREMENT_DYN_STAT(net_connections_throttled_out_stat);
+    fail(res);
+    return CONNECT_FAILURE;
+  }
+
+  // Force family to agree with remote (server) address.
+  options.ip_family = con.addr.sa.sa_family;
+
+  if (is_debug_tag_set("iocore_net")) {
+    char addrbuf[INET6_ADDRSTRLEN];
+    Debug("iocore_net", "connectUp:: local_addr=%s:%d [%s]",
+          options.local_ip.isValid() ? options.local_ip.toString(addrbuf, sizeof(addrbuf)) : "*", options.local_port,
+          NetVCOptions::toString(options.addr_binding));
+  }
+
+  // If this is getting called from the TS API, then we are wiring up a file descriptor
+  // provided by the caller. In that case, we know that the socket is already connected.
+  if (fd == NO_FD) {
+    // Due to multi-threads system, the fd returned from con.open() may exceed the limitation of check_net_throttle().
+    con.open(options, [this, fail](int res) {
+      if (res < 0) {
+        Debug(TAG, "connectUp failed with %s", strerror(-res));
+        fail(res);
+        return;
+      }
+
+      con.connect(nullptr, options, [this, fail](int res) {
+        if (res < 0) {
+          fail(res);
+          return;
+        }
+
+        // Did not fail, increment connection count
+        NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
+        ink_release_assert(con.fd != NO_FD);
+
+        // Setup a timeout callback handler.
+        SET_HANDLER(&UnixNetVConnection::mainEvent);
+
+        set_inactivity_timeout(0);
+        this->set_local_addr();
+        action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+      });
+    });
+  } else {
+    // TODO
+    ink_assert(false);
+  }
+
+  return CONNECT_SUCCESS;
 }

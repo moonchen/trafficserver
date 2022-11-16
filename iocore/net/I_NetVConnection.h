@@ -48,11 +48,11 @@
 #define SSL_EVENT_CLIENT 1
 
 // Indicator the context for a NetVConnection
-typedef enum {
+enum NetVConnectionContext_t {
   NET_VCONNECTION_UNSET = 0,
   NET_VCONNECTION_IN,  // Client <--> ATS, Client-Side
   NET_VCONNECTION_OUT, // ATS <--> Server, Server-Side
-} NetVConnectionContext_t;
+};
 
 /** Holds client options for NetVConnection.
 
@@ -731,7 +731,7 @@ public:
   /**
     PRIVATE: instances of NetVConnection cannot be created directly
     by the state machines. The objects are created by NetProcessor
-    calls like accept connect_re() etc. The constructor is public
+    calls like accept connect() etc. The constructor is public
     just to avoid compile errors.
 
   */

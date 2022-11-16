@@ -58,9 +58,9 @@ public:
 
   void init() override;
   int start(int, size_t stacksize) override;
-  // TODO: refactoring NetProcessor::connect_re and UnixNetProcessor::connect_re_internal
-  // Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
-  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts);
+  // TODO: refactoring NetProcessor::connect and UnixNetProcessor::connect_re_internal
+  // Action *connect(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
+  Action *connect(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
 
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
   NetVConnection *allocate_vc(EThread *t) const override;

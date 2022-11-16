@@ -231,7 +231,7 @@ SocksEntry::startEvent(int event, void *data)
 
     NetVCOptions options;
     options.socks_support = NO_SOCKS;
-    netProcessor.connect_re(this, &server_addr.sa, &options);
+    netProcessor.connect(this, &server_addr.sa, &options);
   }
 
   return EVENT_CONT;
@@ -598,7 +598,7 @@ socks5BasicAuthHandler(int event, unsigned char *p, void (**h_ptr)(void))
   switch (event) {
   case SOCKS_AUTH_OPEN:
     p[ret++] = SOCKS5_VERSION;        // version
-    p[ret++] = (pass_phrase) ? 2 : 1; //#Methods
+    p[ret++] = (pass_phrase) ? 2 : 1; // #Methods
     p[ret++] = 0;                     // no authentication
     if (pass_phrase) {
       p[ret++] = 2;

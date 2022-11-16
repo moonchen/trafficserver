@@ -117,23 +117,6 @@ public:
   */
   void reenable();
 
-  /**
-    Reenable the IO operation.
-
-    Interface that the state machine uses to reenable an I/O
-    operation.  Reenable tells the VConnection that more data is
-    available for the operation and that it should try to continue
-    the operation in progress.  I/O operations become disabled when
-    they can make no forward progress.  For a read this means that
-    it's buffer is full. For a write, that it's buffer is empty.
-    If reenable is called and progress is still not possible, it
-    is ignored and no events are generated. However, unnecessary
-    reenables (ones where no progress can be made) should be avoided
-    as they hurt system throughput and waste CPU.
-
-  */
-  void reenable_re();
-
   void disable();
   bool is_disabled() const;
 

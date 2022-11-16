@@ -23,10 +23,10 @@
 
 #pragma once
 
-#include "I_IO_URING.h"
 #include "I_NetVConnection.h"
-#include "P_Connection.h"
+#include "IOUringConnection.h"
 #include "IOUringNetAccept.h"
+#include "I_IO_URING.h"
 
 class IOUringNetVConnection;
 
@@ -78,9 +78,10 @@ public:
   void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
   void set_mptcp_state() override;
+  int connectUp(EThread *t, int fd);
 
   const int id;
-  Connection con;
+  IOUringConnection con;
   Action action_;
   int recursion                   = 0;
   bool from_accept_thread         = false;
@@ -97,6 +98,10 @@ private:
   int mainEvent(int event, Event *e);
   int write_signal_and_update(int event);
   void load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf);
+  void _close();
+
+  std::function<void(int)> _connectUp_handler;
+  std::function<void(int)> _connectUp_handler_2;
 
   bool closed;
   IOUringReader read;
