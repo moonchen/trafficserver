@@ -175,7 +175,7 @@ NetProcessor::stop_accept()
 }
 
 Action *
-UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
+UnixNetProcessor::connect(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
 {
   if (TSSystemState::is_event_system_shut_down()) {
     return nullptr;
@@ -255,12 +255,6 @@ UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target
   } else {
     return result;
   }
-}
-
-Action *
-UnixNetProcessor::connect(Continuation *cont, UnixNetVConnection ** /* avc */, sockaddr const *target, NetVCOptions *opt)
-{
-  return connect_re(cont, target, opt);
 }
 
 struct PollCont;

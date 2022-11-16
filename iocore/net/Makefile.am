@@ -233,7 +233,9 @@ libinknet_a_SOURCES += \
 	P_IOUringNetVConnection.h \
 	IOUringNetVConnection.cc \
 	IOUringNetAccept.h \
-	IOUringNetAccept.cc
+	IOUringNetAccept.cc \
+	IOUringConnection.h \
+	IOUringConnection.cc
 
 if BUILD_TESTS
 libinknet_a_SOURCES += \

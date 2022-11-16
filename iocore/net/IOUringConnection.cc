@@ -21,12 +21,13 @@
   limitations under the License.
  */
 
-/**************************************************************************
-  Connections
-
-**************************************************************************/
 #include "P_Net.h"
+#include "IOUringConnection.h"
+#include "tscore/ink_assert.h"
 #include "tscore/ink_defs.h"
+#include "tscore/Diags.h"
+
+constexpr auto TAG = "io_uring";
 
 #define SET_NO_LINGER
 // set in the OS
@@ -106,14 +107,14 @@ template <typename T> struct cleaner {
     clients can pass temporaries and not have to declare a variable in
     order to tweak options.
  */
-NetVCOptions const Connection::DEFAULT_OPTIONS;
+NetVCOptions const IOUringConnection::DEFAULT_OPTIONS;
 
-int
-Connection::open(NetVCOptions const &opt)
+IOUringConnection::~IOUringConnection() {}
+
+void
+IOUringConnection::open(const NetVCOptions &opt, const std::function<void(int)> &handler)
 {
   ink_assert(fd == NO_FD);
-  int enable_reuseaddr = 1; // used for sockopt setting
-  int res              = 0; // temp result
   IpEndpoint local_addr;
   sock_type = NetVCOptions::USE_UDP == opt.ip_proto ? SOCK_DGRAM : SOCK_STREAM;
   int family;
@@ -138,83 +139,87 @@ Connection::open(NetVCOptions const &opt)
     local_addr.network_order_port() = htons(opt.local_port);
   }
 
-  res = SocketManager::socket(family, sock_type, 0);
-  if (-1 == res) {
-    return -errno;
-  }
+  auto context = IOUringContext::local_context();
+  ink_assert(context);
+  io_uring_sqe *sqe = context->next_sqe(&_open_handler);
+  ink_release_assert(sqe);
+  io_uring_prep_socket(sqe, family, sock_type, 0, 0);
+  _open_handler = LambdaIOUringHandler{[handler, &opt, local_addr, is_any_address, this](int res) -> void {
+    if (res < 0) {
+      handler(res);
+      return;
+    }
 
-  fd = res;
-  // mark fd for close until we succeed.
-  cleaner<Connection> cleanup(this, &Connection::_cleanup);
+    fd = res;
+    // mark fd for close until we succeed.
+    cleaner<IOUringConnection> cleanup(this, &IOUringConnection::_cleanup);
 
-  // Try setting the various socket options, if requested.
+    int enable_reuseaddr = 1; // used for sockopt setting
+    // No setsockopt for io_uring yet
+    if (-1 == safe_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, static_cast<void *>(&enable_reuseaddr), sizeof(enable_reuseaddr))) {
+      handler(-errno);
+      return;
+    }
 
-  if (-1 == safe_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char *>(&enable_reuseaddr), sizeof(enable_reuseaddr))) {
-    return -errno;
-  }
-
-  if (NetVCOptions::FOREIGN_ADDR == opt.addr_binding) {
-    static char const *const DEBUG_TEXT = "::open setsockopt() IP_TRANSPARENT";
+    if (NetVCOptions::FOREIGN_ADDR == opt.addr_binding) {
+      static char const *const DEBUG_TEXT = "::open setsockopt() IP_TRANSPARENT";
 #if TS_USE_TPROXY
-    int value = 1;
-    if (-1 == safe_setsockopt(fd, SOL_IP, TS_IP_TRANSPARENT, reinterpret_cast<char *>(&value), sizeof(value))) {
-      Debug("socket", "%s - fail %d:%s", DEBUG_TEXT, errno, strerror(errno));
-      return -errno;
-    } else {
-      Debug("socket", "%s set", DEBUG_TEXT);
-    }
+      int value = 1;
+      if (-1 == safe_setsockopt(fd, SOL_IP, TS_IP_TRANSPARENT, reinterpret_cast<char *>(&value), sizeof(value))) {
+        Debug("socket", "%s - fail %d:%s", DEBUG_TEXT, errno, strerror(errno));
+        handler(-errno);
+        return;
+      } else {
+        Debug("socket", "%s set", DEBUG_TEXT);
+      }
 #else
-    Debug("socket", "%s - requested but TPROXY not configured", DEBUG_TEXT);
+      Debug("socket", "%s - requested but TPROXY not configured", DEBUG_TEXT);
 #endif
-  }
+    }
 
-  if (!opt.f_blocking_connect && -1 == safe_nonblocking(fd)) {
-    return -errno;
-  }
-
-  if (opt.socket_recv_bufsize > 0) {
-    if (SocketManager::set_rcvbuf_size(fd, opt.socket_recv_bufsize)) {
-      // Round down until success
-      int rbufsz = ROUNDUP(opt.socket_recv_bufsize, 1024);
-      while (rbufsz && !SocketManager::set_rcvbuf_size(fd, rbufsz)) {
-        rbufsz -= 1024;
+    if (opt.socket_recv_bufsize > 0) {
+      if (SocketManager::set_rcvbuf_size(fd, opt.socket_recv_bufsize)) {
+        // Round down until success
+        int rbufsz = ROUNDUP(opt.socket_recv_bufsize, 1024);
+        while (rbufsz && !SocketManager::set_rcvbuf_size(fd, rbufsz)) {
+          rbufsz -= 1024;
+        }
+        Debug("socket", "::open: recv_bufsize = %d of %d", rbufsz, opt.socket_recv_bufsize);
       }
-      Debug("socket", "::open: recv_bufsize = %d of %d", rbufsz, opt.socket_recv_bufsize);
     }
-  }
-  if (opt.socket_send_bufsize > 0) {
-    if (SocketManager::set_sndbuf_size(fd, opt.socket_send_bufsize)) {
-      // Round down until success
-      int sbufsz = ROUNDUP(opt.socket_send_bufsize, 1024);
-      while (sbufsz && !SocketManager::set_sndbuf_size(fd, sbufsz)) {
-        sbufsz -= 1024;
+    if (opt.socket_send_bufsize > 0) {
+      if (SocketManager::set_sndbuf_size(fd, opt.socket_send_bufsize)) {
+        // Round down until success
+        int sbufsz = ROUNDUP(opt.socket_send_bufsize, 1024);
+        while (sbufsz && !SocketManager::set_sndbuf_size(fd, sbufsz)) {
+          sbufsz -= 1024;
+        }
+        Debug("socket", "::open: send_bufsize = %d of %d", sbufsz, opt.socket_send_bufsize);
       }
-      Debug("socket", "::open: send_bufsize = %d of %d", sbufsz, opt.socket_send_bufsize);
     }
-  }
 
-  // apply dynamic options
-  apply_options(opt);
+    // apply dynamic options
+    apply_options(opt);
 
-  if (local_addr.network_order_port() || !is_any_address) {
-    if (-1 == SocketManager::ink_bind(fd, &local_addr.sa, ats_ip_size(&local_addr.sa))) {
-      return -errno;
+    if (local_addr.network_order_port() || !is_any_address) {
+      if (-1 == SocketManager::ink_bind(fd, &local_addr.sa, ats_ip_size(&local_addr.sa))) {
+        handler(-errno);
+        return;
+      }
     }
-  }
 
-  cleanup.reset();
-  is_bound = true;
-  return 0;
+    cleanup.reset();
+    is_bound = true;
+    handler(0);
+  }};
 }
 
-int
-Connection::connect(sockaddr const *target, NetVCOptions const &opt)
+void
+IOUringConnection::connect(sockaddr const *target, NetVCOptions const &opt, const std::function<void(int)> &handler)
 {
   ink_assert(fd != NO_FD);
   ink_assert(is_bound);
   ink_assert(!is_connected);
-
-  int res;
 
   if (target != nullptr) {
     this->setRemote(target);
@@ -223,50 +228,68 @@ Connection::connect(sockaddr const *target, NetVCOptions const &opt)
   // apply dynamic options with this.addr initialized
   apply_options(opt);
 
-  cleaner<Connection> cleanup(this, &Connection::_cleanup); // mark for close until we succeed.
+  cleaner<IOUringConnection> cleanup(this, &IOUringConnection::_cleanup);
 
-  if (opt.f_tcp_fastopen && !opt.f_blocking_connect) {
+  if (opt.f_tcp_fastopen) {
     // TCP Fast Open is (effectively) a non-blocking connect, so set the
     // return value we would see in that case.
-    errno = EINPROGRESS;
-    res   = -1;
-  } else {
-    res = ::connect(fd, &this->addr.sa, ats_ip_size(&this->addr.sa));
+    handler(-EINPROGRESS);
+    return;
   }
 
-  // It's only really an error if either the connect was blocking
-  // or it wasn't blocking and the error was other than EINPROGRESS.
-  // (Is EWOULDBLOCK ok? Does that start the connect?)
-  // We also want to handle the cases where the connect blocking
-  // and IO blocking differ, by turning it on or off as needed.
-  if (-1 == res && (opt.f_blocking_connect || !(EINPROGRESS == errno || EWOULDBLOCK == errno))) {
-    return -errno;
-  } else if (opt.f_blocking_connect && !opt.f_blocking) {
-    if (-1 == safe_nonblocking(fd)) {
-      return -errno;
+  auto context = IOUringContext::local_context();
+  ink_assert(context);
+  io_uring_sqe *sqe = context->next_sqe(&_connect_handler);
+  ink_release_assert(sqe);
+  io_uring_prep_connect(sqe, fd, &this->addr.sa, ats_ip_size(&this->addr.sa));
+  _connect_handler = LambdaIOUringHandler{[handler, this](int res) {
+    if (res < 0) {
+      Warning("Connect failed with %s", strerror(-res));
+      _cleanup();
     }
-  } else if (!opt.f_blocking_connect && opt.f_blocking) {
-    if (-1 == safe_blocking(fd)) {
-      return -errno;
-    }
-  }
+    handler(res);
+  }};
 
   cleanup.reset();
 
   // Only mark this connection as connected if we successfully called connect(2). When we
   // do the TCP Fast Open later, we need to track this accurately.
-  is_connected = !(opt.f_tcp_fastopen && !opt.f_blocking_connect);
-  return 0;
+  is_connected = !opt.f_tcp_fastopen;
 }
 
 void
-Connection::_cleanup()
+IOUringConnection::close(const std::function<void(int)> &handler)
 {
-  this->close();
+  is_connected = false;
+  is_bound     = false;
+  // don't close any of the standards
+  if (fd >= 2) {
+    int fd_save  = fd;
+    fd           = NO_FD;
+    auto context = IOUringContext::local_context();
+    ink_assert(context);
+    io_uring_sqe *sqe = context->next_sqe(&_close_handler);
+    ink_release_assert(sqe);
+    io_uring_prep_close(sqe, fd_save);
+    _close_handler = LambdaIOUringHandler{[handler](int res) -> void { handler(res); }};
+  } else if (fd != NO_FD) {
+    fd = NO_FD;
+    ink_assert(false);
+  }
 }
 
 void
-Connection::apply_options(const NetVCOptions &opt)
+IOUringConnection::_cleanup()
+{
+  close([](int res) {
+    if (res < 0) {
+      Debug(TAG, "Failed to close.");
+    }
+  });
+}
+
+void
+IOUringConnection::apply_options(const NetVCOptions &opt)
 {
   // Set options which can be changed after a connection is established
   // ignore other changes

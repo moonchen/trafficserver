@@ -79,7 +79,7 @@ struct SocksProxy : public Continuation {
    *             |                      V                                     V            |
    *             |                  HTTP_REQ                             SERVER_TUNNEL     |
    *             |                      |                                     |            |
-   *             |                      |                                (connect_re)      |
+   *             |                      |                                (connect)      |
    *             |                      |                                     |            |
    *             V                      V               NET_EVENT_OPEN        |            |
    *        SOCKS_ERROR  -------->  ALL_DONE  <-------------------------------+            |
@@ -531,7 +531,7 @@ SocksProxy::parse_socks_client_request(unsigned char *p)
       vc_options.socks_support = p[1];
       vc_options.socks_version = version;
 
-      Action *action = netProcessor.connect_re(this, ats_ip_sa_cast(&addr), &vc_options);
+      Action *action = netProcessor.connect(this, ats_ip_sa_cast(&addr), &vc_options);
       if (action != ACTION_RESULT_DONE) {
         ink_release_assert(pending_action == nullptr);
         pending_action = action;

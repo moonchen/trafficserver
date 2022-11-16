@@ -167,7 +167,7 @@ IOUringContext::submit_and_wait(int ms)
   if (ret < 0) {
     switch (ret) {
     case -ETIME:
-      break;
+    case -EINTR:
     case -EAGAIN:
       break;
     default:

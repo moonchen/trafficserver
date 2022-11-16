@@ -213,7 +213,7 @@ public:
   void attempt_delete();
 
   PluginVC *connect();
-  Action *connect_re(Continuation *c);
+  Action *connect(Continuation *c);
   void kill_no_connect();
 
   /// Set the active address.
