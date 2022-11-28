@@ -50,7 +50,7 @@ void
 IOUringNetVConnection::prep_read()
 {
   ink_assert(thread == this_ethread());
-  if (!read.enabled) {
+  if (!read.in_progress) {
     return;
   }
 
@@ -236,7 +236,7 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
 void
 IOUringNetVConnection::prep_write()
 {
-  if (!write.enabled) {
+  if (!write.in_progress) {
     return;
   }
 
@@ -247,7 +247,7 @@ IOUringNetVConnection::prep_write()
   // If there is nothing to do, disable
   int64_t ntodo = write.vio.ntodo();
   if (ntodo <= 0) {
-    write.enabled = false;
+    write.in_progress = false;
     return;
   }
 
@@ -268,7 +268,7 @@ IOUringNetVConnection::prep_write()
 
     ntodo = write.vio.ntodo();
     if (ntodo <= 0) {
-      write.enabled = false;
+      write.in_progress = false;
       return;
     }
 
@@ -282,7 +282,7 @@ IOUringNetVConnection::prep_write()
   // if there is nothing to do, disable
   ink_assert(towrite >= 0);
   if (towrite <= 0) {
-    write.enabled = false;
+    write.in_progress = false;
     return;
   }
 
@@ -305,13 +305,13 @@ IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *bu
 
   if (buf) {
     read.vio.buffer.writer_for(buf);
-    if (!read.enabled) {
+    if (!read.in_progress) {
       read.vio.reenable();
     }
   } else {
     // TODO: caller wants to cancel, but read might still be in progress
     read.vio.buffer.clear();
-    read.enabled = false;
+    read.in_progress = false;
   }
 
   return &read.vio;
@@ -336,11 +336,11 @@ IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferRead
   if (reader) {
     ink_assert(!owner);
     write.vio.buffer.reader_for(reader);
-    if (nbytes && !write.enabled) {
+    if (nbytes && !write.in_progress) {
       write.vio.reenable();
     }
   } else {
-    write.enabled = false;
+    write.in_progress = false;
   }
   return &write.vio;
 }
@@ -436,13 +436,13 @@ IOUringNetVConnection::apply_options()
 void
 IOUringNetVConnection::reenable(VIO *vio)
 {
-  if (vio == &read.vio && !read.enabled) {
+  if (vio == &read.vio && !read.in_progress) {
     Debug(TAG, "reenable read");
-    read.enabled = true;
+    read.in_progress = true;
     prep_read();
-  } else if (vio == &write.vio && !write.enabled) {
+  } else if (vio == &write.vio && !write.in_progress) {
     Debug(TAG, "reenable write");
-    write.enabled = true;
+    write.in_progress = true;
     prep_write();
   }
 }
@@ -572,7 +572,6 @@ IOUringReader::handle_complete(io_uring_cqe *cqe)
       vio.cont->handleEvent(VC_EVENT_READ_COMPLETE, &vio);
     } else {
       vio.cont->handleEvent(VC_EVENT_READ_READY, &vio);
-      vc->prep_read();
     }
   }
 

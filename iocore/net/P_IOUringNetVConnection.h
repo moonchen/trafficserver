@@ -35,7 +35,7 @@ class IOUringReader : public IOUringCompletionHandler
 public:
   void handle_complete(io_uring_cqe *) override;
   VIO vio;
-  bool enabled = false;
+  bool in_progress = false; // is there an outstanding read in the io_uring?
   IOUringNetVConnection *vc;
 };
 
@@ -44,7 +44,7 @@ class IOUringWriter : public IOUringCompletionHandler
 public:
   void handle_complete(io_uring_cqe *) override;
   VIO vio;
-  bool enabled = false;
+  bool in_progress = false; // is there an outstanding write in the io_uring?
   IOUringNetVConnection *vc;
 };
 
