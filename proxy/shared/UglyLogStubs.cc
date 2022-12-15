@@ -24,6 +24,7 @@
 // This is total BS, because our libraries are riddled with cross dependencies.
 // TODO: Clean up the dependency mess, and get rid of this.
 
+#include "tscore/ink_assert.h"
 #include "tscore/ink_platform.h"
 #include "tscore/ink_uuid.h"
 #include "LogObject.h"
@@ -188,3 +189,10 @@ ClassAllocator<CacheRemoveCont> cacheRemoveContAllocator("cacheRemoveCont");
 CacheHostTable::CacheHostTable(Cache * /* c ATS_UNUSED */, CacheType /* typ ATS_UNUSED */) {}
 
 CacheHostTable::~CacheHostTable() {}
+
+Action *
+UnixNetProcessor::connect(Continuation *cont, sockaddr const *addr, NetVCOptions *opts)
+{
+  ink_release_assert(false);
+  return nullptr;
+}

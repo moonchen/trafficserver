@@ -23,6 +23,8 @@ limitations under the License.
 
 #pragma once
 
+#include "I_Action.h"
+
 /** Hold a pending @c Action.
  *
  * This is modeled on smart pointer classes. This class wraps a pointer to

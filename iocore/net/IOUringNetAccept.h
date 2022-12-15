@@ -42,6 +42,12 @@ public:
 
   void handle_complete(io_uring_cqe *) override;
 
+  std::string
+  id() const override
+  {
+    return "accept";
+  }
+
   IOUringAcceptConnection &
   operator=(const IOUringAcceptConnection &other)
   {

@@ -105,7 +105,7 @@ QUICNetProcessor::allocate_vc(EThread *t) const
 }
 
 Action *
-QUICNetProcessor::connect_re(Continuation *cont, sockaddr const *remote_addr, NetVCOptions *opt)
+QUICNetProcessor::connect(Continuation *cont, sockaddr const *remote_addr, NetVCOptions *opt)
 {
   Debug("quic_ps", "connect to server");
   EThread *t = cont->mutex->thread_holding;

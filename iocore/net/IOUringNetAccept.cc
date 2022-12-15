@@ -145,7 +145,7 @@ IOUringNetAccept::initialize_vc(NetVConnection *_vc, Connection &con, EThread *l
   ink_release_assert(vc != nullptr);
 
   NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
-  vc->con.move(con);
+  vc->con = std::move(con);
   vc->set_remote_addr(con.addr);
   vc->action_ = *action_;
   vc->set_is_transparent(opt.f_inbound_transparent);

@@ -28,6 +28,7 @@
 #include "P_IOUringNetVConnection.h"
 #include "liburing.h"
 #include "tscore/ink_assert.h"
+#include "tscore/InkErrno.h"
 #include <liburing/io_uring.h>
 
 constexpr auto TAG = "io_uring";
@@ -43,13 +44,16 @@ IOUringNetVConnection::IOUringNetVConnection() : id(get_next_connection_id()), c
   SET_HANDLER(&IOUringNetVConnection::startEvent);
 }
 
-IOUringNetVConnection::~IOUringNetVConnection() {}
+IOUringNetVConnection::~IOUringNetVConnection()
+{
+  Debug(TAG, "IOUringNetVConnection destructor");
+}
 
 void
 IOUringNetVConnection::prep_read()
 {
   ink_assert(thread == this_ethread());
-  if (!read.enabled) {
+  if (!read.in_progress) {
     return;
   }
 
@@ -65,10 +69,12 @@ IOUringNetVConnection::prep_read()
   }
   */
 
-  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&read);
-  ink_assert(sqe != nullptr);
   MIOBufferAccessor &buf = read.vio.buffer;
   ink_assert(buf.writer());
+  /*
+  if (buf.high_water()) {
+  }
+  */
 
   // if there is nothing to do, do nothing
   int64_t ntodo = read.vio.ntodo();
@@ -80,6 +86,9 @@ IOUringNetVConnection::prep_read()
   if (toread > ntodo) {
     toread = ntodo;
   }
+
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&read);
+  ink_assert(sqe != nullptr);
 
   // prepare an sqe to read data
   int64_t rattempted = 0, total_read = 0;
@@ -119,6 +128,7 @@ IOUringNetVConnection::prep_read()
 
     // TODO(mo): retain buffer blocks
 
+    ++ops_in_flight;
     io_uring_prep_recvmsg(sqe, con.fd, &msg, 0);
     Debug(TAG, "prep_recvmsg, op = %p", &read);
 
@@ -220,7 +230,9 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   // r = SocketManager::sendmsg(con.fd, &msg, flags);
   io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&write);
   ink_assert(sqe != nullptr);
+  --ops_in_flight;
   io_uring_prep_sendmsg(sqe, con.fd, &msg, flags);
+  Debug(TAG, "prep_sendmsg, op = %p", &write);
 
   tmp_reader->dealloc();
 }
@@ -229,7 +241,7 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
 void
 IOUringNetVConnection::prep_write()
 {
-  if (!write.enabled) {
+  if (!write.in_progress) {
     return;
   }
 
@@ -240,7 +252,7 @@ IOUringNetVConnection::prep_write()
   // If there is nothing to do, disable
   int64_t ntodo = write.vio.ntodo();
   if (ntodo <= 0) {
-    write.enabled = false;
+    write.in_progress = false;
     return;
   }
 
@@ -261,7 +273,7 @@ IOUringNetVConnection::prep_write()
 
     ntodo = write.vio.ntodo();
     if (ntodo <= 0) {
-      write.enabled = false;
+      write.in_progress = false;
       return;
     }
 
@@ -275,7 +287,7 @@ IOUringNetVConnection::prep_write()
   // if there is nothing to do, disable
   ink_assert(towrite >= 0);
   if (towrite <= 0) {
-    write.enabled = false;
+    write.in_progress = false;
     return;
   }
 
@@ -298,13 +310,13 @@ IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *bu
 
   if (buf) {
     read.vio.buffer.writer_for(buf);
-    if (!read.enabled) {
+    if (!read.in_progress) {
       read.vio.reenable();
     }
   } else {
     // TODO: caller wants to cancel, but read might still be in progress
     read.vio.buffer.clear();
-    read.enabled = false;
+    read.in_progress = false;
   }
 
   return &read.vio;
@@ -329,11 +341,11 @@ IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferRead
   if (reader) {
     ink_assert(!owner);
     write.vio.buffer.reader_for(reader);
-    if (nbytes && !write.enabled) {
+    if (nbytes && !write.in_progress) {
       write.vio.reenable();
     }
   } else {
-    write.enabled = false;
+    write.in_progress = false;
   }
   return &write.vio;
 }
@@ -342,100 +354,111 @@ void
 IOUringNetVConnection::do_io_close(int lerrno)
 {
   Debug(TAG, "%s", __FUNCTION__);
+
+  // this is only available since kernel 5.19
+  // io_uring_prep_cancel_fd()
+
+  closing = true;
+  con.close([&](int res) {
+    Debug(TAG, "%s(%p, %d) - %d", "close", this, lerrno, ops_in_flight);
+    ink_assert(res == 0);
+    // ink_assert(ops_in_flight == 0);
+    delete this;
+  });
 }
 
 void
 IOUringNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_active_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_inactivity_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_default_inactivity_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 bool
 IOUringNetVConnection::is_default_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return false;
 }
 
 void
 IOUringNetVConnection::cancel_active_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::cancel_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::add_to_keep_alive_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::remove_from_keep_alive_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 bool
 IOUringNetVConnection::add_to_active_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return true;
 }
 
 ink_hrtime
 IOUringNetVConnection::get_active_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 ink_hrtime
 IOUringNetVConnection::get_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 void
 IOUringNetVConnection::apply_options()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::reenable(VIO *vio)
 {
-  Debug(TAG, "%s", __FUNCTION__);
-
-  if (vio == &read.vio && !read.enabled) {
-    read.enabled = true;
+  if (vio == &read.vio && !read.in_progress) {
+    Debug(TAG, "reenable read");
+    read.in_progress = true;
     prep_read();
-  } else if (vio == &write.vio && !write.enabled) {
-    write.enabled = true;
+  } else if (vio == &write.vio && !write.in_progress) {
+    Debug(TAG, "reenable write");
+    write.in_progress = true;
     prep_write();
   }
 }
@@ -443,20 +466,20 @@ IOUringNetVConnection::reenable(VIO *vio)
 void
 IOUringNetVConnection::reenable_re(VIO *vio)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 SOCKET
 IOUringNetVConnection::get_socket()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 int
 IOUringNetVConnection::set_tcp_congestion_control(int side)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
@@ -491,7 +514,7 @@ IOUringNetVConnection::set_remote_addr(const sockaddr *new_sa)
 void
 IOUringNetVConnection::set_mptcp_state()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 int
@@ -526,6 +549,8 @@ int
 IOUringNetVConnection::startEvent(int event, Event *e)
 {
   Debug(TAG, "startEvent");
+  // TODO: continue to open a connection
+
   return EVENT_DONE;
 }
 
@@ -544,11 +569,14 @@ IOUringReader::handle_complete(io_uring_cqe *cqe)
   Debug(TAG, "read.handle_complete r = %d", r);
 
   SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+  --vc->ops_in_flight;
 
   if (r <= 0) {
     Debug(TAG, "read error vio: %d %s", r, strerror(-r));
     if (!r || r == -ECONNRESET) {
-      vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+      if (!vc->closing) {
+        vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+      }
     } else {
       vio.vc_server->lerrno = -r;
       vio.cont->handleEvent(VC_EVENT_ERROR, &vio);
@@ -563,7 +591,6 @@ IOUringReader::handle_complete(io_uring_cqe *cqe)
       vio.cont->handleEvent(VC_EVENT_READ_COMPLETE, &vio);
     } else {
       vio.cont->handleEvent(VC_EVENT_READ_READY, &vio);
-      vc->prep_read();
     }
   }
 
@@ -580,6 +607,7 @@ IOUringWriter::handle_complete(io_uring_cqe *cqe)
 
   auto mutex = vio.mutex;
   SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+  --vc->ops_in_flight;
 
   if (!vc->con.is_connected && vc->options.f_tcp_fastopen) {
     if (r < 0) {
@@ -616,4 +644,80 @@ IOUringWriter::handle_complete(io_uring_cqe *cqe)
   }
 
   NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+}
+
+void
+IOUringNetVConnection::_close()
+{
+  // TODO: cancel in-flight ops
+}
+
+int
+IOUringNetVConnection::connectUp(EThread *t, int fd)
+{
+  Debug(TAG, "%s", __FUNCTION__);
+  int res;
+
+  auto fail = [this, fd](int res) {
+    lerrno = -res;
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    if (fd != NO_FD) {
+      con.fd = NO_FD;
+    }
+  };
+
+  thread = t;
+  if (check_net_throttle(CONNECT)) {
+    check_throttle_warning(CONNECT);
+    res = -ENET_THROTTLING;
+    NET_INCREMENT_DYN_STAT(net_connections_throttled_out_stat);
+    fail(res);
+    return CONNECT_FAILURE;
+  }
+
+  // Force family to agree with remote (server) address.
+  options.ip_family = con.addr.sa.sa_family;
+
+  if (is_debug_tag_set("iocore_net")) {
+    char addrbuf[INET6_ADDRSTRLEN];
+    Debug("iocore_net", "connectUp:: local_addr=%s:%d [%s]",
+          options.local_ip.isValid() ? options.local_ip.toString(addrbuf, sizeof(addrbuf)) : "*", options.local_port,
+          NetVCOptions::toString(options.addr_binding));
+  }
+
+  // If this is getting called from the TS API, then we are wiring up a file descriptor
+  // provided by the caller. In that case, we know that the socket is already connected.
+  if (fd == NO_FD) {
+    // Due to multi-threads system, the fd returned from con.open() may exceed the limitation of check_net_throttle().
+    con.open(options, [this, fail](int res) {
+      if (res < 0) {
+        Debug(TAG, "connectUp failed with %s", strerror(-res));
+        fail(res);
+        return;
+      }
+
+      con.connect(nullptr, options, [this, fail](int res) {
+        if (res < 0) {
+          fail(res);
+          return;
+        }
+
+        // Did not fail, increment connection count
+        NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
+        ink_release_assert(con.fd != NO_FD);
+
+        // Setup a timeout callback handler.
+        SET_HANDLER(&UnixNetVConnection::mainEvent);
+
+        set_inactivity_timeout(0);
+        this->set_local_addr();
+        action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+      });
+    });
+  } else {
+    // TODO
+    ink_assert(false);
+  }
+
+  return CONNECT_SUCCESS;
 }

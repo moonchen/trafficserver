@@ -131,7 +131,7 @@ IOUringContext::handle_cqe(io_uring_cqe *cqe)
 {
   auto *op = reinterpret_cast<IOUringCompletionHandler *>(io_uring_cqe_get_data(cqe));
 
-  Debug(TAG, "Got cqe: res = %d, user_data = %p", cqe->res, op);
+  Debug(TAG, "Got cqe: res = %d, user_data = %p, id = %s", cqe->res, op, op->id().c_str());
   op->handle_complete(cqe);
 }
 
@@ -167,7 +167,7 @@ IOUringContext::submit_and_wait(int ms)
   if (ret < 0) {
     switch (ret) {
     case -ETIME:
-      break;
+    case -EINTR:
     case -EAGAIN:
       break;
     default:

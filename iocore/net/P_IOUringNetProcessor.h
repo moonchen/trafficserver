@@ -42,7 +42,7 @@ public:
   // NetProcessor
   void init() override;
 
-  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts);
+  Action *connect(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
 
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
   NetVConnection *allocate_vc(EThread *) const override;

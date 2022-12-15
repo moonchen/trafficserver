@@ -116,7 +116,7 @@ struct PollCont : public Continuation {
   NetEvents from their queues. If vc wants to be managed by NetHandler, the vc
   should be derived from NetEvent. The vc can be made of NetProcessor (allocate_vc)
   either by directly adding a NetEvent to the queue (NetHandler::startIO), or more
-  conveniently, calling a method service call (NetProcessor::connect_re) which
+  conveniently, calling a method service call (NetProcessor::connect) which
   synthesizes the NetEvent and places it in the queue.
 
   Callback event codes:

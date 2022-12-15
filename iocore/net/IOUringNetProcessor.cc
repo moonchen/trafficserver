@@ -21,7 +21,9 @@
   limitations under the License.
  */
 
+#include "I_Action.h"
 #include "I_EventProcessor.h"
+#include "I_NetVConnection.h"
 #include "P_IOUringNet.h"
 #include "P_IOUringNetProcessor.h"
 #include "P_IOUringNetVConnection.h"
@@ -91,4 +93,41 @@ IOUringNetProcessor::createNetAccept(NetProcessor::AcceptOptions const &opt)
   // TODO:
   Debug(TAG, "createNetAccept()");
   return new IOUringNetAccept(opt);
+}
+
+Action *
+IOUringNetProcessor::connect(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
+{
+  if (TSSystemState::is_event_system_shut_down()) {
+    return nullptr;
+  }
+
+  ink_release_assert(opt);
+  EThread *t = eventProcessor.assign_affinity_by_type(cont, opt->etype);
+  auto vc    = dynamic_cast<IOUringNetVConnection *>(allocate_vc(t));
+
+  ink_release_assert(vc);
+  vc->options = *opt;
+  vc->set_context(NET_VCONNECTION_OUT);
+
+  // TODO: SOCKS
+  vc->mutex      = cont->mutex;
+  Action *result = &vc->action_;
+  vc->con.setRemote(target);
+  vc->action_ = cont;
+
+  MUTEX_TRY_LOCK(lock, cont->mutex, t);
+  if (lock.is_locked()) {
+    auto ret = vc->connectUp(t, NO_FD);
+    if (ret != CONNECT_SUCCESS) {
+      Error("connect: connectUp failed");
+      return ACTION_IO_ERROR;
+    }
+    return result;
+  }
+
+  // Try to open later
+  t->schedule_imm(vc);
+
+  return result;
 }

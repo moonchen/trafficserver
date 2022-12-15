@@ -35,6 +35,12 @@ public:
   void prep_eventfd_read();
   void handle_complete(io_uring_cqe *) override;
 
+  std::string
+  id() const override
+  {
+    return "wakeup";
+  }
+
 private:
   const EThread *_thread;
 };

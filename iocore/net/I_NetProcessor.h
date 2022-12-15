@@ -173,17 +173,13 @@ public:
       - On success calls: c->handleEvent(NET_EVENT_OPEN, NetVConnection *)
       - On failure calls: c->handleEvent(NET_EVENT_OPEN_FAILED, -errno)
 
-    @note Connection may not have been established when cont is
-      call back with success. If this behaviour is desired use
-      synchronous connect connet_s method.
-
     @param cont Continuation to be called back with events.
     @param addr target address and port to connect to.
     @param options @see NetVCOptions.
 
   */
 
-  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *options = nullptr);
+  virtual Action *connect(Continuation *cont, sockaddr const *addr, NetVCOptions *options = nullptr) = 0;
 
   /**
     Initializes the net processor. This must be called before the event threads are started.
@@ -247,7 +243,7 @@ private:
 
   @code
     netProcessor.accept(my_cont, ...);
-    netProcessor.connect_re(my_cont, ...);
+    netProcessor.connect(my_cont, ...);
   @endcode
 
 */

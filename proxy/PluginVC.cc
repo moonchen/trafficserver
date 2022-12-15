@@ -1047,7 +1047,7 @@ PluginVCCore::connect()
 }
 
 Action *
-PluginVCCore::connect_re(Continuation *c)
+PluginVCCore::connect(Continuation *c)
 {
   ink_release_assert(connect_to != nullptr);
 
