@@ -38,6 +38,9 @@ class IOUringCompletionHandler
 {
 public:
   virtual void handle_complete(io_uring_cqe *) = 0;
+
+  // TODO(cmcfarlen): maybe we don't need this long-term
+  virtual std::string id() const = 0;
 };
 
 class IOUringContext

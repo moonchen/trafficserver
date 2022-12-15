@@ -241,12 +241,14 @@ IOUringConnection::connect(sockaddr const *target, NetVCOptions const &opt, cons
   ink_assert(context);
   io_uring_sqe *sqe = context->next_sqe(&_connect_handler);
   ink_release_assert(sqe);
+  ++this->ops_in_flight;
   io_uring_prep_connect(sqe, fd, &this->addr.sa, ats_ip_size(&this->addr.sa));
   _connect_handler = LambdaIOUringHandler{[handler, this](int res) {
     if (res < 0) {
       Warning("Connect failed with %s", strerror(-res));
       _cleanup();
     }
+    --this->ops_in_flight;
     handler(res);
   }};
 
@@ -270,8 +272,12 @@ IOUringConnection::close(const std::function<void(int)> &handler)
     ink_assert(context);
     io_uring_sqe *sqe = context->next_sqe(&_close_handler);
     ink_release_assert(sqe);
+    ++this->ops_in_flight;
     io_uring_prep_close(sqe, fd_save);
-    _close_handler = LambdaIOUringHandler{[handler](int res) -> void { handler(res); }};
+    _close_handler = LambdaIOUringHandler{[handler, this](int res) -> void {
+      --this->ops_in_flight;
+      handler(res);
+    }};
   } else if (fd != NO_FD) {
     fd = NO_FD;
     ink_assert(false);

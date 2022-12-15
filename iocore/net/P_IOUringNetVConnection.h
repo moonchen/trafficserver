@@ -34,6 +34,12 @@ class IOUringReader : public IOUringCompletionHandler
 {
 public:
   void handle_complete(io_uring_cqe *) override;
+
+  std::string
+  id() const override
+  {
+    return "read";
+  }
   VIO vio;
   bool in_progress = false; // is there an outstanding read in the io_uring?
   IOUringNetVConnection *vc;
@@ -43,6 +49,11 @@ class IOUringWriter : public IOUringCompletionHandler
 {
 public:
   void handle_complete(io_uring_cqe *) override;
+  std::string
+  id() const override
+  {
+    return "write";
+  }
   VIO vio;
   bool in_progress = false; // is there an outstanding write in the io_uring?
   IOUringNetVConnection *vc;
@@ -86,6 +97,8 @@ public:
   int recursion                   = 0;
   bool from_accept_thread         = false;
   IOUringNetAccept *accept_object = nullptr;
+  int ops_in_flight               = 0;
+  bool closing                    = false;
 
   int acceptEvent(int event, Event *e);
 

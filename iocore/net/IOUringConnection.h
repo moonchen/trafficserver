@@ -46,6 +46,12 @@ public:
     _f(res);
   }
 
+  std::string
+  id() const override
+  {
+    return "lambda";
+  }
+
 private:
   std::function<void(int)> _f;
 };
@@ -59,6 +65,7 @@ public:
   bool is_bound     = false; ///< Flag for already bound to a local address.
   bool is_connected = false; ///< Flag for already connected.
   int sock_type     = 0;
+  int ops_in_flight = 0; ///< The number of current active io_uring ops for this connection
 
   /** Create and initialize the socket for this connection.
 

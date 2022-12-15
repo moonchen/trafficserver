@@ -44,7 +44,10 @@ IOUringNetVConnection::IOUringNetVConnection() : id(get_next_connection_id()), c
   SET_HANDLER(&IOUringNetVConnection::startEvent);
 }
 
-IOUringNetVConnection::~IOUringNetVConnection() {}
+IOUringNetVConnection::~IOUringNetVConnection()
+{
+  Debug(TAG, "IOUringNetVConnection destructor");
+}
 
 void
 IOUringNetVConnection::prep_read()
@@ -125,6 +128,7 @@ IOUringNetVConnection::prep_read()
 
     // TODO(mo): retain buffer blocks
 
+    ++ops_in_flight;
     io_uring_prep_recvmsg(sqe, con.fd, &msg, 0);
     Debug(TAG, "prep_recvmsg, op = %p", &read);
 
@@ -226,6 +230,7 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   // r = SocketManager::sendmsg(con.fd, &msg, flags);
   io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&write);
   ink_assert(sqe != nullptr);
+  --ops_in_flight;
   io_uring_prep_sendmsg(sqe, con.fd, &msg, flags);
   Debug(TAG, "prep_sendmsg, op = %p", &write);
 
@@ -349,88 +354,99 @@ void
 IOUringNetVConnection::do_io_close(int lerrno)
 {
   Debug(TAG, "%s", __FUNCTION__);
+
+  // this is only available since kernel 5.19
+  // io_uring_prep_cancel_fd()
+
+  closing = true;
+  con.close([&](int res) {
+    Debug(TAG, "%s(%p, %d) - %d", "close", this, lerrno, ops_in_flight);
+    ink_assert(res == 0);
+    // ink_assert(ops_in_flight == 0);
+    delete this;
+  });
 }
 
 void
 IOUringNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_active_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_inactivity_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::set_default_inactivity_timeout(ink_hrtime timeout_in)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 bool
 IOUringNetVConnection::is_default_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return false;
 }
 
 void
 IOUringNetVConnection::cancel_active_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::cancel_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::add_to_keep_alive_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
 IOUringNetVConnection::remove_from_keep_alive_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 bool
 IOUringNetVConnection::add_to_active_queue()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return true;
 }
 
 ink_hrtime
 IOUringNetVConnection::get_active_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 ink_hrtime
 IOUringNetVConnection::get_inactivity_timeout()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 void
 IOUringNetVConnection::apply_options()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 void
@@ -450,20 +466,20 @@ IOUringNetVConnection::reenable(VIO *vio)
 void
 IOUringNetVConnection::reenable_re(VIO *vio)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 SOCKET
 IOUringNetVConnection::get_socket()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
 int
 IOUringNetVConnection::set_tcp_congestion_control(int side)
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
   return 0;
 }
 
@@ -498,7 +514,7 @@ IOUringNetVConnection::set_remote_addr(const sockaddr *new_sa)
 void
 IOUringNetVConnection::set_mptcp_state()
 {
-  Debug(TAG, "%s", __FUNCTION__);
+  Debug(TAG, "TODO %s", __FUNCTION__);
 }
 
 int
@@ -553,11 +569,14 @@ IOUringReader::handle_complete(io_uring_cqe *cqe)
   Debug(TAG, "read.handle_complete r = %d", r);
 
   SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+  --vc->ops_in_flight;
 
   if (r <= 0) {
     Debug(TAG, "read error vio: %d %s", r, strerror(-r));
     if (!r || r == -ECONNRESET) {
-      vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+      if (!vc->closing) {
+        vio.cont->handleEvent(VC_EVENT_EOS, &vio);
+      }
     } else {
       vio.vc_server->lerrno = -r;
       vio.cont->handleEvent(VC_EVENT_ERROR, &vio);
@@ -588,6 +607,7 @@ IOUringWriter::handle_complete(io_uring_cqe *cqe)
 
   auto mutex = vio.mutex;
   SCOPED_MUTEX_LOCK(lock, vio.mutex, this_ethread());
+  --vc->ops_in_flight;
 
   if (!vc->con.is_connected && vc->options.f_tcp_fastopen) {
     if (r < 0) {

@@ -83,6 +83,18 @@ struct ink_aiocb : public IOUringCompletionHandler {
   AIOCallback *aio_op  = nullptr;
 
   void handle_complete(io_uring_cqe *) override;
+  std::string
+  id() const override
+  {
+    switch (aio_lio_opcode) {
+    case LIO_READ:
+      return "aio_read";
+    case LIO_WRITE:
+      return "aio_write";
+    default:
+      return "aio_idk";
+    }
+  }
 };
 
 #else
