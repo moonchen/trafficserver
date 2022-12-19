@@ -66,7 +66,7 @@ public:
 
   void submit();
   void service();
-  void submit_and_wait(int ms);
+  void submit_and_wait(ink_hrtime delay);
 
   int register_eventfd();
 
