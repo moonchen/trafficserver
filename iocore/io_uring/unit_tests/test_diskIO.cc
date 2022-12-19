@@ -25,6 +25,7 @@
 
 #include "I_IO_URING.h"
 #include "tscore/ts_file.h"
+#include "tscore/ink_hrtime.h"
 
 #include <functional>
 
@@ -64,6 +65,10 @@ public:
   handle_complete(io_uring_cqe *c) override
   {
     f(c->res);
+  }
+
+  std::string id() const override {
+    return "holder";
   }
 
 private:
@@ -136,13 +141,13 @@ TEST_CASE("disk_io", "[io_uring]")
   REQUIRE(fd != -1);
 
   io_uring_write(ctx, fd, "hello", 5, [](int result) { REQUIRE(result == 5); });
-  ctx.submit_and_wait(100);
+  ctx.submit_and_wait(100*HRTIME_MSECOND);
   io_uring_close(ctx, fd, [&fd](int result) {
     REQUIRE(result == 0);
     fd = -1;
   });
 
-  ctx.submit_and_wait(100);
+  ctx.submit_and_wait(100 * HRTIME_MSECOND);
 
   REQUIRE(fd == -1);
 
@@ -155,7 +160,7 @@ TEST_CASE("disk_io", "[io_uring]")
     REQUIRE("hello"sv == std::string_view(buffer, result));
   });
 
-  ctx.submit_and_wait(100);
+  ctx.submit_and_wait(100 * HRTIME_MSECOND);
 }
 
 void
@@ -259,7 +264,7 @@ TEST_CASE("net_io", "[io_uring]")
     connected = true;
   });
 
-  ctx.submit_and_wait(1000);
+  ctx.submit_and_wait(1 * HRTIME_SECOND);
 
   REQUIRE(server.clients == 1);
   REQUIRE(connected);
