@@ -59,7 +59,7 @@ IOUringNetHandler::waitForActivity(ink_hrtime timeout)
 {
   IOUringContext *ur = IOUringContext::local_context();
 
-  ur->submit_and_wait(ink_hrtime_to_msec(timeout));
+  ur->submit_and_wait(timeout);
   return 0;
 }
 
