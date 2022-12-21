@@ -59,7 +59,7 @@ private:
 class IOUringConnection
 {
 public:
-  SOCKET fd;                 ///< Socket for connection.
+  SOCKET fd = NO_FD;         ///< Socket for connection.
   IpEndpoint addr;           ///< Associated address.
   socklen_t addrlen;         ///< size of addr
   bool is_bound     = false; ///< Flag for already bound to a local address.

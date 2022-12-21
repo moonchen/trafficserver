@@ -93,20 +93,20 @@ IOUringNetVConnection::prep_read()
   // prepare an sqe to read data
   int64_t rattempted = 0, total_read = 0;
   unsigned niov = 0;
-  IOVec tiovec[NET_MAX_IOV];
   if (toread) {
+    // NOTE(cmcfarlen): Mo said this returns the wrong pointer after the first read
     IOBufferBlock *b = buf.writer()->first_write_block();
     niov             = 0;
     rattempted       = 0;
     while (b && niov < NET_MAX_IOV) {
       int64_t a = b->write_avail();
       if (a > 0) {
-        tiovec[niov].iov_base = b->_end;
-        int64_t togo          = toread - total_read - rattempted;
+        read.tiovec[niov].iov_base = b->_end;
+        int64_t togo               = toread - total_read - rattempted;
         if (a > togo) {
           a = togo;
         }
-        tiovec[niov].iov_len = a;
+        read.tiovec[niov].iov_len = a;
         rattempted += a;
         niov++;
         if (a >= togo) {
@@ -117,19 +117,19 @@ IOUringNetVConnection::prep_read()
     }
 
     ink_assert(niov > 0);
-    ink_assert(niov <= countof(tiovec));
-    struct msghdr msg;
+    ink_assert(niov <= countof(read.tiovec));
 
-    ink_zero(msg);
-    msg.msg_name    = const_cast<sockaddr *>(get_remote_addr());
-    msg.msg_namelen = ats_ip_size(get_remote_addr());
-    msg.msg_iov     = &tiovec[0];
-    msg.msg_iovlen  = niov;
+    ink_zero(read.msg);
+    read.msg.msg_name    = const_cast<sockaddr *>(get_remote_addr());
+    read.msg.msg_namelen = ats_ip_size(get_remote_addr());
+    read.msg.msg_iov     = &read.tiovec[0];
+    read.msg.msg_iovlen  = niov;
 
     // TODO(mo): retain buffer blocks
 
     ++ops_in_flight;
-    io_uring_prep_recvmsg(sqe, con.fd, &msg, 0);
+    // NOTE(cmcfarlen): second read gets -90 result
+    io_uring_prep_recvmsg(sqe, con.fd, &read.msg, 0);
     Debug(TAG, "prep_recvmsg, op = %p", &read);
 
     NET_INCREMENT_DYN_STAT(net_calls_to_read_stat);
@@ -177,7 +177,6 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   int64_t try_to_write       = 0;
   IOBufferReader *tmp_reader = buf.reader()->clone();
 
-  IOVec tiovec[NET_MAX_IOV];
   unsigned niov = 0;
   try_to_write  = 0;
 
@@ -200,8 +199,8 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
     }
 
     // build an iov entry
-    tiovec[niov].iov_len  = len;
-    tiovec[niov].iov_base = tmp_reader->start();
+    write.tiovec[niov].iov_len  = len;
+    write.tiovec[niov].iov_base = tmp_reader->start();
     niov++;
 
     try_to_write += len;
@@ -209,19 +208,18 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   }
 
   ink_assert(niov > 0);
-  ink_assert(niov <= countof(tiovec));
+  ink_assert(niov <= countof(write.tiovec));
 
   // If the platform doesn't support TCP Fast Open, verify that we
   // correctly disabled support in the socket option configuration.
   ink_assert(MSG_FASTOPEN != 0 || this->options.f_tcp_fastopen == false);
-  struct msghdr msg;
 
-  ink_zero(msg);
-  msg.msg_name    = const_cast<sockaddr *>(this->get_remote_addr());
-  msg.msg_namelen = ats_ip_size(this->get_remote_addr());
-  msg.msg_iov     = &tiovec[0];
-  msg.msg_iovlen  = niov;
-  int flags       = 0;
+  ink_zero(write.msg);
+  write.msg.msg_name    = const_cast<sockaddr *>(this->get_remote_addr());
+  write.msg.msg_namelen = ats_ip_size(this->get_remote_addr());
+  write.msg.msg_iov     = &write.tiovec[0];
+  write.msg.msg_iovlen  = niov;
+  int flags             = 0;
 
   if (!this->con.is_connected && this->options.f_tcp_fastopen) {
     NET_INCREMENT_DYN_STAT(net_fastopen_attempts_stat);
@@ -230,8 +228,8 @@ IOUringNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor 
   // r = SocketManager::sendmsg(con.fd, &msg, flags);
   io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&write);
   ink_assert(sqe != nullptr);
-  --ops_in_flight;
-  io_uring_prep_sendmsg(sqe, con.fd, &msg, flags);
+  ++ops_in_flight;
+  io_uring_prep_sendmsg(sqe, con.fd, &write.msg, flags);
   Debug(TAG, "prep_sendmsg, op = %p", &write);
 
   tmp_reader->dealloc();
