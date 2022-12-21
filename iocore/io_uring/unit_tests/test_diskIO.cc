@@ -67,7 +67,9 @@ public:
     f(c->res);
   }
 
-  std::string id() const override {
+  std::string
+  id() const override
+  {
     return "holder";
   }
 
@@ -141,7 +143,7 @@ TEST_CASE("disk_io", "[io_uring]")
   REQUIRE(fd != -1);
 
   io_uring_write(ctx, fd, "hello", 5, [](int result) { REQUIRE(result == 5); });
-  ctx.submit_and_wait(100*HRTIME_MSECOND);
+  ctx.submit_and_wait(100 * HRTIME_MSECOND);
   io_uring_close(ctx, fd, [&fd](int result) {
     REQUIRE(result == 0);
     fd = -1;

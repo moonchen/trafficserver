@@ -89,7 +89,7 @@ IOUringNetAccept::acceptLoopEvent(int event, void *ep)
   // setup eventfd for activity?
 
   do {
-    ctx->submit_and_wait(1*HRTIME_SECOND);
+    ctx->submit_and_wait(1 * HRTIME_SECOND);
   } while (!TSSystemState::is_event_system_shut_down());
   Warning("Accept loop stopped!");
 

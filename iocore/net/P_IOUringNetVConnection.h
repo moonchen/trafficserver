@@ -43,6 +43,8 @@ public:
   VIO vio;
   bool in_progress = false; // is there an outstanding read in the io_uring?
   IOUringNetVConnection *vc;
+  IOVec tiovec[NET_MAX_IOV];
+  struct msghdr msg;
 };
 
 class IOUringWriter : public IOUringCompletionHandler
@@ -57,6 +59,8 @@ public:
   VIO vio;
   bool in_progress = false; // is there an outstanding write in the io_uring?
   IOUringNetVConnection *vc;
+  IOVec tiovec[NET_MAX_IOV];
+  struct msghdr msg;
 };
 
 class IOUringNetVConnection : public NetVConnection
