@@ -2083,6 +2083,7 @@ void
 HostDBRecord::free()
 {
   if (_iobuffer_index > 0) {
+    // NOTE: This causes a crash on exit. REMOVE THIS WORKAROUND
     // Debug("hostdb", "freeing %d bytes at [%p]", (1 << (7 + _iobuffer_index)), this);
     ioBufAllocator[_iobuffer_index].free_void(static_cast<void *>(this));
   }
