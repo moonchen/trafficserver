@@ -5219,7 +5219,6 @@ HttpSM::do_http_server_open(bool raw)
 
   // We did not manage to get an existing session and need to open a new connection
   NetVCOptions opt;
-  opt.f_blocking_connect = false;
   opt.set_sock_param(t_state.txn_conf->sock_recv_buffer_size_out, t_state.txn_conf->sock_send_buffer_size_out,
                      t_state.txn_conf->sock_option_flag_out, t_state.txn_conf->sock_packet_mark_out,
                      t_state.txn_conf->sock_packet_tos_out, t_state.txn_conf->sock_packet_notsent_lowat);

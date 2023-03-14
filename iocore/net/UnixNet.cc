@@ -1,10 +1,11 @@
-/** @file
+/**@file
 
-  A brief file description
+   A brief file description
 
-  @section license License
+ @section license License
 
-  Licensed to the Apache Software Foundation (ASF) under one
+   Licensed to the Apache Software
+   Foundation(ASF) under one
   or more contributor license agreements.  See the NOTICE file
   distributed with this work for additional information
   regarding copyright ownership.  The ASF licenses this file
@@ -21,8 +22,10 @@
   limitations under the License.
  */
 
+#include "EventIO.h"
 #include "P_Net.h"
 #include "I_AIO.h"
+#include "ReadWriteEventIO.h"
 #include "tscore/ink_hrtime.h"
 
 using namespace std::literals;
@@ -38,8 +41,6 @@ ink_hrtime last_transient_accept_error;
 NetHandler::Config NetHandler::global_config;
 std::bitset<std::numeric_limits<unsigned int>::digits> NetHandler::active_thread_types;
 const std::bitset<NetHandler::CONFIG_ITEM_COUNT> NetHandler::config_value_affects_per_thread_value{0x3};
-
-extern "C" void fd_reify(struct ev_loop *);
 
 // INKqa10496
 // One Inactivity cop runs on each thread once every second and
@@ -229,20 +230,6 @@ PollCont::do_poll(ink_hrtime timeout)
 #endif
 }
 
-static void
-net_signal_hook_callback(EThread *thread)
-{
-#if HAVE_EVENTFD
-  uint64_t counter;
-  ATS_UNUSED_RETURN(read(thread->evfd, &counter, sizeof(uint64_t)));
-#elif TS_USE_PORT
-/* Nothing to drain or do */
-#else
-  char dummy[1024];
-  ATS_UNUSED_RETURN(read(thread->evpipe[0], &dummy[0], 1024));
-#endif
-}
-
 void
 initialize_thread_for_net(EThread *thread)
 {
@@ -265,13 +252,12 @@ initialize_thread_for_net(EThread *thread)
   thread->schedule_every(inactivityCop, HRTIME_SECONDS(cop_freq));
 
   thread->set_tail_handler(nh);
-  thread->ep = static_cast<EventIO *>(ats_malloc(sizeof(EventIO)));
-  new (thread->ep) EventIO();
-  thread->ep->type = EVENTIO_ASYNC_SIGNAL;
+  thread->ep.emplace();
 #if HAVE_EVENTFD
-  thread->ep->start(pd, thread->evfd, nullptr, EVENTIO_READ);
 #if TS_USE_LINUX_IO_URING
   thread->ep->start(pd, DiskHandler::local_context());
+#else
+  thread->ep->start(pd, thread->evfd, thread, EVENTIO_READ);
 #endif
 #else
   thread->ep->start(pd, thread->evpipe[0], nullptr, EVENTIO_READ);
@@ -489,7 +475,6 @@ NetHandler::waitForActivity(ink_hrtime timeout)
   EventIO *epd = nullptr;
 #if AIO_MODE == AIO_MODE_IO_URING
   DiskHandler *dh = DiskHandler::local_context();
-  bool servicedh  = false;
 #endif
 
   NET_INCREMENT_DYN_STAT(net_handler_run_stat);
@@ -507,67 +492,18 @@ NetHandler::waitForActivity(ink_hrtime timeout)
 
   // Get & Process polling result
   PollDescriptor *pd = get_PollDescriptor(this->thread);
-  NetEvent *ne       = nullptr;
   for (int x = 0; x < pd->result; x++) {
-    epd = static_cast<EventIO *> get_ev_data(pd, x);
-    if (epd->type == EVENTIO_READWRITE_VC) {
-      ne = epd->data.ne;
-      // Remove triggered NetEvent from cop_list because it won't be timeout before next InactivityCop runs.
-      if (cop_list.in(ne)) {
-        cop_list.remove(ne);
-      }
-      int flags = get_ev_events(pd, x);
-      if (flags & (EVENTIO_ERROR)) {
-        ne->set_error_from_socket();
-      }
-      if (flags & (EVENTIO_READ)) {
-        ne->read.triggered = 1;
-        if (!read_ready_list.in(ne)) {
-          read_ready_list.enqueue(ne);
-        }
-      }
-      if (flags & (EVENTIO_WRITE)) {
-        ne->write.triggered = 1;
-        if (!write_ready_list.in(ne)) {
-          write_ready_list.enqueue(ne);
-        }
-      } else if (!(flags & (EVENTIO_READ))) {
-        Debug("iocore_net_main", "Unhandled epoll event: 0x%04x", flags);
-        // In practice we sometimes see EPOLLERR and EPOLLHUP through there
-        // Anything else would be surprising
-        ink_assert((flags & ~(EVENTIO_ERROR)) == 0);
-        ne->write.triggered = 1;
-        if (!write_ready_list.in(ne)) {
-          write_ready_list.enqueue(ne);
-        }
-      }
-    } else if (epd->type == EVENTIO_DNS_CONNECTION) {
-      if (epd->data.dnscon != nullptr) {
-        epd->data.dnscon->trigger(); // Make sure the DNSHandler for this con knows we triggered
-#if defined(USE_EDGE_TRIGGER)
-        epd->refresh(EVENTIO_READ);
-#endif
-      }
-    } else if (epd->type == EVENTIO_ASYNC_SIGNAL) {
-      net_signal_hook_callback(this->thread);
-    } else if (epd->type == EVENTIO_NETACCEPT) {
-      this->thread->schedule_imm(epd->data.na);
-#if AIO_MODE == AIO_MODE_IO_URING
-    } else if (epd->type == EVENTIO_DISK) {
-      servicedh = true;
-#endif
-    }
+    epd       = static_cast<EventIO *> get_ev_data(pd, x);
+    int flags = get_ev_events(pd, x);
+    epd->process_event(flags);
     ev_next_event(pd, x);
   }
 
   pd->result = 0;
 
   process_ready_list();
-
 #if AIO_MODE == AIO_MODE_IO_URING
-  if (servicedh) {
-    dh->service();
-  }
+  dh->service();
 #endif
 
   return EVENT_CONT;
@@ -803,14 +739,57 @@ NetHandler::remove_from_active_queue(NetEvent *ne)
 }
 
 int
-EventIO::start(EventLoop l, DiskHandler *dh)
+ReadWriteEventIO::start(EventLoop l, NetEvent *ne, NetHandler *nh, int events)
 {
-#if AIO_MODE == AIO_MODE_IO_URING
-  data.dh = dh;
-  int fd  = dh->register_eventfd();
-  type    = EVENTIO_DISK;
-  return start_common(l, fd, EVENTIO_READ);
-#else
-  return 1;
-#endif
+  _ne = ne;
+  _nh = nh;
+  return start_common(l, ne->get_fd(), events);
+}
+
+int
+ReadWriteEventIO::start(EventLoop l, int afd, NetEvent *ne, NetHandler *nh, int events)
+{
+  _ne = ne;
+  _nh = nh;
+  return start_common(l, afd, events);
+}
+
+void
+ReadWriteEventIO::process_event(int flags)
+{
+  // Remove triggered NetEvent from cop_list because it won't be timeout before next InactivityCop runs.
+  if (_nh->cop_list.in(_ne)) {
+    _nh->cop_list.remove(_ne);
+  }
+  if (flags & (EVENTIO_ERROR)) {
+    _ne->set_error_from_socket();
+  }
+  if (flags & (EVENTIO_READ)) {
+    _ne->read.triggered = 1;
+    if (!_nh->read_ready_list.in(_ne)) {
+      _nh->read_ready_list.enqueue(_ne);
+    }
+  }
+  if (flags & (EVENTIO_WRITE)) {
+    _ne->write.triggered = 1;
+    if (!_nh->write_ready_list.in(_ne)) {
+      _nh->write_ready_list.enqueue(_ne);
+    }
+  } else if (!(flags & (EVENTIO_READ))) {
+    Debug("iocore_net_main", "Unhandled epoll event: 0x%04x", flags);
+    // In practice we sometimes see EPOLLERR and EPOLLHUP through there
+    // Anything else would be surprising
+    ink_assert((flags & ~(EVENTIO_ERROR)) == 0);
+    _ne->write.triggered = 1;
+    if (!_nh->write_ready_list.in(_ne)) {
+      _nh->write_ready_list.enqueue(_ne);
+    }
+  }
+}
+
+int
+ReadWriteEventIO::close()
+{
+  EventIO::close(); // discard retval
+  return _ne->close();
 }

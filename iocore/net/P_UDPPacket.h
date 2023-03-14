@@ -32,6 +32,8 @@
 
 #include "I_UDPNet.h"
 
+class UDPConnectionInternal;
+
 class UDPPacketInternal : public UDPPacket
 {
 public:

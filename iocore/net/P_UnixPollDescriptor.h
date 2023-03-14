@@ -42,7 +42,7 @@
 
 #define POLL_DESCRIPTOR_SIZE 32768
 
-typedef struct pollfd Pollfd;
+using Pollfd = struct pollfd;
 
 struct PollDescriptor {
   int result; // result of poll
@@ -59,7 +59,30 @@ struct PollDescriptor {
   int port_fd;
 #endif
 
-  PollDescriptor() { init(); }
+  PollDescriptor()
+  {
+    result = 0;
+#if TS_USE_EPOLL
+    nfds     = 0;
+    epoll_fd = epoll_create(POLL_DESCRIPTOR_SIZE);
+    memset(ePoll_Triggered_Events, 0, sizeof(ePoll_Triggered_Events));
+    memset(pfd, 0, sizeof(pfd));
+#endif
+#if TS_USE_KQUEUE
+    kqueue_fd = kqueue();
+    memset(kq_Triggered_Events, 0, sizeof(kq_Triggered_Events));
+#endif
+  }
+
+  virtual ~PollDescriptor()
+  {
+#if TS_USE_EPOLL
+    close(epoll_fd);
+#endif
+#if TS_USE_KQUEUE
+    close(kqueue_fd);
+#endif
+  }
 #if TS_USE_EPOLL
 #define get_ev_port(a)      ((a)->epoll_fd)
 #define get_ev_events(a, x) ((a)->ePoll_Triggered_Events[(x)].events)
@@ -93,15 +116,6 @@ struct PollDescriptor {
 #define ev_next_event(a, x)
 #endif
 
-#if TS_USE_PORT
-  port_event_t Port_Triggered_Events[POLL_DESCRIPTOR_SIZE];
-#define get_ev_port(a)      ((a)->port_fd)
-#define get_ev_events(a, x) ((a)->Port_Triggered_Events[(x)].portev_events)
-#define get_ev_data(a, x)   ((a)->Port_Triggered_Events[(x)].portev_user)
-#define get_ev_odata(a, x)  ((a)->Port_Triggered_Events[(x)].portev_object)
-#define ev_next_event(a, x)
-#endif
-
   Pollfd *
   alloc()
   {
@@ -113,27 +127,6 @@ struct PollDescriptor {
     return &pfd[nfds++];
 #else
     return nullptr;
-#endif
-  }
-
-private:
-  void
-  init()
-  {
-    result = 0;
-#if TS_USE_EPOLL
-    nfds     = 0;
-    epoll_fd = epoll_create(POLL_DESCRIPTOR_SIZE);
-    memset(ePoll_Triggered_Events, 0, sizeof(ePoll_Triggered_Events));
-    memset(pfd, 0, sizeof(pfd));
-#endif
-#if TS_USE_KQUEUE
-    kqueue_fd = kqueue();
-    memset(kq_Triggered_Events, 0, sizeof(kq_Triggered_Events));
-#endif
-#if TS_USE_PORT
-    port_fd = port_create();
-    memset(Port_Triggered_Events, 0, sizeof(Port_Triggered_Events));
 #endif
   }
 };
