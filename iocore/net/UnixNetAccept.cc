@@ -24,6 +24,7 @@
 #include <tscore/TSSystemState.h>
 #include <tscore/ink_defs.h>
 
+#include "EventIO.h"
 #include "P_Net.h"
 
 using NetAcceptHandler = int (NetAccept::*)(int, void *);
@@ -589,4 +590,23 @@ NetProcessor *
 NetAccept::getNetProcessor() const
 {
   return &netProcessor;
+}
+
+int
+NetAcceptEventIO::start(EventLoop l, NetAccept *na, int events)
+{
+  _na = na;
+  return start_common(l, _na->server.fd, events);
+}
+void
+NetAcceptEventIO::process_event(int flags)
+{
+  this_ethread()->schedule_imm(_na);
+}
+
+int
+NetAcceptEventIO::close()
+{
+  EventIO::stop(); // discard retval
+  return _na->server.close();
 }

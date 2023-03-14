@@ -31,6 +31,10 @@
 #include "I_PriorityEventQueue.h"
 #include "I_ProtectedQueue.h"
 #include "tscpp/util/Histogram.h"
+#include "../net/AsyncSignalEventIO.h"
+#include "../aio/DiskEventIO.h"
+
+#include <optional>
 
 // TODO: This would be much nicer to have "run-time" configurable (or something),
 // perhaps based on proxy.config.stat_api.max_stats_allowed or other configs. XXX
@@ -41,7 +45,6 @@
 #define MUTEX_RETRY_DELAY HRTIME_MSECONDS(20)
 
 class DiskHandler;
-struct EventIO;
 
 class ServerSessionPool;
 class PreWarmQueue;
@@ -336,10 +339,14 @@ public:
 
 #if HAVE_EVENTFD
   int evfd = ts::NO_FD;
+#if TS_USE_LINUX_IO_URING
+  std::optional<DiskEventIO> ep;
+#else
+  std::optional<AsyncSignalEventIO> ep;
+#endif
 #else
   int evpipe[2];
 #endif
-  EventIO *ep = nullptr;
 
   ThreadType tt = REGULAR;
   /** Initial event to call, before any scheduling.

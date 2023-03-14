@@ -38,7 +38,7 @@ AM_CPPFLAGS += \
 
 TESTS = $(check_PROGRAMS)
 
-check_PROGRAMS = test_certlookup test_UDPNet test_libinknet
+check_PROGRAMS = test_certlookup test_UDPNet test_libinknet test_TCPConnection
 noinst_LIBRARIES = libinknet.a
 
 test_certlookup_LDFLAGS = \
@@ -120,13 +120,48 @@ test_libinknet_LDADD = \
 	$(top_builddir)/proxy/ParentSelectionStrategy.o \
 	@HWLOC_LIBS@ @OPENSSL_LIBS@ @LIBPCRE@ @YAMLCPP_LIBS@ @SWOC_LIBS@
 
+test_TCPConnection_SOURCES = \
+	unit_tests/test_TCPConnection.cc \
+	TCPListener.cc \
+	TCPConnection.cc \
+	AcceptOptions.cc \
+	AcceptOptions.h \
+	EventIO.cc \
+	EventIO.h \
+	NetVCOptions.h \
+	NetVCOptions.cc
+
+test_TCPConnection_CPPFLAGS = \
+	$(AM_CPPFLAGS) \
+	$(iocore_include_dirs) \
+	-I$(abs_top_srcdir)/tests/include \
+	-I$(abs_top_srcdir)/include
+
+test_TCPConnection_LDFLAGS = \
+	@AM_LDFLAGS@ \
+	@OPENSSL_LDFLAGS@ \
+	@YAMLCPP_LDFLAGS@ \
+	@SWOC_LDFLAGS@
+
+test_TCPConnection_LDADD = \
+	$(top_builddir)/iocore/eventsystem/libinkevent.a \
+	$(top_builddir)/src/records/librecords_p.a \
+	$(top_builddir)/lib/swoc/libtsswoc.la \
+	$(top_builddir)/src/tscore/libtscore.la
+
 libinknet_a_SOURCES = \
+  AcceptOptions.cc \
+  AcceptOptions.h \
 	ALPNSupport.cc \
+	AsyncSignalEventIO.cc \
+	AsyncSignalEventIO.h \
 	BIO_fastopen.cc \
 	BIO_fastopen.h \
 	BoringSSLUtils.cc \
 	BoringSSLUtils.h \
 	Connection.cc \
+	EventIO.h \
+	EventIO.cc \
 	I_Net.h \
 	I_NetProcessor.h \
 	I_NetVConnection.h \
@@ -139,6 +174,9 @@ libinknet_a_SOURCES = \
 	YamlSNIConfig.h \
 	YamlSNIConfig.cc \
 	Net.cc \
+	NetAIO.h \
+	NetVCOptions.h \
+	NetVCOptions.cc \
 	NetVConnection.cc \
 	P_ALPNSupport.h \
 	P_SNIActionPerformer.h \
@@ -194,12 +232,16 @@ libinknet_a_SOURCES = \
 	SSLSessionTicket.cc \
 	SSLUtils.cc \
 	OCSPStapling.cc \
+	TCPConnection.cc \
+	TCPListener.cc \
 	TLSBasicSupport.cc \
 	TLSEarlyDataSupport.cc \
 	TLSKeyLogger.cc \
 	TLSSessionResumptionSupport.cc \
 	TLSSNISupport.cc \
 	TLSTunnelSupport.cc \
+	UDPEventIO.h \
+	UDPEventIO.cc \
 	UDPIOEvent.cc \
 	UnixConnection.cc \
 	UnixNet.cc \

@@ -30,6 +30,8 @@ check_PROGRAMS = test_AIO
 
 libinkaio_a_SOURCES = \
 	AIO.cc \
+	DiskEventIO.cc \
+	DiskEventIO.h \
 	I_AIO.h \
 	Inline.cc \
 	P_AIO.h
