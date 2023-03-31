@@ -129,7 +129,8 @@ test_TCPConnection_SOURCES = \
 	EventIO.cc \
 	EventIO.h \
 	NetVCOptions.h \
-	NetVCOptions.cc
+	NetVCOptions.cc \
+	../eventsystem/SocketManager.cc
 
 test_TCPConnection_CPPFLAGS = \
 	$(AM_CPPFLAGS) \
@@ -144,8 +145,6 @@ test_TCPConnection_LDFLAGS = \
 	@SWOC_LDFLAGS@
 
 test_TCPConnection_LDADD = \
-	$(top_builddir)/iocore/eventsystem/libinkevent.a \
-	$(top_builddir)/src/records/librecords_p.a \
 	$(top_builddir)/lib/swoc/libtsswoc.la \
 	$(top_builddir)/src/tscore/libtscore.la
 

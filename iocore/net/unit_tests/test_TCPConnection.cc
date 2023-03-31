@@ -43,8 +43,7 @@ do_poll(PollDescriptor *pd, int poll_timeout)
   struct timespec tv;
   tv.tv_sec  = poll_timeout / 1000;
   tv.tv_nsec = 1000000 * (poll_timeout % 1000);
-  pollDescriptor->result =
-    kevent(pollDescriptor->kqueue_fd, nullptr, 0, pollDescriptor->kq_Triggered_Events, POLL_DESCRIPTOR_SIZE, &tv);
+  pd->result = kevent(pd->kqueue_fd, nullptr, 0, pd->kq_Triggered_Events, POLL_DESCRIPTOR_SIZE, &tv);
 #endif
 
   // Get & Process polling result
@@ -238,7 +237,7 @@ TEST_CASE("Listen and Connect", "[listen][connect]")
   AcceptOptions aopt;
   aopt.local_port = LISTEN_PORT;
   auto l          = std::make_unique<Listener>(done, topt, pd);
-  NetAIO::TCPListener listener{local, aopt, 0, pd, *l};
+  NetAIO::TCPListener listener{local, aopt, 0, 5, pd, *l};
 
   // Set up connector
   IpEndpoint localhost;

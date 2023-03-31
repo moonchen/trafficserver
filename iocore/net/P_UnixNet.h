@@ -29,26 +29,6 @@
 #include "tscore/ink_platform.h"
 #include "EventIO.h"
 
-#if TS_USE_KQUEUE
-#ifdef USE_EDGE_TRIGGER_KQUEUE
-#define USE_EDGE_TRIGGER    1
-#define INK_EV_EDGE_TRIGGER EV_CLEAR
-#else
-#define INK_EV_EDGE_TRIGGER 0
-#endif
-#define EVENTIO_READ  INK_EVP_IN
-#define EVENTIO_WRITE INK_EVP_OUT
-#define EVENTIO_ERROR (0x010 | 0x002 | 0x020) // ERR PRI HUP
-#endif
-#if TS_USE_PORT
-#ifdef USE_EDGE_TRIGGER_PORT
-#define USE_EDGE_TRIGGER 1
-#endif
-#define EVENTIO_READ  POLLIN
-#define EVENTIO_WRITE POLLOUT
-#define EVENTIO_ERROR (POLLERR | POLLPRI | POLLHUP)
-#endif
-
 struct PollDescriptor;
 
 #include "P_Net.h"
