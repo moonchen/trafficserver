@@ -185,7 +185,8 @@ public:
 class TCPListener
 {
 public:
-  TCPListener(const IpEndpoint &local, const AcceptOptions &opt, int accept_mss, PollDescriptor &pd, TCPListenerObserver &observer);
+  explicit TCPListener(const IpEndpoint &local, const AcceptOptions &opt, int accept_mss, int backlog, PollDescriptor &pd,
+                       TCPListenerObserver &observer);
   virtual ~TCPListener();
 
   TCPListener(const TCPListener &other)            = delete;
@@ -203,13 +204,14 @@ private:
   int _get_listen_backlog();
 
   int _fd{NO_FD};
+  bool _ready{true};
+  const int _accept_mss;
+  const int _backlog;
   const IpEndpoint _local;
   const AcceptOptions &_opt;
-  const int _accept_mss;
   PollDescriptor &_pd;
   TCPListenerObserver &_observer;
   TCPListenerEventIO _ep{*this};
-  bool _ready{true};
 };
 
 extern const NetVCOptions DEFAULT_OPTIONS;

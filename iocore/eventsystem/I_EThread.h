@@ -345,6 +345,7 @@ public:
   std::optional<AsyncSignalEventIO> ep;
 #endif
 #else
+  std::optional<AsyncSignalEventIO> ep;
   int evpipe[2];
 #endif
 

@@ -23,6 +23,7 @@
 
 #include "AcceptOptions.h"
 #include "NetAIO.h"
+#include "I_SocketManager.h"
 
 #include "tscore/ink_assert.h"
 #include "tscore/ink_inet.h"
@@ -30,9 +31,9 @@
 
 using namespace NetAIO;
 
-TCPListener::TCPListener(const IpEndpoint &local, const AcceptOptions &_opt, int accept_mss, PollDescriptor &pd,
+TCPListener::TCPListener(const IpEndpoint &local, const AcceptOptions &_opt, int accept_mss, int backlog, PollDescriptor &pd,
                          TCPListenerObserver &observer)
-  : _local(local), _opt(_opt), _accept_mss(accept_mss), _pd(pd), _observer(observer)
+  : _accept_mss(accept_mss), _backlog(backlog), _local(local), _opt(_opt), _pd(pd), _observer(observer)
 {
   if (_listen() == 0) {
     // Empty the accept queue now so that epoll will wake us up when new connections arrive.
@@ -48,18 +49,9 @@ TCPListener::~TCPListener()
 }
 
 int
-TCPListener::_get_listen_backlog()
-{
-  int listen_backlog;
-
-  REC_ReadConfigInteger(listen_backlog, "proxy.config.net.listen_backlog");
-  return (0 < listen_backlog && listen_backlog <= 65535) ? listen_backlog : ats_tcp_somaxconn();
-}
-int
 TCPListener::_setup_fd_for_listen()
 {
-  int res               = 0;
-  int listen_per_thread = 0;
+  int res = 0;
 
   ink_assert(_fd != NO_FD);
 
@@ -129,17 +121,15 @@ TCPListener::_setup_fd_for_listen()
   if (safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, SOCKOPT_ON, sizeof(int)) < 0) {
     goto Lerror;
   }
-  REC_ReadConfigInteger(listen_per_thread, "proxy.config.exec_thread.listen");
-  if (listen_per_thread == 1) {
-    if (safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEPORT, SOCKOPT_ON, sizeof(int)) < 0) {
-      goto Lerror;
-    }
-#ifdef SO_REUSEPORT_LB
-    if (safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEPORT_LB, SOCKOPT_ON, sizeof(int)) < 0) {
-      goto Lerror;
-    }
-#endif
+
+  if (safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEPORT, SOCKOPT_ON, sizeof(int)) < 0) {
+    goto Lerror;
   }
+#ifdef SO_REUSEPORT_LB
+  if (safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEPORT_LB, SOCKOPT_ON, sizeof(int)) < 0) {
+    goto Lerror;
+  }
+#endif
 
   if ((_opt.sockopt_flags & NetVCOptions::SOCK_OPT_NO_DELAY) &&
       safe_setsockopt(_fd, IPPROTO_TCP, TCP_NODELAY, SOCKOPT_ON, sizeof(int)) < 0) {
@@ -277,7 +267,7 @@ TCPListener::_listen()
     goto Lerror;
   }
 
-  if ((res = safe_listen(_fd, _get_listen_backlog())) < 0) {
+  if ((res = safe_listen(_fd, _backlog)) < 0) {
     goto Lerror;
   }
 
