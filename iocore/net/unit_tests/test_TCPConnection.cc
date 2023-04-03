@@ -21,6 +21,7 @@
   limitations under the License.
  */
 
+#include "I_SocketManager.h"
 #include "NetVCOptions.h"
 #include "P_UnixPollDescriptor.h"
 #include "EventIO.h"
@@ -151,7 +152,7 @@ private:
 class Connector : public NetAIO::TCPConnectionObserver
 {
 public:
-  explicit Connector(bool &done, const IpEndpoint &remote) : _done(done), _remote(remote) {}
+  explicit Connector(bool fastopen, bool &done, const IpEndpoint &remote) : _fastopen(fastopen), _done(done), _remote(remote) {}
   virtual ~Connector() {}
 
   void
@@ -159,15 +160,9 @@ public:
   {
     SUCCEED("Connector: connected");
 
-    memcpy(_buf, MESSAGE);
-    auto out_msg         = std::make_unique<msghdr>();
-    _iov[0].iov_base     = _buf;
-    _iov[0].iov_len      = MESSAGE.size();
-    out_msg->msg_name    = &_remote.sa;
-    out_msg->msg_namelen = ats_ip_size(_remote);
-    out_msg->msg_iov     = &_iov[0];
-    out_msg->msg_iovlen  = 1;
-    c.sendmsg(std::move(out_msg), 0);
+    if (!_fastopen) {
+      send(c);
+    }
   }
 
   void
@@ -200,8 +195,28 @@ public:
     FAIL("Connector::onError source = " << source << ", err = " << err);
   }
 
+  void
+  send(NetAIO::TCPConnection &c)
+  {
+    memcpy(_buf, MESSAGE);
+    auto out_msg         = std::make_unique<msghdr>();
+    _iov[0].iov_base     = _buf;
+    _iov[0].iov_len      = MESSAGE.size();
+    out_msg->msg_name    = &_remote.sa;
+    out_msg->msg_namelen = ats_ip_size(_remote);
+    out_msg->msg_iov     = &_iov[0];
+    out_msg->msg_iovlen  = 1;
+    int flags            = 0;
+    if (_fastopen) {
+      REQUIRE(MSG_FASTOPEN > 0);
+      flags |= MSG_FASTOPEN;
+    }
+    c.sendmsg(std::move(out_msg), flags);
+  }
+
 private:
   static constexpr std::string_view MESSAGE = "Hello World";
+  const bool _fastopen;
   bool &_done;
   IpEndpoint _remote;
   struct iovec _iov[1];
@@ -242,8 +257,42 @@ TEST_CASE("Listen and Connect", "[listen][connect]")
   // Set up connector
   IpEndpoint localhost;
   ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), LISTEN_PORT);
-  auto connector = std::make_unique<Connector>(done, localhost);
+  auto connector = std::make_unique<Connector>(false, done, localhost);
   NetAIO::TCPConnection conn{localhost, topt, pd, *connector};
+
+  while (!done) {
+    do_poll(&pd, 1);
+  }
+
+  REQUIRE(1 == 1);
+}
+
+TEST_CASE("TCP Fast Open", "[listen][connect][fastopen]")
+{
+  if (!SocketManager::fastopen_supported()) {
+    SUCCEED();
+  }
+  bool done                      = false;
+  constexpr uint16_t LISTEN_PORT = 51524;
+  PollDescriptor pd;
+
+  NetVCOptions topt;
+  topt.f_tcp_fastopen = true;
+
+  // Set up listener
+  IpEndpoint local;
+  ats_ip4_set(&local, htonl(INADDR_ANY), LISTEN_PORT);
+  AcceptOptions aopt;
+  aopt.local_port = LISTEN_PORT;
+  auto l          = std::make_unique<Listener>(done, topt, pd);
+  NetAIO::TCPListener listener{local, aopt, 0, 5, pd, *l};
+
+  // Set up connector
+  IpEndpoint localhost;
+  ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), LISTEN_PORT);
+  auto connector = std::make_unique<Connector>(true, done, localhost);
+  NetAIO::TCPConnection conn{localhost, topt, pd, *connector};
+  connector->send(conn);
 
   while (!done) {
     do_poll(&pd, 1);
