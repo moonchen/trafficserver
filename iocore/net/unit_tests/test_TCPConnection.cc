@@ -35,6 +35,8 @@
 
 #include <optional>
 
+static constexpr std::string_view MESSAGE = "Hello World";
+
 static void
 do_poll(PollDescriptor *pd, int poll_timeout)
 {
@@ -100,7 +102,7 @@ public:
   void
   onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConnection &c) override
   {
-    FAIL("Connector::onError: source = " << source << ", err = " << err);
+    FAIL("Echoer::onError: source = " << source << ", err = " << err << " (" << strerror(err) << ")");
   }
 
 private:
@@ -140,7 +142,7 @@ public:
   void
   onError(NetAIO::ErrorSource source, int err) override
   {
-    FAIL("Listener::onError");
+    FAIL("Listener::onError: source = " << source << ", err = " << err << " (" << strerror(err) << ")");
   }
 
 private:
@@ -186,13 +188,19 @@ public:
   onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c) override
   {
     INFO("Connector::onSendmsg: sent " << bytes << " bytes");
-    _receive(c);
+    REQUIRE(bytes > 0);
+    _bytes_sent += bytes;
+    if (_bytes_sent < MESSAGE.size()) {
+      send(c);
+    } else {
+      _receive(c);
+    }
   }
 
   void
   onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConnection &c) override
   {
-    FAIL("Connector::onError source = " << source << ", err = " << err);
+    FAIL("Connector::onError: source = " << source << ", err = " << err << " (" << strerror(err) << ")");
   }
 
   void
@@ -215,13 +223,13 @@ public:
   }
 
 private:
-  static constexpr std::string_view MESSAGE = "Hello World";
   const bool _fastopen;
   bool &_done;
   IpEndpoint _remote;
   struct iovec _iov[1];
   char _buf[1024];
   std::string _full_echo;
+  size_t _bytes_sent = 0;
 
   void
   _receive(NetAIO::TCPConnection &c)
@@ -241,14 +249,14 @@ private:
 TEST_CASE("Listen and Connect", "[listen][connect]")
 {
   bool done                      = false;
-  constexpr uint16_t LISTEN_PORT = 51524;
+  constexpr uint16_t LISTEN_PORT = 51525;
   PollDescriptor pd;
 
   NetVCOptions topt;
 
   // Set up listener
   IpEndpoint local;
-  ats_ip4_set(&local, htonl(INADDR_ANY), LISTEN_PORT);
+  ats_ip4_set(&local, htonl(INADDR_LOOPBACK), htons(LISTEN_PORT));
   AcceptOptions aopt;
   aopt.local_port = LISTEN_PORT;
   auto l          = std::make_unique<Listener>(done, topt, pd);
@@ -256,15 +264,13 @@ TEST_CASE("Listen and Connect", "[listen][connect]")
 
   // Set up connector
   IpEndpoint localhost;
-  ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), LISTEN_PORT);
+  ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), htons(LISTEN_PORT));
   auto connector = std::make_unique<Connector>(false, done, localhost);
   NetAIO::TCPConnection conn{localhost, topt, pd, *connector};
 
   while (!done) {
     do_poll(&pd, 1);
   }
-
-  REQUIRE(1 == 1);
 }
 
 TEST_CASE("TCP Fast Open", "[listen][connect][fastopen]")
@@ -272,31 +278,32 @@ TEST_CASE("TCP Fast Open", "[listen][connect][fastopen]")
   if (!SocketManager::fastopen_supported()) {
     SUCCEED();
   }
-  bool done                      = false;
-  constexpr uint16_t LISTEN_PORT = 51524;
-  PollDescriptor pd;
 
-  NetVCOptions topt;
-  topt.f_tcp_fastopen = true;
+  for (int i = 0; i < 2; i++) {
+    bool done                      = false;
+    constexpr uint16_t LISTEN_PORT = 51524;
+    PollDescriptor pd;
 
-  // Set up listener
-  IpEndpoint local;
-  ats_ip4_set(&local, htonl(INADDR_ANY), LISTEN_PORT);
-  AcceptOptions aopt;
-  aopt.local_port = LISTEN_PORT;
-  auto l          = std::make_unique<Listener>(done, topt, pd);
-  NetAIO::TCPListener listener{local, aopt, 0, 5, pd, *l};
+    NetVCOptions topt;
+    topt.f_tcp_fastopen = true;
 
-  // Set up connector
-  IpEndpoint localhost;
-  ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), LISTEN_PORT);
-  auto connector = std::make_unique<Connector>(true, done, localhost);
-  NetAIO::TCPConnection conn{localhost, topt, pd, *connector};
-  connector->send(conn);
+    // Set up listener
+    IpEndpoint local;
+    ats_ip4_set(&local, htonl(INADDR_LOOPBACK), htons(LISTEN_PORT));
+    AcceptOptions aopt;
+    aopt.sockopt_flags |= NetVCOptions::SOCK_OPT_TCP_FAST_OPEN;
+    auto l             = std::make_unique<Listener>(done, topt, pd);
+    NetAIO::TCPListener listener{local, aopt, 0, 5, pd, *l};
 
-  while (!done) {
-    do_poll(&pd, 1);
+    // Set up connector
+    IpEndpoint localhost;
+    ats_ip4_set(&localhost, htonl(INADDR_LOOPBACK), htons(LISTEN_PORT));
+    auto connector = std::make_unique<Connector>(true, done, localhost);
+    NetAIO::TCPConnection conn{localhost, topt, pd, *connector};
+    connector->send(conn);
+
+    while (!done) {
+      do_poll(&pd, 1);
+    }
   }
-
-  REQUIRE(1 == 1);
 }
