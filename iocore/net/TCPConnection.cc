@@ -163,13 +163,18 @@ NetAIO::TCPConnection::_connect()
     return;
   }
 
+  // Wait for the connect to complete.
+  _ep.start(&_pd, _fd, EVENTIO_WRITE);
+
   if (_opt.f_tcp_fastopen) {
     // TCP Fast Open is (effectively) a non-blocking connect, so set the
     // return value we would see in that case.
-    errno = EINPROGRESS;
-    res   = -1;
+    errno        = EINPROGRESS;
+    res          = -1;
+    _write_ready = true;
   } else {
-    res = ::connect(_fd, &_remote.sa, ats_ip_size(&this->_remote.sa));
+    _write_ready = false;
+    res          = ::connect(_fd, &_remote.sa, ats_ip_size(&this->_remote.sa));
   }
 
   // It's only really an error if either the connect was blocking
@@ -184,8 +189,6 @@ NetAIO::TCPConnection::_connect()
 
   cleanup.reset();
   _state = TCP_CONNECTING;
-  // Wait for the connect to complete.
-  _ep.start(&_pd, _fd, EVENTIO_WRITE);
 }
 
 void
@@ -264,12 +267,11 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
 
   ink_release_assert(!_recvmsg_msg);
 
-  if (_state != TCP_CONNECTED) {
-    _observer.onError(ES_RECVMSG, ENOTCONN, *this);
-    return false;
-  }
-
   if (_read_ready) {
+    size_t total_len = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+      total_len += msg->msg_iov[i].iov_len;
+    }
     int res = ::recvmsg(_fd, msg.get(), flags);
     if (res == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -278,8 +280,13 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
         _observer.onError(ES_RECVMSG, errno, *this);
       }
     } else {
+      ink_assert(res >= 0);
       _observer.onRecvmsg(res, std::move(msg), *this);
+      if (static_cast<size_t>(res) < total_len) {
+        _read_ready = false;
+      }
     }
+
     // TODO: if less than the full amount is read, consider the fd not ready for read.
   }
 
@@ -308,17 +315,27 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
     ink_release_assert(!_sendmsg_msg);
 
     if (_write_ready) {
+      size_t total_len = 0;
+      for (size_t i = 0; i < msg->msg_iovlen; i++) {
+        auto len  = msg->msg_iov[i].iov_len;
+        total_len += len;
+      }
       int res = ::sendmsg(_fd, msg.get(), flags);
       if (res == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == EINPROGRESS && _opt.f_tcp_fastopen)) {
           _write_ready = false;
         } else {
           _observer.onError(ES_SENDMSG, errno, *this);
         }
       } else {
         _observer.onSendmsg(res, std::move(_sendmsg_msg), *this);
+
+        // if less than the full amount is written, consider the fd not ready for write.
+        ink_assert(res >= 0);
+        if (static_cast<size_t>(res) < total_len) {
+          _write_ready = false;
+        }
       }
-      // TODO: if less than the full amount is written, consider the fd not ready for write.
     }
 
     if (!_write_ready) {
@@ -381,6 +398,11 @@ NetAIO::TCPConnection::poll(int flags)
 
   if (flags & EVENTIO_WRITE) {
     _write_ready = true;
+  }
+
+  if (flags & EVENTIO_ERROR) {
+    _observer.onError(ES_POLL, errno, *this);
+    return;
   }
 
   if (_state == TCP_CONNECTING) {

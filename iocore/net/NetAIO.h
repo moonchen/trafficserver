@@ -47,7 +47,8 @@ enum ErrorSource {
   ES_CLOSE,
   ES_SETSOCKOPT,
   ES_FCNTL,
-  ES_LISTEN
+  ES_LISTEN,
+  ES_POLL
 };
 
 class TCPConnection;
