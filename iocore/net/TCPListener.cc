@@ -30,6 +30,7 @@
 #include "tscore/ink_sock.h"
 
 using namespace NetAIO;
+constexpr auto TAG = "TCPListener";
 
 TCPListener::TCPListener(const IpEndpoint &local, const AcceptOptions &_opt, int accept_mss, int backlog, PollDescriptor &pd,
                          TCPListenerObserver &observer)
@@ -144,7 +145,8 @@ TCPListener::_setup_fd_for_listen()
 
 #ifdef TCP_FASTOPEN
   if ((_opt.sockopt_flags & NetVCOptions::SOCK_OPT_TCP_FAST_OPEN) &&
-      safe_setsockopt(_fd, IPPROTO_TCP, TCP_FASTOPEN, &_opt.tfo_queue_length, sizeof _opt.tfo_queue_length)) {
+      safe_setsockopt(_fd, IPPROTO_TCP, TCP_FASTOPEN, SOCKOPT_ON, sizeof(int)) < 0) {
+    // safe_setsockopt(_fd, IPPROTO_TCP, TCP_FASTOPEN, &_opt.tfo_queue_length, sizeof(int)) < 0) {
     goto Lerror;
   }
 #endif
@@ -283,7 +285,7 @@ Lerror:
     _close();
   }
 
-  Error("Could not bind or listen to port %d (error: %d)", ats_ip_port_host_order(&_local), res);
+  Debug(TAG, "Could not bind or listen to port %d (error: %d)", ats_ip_port_host_order(&_local), res);
   return res;
 }
 

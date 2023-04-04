@@ -277,6 +277,7 @@ TEST_CASE("TCP Fast Open", "[listen][connect][fastopen]")
 {
   if (!SocketManager::fastopen_supported()) {
     SUCCEED();
+    return;
   }
 
   for (int i = 0; i < 2; i++) {
@@ -291,8 +292,9 @@ TEST_CASE("TCP Fast Open", "[listen][connect][fastopen]")
     IpEndpoint local;
     ats_ip4_set(&local, htonl(INADDR_LOOPBACK), htons(LISTEN_PORT));
     AcceptOptions aopt;
-    aopt.sockopt_flags |= NetVCOptions::SOCK_OPT_TCP_FAST_OPEN;
-    auto l             = std::make_unique<Listener>(done, topt, pd);
+    aopt.sockopt_flags    |= NetVCOptions::SOCK_OPT_TCP_FAST_OPEN;
+    aopt.tfo_queue_length = 5;
+    auto l                = std::make_unique<Listener>(done, topt, pd);
     NetAIO::TCPListener listener{local, aopt, 0, 5, pd, *l};
 
     // Set up connector

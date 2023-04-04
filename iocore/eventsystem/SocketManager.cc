@@ -350,7 +350,7 @@ SocketManager::fastopen_supported()
   ats_scoped_fd fd(::open("/proc/sys/net/ipv4/tcp_fastopen", O_RDONLY));
   int value = 0;
 
-  if (fd) {
+  if (fd.isValid()) {
     TextBuffer buffer(16);
 
     buffer.slurp(fd.get());

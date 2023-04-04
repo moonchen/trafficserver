@@ -269,7 +269,7 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
 
   if (_read_ready) {
     size_t total_len = 0;
-    for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+    for (auto i = msg->msg_iovlen - msg->msg_iovlen; i < msg->msg_iovlen; i++) {
       total_len += msg->msg_iov[i].iov_len;
     }
     int res = ::recvmsg(_fd, msg.get(), flags);
@@ -316,7 +316,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
 
     if (_write_ready) {
       size_t total_len = 0;
-      for (size_t i = 0; i < msg->msg_iovlen; i++) {
+      for (auto i = msg->msg_iovlen - msg->msg_iovlen; i < msg->msg_iovlen; i++) {
         auto len  = msg->msg_iov[i].iov_len;
         total_len += len;
       }
