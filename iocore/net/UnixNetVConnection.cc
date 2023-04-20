@@ -24,6 +24,8 @@
 #include "P_Net.h"
 #include "tscore/ink_platform.h"
 #include "tscore/InkErrno.h"
+#include "P_UnixNet.h"
+#include "P_UnixNetVConnection.h"
 
 #include <termios.h>
 

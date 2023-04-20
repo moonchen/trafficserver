@@ -82,7 +82,7 @@ NetAIO::TCPConnection::_open()
 
   _fd = res;
   // mark _fd for close until we succeed.
-  ScopeGuard cleanup{[this]() { _close(); }};
+  ScopeGuard cleanup{[this]() { close(); }};
 
   // Try setting the various socket options, if requested.
 
@@ -156,7 +156,7 @@ NetAIO::TCPConnection::_connect()
   // apply dynamic options with this.addr initialized
   _apply_options();
 
-  ScopeGuard cleanup{[this]() { _close(); }}; // mark for close until we succeed.
+  ScopeGuard cleanup{[this]() { close(); }}; // mark for close until we succeed.
 
   if (!_register_poll()) {
     _observer.onError(ES_REGISTER, errno, *this);
@@ -177,11 +177,6 @@ NetAIO::TCPConnection::_connect()
     res          = ::connect(_fd, &_remote.sa, ats_ip_size(&this->_remote.sa));
   }
 
-  // It's only really an error if either the connect was blocking
-  // or it wasn't blocking and the error was other than EINPROGRESS.
-  // (Is EWOULDBLOCK ok? Does that start the connect?)
-  // We also want to handle the cases where the connect blocking
-  // and IO blocking differ, by turning it on or off as needed.
   if (-1 == res && !(EINPROGRESS == errno || EWOULDBLOCK == errno)) {
     _observer.onError(ES_CONNECT, errno, *this);
     return;
@@ -239,7 +234,7 @@ NetAIO::TCPConnection::_apply_options()
 }
 
 void
-NetAIO::TCPConnection::_close()
+NetAIO::TCPConnection::close()
 {
   // don't close any of the standards
   if (_fd >= 2 && _fd != NO_FD) {
@@ -350,6 +345,23 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
   }
 
   return true;
+}
+
+bool
+NetAIO::TCPConnection::shutdown(int how)
+{
+  int res = SocketManager::shutdown(_fd, how);
+  if (res == 0) {
+    if (how == SHUT_RD) {
+      _state = TCP_SHUTDOWN_RD;
+    } else if (how == SHUT_WR) {
+      _state = TCP_SHUTDOWN_WR;
+    } else if (how == SHUT_RDWR) {
+      _state = TCP_SHUTDOWN_RDWR;
+    }
+  } else {
+    _observer.onError(ES_SHUTDOWN, errno, *this);
+  }
 }
 
 void

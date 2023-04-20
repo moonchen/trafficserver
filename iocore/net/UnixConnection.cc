@@ -27,6 +27,7 @@
 **************************************************************************/
 #include "P_Net.h"
 #include "tscore/ink_defs.h"
+#include "P_Connection.h"
 
 #define SET_NO_LINGER
 // set in the OS

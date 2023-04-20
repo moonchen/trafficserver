@@ -38,8 +38,8 @@ struct UnixNetProcessor : public NetProcessor {
 public:
   virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
 
-  Action *connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *options = nullptr);
   Action *connect(Continuation *cont, UnixNetVConnection **vc, sockaddr const *target, NetVCOptions *opt = nullptr);
+  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
 
   virtual NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt);
   NetVConnection *allocate_vc(EThread *t) override;
@@ -57,12 +57,6 @@ public:
   int n_netthreads;
   EThread **netthreads;
 };
-
-TS_INLINE Action *
-NetProcessor::connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts)
-{
-  return static_cast<UnixNetProcessor *>(this)->connect_re_internal(cont, addr, opts);
-}
 
 extern UnixNetProcessor unix_netProcessor;
 

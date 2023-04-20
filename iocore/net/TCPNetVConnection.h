@@ -1,5 +1,4 @@
 /** @file
-
   A brief file description
 
   @section license License
@@ -31,19 +30,16 @@
 
 #pragma once
 
+#include "I_Lock.h"
+#include "tscore/ink_hrtime.h"
 #include "tscore/ink_sock.h"
 #include "I_NetVConnection.h"
-#include "P_UnixNetState.h"
 #include "NetEvent.h"
 #include "NetAIO.h"
 
-class TCPNetVConnection;
-class NetHandler;
-struct PollDescriptor;
-
 enum tcp_congestion_control_t { CLIENT_SIDE, SERVER_SIDE };
 
-class TCPNetVConnection : public NetVConnection, public NetEvent
+class TCPNetVConnection : public NetVConnection, public NetAIO::TCPConnectionObserver
 {
 public:
   VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
@@ -114,89 +110,18 @@ public:
 
   void get_local_sa();
 
-  // these are not part of the pure virtual interface.  They were
-  // added to reduce the amount of duplicate code in classes inherited
-  // from NetVConnection (SSL).
-  virtual int
-  sslStartHandShake(int event, int &err)
-  {
-    (void)event;
-    (void)err;
-    return EVENT_ERROR;
-  }
-
-  virtual bool
-  getSSLHandShakeComplete() const
-  {
-    return (true);
-  }
-
-  virtual bool
-  trackFirstHandshake()
-  {
-    return false;
-  }
-
-  // NetEvent
-  void net_read_io(NetHandler *nh, EThread *lthread) override;
-  void net_write_io(NetHandler *nh, EThread *lthread) override;
-  void free(EThread *t) override;
-  int
-  close() override
-  {
-    return this->con._close();
-  }
-  int
-  get_fd() override
-  {
-    return this->con.fd;
-  }
-
-  EThread *
-  get_thread() override
-  {
-    return this->thread;
-  }
-
-  int
-  callback(int event = CONTINUATION_EVENT_NONE, void *data = nullptr) override
-  {
-    return this->handleEvent(event, data);
-  }
-
-  Ptr<ProxyMutex> &
-  get_mutex() override
-  {
-    return this->mutex;
-  }
-
-  ContFlags &
-  get_control_flags() override
-  {
-    return this->control_flags;
-  }
+  // TCPConnectionObserver
+  void onConnect(NetAIO::TCPConnection &c) override;
+  void onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c) override;
+  void onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c) override;
+  void onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConnection &c) override;
 
   virtual int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
-  void readDisable(NetHandler *nh);
-  void readSignalError(NetHandler *nh, int err);
-  int readSignalDone(int event, NetHandler *nh);
-  int readSignalAndUpdate(int event);
-  void readReschedule(NetHandler *nh);
-  void writeReschedule(NetHandler *nh);
-  void netActivity(EThread *lthread);
-  /**
-   * If the current object's thread does not match the t argument, create a new
-   * NetVC in the thread t context based on the socket and ssl information in the
-   * current NetVC and mark the current NetVC to be closed.
-   */
-  TCPNetVConnection *migrateToCurrentThread(Continuation *c, EThread *t);
 
   Action action_;
 
   unsigned int id = 0;
 
-  NetAIO::TCPConnection con;
-  int recursion           = 0;
   bool from_accept_thread = false;
 
   int startEvent(int event, Event *e);
@@ -213,119 +138,45 @@ public:
   ink_hrtime get_inactivity_timeout() override;
   ink_hrtime get_active_timeout() override;
 
-  virtual void set_local_addr() override;
+  void set_local_addr() override;
   void set_mptcp_state() override;
-  virtual void set_remote_addr() override;
+  void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
   int set_tcp_congestion_control(int side) override;
   void apply_options() override;
 
-  friend void write_to_net_io(NetHandler *, TCPNetVConnection *, EThread *);
+private:
+  int _read_from_net(int event = 0, Event *e = nullptr);
+  int _handle_read_done(int event = 0, Event *e = nullptr);
+  VIO _read_vio{VIO::READ};
+  void _read_reschedule();
+  int _read_signal_and_update(int event);
+  int _read_signal_done(int event);
+  int _read_signal_error(int lerrno);
+  struct read_state {
+    int r;
+    MutexTryLock lock;
+    bool finished = false;
+  } _read_state;
+
+  int _write_to_net(int event = 0, Event *e = nullptr);
+  int _handle_write_done(int event = 0, Event *e = nullptr);
+  VIO _write_vio{VIO::WRITE};
+  void _write_reschedule();
+  int _write_signal_and_update(int event);
+  int _write_signal_done(int event);
+  int _write_signal_error(int lerrno);
+  struct write_state {
+    int r;
+    MutexTryLock lock;
+    bool finished = false;
+    int signalled;
+  } _write_state;
+
+  int _recursion = 0;
+  NetAIO::TCPConnection _con;
 };
 
-extern ClassAllocator<TCPNetVConnection> netVCAllocator;
+extern ClassAllocator<TCPNetVConnection> tcpNetVCAllocator;
 
-typedef int (TCPNetVConnection::*NetVConnHandler)(int, void *);
-
-inline void
-TCPNetVConnection::set_remote_addr()
-{
-  ats_ip_copy(&remote_addr, &con.addr);
-  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
-  set_cont_flags(get_control_flags());
-}
-
-inline void
-TCPNetVConnection::set_remote_addr(const sockaddr *new_sa)
-{
-  ats_ip_copy(&remote_addr, new_sa);
-  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
-  set_cont_flags(get_control_flags());
-}
-
-inline void
-TCPNetVConnection::set_local_addr()
-{
-  int local_sa_size = sizeof(local_addr);
-  // This call will fail if fd is closed already. That is ok, because the
-  // `local_addr` is checked within get_local_addr() and the `got_local_addr`
-  // is set only with a valid `local_addr`.
-  ATS_UNUSED_RETURN(safe_getsockname(con.fd, &local_addr.sa, &local_sa_size));
-}
-
-// Update the internal VC state variable for MPTCP
-inline void
-TCPNetVConnection::set_mptcp_state()
-{
-  int mptcp_enabled      = -1;
-  int mptcp_enabled_size = sizeof(mptcp_enabled);
-
-  if (0 == safe_getsockopt(con.fd, IPPROTO_TCP, MPTCP_ENABLED, (char *)&mptcp_enabled, &mptcp_enabled_size)) {
-    Debug("socket_mptcp", "MPTCP socket state: %d", mptcp_enabled);
-    mptcp_state = mptcp_enabled > 0 ? true : false;
-  } else {
-    Debug("socket_mptcp", "MPTCP failed getsockopt(): %s", strerror(errno));
-  }
-}
-
-inline ink_hrtime
-TCPNetVConnection::get_active_timeout()
-{
-  return active_timeout_in;
-}
-
-inline ink_hrtime
-TCPNetVConnection::get_inactivity_timeout()
-{
-  return inactivity_timeout_in;
-}
-
-inline void
-TCPNetVConnection::set_active_timeout(ink_hrtime timeout_in)
-{
-  Debug("socket", "Set active timeout=%" PRId64 ", NetVC=%p", timeout_in, this);
-  active_timeout_in        = timeout_in;
-  next_activity_timeout_at = (active_timeout_in > 0) ? Thread::get_hrtime() + timeout_in : 0;
-}
-
-inline void
-TCPNetVConnection::cancel_inactivity_timeout()
-{
-  Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
-  inactivity_timeout_in      = 0;
-  next_inactivity_timeout_at = 0;
-}
-
-inline void
-TCPNetVConnection::cancel_active_timeout()
-{
-  Debug("socket", "Cancel active timeout for NetVC=%p", this);
-  active_timeout_in        = 0;
-  next_activity_timeout_at = 0;
-}
-
-inline TCPNetVConnection::~TCPNetVConnection() {}
-
-inline SOCKET
-TCPNetVConnection::get_socket()
-{
-  return con.fd;
-}
-
-inline void
-TCPNetVConnection::set_action(Continuation *c)
-{
-  action_ = c;
-}
-
-inline const Action *
-TCPNetVConnection::get_action() const
-{
-  return &action_;
-}
-
-// declarations for local use (within the net module)
-
-void write_to_net(NetHandler *nh, TCPNetVConnection *vc, EThread *thread);
-void write_to_net_io(NetHandler *nh, TCPNetVConnection *vc, EThread *thread);
-void net_activity(TCPNetVConnection *vc, EThread *thread);
+using NetVConnHandler = int (TCPNetVConnection::*)(int, void *);

@@ -95,14 +95,8 @@ extern RecRawStatBlock *net_rsb;
 #include "P_EventSystem.h"
 #include "I_Net.h"
 #include "P_NetVConnection.h"
-#include "P_UnixNet.h"
-#include "P_UnixNetProcessor.h"
-#include "P_NetAccept.h"
-#include "P_UnixNetVConnection.h"
-#include "P_UnixPollDescriptor.h"
 #include "P_Socks.h"
 #include "P_CompletionUtil.h"
-#include "P_NetVCTest.h"
 
 static constexpr ts::ModuleVersion NET_SYSTEM_MODULE_INTERNAL_VERSION(NET_SYSTEM_MODULE_PUBLIC_VERSION, ts::ModuleVersion::PRIVATE);
 

@@ -155,7 +155,7 @@ NetProcessor::stop_accept()
 }
 
 Action *
-UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
+UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
 {
   if (TSSystemState::is_event_system_shut_down()) {
     return nullptr;

@@ -48,7 +48,8 @@ enum ErrorSource {
   ES_SETSOCKOPT,
   ES_FCNTL,
   ES_LISTEN,
-  ES_POLL
+  ES_POLL,
+  ES_SHUTDOWN
 };
 
 class TCPConnection;
@@ -80,7 +81,9 @@ public:
     TCP_CONNECTING,
     TCP_CONNECTED,
     TCP_HALF_SHUTDOWN,
-    TCP_SHUTDOWN
+    TCP_SHUTDOWN_RD,
+    TCP_SHUTDOWN_WR,
+    TCP_SHUTDOWN_RDWR
     // There is no TCP_CLOSING state because we support destruction
   };
 
@@ -93,7 +96,10 @@ public:
   TCPConnection operator=(const TCPConnection &other) = delete;
 
   // Destructor.  If the connection is open, it will be closed.
-  virtual ~TCPConnection() { _close(); }
+  virtual ~TCPConnection() { close(); }
+
+  // Asynchronously close.
+  void close();
 
   // Attempt to read nbytes from the connection.  The format of msg is the same as for recvmsg.  onRecvmsg will be called when the
   // read makes progress.
@@ -115,8 +121,33 @@ public:
   // Returns true if the write can proceed.  False if the write cannot proceed because the connection is not open, or another
   // write is outstanding.
   bool sendmsg(std::unique_ptr<struct msghdr> msg, int flags);
+  bool shutdown(int how);
 
   void poll(int flags);
+
+  bool
+  is_connecting() const
+  {
+    return _state == TCP_CONNECTING;
+  }
+
+  bool
+  is_shutdown_read() const
+  {
+    return _state == TCP_SHUTDOWN_RD || _state == TCP_SHUTDOWN_RDWR;
+  }
+
+  bool
+  is_shutdown_write() const
+  {
+    return _state == TCP_SHUTDOWN_WR || _state == TCP_SHUTDOWN_RDWR;
+  }
+
+  bool
+  is_closed() const
+  {
+    return _state == TCP_CLOSED;
+  }
 
 private:
   int _fd;
@@ -143,7 +174,6 @@ private:
 
   bool _open();
   void _connect();
-  void _close();
   void _apply_options();
   void _poll_connected(int flags);
   bool _register_poll();
