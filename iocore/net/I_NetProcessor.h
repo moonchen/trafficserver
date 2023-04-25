@@ -192,3 +192,4 @@ extern NetProcessor &netProcessor;
 */
 extern NetProcessor &sslNetProcessor;
 extern NetProcessor &quicNetProcessor;
+extern NetProcessor &tcpNetProcessor;

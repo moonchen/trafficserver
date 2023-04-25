@@ -35,8 +35,10 @@
 #endif
 
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include "P_UDPNet.h"
 #include "I_AIO.h"
+#include "tscore/ink_sock.h"
 
 #include "netinet/udp.h"
 #ifndef UDP_SEGMENT

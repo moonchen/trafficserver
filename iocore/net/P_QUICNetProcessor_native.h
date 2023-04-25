@@ -39,6 +39,7 @@
 
 #include "tscore/ink_platform.h"
 #include "P_Net.h"
+#include "P_UnixNetProcessor.h"
 #include "quic/QUICConnectionTable.h"
 
 class UnixNetVConnection;

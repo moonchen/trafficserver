@@ -232,6 +232,8 @@ libinknet_a_SOURCES = \
 	SSLUtils.cc \
 	OCSPStapling.cc \
 	TCPConnection.cc \
+	TCPNetVConnection.h \
+	TCPNetVConnection.cc \
 	TCPListener.cc \
 	TLSBasicSupport.cc \
 	TLSEarlyDataSupport.cc \

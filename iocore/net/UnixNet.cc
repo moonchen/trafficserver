@@ -24,6 +24,7 @@
 
 #include "EventIO.h"
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include "I_AIO.h"
 #include "ReadWriteEventIO.h"
 #include "tscore/ink_hrtime.h"

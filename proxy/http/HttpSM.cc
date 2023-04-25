@@ -33,6 +33,7 @@
 #include "HttpSessionManager.h"
 #include "P_Cache.h"
 #include "P_Net.h"
+#include "P_UnixNetVConnection.h"
 #include "PreWarmConfig.h"
 #include "PreWarmManager.h"
 #include "StatPages.h"

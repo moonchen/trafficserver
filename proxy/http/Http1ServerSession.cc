@@ -28,6 +28,7 @@
    Description:
 
  ****************************************************************************/
+#include "P_UnixNetVConnection.h"
 #include "tscore/ink_config.h"
 #include "tscore/BufferWriter.h"
 #include "tscore/bwf_std_format.h"

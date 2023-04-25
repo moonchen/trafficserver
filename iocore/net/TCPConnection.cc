@@ -22,6 +22,7 @@
  */
 #include "EventIO.h"
 #include "NetAIO.h"
+#include "NetVCOptions.h"
 #include "ScopeGuard.h"
 #include "I_SocketManager.h"
 
@@ -29,12 +30,13 @@
 #include "tscore/ink_sock.h"
 #include "tscore/ink_assert.h"
 
+#include <optional>
 #include <sys/socket.h>
 
 const NetVCOptions NetAIO::DEFAULT_OPTIONS{};
 static constexpr auto TAG{"TCPConnection"};
 
-NetAIO::TCPConnection::TCPConnection(const IpEndpoint &target, const NetVCOptions &opt, PollDescriptor &pd,
+NetAIO::TCPConnection::TCPConnection(const IpEndpoint &target, const NetVCOptions *opt, PollDescriptor &pd,
                                      TCPConnectionObserver &observer, int fd)
   : _fd{fd}, _remote{target}, _opt{opt}, _pd(pd), _observer{observer}, _thread_id{std::this_thread::get_id()}
 {
@@ -59,19 +61,19 @@ NetAIO::TCPConnection::_open()
   int family;
 
   bool is_any_address = false;
-  if (NetVCOptions::FOREIGN_ADDR == _opt.addr_binding || NetVCOptions::INTF_ADDR == _opt.addr_binding) {
+  if (NetVCOptions::FOREIGN_ADDR == _opt->addr_binding || NetVCOptions::INTF_ADDR == _opt->addr_binding) {
     // Same for now, transparency for foreign addresses must be handled
     // *after* the socket is created, and we need to do this calculation
     // before the socket to get the IP family correct.
-    ink_release_assert(_opt.local_ip.isValid());
-    local_addr.assign(_opt.local_ip, htons(_opt.local_port));
-    family = _opt.local_ip.family();
+    ink_release_assert(_opt->local_ip.isValid());
+    local_addr.assign(_opt->local_ip, htons(_opt->local_port));
+    family = _opt->local_ip.family();
   } else {
     // No local address specified, so use family option if possible.
-    family = ats_is_ip(_opt.ip_family) ? _opt.ip_family : AF_INET;
+    family = ats_is_ip(_opt->ip_family) ? _opt->ip_family : AF_INET;
     local_addr.setToAnyAddr(family);
     is_any_address                  = true;
-    local_addr.network_order_port() = htons(_opt.local_port);
+    local_addr.network_order_port() = htons(_opt->local_port);
   }
 
   res = SocketManager::socket(family, SOCK_STREAM, 0);
@@ -91,7 +93,7 @@ NetAIO::TCPConnection::_open()
     return false;
   }
 
-  if (NetVCOptions::FOREIGN_ADDR == _opt.addr_binding) {
+  if (NetVCOptions::FOREIGN_ADDR == _opt->addr_binding) {
     static char const *const DEBUG_TEXT = "::open setsockopt() IP_TRANSPARENT";
 #if TS_USE_TPROXY
     int value = 1;
@@ -111,29 +113,29 @@ NetAIO::TCPConnection::_open()
     return false;
   }
 
-  if (_opt.socket_recv_bufsize > 0) {
-    if (SocketManager::set_rcvbuf_size(_fd, _opt.socket_recv_bufsize)) {
+  if (_opt->socket_recv_bufsize > 0) {
+    if (SocketManager::set_rcvbuf_size(_fd, _opt->socket_recv_bufsize)) {
       // Round down until success
-      int rbufsz = ROUNDUP(_opt.socket_recv_bufsize, 1024);
+      int rbufsz = ROUNDUP(_opt->socket_recv_bufsize, 1024);
       while (rbufsz && !SocketManager::set_rcvbuf_size(_fd, rbufsz)) {
         rbufsz -= 1024;
       }
-      Debug(TAG, "::open: recv_bufsize = %d of %d", rbufsz, _opt.socket_recv_bufsize);
+      Debug(TAG, "::open: recv_bufsize = %d of %d", rbufsz, _opt->socket_recv_bufsize);
     }
   }
-  if (_opt.socket_send_bufsize > 0) {
-    if (SocketManager::set_sndbuf_size(_fd, _opt.socket_send_bufsize)) {
+  if (_opt->socket_send_bufsize > 0) {
+    if (SocketManager::set_sndbuf_size(_fd, _opt->socket_send_bufsize)) {
       // Round down until success
-      int sbufsz = ROUNDUP(_opt.socket_send_bufsize, 1024);
+      int sbufsz = ROUNDUP(_opt->socket_send_bufsize, 1024);
       while (sbufsz && !SocketManager::set_sndbuf_size(_fd, sbufsz)) {
         sbufsz -= 1024;
       }
-      Debug(TAG, "::open: send_bufsize = %d of %d", sbufsz, _opt.socket_send_bufsize);
+      Debug(TAG, "::open: send_bufsize = %d of %d", sbufsz, _opt->socket_send_bufsize);
     }
   }
 
   // apply dynamic options
-  _apply_options();
+  apply_options(_opt);
 
   if (local_addr.network_order_port() || !is_any_address) {
     if (-1 == SocketManager::ink_bind(_fd, &local_addr.sa, ats_ip_size(&local_addr.sa))) {
@@ -154,7 +156,7 @@ NetAIO::TCPConnection::_connect()
   int res;
 
   // apply dynamic options with this.addr initialized
-  _apply_options();
+  apply_options(_opt);
 
   ScopeGuard cleanup{[this]() { close(); }}; // mark for close until we succeed.
 
@@ -166,7 +168,7 @@ NetAIO::TCPConnection::_connect()
   // Wait for the connect to complete.
   _ep.start(&_pd, _fd, EVENTIO_WRITE);
 
-  if (_opt.f_tcp_fastopen) {
+  if (_opt->f_tcp_fastopen) {
     // TCP Fast Open is (effectively) a non-blocking connect, so set the
     // return value we would see in that case.
     errno        = EINPROGRESS;
@@ -187,19 +189,21 @@ NetAIO::TCPConnection::_connect()
 }
 
 void
-NetAIO::TCPConnection::_apply_options()
+NetAIO::TCPConnection::apply_options(const NetVCOptions *options)
 {
+  _opt = options;
+
   // Set options which can be changed after a connection is established
   // ignore other changes
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_NO_DELAY) {
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_NO_DELAY) {
     safe_setsockopt(_fd, IPPROTO_TCP, TCP_NODELAY, SOCKOPT_ON, sizeof(int));
     Debug(TAG, "::open: setsockopt() TCP_NODELAY on socket");
   }
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_KEEP_ALIVE) {
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_KEEP_ALIVE) {
     safe_setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, SOCKOPT_ON, sizeof(int));
     Debug(TAG, "::open: setsockopt() SO_KEEPALIVE on socket");
   }
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_LINGER_ON) {
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_LINGER_ON) {
     struct linger l;
     l.l_onoff  = 1;
     l.l_linger = 0;
@@ -207,23 +211,23 @@ NetAIO::TCPConnection::_apply_options()
     Debug(TAG, "::open:: setsockopt() turn on SO_LINGER on socket");
   }
 #ifdef TCP_NOTSENT_LOWAT
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_TCP_NOTSENT_LOWAT) {
-    uint32_t lowat = _opt.packet_notsent_lowat;
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_TCP_NOTSENT_LOWAT) {
+    uint32_t lowat = _opt->packet_notsent_lowat;
     safe_setsockopt(_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, reinterpret_cast<char *>(&lowat), sizeof(lowat));
     Debug(TAG, "::open:: setsockopt() set TCP_NOTSENT_LOWAT to %d", lowat);
   }
 #endif
 
 #if TS_HAS_SO_MARK
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_PACKET_MARK) {
-    uint32_t mark = _opt.packet_mark;
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_PACKET_MARK) {
+    uint32_t mark = _opt->packet_mark;
     safe_setsockopt(_fd, SOL_SOCKET, SO_MARK, reinterpret_cast<char *>(&mark), sizeof(uint32_t));
   }
 #endif
 
 #if TS_HAS_IP_TOS
-  if (_opt.sockopt_flags & NetVCOptions::SOCK_OPT_PACKET_TOS) {
-    uint32_t tos = _opt.packet_tos;
+  if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_PACKET_TOS) {
+    uint32_t tos = _opt->packet_tos;
     if (_remote.isIp4()) {
       safe_setsockopt(_fd, IPPROTO_IP, IP_TOS, reinterpret_cast<char *>(&tos), sizeof(uint32_t));
     } else if (_remote.isIp6()) {
@@ -241,6 +245,9 @@ NetAIO::TCPConnection::close()
     int fd_save = _fd;
     _fd         = NO_FD;
     SocketManager::close(fd_save);
+    _observer.onClose(*this);
+  } else if (_fd == NO_FD) {
+    // Do nothing
   } else {
     Error("TCPConnection should not be managing fd %d", _fd);
     ink_assert(!"Wrong fd in TCPConnection::close()");
@@ -306,7 +313,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
     return false;
   }
 
-  if (_state == TCP_CONNECTED || (_state == TCP_CONNECTING && _opt.f_tcp_fastopen)) {
+  if (_state == TCP_CONNECTED || (_state == TCP_CONNECTING && _opt->f_tcp_fastopen)) {
     ink_release_assert(!_sendmsg_msg);
 
     if (_write_ready) {
@@ -317,7 +324,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
       }
       int res = ::sendmsg(_fd, msg.get(), flags);
       if (res == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == EINPROGRESS && _opt.f_tcp_fastopen)) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == EINPROGRESS && _opt->f_tcp_fastopen)) {
           _write_ready = false;
         } else {
           _observer.onError(ES_SENDMSG, errno, *this);
@@ -362,6 +369,7 @@ NetAIO::TCPConnection::shutdown(int how)
   } else {
     _observer.onError(ES_SHUTDOWN, errno, *this);
   }
+  return true;
 }
 
 void

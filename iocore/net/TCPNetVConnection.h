@@ -31,13 +31,12 @@
 #pragma once
 
 #include "I_Lock.h"
+#include "NetVCOptions.h"
 #include "tscore/ink_hrtime.h"
 #include "tscore/ink_sock.h"
 #include "I_NetVConnection.h"
 #include "NetEvent.h"
 #include "NetAIO.h"
-
-enum tcp_congestion_control_t { CLIENT_SIDE, SERVER_SIDE };
 
 class TCPNetVConnection : public NetVConnection, public NetAIO::TCPConnectionObserver
 {
@@ -94,7 +93,8 @@ public:
   // only from the free list using TCPNetVConnection::alloc().  //
   // The constructor is public just to avoid compile errors.      //
   /////////////////////////////////////////////////////////////////
-  TCPNetVConnection();
+  TCPNetVConnection(const IpEndpoint *target, NetVCOptions *opt, EThread *t);
+  void free(EThread *t);
 
   int populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
@@ -115,8 +115,7 @@ public:
   void onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c) override;
   void onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c) override;
   void onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConnection &c) override;
-
-  virtual int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
+  void onClose(NetAIO::TCPConnection &c) override;
 
   Action action_;
 
@@ -127,7 +126,7 @@ public:
   int startEvent(int event, Event *e);
   int acceptEvent(int event, Event *e);
   int mainEvent(int event, Event *e);
-  virtual int connectUp(EThread *t, int fd);
+
   /**
    * Populate the current object based on the socket information in the
    * con parameter.
@@ -140,9 +139,9 @@ public:
 
   void set_local_addr() override;
   void set_mptcp_state() override;
+  int set_tcp_congestion_control(int side) override;
   void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
-  int set_tcp_congestion_control(int side) override;
   void apply_options() override;
 
 private:
@@ -155,7 +154,7 @@ private:
   int _read_signal_error(int lerrno);
   struct read_state {
     int r;
-    MutexTryLock lock;
+    std::optional<MutexTryLock> lock;
     bool finished = false;
   } _read_state;
 
@@ -168,7 +167,7 @@ private:
   int _write_signal_error(int lerrno);
   struct write_state {
     int r;
-    MutexTryLock lock;
+    std::optional<MutexTryLock> lock;
     bool finished = false;
     int signalled;
   } _write_state;
@@ -178,5 +177,3 @@ private:
 };
 
 extern ClassAllocator<TCPNetVConnection> tcpNetVCAllocator;
-
-using NetVConnHandler = int (TCPNetVConnection::*)(int, void *);

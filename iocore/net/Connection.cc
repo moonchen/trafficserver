@@ -32,6 +32,7 @@
 
 #include "P_Connection.h"
 #include "P_Net.h"
+#include "tscore/ink_sock.h"
 
 #ifdef SO_ACCEPTFILTER
 #include <sys/param.h>

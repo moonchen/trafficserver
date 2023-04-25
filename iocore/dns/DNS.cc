@@ -22,7 +22,9 @@
  */
 
 #include "P_DNS.h"
+#include "P_UnixNet.h"
 #include "tscore/ink_inet.h"
+#include "tscore/Regression.h"
 
 #include "I_SplitDNS.h"
 

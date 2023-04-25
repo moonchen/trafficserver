@@ -30,6 +30,7 @@
 
  ****************************************************************************/
 
+#include "P_UnixNetVConnection.h"
 #include "tscore/ink_resolver.h"
 #include "Http1ClientSession.h"
 #include "Http1Transaction.h"

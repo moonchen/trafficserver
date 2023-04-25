@@ -26,6 +26,9 @@
 
 #include "EventIO.h"
 #include "P_Net.h"
+#include "P_UnixNet.h"
+#include "P_NetAccept.h"
+#include "P_UnixNetVConnection.h"
 
 using NetAcceptHandler = int (NetAccept::*)(int, void *);
 int accept_till_done   = 1;

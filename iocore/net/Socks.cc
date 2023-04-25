@@ -30,7 +30,9 @@
   duplicated in UnixNet.cc and NTNetProcessor.cc
 */
 
+#include "I_NetProcessor.h"
 #include "P_Net.h"
+#include "P_UnixNetVConnection.h"
 #include "tscore/I_Layout.h"
 #include "tscore/ink_sock.h"
 #include "tscore/InkErrno.h"

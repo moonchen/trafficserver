@@ -74,6 +74,7 @@
 #include "PluginVC.h"
 #include "P_EventSystem.h"
 #include "P_Net.h"
+#include "P_NetVCTest.h"
 #include "tscore/Regression.h"
 
 #define PVC_LOCK_RETRY_TIME      HRTIME_MSECONDS(10)

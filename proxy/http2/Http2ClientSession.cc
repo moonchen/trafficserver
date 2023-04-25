@@ -23,6 +23,7 @@
 
 #include "Http2ClientSession.h"
 #include "HttpDebugNames.h"
+#include "P_UnixNetVConnection.h"
 #include "tscore/ink_base64.h"
 #include "Http2CommonSessionInternal.h"
 #include "TLSSNISupport.h"

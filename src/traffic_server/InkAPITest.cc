@@ -46,6 +46,7 @@
 #include "records/I_RecCore.h"
 
 #include "P_Net.h"
+#include "P_UnixNetVConnection.h"
 #include "records/I_RecHttp.h"
 
 #include "http/HttpSM.h"

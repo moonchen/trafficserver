@@ -31,6 +31,7 @@
 #include "P_DNS.h"
 #include "P_DNSConnection.h"
 #include "P_DNSProcessor.h"
+#include "tscore/ink_sock.h"
 
 #define SET_TCP_NO_DELAY
 #define SET_NO_LINGER

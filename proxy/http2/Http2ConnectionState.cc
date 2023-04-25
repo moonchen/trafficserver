@@ -22,6 +22,7 @@
  */
 
 #include "P_Net.h"
+#include "P_UnixNetVConnection.h"
 #include "HTTP2.h"
 #include "Http2ConnectionState.h"
 #include "Http2ClientSession.h"

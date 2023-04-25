@@ -22,13 +22,19 @@
  */
 
 #include "P_Net.h"
+#include "TCPNetVConnection.h"
 #include "tscore/InkErrno.h"
+#include "tscore/ink_inet.h"
 #include "tscore/ink_sock.h"
 #include "tscore/TSSystemState.h"
 #include "P_SSLNextProtocolAccept.h"
 
 // For Stat Pages
 #include "StatPages.h"
+
+#ifdef USE_TCP_NETVC
+#include "TCPNetVConnection.h"
+#endif
 
 int net_accept_number = 0;
 NetProcessor::AcceptOptions const NetProcessor::DEFAULT_ACCEPT_OPTIONS;
@@ -160,7 +166,23 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
   if (TSSystemState::is_event_system_shut_down()) {
     return nullptr;
   }
-  EThread *t             = eventProcessor.assign_affinity_by_type(cont, opt->etype);
+  EThread *t = eventProcessor.assign_affinity_by_type(cont, opt->etype);
+#ifdef USE_TCP_NETVC
+  IpEndpoint ip_target;
+  ip_target.assign(target);
+
+  TCPNetVConnection *vc;
+  if (t) {
+    vc = THREAD_ALLOC_INIT(tcpNetVCAllocator, t, &ip_target, opt, t);
+  } else {
+    if (likely(vc = tcpNetVCAllocator.alloc(&ip_target, opt, t))) {
+      vc->from_accept_thread = true;
+    }
+  }
+  vc->id    = net_next_connection_number();
+  vc->mutex = cont->mutex;
+  return &vc->action_;
+#else
   UnixNetVConnection *vc = (UnixNetVConnection *)this->allocate_vc(t);
 
   if (opt) {
@@ -170,7 +192,7 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
   }
 
   vc->set_context(NET_VCONNECTION_OUT);
-  bool using_socks = (socks_conf_stuff->socks_needed && opt->socks_support != NO_SOCKS
+  bool using_socks       = (socks_conf_stuff->socks_needed && opt->socks_support != NO_SOCKS
 #ifdef SOCKS_WITH_TS
                       && (opt->socks_version != SOCKS_DEFAULT_VERSION ||
                           /* This implies we are tunnelling.
@@ -235,6 +257,7 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
   } else {
     return result;
   }
+#endif
 }
 
 Action *

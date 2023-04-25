@@ -23,10 +23,14 @@
 
 #include "TCPNetVConnection.h"
 #include "I_Continuation.h"
+#include "I_Event.h"
 #include "I_IOBuffer.h"
 #include "NetAIO.h"
+#include "NetVCOptions.h"
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include "tscore/ink_assert.h"
+#include "tscore/ink_inet.h"
 #include "tscore/ink_platform.h"
 #include "tscore/InkErrno.h"
 
@@ -247,7 +251,7 @@ void
 TCPNetVConnection::onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c)
 {
   ink_release_assert(&c == &_con);
-  ink_release_assert(_read_state.lock.is_locked());
+  ink_release_assert(_read_state.lock && _read_state.lock->is_locked());
   ink_release_assert(_read_vio.mutex->thread_holding == this_ethread());
   ink_release_assert(_read_vio.op == VIO::READ);
   ink_release_assert(!_read_vio.is_disabled());
@@ -263,6 +267,14 @@ TCPNetVConnection::onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, 
 void
 TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConnection &c)
 {
+  ink_release_assert(&c == &_con);
+
+  // Failed connection
+  if (source == NetAIO::ES_CONNECT || source == NetAIO::ES_SOCKET || source == NetAIO::ES_BIND) {
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(err));
+    return;
+  }
+
   // Handle EOS
   if (source == NetAIO::ES_RECVMSG && err == ECONNRESET) {
     _read_signal_done(VC_EVENT_EOS);
@@ -271,8 +283,11 @@ TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConne
 
   if (source == NetAIO::ES_SENDMSG) {
     _write_signal_error(err);
+    return;
   }
+
   // TODO: close this NetVConnection
+  c.close();
 }
 
 // Handle the completion of an async read of the underlying connection.
@@ -280,7 +295,8 @@ TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConne
 int
 TCPNetVConnection::_handle_read_done(int event, Event *e)
 {
-  auto lock = std::move(_read_state.lock);
+  ink_release_assert(_read_state.lock);
+  auto lock = std::move(_read_state.lock.value());
   int r     = _read_state.r;
 
   ink_release_assert(lock.is_locked());
@@ -451,10 +467,28 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
   return EVENT_DONE;
 }
 
+void
+TCPNetVConnection::onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c)
+{
+  ink_release_assert(&c == &_con);
+  ink_release_assert(_write_state.lock && _write_state.lock->is_locked());
+  ink_release_assert(_write_vio.mutex->thread_holding == this_ethread());
+  ink_release_assert(_write_vio.op == VIO::WRITE);
+  ink_release_assert(!_write_vio.is_disabled());
+
+  _write_state.r        = bytes;
+  _write_state.finished = true;
+  SET_HANDLER(&TCPNetVConnection::mainEvent);
+  thread->schedule_imm_local(this);
+
+  // let msg get freed here
+}
+
 int
 TCPNetVConnection::_handle_write_done(int event, Event *e)
 {
-  auto lock              = std::move(_write_state.lock);
+  ink_release_assert(_write_state.lock);
+  auto lock              = std::move(_write_state.lock.value());
   auto r                 = _write_state.r;
   MIOBufferAccessor &buf = _write_vio.buffer;
 
@@ -550,7 +584,7 @@ TCPNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
   _read_vio.cont      = c;
   _read_vio.nbytes    = nbytes;
   _read_vio.ndone     = 0;
-  _read_vio.vc_server = (VConnection *)this;
+  _read_vio.vc_server = this;
   if (buf) {
     _read_vio.buffer.writer_for(buf);
     if (_read_vio.is_disabled()) {
@@ -575,7 +609,7 @@ TCPNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
   _write_vio.cont      = c;
   _write_vio.nbytes    = nbytes;
   _write_vio.ndone     = 0;
-  _write_vio.vc_server = (VConnection *)this;
+  _write_vio.vc_server = this;
   if (reader) {
     ink_assert(!owner);
     _write_vio.buffer.reader_for(reader);
@@ -683,20 +717,21 @@ TCPNetVConnection::reenable_re(VIO *vio)
   reenable(vio);
 }
 
-TCPNetVConnection::TCPNetVConnection()
+TCPNetVConnection::TCPNetVConnection(const IpEndpoint *target, NetVCOptions *opt, EThread *t)
+  : _con(*target, opt, *get_PollDescriptor(t), *this)
 {
   SET_HANDLER(&TCPNetVConnection::startEvent);
+  netvc_context = NET_VCONNECTION_OUT;
 }
 
 // Private methods
 
-int
-TCPNetVConnection::startEvent(int /* event ATS_UNUSED */, Event *e)
+void
+TCPNetVConnection::onConnect(NetAIO::TCPConnection &c)
 {
-  if (!action_.cancelled) {
-    connectUp(e->ethread, NO_FD);
-  }
-  return EVENT_DONE;
+  SET_HANDLER(&TCPNetVConnection::mainEvent);
+  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
+  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
 }
 
 int
@@ -749,134 +784,33 @@ TCPNetVConnection::mainEvent(int event, Event *e)
     return EVENT_DONE;
   }
 
-  int signal_event;
-  Continuation *reader_cont = nullptr;
-  Continuation *writer_cont = nullptr;
-
-  writer_cont = _write_vio.cont;
-
   if (_con.is_closed()) {
     return EVENT_DONE;
   }
 
   if (_read_state.finished) {
     ink_assert(_read_vio.op == VIO::READ);
-    reader_cont = _read_vio.cont;
+    _read_state.finished = false;
     _handle_read_done();
-    if (_read_signal_and_update(signal_event) == EVENT_DONE) {
-      return EVENT_DONE;
-    }
   }
 
-  if (_write_vio.op == VIO::WRITE && !_con.is_shutdown_write() && reader_cont != _write_vio.cont &&
-      writer_cont == _write_vio.cont) {
-    if (_write_signal_and_update(signal_event) == EVENT_DONE) {
-      return EVENT_DONE;
-    }
+  if (_write_state.finished) {
+    ink_assert(_read_vio.op == VIO::WRITE);
+    _write_state.finished = false;
+    _handle_write_done();
   }
   return EVENT_DONE;
 }
 
 int
-TCPNetVConnection::connectUp(EThread *t, int fd)
+TCPNetVConnection::startEvent(int event, Event *e)
 {
-  int res;
-
-  thread = t;
-  /*
-  // TODO: check throttle
-  if (check_net_throttle(CONNECT)) {
-    check_throttle_warning(CONNECT);
-    res = -ENET_THROTTLING;
-    NET_INCREMENT_DYN_STAT(net_connections_throttled_out_stat);
-    goto fail;
-  }
-  */
-
-  //
-  // Initialize this TCPNetVConnection
-  //
-  if (is_debug_tag_set("iocore_net")) {
-    char addrbuf[INET6_ADDRSTRLEN];
-    Debug("iocore_net", "connectUp:: local_addr=%s:%d [%s]",
-          options.local_ip.isValid() ? options.local_ip.toString(addrbuf, sizeof(addrbuf)) : "*", options.local_port,
-          NetVCOptions::toString(options.addr_binding));
-  }
-
-  // If this is getting called from the TS API, then we are wiring up a file descriptor
-  // provided by the caller. In that case, we know that the socket is already connected.
-  if (fd == NO_FD) {
-    // Due to multi-threads system, the fd returned from con.open() may exceed the limitation of check_net_throttle().
-    _con = std::move(NetAIO::TCPConnection{remote, opt, pd, observer});
-    res  = con._open(options);
-    if (res != 0) {
-      goto fail;
-    }
-  } else {
-    int len = sizeof(con.sock_type);
-
-    // This call will fail if fd is not a socket (e.g. it is a
-    // eventfd or a regular file fd.  That is ok, because sock_type
-    // is only used when setting up the socket.
-    safe_getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char *>(&con.sock_type), &len);
-    safe_nonblocking(fd);
-    con.fd           = fd;
-    con.is_connected = true;
-    con.is_bound     = true;
-  }
-
-  // Must connect after EventIO::Start() to avoid a race condition
-  // when edge triggering is used.
-  if ((res = get_NetHandler(t)->startIO(this)) < 0) {
-    goto fail;
-  }
-
-  if (fd == NO_FD) {
-    res = con._connect(nullptr, options);
-    if (res != 0) {
-      // fast stopIO
-      goto fail;
-    }
-  }
-
-  // Did not fail, increment connection count
-  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
-  ink_release_assert(con.fd != NO_FD);
-
-  // Setup a timeout callback handler.
-  SET_HANDLER(&TCPNetVConnection::mainEvent);
-  // Send this netvc to InactivityCop.
-  nh->startCop(this);
-
-  set_inactivity_timeout(0);
-  ink_assert(!active_timeout_in);
-  set_local_addr();
-  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
-  return CONNECT_SUCCESS;
-
-fail:
-  lerrno = -res;
-  action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)static_cast<intptr_t>(res));
-  if (fd != NO_FD) {
-    con.fd = NO_FD;
-  }
-  if (nullptr != nh) {
-    nh->free_netevent(this);
-  } else {
-    free(t);
-  }
-  return CONNECT_FAILURE;
+  return EVENT_CONT;
 }
 
 void
 TCPNetVConnection::clear()
 {
-  // clear timeout variables
-  next_inactivity_timeout_at = 0;
-  next_activity_timeout_at   = 0;
-  inactivity_timeout_in      = 0;
-  active_timeout_in          = 0;
-
   // clear variables for reuse
   mutex.clear();
   action_.mutex.clear();
@@ -885,12 +819,6 @@ TCPNetVConnection::clear()
   attributes      = 0;
   _read_vio.mutex.clear();
   _write_vio.mutex.clear();
-  flags                = 0;
-  nh                   = nullptr;
-  read.triggered       = 0;
-  write.triggered      = 0;
-  read.enabled         = 0;
-  write.enabled        = 0;
   _read_vio.cont       = nullptr;
   _write_vio.cont      = nullptr;
   _read_vio.vc_server  = nullptr;
@@ -900,128 +828,62 @@ TCPNetVConnection::clear()
     _read_vio.buffer.clear();
     _write_vio.buffer.clear();
   }
-  _closed       = 0;
   netvc_context = NET_VCONNECTION_UNSET;
-  ink_assert(!read.ready_link.prev && !read.ready_link.next);
-  ink_assert(!read.enable_link.next);
-  ink_assert(!write.ready_link.prev && !write.ready_link.next);
-  ink_assert(!write.enable_link.next);
-  ink_assert(!link.next && !link.prev);
+}
+
+void
+TCPNetVConnection::onClose(NetAIO::TCPConnection &c)
+{
+  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, -1);
 }
 
 void
 TCPNetVConnection::free(EThread *t)
 {
   ink_release_assert(t == this_ethread());
-
-  // close socket fd
-  if (con.fd != NO_FD) {
-    NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, -1);
-  }
-  con._close();
+  _con.close();
 
   clear();
   SET_CONTINUATION_HANDLER(this, &TCPNetVConnection::startEvent);
-  ink_assert(con.fd == NO_FD);
+  ink_assert(_con.is_closed());
   ink_assert(t == this_ethread());
 
   if (from_accept_thread) {
-    netVCAllocator.free(this);
+    tcpNetVCAllocator.free(this);
   } else {
-    THREAD_FREE(this, netVCAllocator, t);
+    THREAD_FREE(this, tcpNetVCAllocator, t);
   }
 }
 
 void
 TCPNetVConnection::apply_options()
 {
-  con._apply_options(options);
-}
-
-TS_INLINE void
-TCPNetVConnection::set_inactivity_timeout(ink_hrtime timeout_in)
-{
-  Debug("socket", "Set inactive timeout=%" PRId64 ", for NetVC=%p", timeout_in, this);
-  inactivity_timeout_in      = timeout_in;
-  next_inactivity_timeout_at = (timeout_in > 0) ? Thread::get_hrtime() + inactivity_timeout_in : 0;
-}
-
-TS_INLINE void
-TCPNetVConnection::set_default_inactivity_timeout(ink_hrtime timeout_in)
-{
-  Debug("socket", "Set default inactive timeout=%" PRId64 ", for NetVC=%p", timeout_in, this);
-  default_inactivity_timeout_in = timeout_in;
-}
-
-TS_INLINE bool
-TCPNetVConnection::is_default_inactivity_timeout()
-{
-  return (use_default_inactivity_timeout && inactivity_timeout_in == 0);
-}
-
-/*
- * Close down the current netVC.  Save aside the socket and SSL information
- * and create new netVC in the current thread/netVC
- */
-TCPNetVConnection *
-TCPNetVConnection::migrateToCurrentThread(Continuation *cont, EThread *t)
-{
-  // TODO
-  ink_release_assert(false);
-  return nullptr;
-}
-
-NetProcessor *
-TCPNetVConnection::_getNetProcessor()
-{
-  return &netProcessor;
+  _con.apply_options(&options);
 }
 
 void
 TCPNetVConnection::add_to_keep_alive_queue()
 {
-  MUTEX_TRY_LOCK(lock, nh->mutex, this_ethread());
-  if (lock.is_locked()) {
-    nh->add_to_keep_alive_queue(this);
-  } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on keep_alive_queue.");
-  }
+  // TODO
 }
 
 void
 TCPNetVConnection::remove_from_keep_alive_queue()
 {
-  MUTEX_TRY_LOCK(lock, nh->mutex, this_ethread());
-  if (lock.is_locked()) {
-    nh->remove_from_keep_alive_queue(this);
-  } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on keep_alive_queue.");
-  }
+  // TODO
 }
 
 bool
 TCPNetVConnection::add_to_active_queue()
 {
-  bool result = false;
-
-  MUTEX_TRY_LOCK(lock, nh->mutex, this_ethread());
-  if (lock.is_locked()) {
-    result = nh->add_to_active_queue(this);
-  } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on active_queue.");
-  }
-  return result;
+  // TODO
+  return true;
 }
 
 void
 TCPNetVConnection::remove_from_active_queue()
 {
-  MUTEX_TRY_LOCK(lock, nh->mutex, this_ethread());
-  if (lock.is_locked()) {
-    nh->remove_from_active_queue(this);
-  } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on active_queue.");
-  }
+  // TODO
 }
 
 int
@@ -1085,29 +947,13 @@ TCPNetVConnection::set_tcp_congestion_control(int side)
 }
 
 void
-TCPNetVConnection::set_remote_addr()
-{
-  ats_ip_copy(&remote_addr, &con.addr);
-  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
-  set_cont_flags(get_control_flags());
-}
-
-void
-TCPNetVConnection::set_remote_addr(const sockaddr *new_sa)
-{
-  ats_ip_copy(&remote_addr, new_sa);
-  this->control_flags.set_flag(ContFlags::DEBUG_OVERRIDE, diags()->test_override_ip(remote_addr));
-  set_cont_flags(get_control_flags());
-}
-
-void
 TCPNetVConnection::set_local_addr()
 {
   int local_sa_size = sizeof(local_addr);
   // This call will fail if fd is closed already. That is ok, because the
   // `local_addr` is checked within get_local_addr() and the `got_local_addr`
   // is set only with a valid `local_addr`.
-  ATS_UNUSED_RETURN(safe_getsockname(con.fd, &local_addr.sa, &local_sa_size));
+  ATS_UNUSED_RETURN(safe_getsockname(_con.get_fd(), &local_addr.sa, &local_sa_size));
 }
 
 // Update the internal VC state variable for MPTCP
@@ -1117,7 +963,8 @@ TCPNetVConnection::set_mptcp_state()
   int mptcp_enabled      = -1;
   int mptcp_enabled_size = sizeof(mptcp_enabled);
 
-  if (0 == safe_getsockopt(con.fd, IPPROTO_TCP, MPTCP_ENABLED, (char *)&mptcp_enabled, &mptcp_enabled_size)) {
+  if (0 ==
+      safe_getsockopt(_con.get_fd(), IPPROTO_TCP, MPTCP_ENABLED, reinterpret_cast<char *>(&mptcp_enabled), &mptcp_enabled_size)) {
     Debug("socket_mptcp", "MPTCP socket state: %d", mptcp_enabled);
     mptcp_state = mptcp_enabled > 0 ? true : false;
   } else {
@@ -1128,37 +975,52 @@ TCPNetVConnection::set_mptcp_state()
 ink_hrtime
 TCPNetVConnection::get_active_timeout()
 {
-  return active_timeout_in;
+  // TODO
+  return 0;
 }
 
 ink_hrtime
 TCPNetVConnection::get_inactivity_timeout()
 {
-  return inactivity_timeout_in;
+  // TODO
+  return 0;
 }
 
 void
 TCPNetVConnection::set_active_timeout(ink_hrtime timeout_in)
 {
-  Debug("socket", "Set active timeout=%" PRId64 ", NetVC=%p", timeout_in, this);
-  active_timeout_in        = timeout_in;
-  next_activity_timeout_at = (active_timeout_in > 0) ? Thread::get_hrtime() + timeout_in : 0;
+  // TODO
+}
+
+void
+TCPNetVConnection::set_inactivity_timeout(ink_hrtime timeout_in)
+{
+  // TODO
+}
+
+void
+TCPNetVConnection::set_default_inactivity_timeout(ink_hrtime timeout_in)
+{
+  // TODO
+}
+
+bool
+TCPNetVConnection::is_default_inactivity_timeout()
+{
+  // TODO
+  return false;
 }
 
 void
 TCPNetVConnection::cancel_inactivity_timeout()
 {
-  Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
-  inactivity_timeout_in      = 0;
-  next_inactivity_timeout_at = 0;
+  // TODO
 }
 
 void
 TCPNetVConnection::cancel_active_timeout()
 {
-  Debug("socket", "Cancel active timeout for NetVC=%p", this);
-  active_timeout_in        = 0;
-  next_activity_timeout_at = 0;
+  // TODO
 }
 
 TCPNetVConnection::~TCPNetVConnection() {}
@@ -1166,7 +1028,7 @@ TCPNetVConnection::~TCPNetVConnection() {}
 SOCKET
 TCPNetVConnection::get_socket()
 {
-  return con.fd;
+  return _con.get_fd();
 }
 
 void
@@ -1179,4 +1041,16 @@ const Action *
 TCPNetVConnection::get_action() const
 {
   return &action_;
+}
+
+void
+TCPNetVConnection::set_remote_addr()
+{
+  ink_release_assert(!"not implemented");
+}
+
+void
+TCPNetVConnection::set_remote_addr(const sockaddr *new_sa)
+{
+  ink_release_assert(!"not implemented");
 }

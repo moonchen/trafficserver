@@ -68,6 +68,7 @@ extern "C" int plock(int);
 #include "tscore/signals.h"
 #include "P_EventSystem.h"
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include "P_QUICNetProcessor.h"
 #include "P_UDPNet.h"
 #include "P_DNS.h"

@@ -71,6 +71,7 @@ public:
   virtual void onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, TCPConnection &c) = 0;
   virtual void onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, TCPConnection &c) = 0;
   virtual void onError(ErrorSource source, int err, TCPConnection &c)                         = 0;
+  virtual void onClose(TCPConnection &c)                                                      = 0;
 };
 
 class TCPConnection
@@ -89,7 +90,7 @@ public:
 
   // Constructor for a TCPConnection based on an existing fd that is connected.
   // If fd is NO_FD, then a new socket will be created and connected to target.
-  TCPConnection(const IpEndpoint &remote, const NetVCOptions &opt, PollDescriptor &pd, TCPConnectionObserver &observer,
+  TCPConnection(const IpEndpoint &remote, const NetVCOptions *opt, PollDescriptor &pd, TCPConnectionObserver &observer,
                 int fd = NO_FD);
 
   TCPConnection(const TCPConnection &other)           = delete;
@@ -149,13 +150,21 @@ public:
     return _state == TCP_CLOSED;
   }
 
+  void apply_options(const NetVCOptions *options);
+
+  int
+  get_fd() const
+  {
+    return _fd;
+  }
+
 private:
   int _fd;
   enum state _state { TCP_CLOSED };
   bool _recvmsg_in_progress{false};
   bool _sendmsg_in_progress{false};
   const IpEndpoint _remote;
-  const NetVCOptions &_opt;
+  const NetVCOptions *_opt;
   PollDescriptor &_pd;
   TCPConnectionObserver &_observer;
 
@@ -174,7 +183,6 @@ private:
 
   bool _open();
   void _connect();
-  void _apply_options();
   void _poll_connected(int flags);
   bool _register_poll();
 

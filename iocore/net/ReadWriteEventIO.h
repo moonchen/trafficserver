@@ -25,9 +25,9 @@
 #pragma once
 
 #include "EventIO.h"
-#include "NetEvent.h"
 
 class NetHandler;
+class NetEvent;
 
 class ReadWriteEventIO : public EventIO
 {
