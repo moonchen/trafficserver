@@ -46,8 +46,12 @@ NetAIO::TCPConnection::TCPConnection(const IpEndpoint &target, const NetVCOption
     }
     _state = TCP_CONNECTING;
   } else {
-    _ep.start(&_pd, _fd, EVENTIO_READ | EVENTIO_WRITE);
-    _state = TCP_CONNECTED;
+    if (_register_poll()) {
+      _state = TCP_CONNECTED;
+    } else {
+      _observer.onError(ES_REGISTER, errno, *this);
+      _state = TCP_CLOSED;
+    }
   }
 }
 
@@ -165,9 +169,6 @@ NetAIO::TCPConnection::_connect()
     return;
   }
 
-  // Wait for the connect to complete.
-  _ep.start(&_pd, _fd, EVENTIO_WRITE);
-
   if (_opt->f_tcp_fastopen) {
     // TCP Fast Open is (effectively) a non-blocking connect, so set the
     // return value we would see in that case.
@@ -180,12 +181,21 @@ NetAIO::TCPConnection::_connect()
   }
 
   if (-1 == res && !(EINPROGRESS == errno || EWOULDBLOCK == errno)) {
+    _state = TCP_CLOSED;
     _observer.onError(ES_CONNECT, errno, *this);
     return;
+  } else if (-1 == res && (EINPROGRESS == errno || EWOULDBLOCK == errno)) {
+    _state = TCP_CONNECTING;
+    Debug(TAG, "%d: connecting", _fd);
+    _read_ready  = false;
+    _write_ready = false;
+  } else if (res == 0) {
+    _state = TCP_CONNECTED;
+  } else {
+    ink_release_assert(!"Unexpected return value from connect()");
   }
 
   cleanup.reset();
-  _state = TCP_CONNECTING;
 }
 
 void
@@ -275,8 +285,10 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
       total_len += msg->msg_iov[i].iov_len;
     }
     int res = ::recvmsg(_fd, msg.get(), flags);
+    Debug(TAG, "recvmsg(%d, %p, %d) -> res=%d, errno = %d", _fd, msg.get(), flags, res, errno);
     if (res == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        Debug(TAG, "poll: %d read not ready", _fd);
         _read_ready = false;
       } else {
         _observer.onError(ES_RECVMSG, errno, *this);
@@ -285,11 +297,10 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
       ink_assert(res >= 0);
       _observer.onRecvmsg(res, std::move(msg), *this);
       if (static_cast<size_t>(res) < total_len) {
+        Debug(TAG, "poll: %d read not ready", _fd);
         _read_ready = false;
       }
     }
-
-    // TODO: if less than the full amount is read, consider the fd not ready for read.
   }
 
   if (!_read_ready) {
@@ -297,6 +308,7 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
     _recvmsg_in_progress = true;
     _recvmsg_msg         = std::move(msg);
     _recvmsg_flags       = flags;
+    Debug(TAG, "_recvmsg_msg->msg_iov[0].iovlen = %zu", _recvmsg_msg->msg_iov[0].iov_len);
   }
 
   return true;
@@ -323,8 +335,10 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
         total_len += len;
       }
       int res = ::sendmsg(_fd, msg.get(), flags);
+      Debug(TAG, "sendmsg(%d, %p, %d) -> res=%d, errno=%d", _fd, msg.get(), flags, res, errno);
       if (res == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == EINPROGRESS && _opt->f_tcp_fastopen)) {
+          Debug(TAG, "poll: %d write not ready", _fd);
           _write_ready = false;
         } else {
           _observer.onError(ES_SENDMSG, errno, *this);
@@ -335,6 +349,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
         // if less than the full amount is written, consider the fd not ready for write.
         ink_assert(res >= 0);
         if (static_cast<size_t>(res) < total_len) {
+          Debug(TAG, "poll: %d write not ready", _fd);
           _write_ready = false;
         }
       }
@@ -376,9 +391,12 @@ void
 NetAIO::TCPConnection::_poll_connected(int flags)
 {
   if (_recvmsg_in_progress && _read_ready) {
+    Debug(TAG, "_recvmsg_msg->msg_iov[0].iovlen = %zu", _recvmsg_msg->msg_iov[0].iov_len);
     int res = ::recvmsg(_fd, _recvmsg_msg.get(), _recvmsg_flags);
+    Debug(TAG, "recvmsg(%d, %p, %d) -> res=%d, errno = %d", _fd, _recvmsg_msg.get(), _recvmsg_flags, res, errno);
     if (res == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        Debug(TAG, "poll: %d read not ready", _fd);
         _read_ready = false;
         _rearm_read();
         return;
@@ -393,8 +411,10 @@ NetAIO::TCPConnection::_poll_connected(int flags)
 
   if (_sendmsg_in_progress && _write_ready) {
     int res = ::sendmsg(_fd, _sendmsg_msg.get(), _sendmsg_flags);
+    Debug(TAG, "sendmsg(%d, %p, %d) -> res=%d, errno=%d", _fd, _sendmsg_msg.get(), _sendmsg_flags, res, errno);
     if (res == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        Debug(TAG, "poll: %d write not ready", _fd);
         _write_ready = false;
         _rearm_write();
         return;
@@ -413,10 +433,12 @@ NetAIO::TCPConnection::poll(int flags)
 {
   // Edge-triggered epoll: update states
   if (flags & EVENTIO_READ) {
+    Debug(TAG, "poll: %d read ready", _fd);
     _read_ready = true;
   }
 
   if (flags & EVENTIO_WRITE) {
+    Debug(TAG, "poll: %d write ready", _fd);
     _write_ready = true;
   }
 

@@ -42,8 +42,6 @@ class UnixNetVConnection;
 class NetHandler;
 struct PollDescriptor;
 
-enum tcp_congestion_control_t { CLIENT_SIDE, SERVER_SIDE };
-
 class UnixNetVConnection : public NetVConnection, public NetEvent
 {
 public:
@@ -220,7 +218,7 @@ public:
   void set_mptcp_state() override;
   virtual void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
-  int set_tcp_congestion_control(int side) override;
+  int set_tcp_congestion_control(tcp_congestion_control_t side) override;
   void apply_options() override;
 
   friend void write_to_net_io(NetHandler *, UnixNetVConnection *, EThread *);

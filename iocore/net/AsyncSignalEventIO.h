@@ -30,10 +30,10 @@ class EThread;
 class AsyncSignalEventIO : public EventIO
 {
 public:
-  int start(EventLoop l, int fd, EThread *thread, int events);
+  int start(EventLoop l, int fd, int events);
 
   void process_event(int flags) override;
 
 private:
-  EThread *_thread;
+  int _fd;
 };

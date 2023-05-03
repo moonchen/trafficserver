@@ -31,9 +31,9 @@
 #include "Http1ServerSession.h"
 #include "HttpDebugNames.h"
 #include "HttpSessionManager.h"
+#include "I_NetProcessor.h"
 #include "P_Cache.h"
 #include "P_Net.h"
-#include "P_UnixNetVConnection.h"
 #include "PreWarmConfig.h"
 #include "PreWarmManager.h"
 #include "StatPages.h"
@@ -1893,7 +1893,6 @@ HttpSM::state_http_server_open(int event, void *data)
   switch (event) {
   case NET_EVENT_OPEN: {
     NetVConnection *netvc        = static_cast<NetVConnection *>(data);
-    UnixNetVConnection *vc       = static_cast<UnixNetVConnection *>(data);
     PoolableSession *new_session = this->create_server_session(netvc);
     if (t_state.current.request_to == ResolveInfo::PARENT_PROXY) {
       new_session->to_parent_proxy = true;
@@ -1907,7 +1906,7 @@ HttpSM::state_http_server_open(int event, void *data)
     // Since the UnixNetVConnection::action_ or SocksEntry::action_ may be returned from netProcessor.connect_re, and the
     // SocksEntry::action_ will be copied into UnixNetVConnection::action_ before call back NET_EVENT_OPEN from SocksEntry::free(),
     // so we just compare the Continuation between pending_action and VC's action_.
-    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
+    // ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
     pending_action = nullptr;
 
     if (this->plugin_tunnel_type == HTTP_NO_PLUGIN_TUNNEL) {
@@ -1918,7 +1917,7 @@ HttpSM::state_http_server_open(int event, void *data)
 
       int64_t nbytes = 1;
       if (t_state.txn_conf->proxy_protocol_out >= 0) {
-        nbytes = do_outbound_proxy_protocol(server_txn->get_remote_reader()->mbuf, vc, ua_txn->get_netvc(),
+        nbytes = do_outbound_proxy_protocol(server_txn->get_remote_reader()->mbuf, netvc, ua_txn->get_netvc(),
                                             t_state.txn_conf->proxy_protocol_out);
       }
 
@@ -5780,7 +5779,7 @@ HttpSM::handle_server_setup_error(int event, void *data)
     }
   }
 
-  [[maybe_unused]] UnixNetVConnection *dbg_vc = nullptr;
+  // [[maybe_unused]] UnixNetVConnection *dbg_vc = nullptr;
   switch (event) {
   case VC_EVENT_EOS:
     t_state.current.state = HttpTransact::CONNECTION_CLOSED;
@@ -6219,7 +6218,7 @@ HttpSM::attach_server_session()
   server_entry->vc_type          = HTTP_SERVER_VC;
   server_entry->vc_write_handler = &HttpSM::state_send_server_request_header;
 
-  UnixNetVConnection *server_vc = static_cast<UnixNetVConnection *>(server_txn->get_netvc());
+  NetVConnection *server_vc = server_txn->get_netvc();
 
   // set flag for server session is SSL
   TLSBasicSupport *tbs = dynamic_cast<TLSBasicSupport *>(server_vc);

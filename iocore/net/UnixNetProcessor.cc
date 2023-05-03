@@ -179,8 +179,9 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
       vc->from_accept_thread = true;
     }
   }
-  vc->id    = net_next_connection_number();
-  vc->mutex = cont->mutex;
+  vc->id      = net_next_connection_number();
+  vc->mutex   = cont->mutex;
+  vc->action_ = cont;
   return &vc->action_;
 #else
   UnixNetVConnection *vc = (UnixNetVConnection *)this->allocate_vc(t);
@@ -258,12 +259,6 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
     return result;
   }
 #endif
-}
-
-Action *
-UnixNetProcessor::connect(Continuation *cont, UnixNetVConnection ** /* avc */, sockaddr const *target, NetVCOptions *opt)
-{
-  return connect_re(cont, target, opt);
 }
 
 struct PollCont;

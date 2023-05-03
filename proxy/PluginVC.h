@@ -106,7 +106,7 @@ public:
   void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
   void set_mptcp_state() override;
-  int set_tcp_congestion_control(int) override;
+  int set_tcp_congestion_control(tcp_congestion_control_t) override;
 
   void apply_options() override;
 

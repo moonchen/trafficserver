@@ -26,9 +26,9 @@
 #include "I_EThread.h"
 
 int
-AsyncSignalEventIO::start(EventLoop l, int fd, EThread *thread, int events)
+AsyncSignalEventIO::start(EventLoop l, int fd, int events)
 {
-  _thread = thread;
+  _fd = fd;
   return start_common(l, fd, events);
 }
 
@@ -37,11 +37,11 @@ AsyncSignalEventIO::process_event(int flags)
 {
 #if HAVE_EVENTFD
   uint64_t counter;
-  ATS_UNUSED_RETURN(read(_thread->evfd, &counter, sizeof(uint64_t)));
+  ATS_UNUSED_RETURN(read(_fd, &counter, sizeof(uint64_t)));
 #elif TS_USE_PORT
 /* Nothing to drain or do */
 #else
   char dummy[1024];
-  ATS_UNUSED_RETURN(read(_thread->evpipe[0], &dummy[0], 1024));
+  ATS_UNUSED_RETURN(read(_fd, &dummy[0], 1024));
 #endif
 }

@@ -248,10 +248,10 @@ initialize_thread_for_udp_net(EThread *thread)
 #if TS_USE_LINUX_IO_URING
   thread->ep->start(upd, DiskHandler::local_context());
 #else
-  thread->ep->start(upd, thread->evfd, thread, EVENTIO_READ);
+  thread->ep->start(upd, thread->evfd, EVENTIO_READ);
 #endif
 #else
-  thread->ep->start(upd, thread->evpipe[0], nullptr, EVENTIO_READ);
+  thread->ep->start(upd, thread->evpipe[0], EVENTIO_READ);
 #endif
 }
 

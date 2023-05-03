@@ -38,7 +38,6 @@ struct UnixNetProcessor : public NetProcessor {
 public:
   virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
 
-  Action *connect(Continuation *cont, UnixNetVConnection **vc, sockaddr const *target, NetVCOptions *opt = nullptr);
   Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *opts) override;
 
   virtual NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt);

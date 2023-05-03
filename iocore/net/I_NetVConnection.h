@@ -55,6 +55,8 @@ typedef enum {
   NET_VCONNECTION_OUT, // ATS <--> Server, Server-Side
 } NetVConnectionContext_t;
 
+enum tcp_congestion_control_t { CLIENT_SIDE, SERVER_SIDE };
+
 /** Holds client options for NetVConnection.
 
     This class holds various options a user can specify for
@@ -409,7 +411,7 @@ public:
   virtual SOCKET get_socket() = 0;
 
   /** Set the TCP congestion control algorithm */
-  virtual int set_tcp_congestion_control(int side) = 0;
+  virtual int set_tcp_congestion_control(tcp_congestion_control_t side) = 0;
 
   /** Set local sock addr struct. */
   virtual void set_local_addr() = 0;

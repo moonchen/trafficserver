@@ -347,7 +347,7 @@ public:
     return 0;
   }
   int
-  set_tcp_congestion_control(int side) override
+  set_tcp_congestion_control(tcp_congestion_control_t side) override
   {
     return 0;
   }

@@ -258,10 +258,10 @@ initialize_thread_for_net(EThread *thread)
 #if TS_USE_LINUX_IO_URING
   thread->ep->start(pd, DiskHandler::local_context());
 #else
-  thread->ep->start(pd, thread->evfd, thread, EVENTIO_READ);
+  thread->ep->start(pd, thread->evfd, EVENTIO_READ);
 #endif
 #else
-  thread->ep->start(pd, thread->evpipe[0], nullptr, EVENTIO_READ);
+  thread->ep->start(pd, thread->evpipe[0], EVENTIO_READ);
 #endif
 }
 

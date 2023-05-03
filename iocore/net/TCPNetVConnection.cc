@@ -38,6 +38,16 @@
 ClassAllocator<TCPNetVConnection> tcpNetVCAllocator("tcpNetVCAllocator");
 static constexpr auto TAG = "TCPNetVConnection";
 
+// A wrapper around struct msghdr that holds on to the IOVec as well
+struct MsgHdr : public msghdr {
+  MsgHdr() : msghdr()
+  {
+    ink_zero(*this);
+    msg_iov = tiovec;
+  }
+  IOVec tiovec[NET_MAX_IOV];
+};
+
 //
 // Reschedule a TCPNetVConnection by moving it
 // onto or off of the ready_list
@@ -46,7 +56,8 @@ void
 TCPNetVConnection::_read_reschedule()
 {
   ink_release_assert(this_ethread() == thread);
-  SET_HANDLER(&TCPNetVConnection::_read_from_net);
+  ink_assert(handler == &TCPNetVConnection::mainEvent);
+  _read.state = TRY_ISSUE;
   thread->schedule_imm_local(this);
 }
 
@@ -54,7 +65,8 @@ void
 TCPNetVConnection::_write_reschedule()
 {
   ink_release_assert(this_ethread() == thread);
-  SET_HANDLER(&TCPNetVConnection::_write_to_net);
+  ink_assert(handler == &TCPNetVConnection::mainEvent);
+  _write.state = TRY_ISSUE;
   thread->schedule_imm_local(this);
 }
 
@@ -65,10 +77,10 @@ int
 TCPNetVConnection::_read_signal_and_update(int event)
 {
   _recursion++;
-  if (_read_vio.cont && _read_vio.mutex == _read_vio.cont->mutex) {
-    _read_vio.cont->handleEvent(event, &_read_vio);
+  if (_read.vio.cont && _read.vio.mutex == _read.vio.cont->mutex) {
+    _read.vio.cont->handleEvent(event, &_read.vio);
   } else {
-    if (_read_vio.cont) {
+    if (_read.vio.cont) {
       Note("_read_signal_and_update: mutexes are different? this=%p, event=%d", this, event);
     }
     switch (event) {
@@ -76,7 +88,7 @@ TCPNetVConnection::_read_signal_and_update(int event)
     case VC_EVENT_ERROR:
     case VC_EVENT_ACTIVE_TIMEOUT:
     case VC_EVENT_INACTIVITY_TIMEOUT:
-      Debug("inactivity_cop", "event %d: null _read_vio cont, closing this %p", event, this);
+      Debug("inactivity_cop", "event %d: null _read.vio cont, closing this %p", event, this);
       _con.close();
       break;
     default:
@@ -98,10 +110,10 @@ int
 TCPNetVConnection::_write_signal_and_update(int event)
 {
   _recursion++;
-  if (_write_vio.cont && _write_vio.mutex == _write_vio.cont->mutex) {
-    _write_vio.cont->handleEvent(event, &_write_vio);
+  if (_write.vio.cont && _write.vio.mutex == _write.vio.cont->mutex) {
+    _write.vio.cont->handleEvent(event, &_write.vio);
   } else {
-    if (_write_vio.cont) {
+    if (_write.vio.cont) {
       Note("_write_signal_and_update: mutexes are different? this=%p, event=%d", this, event);
     }
     switch (event) {
@@ -109,7 +121,7 @@ TCPNetVConnection::_write_signal_and_update(int event)
     case VC_EVENT_ERROR:
     case VC_EVENT_ACTIVE_TIMEOUT:
     case VC_EVENT_INACTIVITY_TIMEOUT:
-      Debug("inactivity_cop", "event %d: null _write_vio cont, closing this %p", event, this);
+      Debug("inactivity_cop", "event %d: null _write.vio cont, closing this %p", event, this);
       _con.close();
       break;
     default:
@@ -130,8 +142,9 @@ TCPNetVConnection::_write_signal_and_update(int event)
 int
 TCPNetVConnection::_read_signal_done(int event)
 {
-  _read_vio.disable();
+  _read.vio.disable();
   if (_read_signal_and_update(event) == EVENT_DONE) {
+    _read.state = IDLE;
     return EVENT_DONE;
   } else {
     _read_reschedule();
@@ -142,8 +155,9 @@ TCPNetVConnection::_read_signal_done(int event)
 int
 TCPNetVConnection::_write_signal_done(int event)
 {
-  _write_vio.disable();
+  _write.vio.disable();
   if (_write_signal_and_update(event) == EVENT_DONE) {
+    _write.state = IDLE;
     return EVENT_DONE;
   } else {
     _write_reschedule();
@@ -168,8 +182,8 @@ TCPNetVConnection::_write_signal_error(int lerrno)
 int
 TCPNetVConnection::_read_from_net(int event, Event *e)
 {
-  // We need to hold this mutex until the read finishes
-  MUTEX_TRY_LOCK(lock, _read_vio.mutex, thread);
+  // Locking while accessing the buffer
+  MUTEX_TRY_LOCK(lock, _read.vio.mutex, thread);
 
   if (!lock.is_locked()) {
     _read_reschedule();
@@ -180,16 +194,16 @@ TCPNetVConnection::_read_from_net(int event, Event *e)
     return EVENT_DONE;
   }
   // if it is not enabled.
-  if (_read_vio.op != VIO::READ || _read_vio.is_disabled()) {
+  if (_read.vio.op != VIO::READ || _read.vio.is_disabled()) {
     // TODO: cancel?
     return EVENT_DONE;
   }
 
-  MIOBufferAccessor &buf = _read_vio.buffer;
+  MIOBufferAccessor &buf = _read.vio.buffer;
   ink_assert(buf.writer());
 
   // if there is nothing to do, disable connection
-  int64_t ntodo = _read_vio.ntodo();
+  int64_t ntodo = _read.vio.ntodo();
   if (ntodo <= 0) {
     return EVENT_DONE;
   }
@@ -199,10 +213,15 @@ TCPNetVConnection::_read_from_net(int event, Event *e)
     toread = ntodo;
   }
 
+  ink_assert(_read.state == TRY_ISSUE);
+
   // read data
   int64_t rattempted = 0;
   unsigned niov      = 0;
-  IOVec tiovec[NET_MAX_IOV];
+
+  auto msg = std::make_unique<struct MsgHdr>();
+  ink_release_assert(msg);
+
   if (toread) {
     IOBufferBlock *b = buf.writer()->first_write_block();
     niov             = 0;
@@ -210,13 +229,13 @@ TCPNetVConnection::_read_from_net(int event, Event *e)
     while (b && niov < NET_MAX_IOV) {
       int64_t a = b->write_avail();
       if (a > 0) {
-        tiovec[niov].iov_base = b->_end;
-        int64_t togo          = toread - rattempted;
+        msg->tiovec[niov].iov_base = b->_end;
+        int64_t togo               = toread - rattempted;
         if (a > togo) {
           a = togo;
         }
-        tiovec[niov].iov_len = a;
-        rattempted           += a;
+        msg->tiovec[niov].iov_len = a;
+        rattempted                += a;
         niov++;
         if (a >= togo) {
           break;
@@ -226,23 +245,27 @@ TCPNetVConnection::_read_from_net(int event, Event *e)
     }
 
     ink_assert(niov > 0);
-    ink_assert(niov <= countof(tiovec));
-    auto msg = std::make_unique<struct msghdr>();
-
-    ink_zero(msg);
+    ink_assert(niov <= countof(msg->tiovec));
     msg->msg_name    = const_cast<sockaddr *>(get_remote_addr());
     msg->msg_namelen = ats_ip_size(get_remote_addr());
-    msg->msg_iov     = &tiovec[0];
     msg->msg_iovlen  = niov;
-    auto ret         = _con.recvmsg(std::move(msg), 0);
+
+    ink_assert(remote_addr.isValid());
+
+    _read.state = WAIT_FOR_COMPLETION;
+    auto ret    = _con.recvmsg(std::move(msg), 0);
     if (!ret) {
       Error("recvmsg failed");
+      _read.state = IDLE;
+      // TODO: what to do here?
       return EVENT_ERROR;
     } else {
       NET_INCREMENT_DYN_STAT(net_calls_to_read_stat);
-      _read_state.lock = std::move(lock);
     }
   }
+
+  // It's okay to let go of the lock while the recvmsg is happening, since the structure of MIOBuffer is not updated during the
+  // write.
 
   return EVENT_CONT;
 }
@@ -251,14 +274,13 @@ void
 TCPNetVConnection::onRecvmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c)
 {
   ink_release_assert(&c == &_con);
-  ink_release_assert(_read_state.lock && _read_state.lock->is_locked());
-  ink_release_assert(_read_vio.mutex->thread_holding == this_ethread());
-  ink_release_assert(_read_vio.op == VIO::READ);
-  ink_release_assert(!_read_vio.is_disabled());
+  ink_release_assert(_read.vio.op == VIO::READ);
+  ink_release_assert(!_read.vio.is_disabled());
+  ink_release_assert(_read.state == WAIT_FOR_COMPLETION);
 
-  _read_state.r        = bytes;
-  _read_state.finished = true;
-  SET_HANDLER(&TCPNetVConnection::mainEvent);
+  _read.r     = bytes;
+  _read.state = TRY_HANDLER;
+  ink_assert(handler == &TCPNetVConnection::mainEvent);
   thread->schedule_imm_local(this);
 
   // let msg get freed here
@@ -279,6 +301,8 @@ TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConne
   if (source == NetAIO::ES_RECVMSG && err == ECONNRESET) {
     _read_signal_done(VC_EVENT_EOS);
     return;
+  } else {
+    _read_signal_error(err);
   }
 
   if (source == NetAIO::ES_SENDMSG) {
@@ -292,21 +316,21 @@ TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConne
 
 // Handle the completion of an async read of the underlying connection.
 // Errors should not be handled here.
-int
-TCPNetVConnection::_handle_read_done(int event, Event *e)
+void
+TCPNetVConnection::_handle_read_done()
 {
-  ink_release_assert(_read_state.lock);
-  auto lock = std::move(_read_state.lock.value());
-  int r     = _read_state.r;
+  MUTEX_TRY_LOCK(lock, _read.vio.mutex, thread);
+  if (!lock.is_locked()) {
+    thread->schedule_in_local(this, HRTIME_MSECONDS(net_retry_delay));
+  }
 
-  ink_release_assert(lock.is_locked());
-  ink_release_assert(lock.get_mutex()->thread_holding == this_ethread());
+  int r = _read.r;
   ink_release_assert(r > 0);
 
   NET_SUM_DYN_STAT(net_read_bytes_stat, r);
 
   // Add data to buffer and signal continuation.
-  MIOBufferAccessor &buf = _read_vio.buffer;
+  MIOBufferAccessor &buf = _read.vio.buffer;
   ink_assert(buf.writer());
   buf.writer()->fill(r);
 #ifdef DEBUG
@@ -314,33 +338,35 @@ TCPNetVConnection::_handle_read_done(int event, Event *e)
     Debug(TAG, "_read_from_net, read buffer full");
   }
 #endif
-  _read_vio.ndone += r;
+  _read.vio.ndone += r;
 
   // Signal read ready, check if user is not done
 
   // If there are no more bytes to read, signal read complete
-  if (_read_vio.ntodo() <= 0) {
+  if (_read.vio.ntodo() <= 0) {
     _read_signal_done(VC_EVENT_READ_COMPLETE);
     Debug("iocore_net", "read_from_net, read finished - signal done");
-    return EVENT_DONE;
+    return;
   } else {
     if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
-      return EVENT_DONE;
+      _read.state = IDLE;
+      return;
     }
 
     // change of lock... don't look at shared variables!
-    if (lock.get_mutex() != _read_vio.mutex.get()) {
+    if (lock.get_mutex() != _read.vio.mutex.get()) {
       _read_reschedule();
-      return EVENT_CONT;
+      return;
     }
   }
 
   // If here are is no more room, or nothing to do, disable the connection
-  if (_read_vio.ntodo() <= 0 || _read_vio.is_disabled() || !buf.writer()->write_avail()) {
-    return EVENT_DONE;
+  if (_read.vio.ntodo() <= 0 || _read.vio.is_disabled() || !buf.writer()->write_avail()) {
+    _read.state = IDLE;
+    return;
   } else {
     _read_reschedule();
-    return EVENT_CONT;
+    return;
   }
 }
 
@@ -353,9 +379,10 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
 
   NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_stat);
 
-  MUTEX_TRY_LOCK(lock, _write_vio.mutex, thread);
+  // Lock while accessing the buffer
+  MUTEX_TRY_LOCK(lock, _write.vio.mutex, thread);
 
-  if (!lock.is_locked() || lock.get_mutex() != _write_vio.mutex.get()) {
+  if (!lock.is_locked() || lock.get_mutex() != _write.vio.mutex.get()) {
     _write_reschedule();
     return EVENT_CONT;
   }
@@ -366,17 +393,17 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
   }
 
   // If it is not enabled,add to WaitList.
-  if (_write_vio.is_disabled() || _write_vio.op != VIO::WRITE) {
+  if (_write.vio.is_disabled() || _write.vio.op != VIO::WRITE) {
     return EVENT_DONE;
   }
 
   // If there is nothing to do, disable
-  int64_t ntodo = _write_vio.ntodo();
+  int64_t ntodo = _write.vio.ntodo();
   if (ntodo <= 0) {
     return EVENT_DONE;
   }
 
-  MIOBufferAccessor &buf = _write_vio.buffer;
+  MIOBufferAccessor &buf = _write.vio.buffer;
   ink_assert(buf.writer());
 
   // Calculate the amount to write.
@@ -385,7 +412,7 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
     towrite = ntodo;
   }
 
-  _write_state.signalled = 0;
+  _write.signalled = 0;
 
   // signal write ready to allow user to fill the buffer
   if (towrite != ntodo && !buf.writer()->high_water()) {
@@ -393,7 +420,7 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
       return EVENT_DONE;
     }
 
-    _write_state.signalled = 1;
+    _write.signalled = 1;
 
     // Recalculate amount to write
     towrite = buf.reader()->read_avail();
@@ -413,7 +440,9 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
   auto deleter         = [](IOBufferReader *p) { p->dealloc(); };
   std::unique_ptr<IOBufferReader, decltype(deleter)> tmp_reader{p, deleter};
 
-  IOVec tiovec[NET_MAX_IOV];
+  auto msg = std::make_unique<struct MsgHdr>();
+  ink_release_assert(msg);
+
   unsigned niov = 0;
   try_to_write  = 0;
 
@@ -436,8 +465,8 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
     }
 
     // build an iov entry
-    tiovec[niov].iov_len  = len;
-    tiovec[niov].iov_base = tmp_reader->start();
+    msg->tiovec[niov].iov_len  = len;
+    msg->tiovec[niov].iov_base = tmp_reader->start();
     niov++;
 
     try_to_write += len;
@@ -445,22 +474,21 @@ TCPNetVConnection::_write_to_net(int event, Event *e)
   }
 
   ink_assert(niov > 0);
-  ink_assert(niov <= countof(tiovec));
+  ink_assert(niov <= countof(msg->tiovec));
 
-  auto msg = std::make_unique<struct msghdr>();
-  ink_zero(msg);
   msg->msg_name    = const_cast<sockaddr *>(get_remote_addr());
   msg->msg_namelen = ats_ip_size(get_remote_addr());
-  msg->msg_iov     = &tiovec[0];
   msg->msg_iovlen  = niov;
   int flags        = 0;
 
-  auto ret = _con.sendmsg(std::move(msg), flags);
+  _write.state = WAIT_FOR_COMPLETION;
+  auto ret     = _con.sendmsg(std::move(msg), flags);
   if (!ret) {
+    _write.state = WAIT_FOR_COMPLETION;
     Error("sendmsg failed");
+    // TODO: what to do here?
     return EVENT_ERROR;
   }
-  _write_state.lock = std::move(lock);
 
   NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
 
@@ -471,34 +499,38 @@ void
 TCPNetVConnection::onSendmsg(ssize_t bytes, std::unique_ptr<struct msghdr> msg, NetAIO::TCPConnection &c)
 {
   ink_release_assert(&c == &_con);
-  ink_release_assert(_write_state.lock && _write_state.lock->is_locked());
-  ink_release_assert(_write_vio.mutex->thread_holding == this_ethread());
-  ink_release_assert(_write_vio.op == VIO::WRITE);
-  ink_release_assert(!_write_vio.is_disabled());
+  ink_release_assert(_write.vio.op == VIO::WRITE);
+  ink_release_assert(!_write.vio.is_disabled());
+  ink_release_assert(_write.state == WAIT_FOR_COMPLETION);
 
-  _write_state.r        = bytes;
-  _write_state.finished = true;
-  SET_HANDLER(&TCPNetVConnection::mainEvent);
+  _write.r     = bytes;
+  _write.state = TRY_HANDLER;
+  ink_assert(handler == &TCPNetVConnection::mainEvent);
   thread->schedule_imm_local(this);
 
   // let msg get freed here
 }
 
-int
-TCPNetVConnection::_handle_write_done(int event, Event *e)
+void
+TCPNetVConnection::_handle_write_done()
 {
-  ink_release_assert(_write_state.lock);
-  auto lock              = std::move(_write_state.lock.value());
-  auto r                 = _write_state.r;
-  MIOBufferAccessor &buf = _write_vio.buffer;
+  ink_release_assert(_write.state == TRY_HANDLER);
 
+  MUTEX_TRY_LOCK(lock, _write.vio.mutex, thread);
+  if (!lock.is_locked()) {
+    thread->schedule_in(this, HRTIME_MSECONDS(net_retry_delay));
+    return;
+  }
+
+  auto r = _write.r;
   // A write of 0 makes no sense since we tried to write more than 0.
-  ink_assert(r > 0);
+  ink_release_assert(r > 0);
 
+  MIOBufferAccessor &buf = _write.vio.buffer;
   if (r > 0) {
     buf.reader()->consume(r);
     NET_SUM_DYN_STAT(net_write_bytes_stat, r);
-    _write_vio.ndone += r;
+    _write.vio.ndone += r;
   }
 
   // Either we wrote something or got an error.
@@ -511,14 +543,14 @@ TCPNetVConnection::_handle_write_done(int event, Event *e)
   }
 
   // If there are no more bytes to write, signal write complete,
-  ink_assert(_write_vio.ntodo() >= 0);
-  if (_write_vio.ntodo() <= 0) {
+  ink_assert(_write.vio.ntodo() >= 0);
+  if (_write.vio.ntodo() <= 0) {
     _write_signal_done(VC_EVENT_WRITE_COMPLETE);
-    return EVENT_DONE;
+    return;
   }
 
   int event_out = 0;
-  if (!_write_state.signalled || (_write_vio.ntodo() > 0 && !buf.writer()->high_water())) {
+  if (!_write.signalled || (_write.vio.ntodo() > 0 && !buf.writer()->high_water())) {
     event_out = VC_EVENT_WRITE_READY;
   } else if (wbe_event != write_buffer_empty_event) {
     // @a signalled means we won't send an event, and the event values differing means we
@@ -528,21 +560,22 @@ TCPNetVConnection::_handle_write_done(int event, Event *e)
 
   if (event_out) {
     if (_write_signal_and_update(event_out) != EVENT_CONT) {
-      return EVENT_DONE;
+      _write.state = IDLE;
+      return;
     }
 
     // change of lock... don't look at shared variables!
-    if (lock.get_mutex() != _write_vio.mutex.get()) {
+    if (lock.get_mutex() != _write.vio.mutex.get()) {
       _write_reschedule();
-      return EVENT_CONT;
+      return;
     }
   }
 
   if (!(buf.reader()->is_read_avail_more_than(0))) {
-    return EVENT_DONE;
+    return;
   } else {
     _write_reschedule();
-    return EVENT_DONE;
+    return;
   }
 }
 
@@ -559,10 +592,10 @@ TCPNetVConnection::get_data(int id, void *data)
 
   switch (id) {
   case TS_API_DATA_READ_VIO:
-    *ptr.vio = reinterpret_cast<TSVIO>(&_read_vio);
+    *ptr.vio = reinterpret_cast<TSVIO>(&_read.vio);
     return true;
   case TS_API_DATA_WRITE_VIO:
-    *ptr.vio = reinterpret_cast<TSVIO>(&_write_vio);
+    *ptr.vio = reinterpret_cast<TSVIO>(&_write.vio);
     return true;
   case TS_API_DATA_CLOSED:
     *ptr.n = _con.is_closed();
@@ -579,22 +612,22 @@ TCPNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
     Error("do_io_read invoked on _closed this %p, cont %p, nbytes %" PRId64 ", buf %p", this, c, nbytes, buf);
     return nullptr;
   }
-  _read_vio.op        = VIO::READ;
-  _read_vio.mutex     = c ? c->mutex : mutex;
-  _read_vio.cont      = c;
-  _read_vio.nbytes    = nbytes;
-  _read_vio.ndone     = 0;
-  _read_vio.vc_server = this;
+  _read.vio.op        = VIO::READ;
+  _read.vio.mutex     = c ? c->mutex : mutex;
+  _read.vio.cont      = c;
+  _read.vio.nbytes    = nbytes;
+  _read.vio.ndone     = 0;
+  _read.vio.vc_server = this;
   if (buf) {
-    _read_vio.buffer.writer_for(buf);
-    if (_read_vio.is_disabled()) {
-      _read_vio.reenable();
+    _read.vio.buffer.writer_for(buf);
+    if (_read.vio.is_disabled()) {
+      _read.vio.reenable();
     }
   } else {
-    _read_vio.buffer.clear();
-    _read_vio.disable();
+    _read.vio.buffer.clear();
+    _read.vio.disable();
   }
-  return &_read_vio;
+  return &_read.vio;
 }
 
 VIO *
@@ -604,32 +637,32 @@ TCPNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
     Error("do_io_write invoked on _closed this %p, cont %p, nbytes %" PRId64 ", reader %p", this, c, nbytes, reader);
     return nullptr;
   }
-  _write_vio.op        = VIO::WRITE;
-  _write_vio.mutex     = c ? c->mutex : mutex;
-  _write_vio.cont      = c;
-  _write_vio.nbytes    = nbytes;
-  _write_vio.ndone     = 0;
-  _write_vio.vc_server = this;
+  _write.vio.op        = VIO::WRITE;
+  _write.vio.mutex     = c ? c->mutex : mutex;
+  _write.vio.cont      = c;
+  _write.vio.nbytes    = nbytes;
+  _write.vio.ndone     = 0;
+  _write.vio.vc_server = this;
   if (reader) {
     ink_assert(!owner);
-    _write_vio.buffer.reader_for(reader);
-    if (nbytes && _write_vio.is_disabled()) {
-      _write_vio.reenable();
+    _write.vio.buffer.reader_for(reader);
+    if (nbytes && _write.vio.is_disabled()) {
+      _write.vio.reenable();
     }
   } else {
-    _write_vio.disable();
+    _write.vio.disable();
   }
-  return &_write_vio;
+  return &_write.vio;
 }
 
 void
 TCPNetVConnection::do_io_close(int alerrno /* = -1 */)
 {
   // The vio continuations will be cleared in ::clear called from ::free
-  _read_vio.disable();
-  _write_vio.disable();
-  _read_vio.nbytes = 0;
-  _read_vio.op     = VIO::NONE;
+  _read.vio.disable();
+  _write.vio.disable();
+  _read.vio.nbytes = 0;
+  _read.vio.op     = VIO::NONE;
 
   if (netvc_context == NET_VCONNECTION_OUT) {
     // do not clear the iobufs yet to guard
@@ -637,12 +670,12 @@ TCPNetVConnection::do_io_close(int alerrno /* = -1 */)
     Debug("iocore_net", "delay vio buffer clear to protect against  race for this %p", this);
   } else {
     // may be okay to delay for all VCs?
-    _read_vio.buffer.clear();
-    _write_vio.buffer.clear();
+    _read.vio.buffer.clear();
+    _write.vio.buffer.clear();
   }
 
-  _write_vio.nbytes = 0;
-  _write_vio.op     = VIO::NONE;
+  _write.vio.nbytes = 0;
+  _write.vio.op     = VIO::NONE;
 
   if (alerrno && alerrno != -1) {
     lerrno = alerrno;
@@ -659,28 +692,28 @@ TCPNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
   switch (howto) {
   case IO_SHUTDOWN_READ:
     _con.shutdown(SHUT_RD);
-    _read_vio.disable();
-    _read_vio.buffer.clear();
-    _read_vio.nbytes = 0;
-    _read_vio.cont   = nullptr;
+    _read.vio.disable();
+    _read.vio.buffer.clear();
+    _read.vio.nbytes = 0;
+    _read.vio.cont   = nullptr;
     break;
   case IO_SHUTDOWN_WRITE:
     _con.shutdown(SHUT_WR);
-    _write_vio.disable();
-    _write_vio.buffer.clear();
-    _write_vio.nbytes = 0;
-    _write_vio.cont   = nullptr;
+    _write.vio.disable();
+    _write.vio.buffer.clear();
+    _write.vio.nbytes = 0;
+    _write.vio.cont   = nullptr;
     break;
   case IO_SHUTDOWN_READWRITE:
     _con.shutdown(SHUT_RDWR);
-    _read_vio.disable();
-    _write_vio.disable();
-    _read_vio.buffer.clear();
-    _read_vio.nbytes = 0;
-    _write_vio.buffer.clear();
-    _write_vio.nbytes = 0;
-    _read_vio.cont    = nullptr;
-    _write_vio.cont   = nullptr;
+    _read.vio.disable();
+    _write.vio.disable();
+    _read.vio.buffer.clear();
+    _read.vio.nbytes = 0;
+    _write.vio.buffer.clear();
+    _write.vio.nbytes = 0;
+    _read.vio.cont    = nullptr;
+    _write.vio.cont   = nullptr;
     break;
   default:
     ink_assert(!"not reached");
@@ -704,9 +737,11 @@ TCPNetVConnection::reenable(VIO *vio)
   ink_assert(t == this_ethread());
   ink_release_assert(!_con.is_closed());
 
-  if (vio == &_read_vio) {
+  if (vio == &_read.vio) {
+    _read.state = TRY_ISSUE;
     _read_from_net();
   } else {
+    _write.state = TRY_ISSUE;
     _write_to_net();
   }
 }
@@ -717,11 +752,20 @@ TCPNetVConnection::reenable_re(VIO *vio)
   reenable(vio);
 }
 
-TCPNetVConnection::TCPNetVConnection(const IpEndpoint *target, NetVCOptions *opt, EThread *t)
-  : _con(*target, opt, *get_PollDescriptor(t), *this)
+TCPNetVConnection::TCPNetVConnection(const IpEndpoint *remote, NetVCOptions *opt, EThread *t)
+  : _con(*remote, opt, *get_PollDescriptor(t), *this)
 {
   SET_HANDLER(&TCPNetVConnection::startEvent);
-  netvc_context = NET_VCONNECTION_OUT;
+  netvc_context   = NET_VCONNECTION_OUT;
+  thread          = t;
+  remote_addr     = *remote;
+  got_remote_addr = true;
+
+  _read.vio.disable();
+  _write.vio.disable();
+
+  // TODO: throttle
+  // TODO: stats
 }
 
 // Private methods
@@ -731,7 +775,12 @@ TCPNetVConnection::onConnect(NetAIO::TCPConnection &c)
 {
   SET_HANDLER(&TCPNetVConnection::mainEvent);
   NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
-  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+  MUTEX_TRY_LOCK(lock, action_.continuation->mutex, thread);
+  if (lock.is_locked()) {
+    action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+  } else {
+    ink_release_assert(!"failed to get lock for open");
+  }
 }
 
 int
@@ -766,17 +815,16 @@ TCPNetVConnection::acceptEvent(int event, Event *e)
 // and for active and inactivity timeouts.
 //
 int
-TCPNetVConnection::mainEvent(int event, Event *e)
+TCPNetVConnection::mainEvent(int event, void *edata)
 {
-  ink_assert(event == VC_EVENT_ACTIVE_TIMEOUT || event == VC_EVENT_INACTIVITY_TIMEOUT);
   ink_assert(thread == this_ethread());
+  Event *e = static_cast<Event *>(edata);
 
-  ink_release_assert(_read_vio.mutex != _write_vio.mutex);
-  MUTEX_TRY_LOCK(rlock, _read_vio.mutex ? _read_vio.mutex : e->ethread->mutex, e->ethread);
-  MUTEX_TRY_LOCK(wlock, _write_vio.mutex ? _write_vio.mutex : e->ethread->mutex, e->ethread);
+  MUTEX_TRY_LOCK(rlock, _read.vio.mutex ? _read.vio.mutex : e->ethread->mutex, e->ethread);
+  MUTEX_TRY_LOCK(wlock, _write.vio.mutex ? _write.vio.mutex : e->ethread->mutex, e->ethread);
 
-  if (!rlock.is_locked() || !wlock.is_locked() || (_read_vio.mutex && rlock.get_mutex() != _read_vio.mutex.get()) ||
-      (_write_vio.mutex && wlock.get_mutex() != _write_vio.mutex.get())) {
+  if (!rlock.is_locked() || !wlock.is_locked() || (_read.vio.mutex && rlock.get_mutex() != _read.vio.mutex.get()) ||
+      (_write.vio.mutex && wlock.get_mutex() != _write.vio.mutex.get())) {
     return EVENT_CONT;
   }
 
@@ -788,17 +836,36 @@ TCPNetVConnection::mainEvent(int event, Event *e)
     return EVENT_DONE;
   }
 
-  if (_read_state.finished) {
-    ink_assert(_read_vio.op == VIO::READ);
-    _read_state.finished = false;
+  switch (_read.state) {
+  case IDLE:
+  case WAIT_FOR_COMPLETION:
+    break;
+  case TRY_ISSUE:
+    _read_from_net();
+    break;
+  case TRY_HANDLER:
+    ink_assert(_read.vio.op == VIO::READ);
     _handle_read_done();
+    break;
+  default:
+    ink_release_assert(!"Invalid read state");
   }
 
-  if (_write_state.finished) {
-    ink_assert(_read_vio.op == VIO::WRITE);
-    _write_state.finished = false;
+  switch (_write.state) {
+  case IDLE:
+  case WAIT_FOR_COMPLETION:
+    break;
+  case TRY_ISSUE:
+    _write_to_net();
+    break;
+  case TRY_HANDLER:
+    ink_assert(_write.vio.op == VIO::WRITE);
     _handle_write_done();
+    break;
+  default:
+    ink_release_assert(!"Invalid read state");
   }
+
   return EVENT_DONE;
 }
 
@@ -807,7 +874,6 @@ TCPNetVConnection::startEvent(int event, Event *e)
 {
   return EVENT_CONT;
 }
-
 void
 TCPNetVConnection::clear()
 {
@@ -817,16 +883,16 @@ TCPNetVConnection::clear()
   got_remote_addr = false;
   got_local_addr  = false;
   attributes      = 0;
-  _read_vio.mutex.clear();
-  _write_vio.mutex.clear();
-  _read_vio.cont       = nullptr;
-  _write_vio.cont      = nullptr;
-  _read_vio.vc_server  = nullptr;
-  _write_vio.vc_server = nullptr;
+  _read.vio.mutex.clear();
+  _write.vio.mutex.clear();
+  _read.vio.cont       = nullptr;
+  _write.vio.cont      = nullptr;
+  _read.vio.vc_server  = nullptr;
+  _write.vio.vc_server = nullptr;
   options.reset();
   if (netvc_context == NET_VCONNECTION_OUT) {
-    _read_vio.buffer.clear();
-    _write_vio.buffer.clear();
+    _read.vio.buffer.clear();
+    _write.vio.buffer.clear();
   }
   netvc_context = NET_VCONNECTION_UNSET;
 }
@@ -917,7 +983,7 @@ TCPNetVConnection::protocol_contains(std::string_view tag) const
 }
 
 int
-TCPNetVConnection::set_tcp_congestion_control(int side)
+TCPNetVConnection::set_tcp_congestion_control(tcp_congestion_control_t side)
 {
 #ifdef TCP_CONGESTION
   std::string_view ccp;

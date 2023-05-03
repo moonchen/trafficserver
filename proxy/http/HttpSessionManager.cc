@@ -301,6 +301,7 @@ ServerSessionPool::eventHandler(int event, void *data)
       Warning("Connection leak from http keep-alive system fd=%d closed=%d peer_ip_port=%s", unix_net_vc->con.fd,
               unix_net_vc->closed, peer_ip);
     }
+    // TODO: TCPNetVConnection
     ink_assert(0);
   }
   return 0;

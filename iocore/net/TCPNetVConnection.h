@@ -38,6 +38,8 @@
 #include "NetEvent.h"
 #include "NetAIO.h"
 
+enum op_state { IDLE, TRY_ISSUE, WAIT_FOR_COMPLETION, TRY_HANDLER };
+
 class TCPNetVConnection : public NetVConnection, public NetAIO::TCPConnectionObserver
 {
 public:
@@ -93,7 +95,7 @@ public:
   // only from the free list using TCPNetVConnection::alloc().  //
   // The constructor is public just to avoid compile errors.      //
   /////////////////////////////////////////////////////////////////
-  TCPNetVConnection(const IpEndpoint *target, NetVCOptions *opt, EThread *t);
+  TCPNetVConnection(const IpEndpoint *remote, NetVCOptions *opt, EThread *t);
   void free(EThread *t);
 
   int populate_protocol(std::string_view *results, int n) const override;
@@ -125,7 +127,7 @@ public:
 
   int startEvent(int event, Event *e);
   int acceptEvent(int event, Event *e);
-  int mainEvent(int event, Event *e);
+  int mainEvent(int event, void *edata);
 
   /**
    * Populate the current object based on the socket information in the
@@ -139,38 +141,37 @@ public:
 
   void set_local_addr() override;
   void set_mptcp_state() override;
-  int set_tcp_congestion_control(int side) override;
+  int set_tcp_congestion_control(tcp_congestion_control_t side) override;
   void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
   void apply_options() override;
 
 private:
   int _read_from_net(int event = 0, Event *e = nullptr);
-  int _handle_read_done(int event = 0, Event *e = nullptr);
-  VIO _read_vio{VIO::READ};
+  void _handle_read_done();
   void _read_reschedule();
   int _read_signal_and_update(int event);
   int _read_signal_done(int event);
   int _read_signal_error(int lerrno);
-  struct read_state {
+
+  struct read_info {
     int r;
-    std::optional<MutexTryLock> lock;
-    bool finished = false;
-  } _read_state;
+    op_state state = op_state::IDLE;
+    VIO vio{VIO::READ};
+  } _read;
 
   int _write_to_net(int event = 0, Event *e = nullptr);
-  int _handle_write_done(int event = 0, Event *e = nullptr);
-  VIO _write_vio{VIO::WRITE};
+  void _handle_write_done();
   void _write_reschedule();
   int _write_signal_and_update(int event);
   int _write_signal_done(int event);
   int _write_signal_error(int lerrno);
-  struct write_state {
+  struct write_info {
     int r;
-    std::optional<MutexTryLock> lock;
-    bool finished = false;
+    op_state state = op_state::IDLE;
     int signalled;
-  } _write_state;
+    VIO vio{VIO::WRITE};
+  } _write;
 
   int _recursion = 0;
   NetAIO::TCPConnection _con;

@@ -911,7 +911,7 @@ PluginVC::set_mptcp_state()
 }
 
 int
-PluginVC::set_tcp_congestion_control(int ATS_UNUSED)
+PluginVC::set_tcp_congestion_control(tcp_congestion_control_t ATS_UNUSED)
 {
   return -1;
 }
