@@ -254,7 +254,8 @@ NetAIO::TCPConnection::close()
   if (_fd >= 2 && _fd != NO_FD) {
     int fd_save = _fd;
     _fd         = NO_FD;
-    SocketManager::close(fd_save);
+    int res     = SocketManager::close(fd_save);
+    Debug(TAG, "close(%d) -> %d", fd_save, res);
     _observer.onClose(*this);
   } else if (_fd == NO_FD) {
     // Do nothing
@@ -308,7 +309,6 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
     _recvmsg_in_progress = true;
     _recvmsg_msg         = std::move(msg);
     _recvmsg_flags       = flags;
-    Debug(TAG, "_recvmsg_msg->msg_iov[0].iovlen = %zu", _recvmsg_msg->msg_iov[0].iov_len);
   }
 
   return true;
@@ -391,7 +391,6 @@ void
 NetAIO::TCPConnection::_poll_connected(int flags)
 {
   if (_recvmsg_in_progress && _read_ready) {
-    Debug(TAG, "_recvmsg_msg->msg_iov[0].iovlen = %zu", _recvmsg_msg->msg_iov[0].iov_len);
     int res = ::recvmsg(_fd, _recvmsg_msg.get(), _recvmsg_flags);
     Debug(TAG, "recvmsg(%d, %p, %d) -> res=%d, errno = %d", _fd, _recvmsg_msg.get(), _recvmsg_flags, res, errno);
     if (res == -1) {
@@ -443,7 +442,10 @@ NetAIO::TCPConnection::poll(int flags)
   }
 
   if (flags & EVENTIO_ERROR) {
-    _observer.onError(ES_POLL, errno, *this);
+    int error;
+    socklen_t errlen = sizeof error;
+    getsockopt(_fd, SOL_SOCKET, SO_ERROR, &error, &errlen);
+    _observer.onError(ES_POLL, error, *this);
     return;
   }
 

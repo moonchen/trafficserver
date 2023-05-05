@@ -38,7 +38,8 @@
 #include "NetEvent.h"
 #include "NetAIO.h"
 
-enum op_state { IDLE, TRY_ISSUE, WAIT_FOR_COMPLETION, TRY_HANDLER };
+enum class op_state { IDLE, TRY_ISSUE, WAIT_FOR_COMPLETION, TRY_HANDLER, ERROR };
+enum class connect_state { NONE, WAIT, FAILED, DONE };
 
 class TCPNetVConnection : public NetVConnection, public NetAIO::TCPConnectionObserver
 {
@@ -96,7 +97,7 @@ public:
   // The constructor is public just to avoid compile errors.      //
   /////////////////////////////////////////////////////////////////
   TCPNetVConnection(const IpEndpoint *remote, NetVCOptions *opt, EThread *t);
-  void free(EThread *t);
+  // void free(EThread *t);
 
   int populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
@@ -125,8 +126,8 @@ public:
 
   bool from_accept_thread = false;
 
-  int startEvent(int event, Event *e);
-  int acceptEvent(int event, Event *e);
+  int connectEvent(int event, void *edata);
+  int acceptEvent(int event, void *edata);
   int mainEvent(int event, void *edata);
 
   /**
@@ -134,7 +135,7 @@ public:
    * con parameter.
    * This is logic is invoked when the NetVC object is created in a new thread context
    */
-  virtual void clear();
+  // virtual void clear();
 
   ink_hrtime get_inactivity_timeout() override;
   ink_hrtime get_active_timeout() override;
@@ -147,8 +148,13 @@ public:
   void apply_options() override;
 
 private:
+  connect_state _connect_state = connect_state::NONE;
+  int _handle_connect_done(int event = 0, Event *e = nullptr);
+  int _handle_connect_error(int event = 0, Event *e = nullptr);
+
   int _read_from_net(int event = 0, Event *e = nullptr);
   void _handle_read_done();
+  void _handle_read_error();
   void _read_reschedule();
   int _read_signal_and_update(int event);
   int _read_signal_done(int event);
@@ -162,10 +168,10 @@ private:
 
   int _write_to_net(int event = 0, Event *e = nullptr);
   void _handle_write_done();
+  void _handle_write_error();
   void _write_reschedule();
   int _write_signal_and_update(int event);
   int _write_signal_done(int event);
-  int _write_signal_error(int lerrno);
   struct write_info {
     int r;
     op_state state = op_state::IDLE;
