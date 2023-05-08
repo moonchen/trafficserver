@@ -24,6 +24,7 @@
 #include "P_Net.h"
 #include "TCPNetVConnection.h"
 #include "tscore/InkErrno.h"
+#include "tscore/ink_assert.h"
 #include "tscore/ink_inet.h"
 #include "tscore/ink_sock.h"
 #include "tscore/TSSystemState.h"
@@ -175,9 +176,11 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
   if (t) {
     vc = THREAD_ALLOC_INIT(tcpNetVCAllocator, t, &ip_target, opt, t);
   } else {
-    if (likely(vc = tcpNetVCAllocator.alloc(&ip_target, opt, t))) {
-      vc->from_accept_thread = true;
-    }
+    vc = tcpNetVCAllocator.alloc(&ip_target, opt, t);
+  }
+
+  if (vc == nullptr) {
+    ink_release_assert(!"out of memory creating a new TCPNetVConnection");
   }
   vc->id      = net_next_connection_number();
   vc->mutex   = cont->mutex;

@@ -37,7 +37,7 @@
 
 namespace NetAIO
 {
-enum ErrorSource {
+enum class ErrorSource {
   ES_SOCKET,
   ES_REGISTER,
   ES_CONNECT,
@@ -77,7 +77,7 @@ public:
 class TCPConnection
 {
 public:
-  enum state {
+  enum class State {
     TCP_CLOSED,
     TCP_CONNECTING,
     TCP_CONNECTED,
@@ -129,25 +129,25 @@ public:
   bool
   is_connecting() const
   {
-    return _state == TCP_CONNECTING;
+    return _state == State::TCP_CONNECTING;
   }
 
   bool
   is_shutdown_read() const
   {
-    return _state == TCP_SHUTDOWN_RD || _state == TCP_SHUTDOWN_RDWR;
+    return _state == State::TCP_SHUTDOWN_RD || _state == State::TCP_SHUTDOWN_RDWR;
   }
 
   bool
   is_shutdown_write() const
   {
-    return _state == TCP_SHUTDOWN_WR || _state == TCP_SHUTDOWN_RDWR;
+    return _state == State::TCP_SHUTDOWN_WR || _state == State::TCP_SHUTDOWN_RDWR;
   }
 
   bool
   is_closed() const
   {
-    return _state == TCP_CLOSED;
+    return _state == State::TCP_CLOSED;
   }
 
   void apply_options(const NetVCOptions *options);
@@ -160,7 +160,7 @@ public:
 
 private:
   int _fd;
-  enum state _state { TCP_CLOSED };
+  enum State _state { State::TCP_CLOSED };
   bool _recvmsg_in_progress{false};
   bool _sendmsg_in_progress{false};
   const IpEndpoint _remote;

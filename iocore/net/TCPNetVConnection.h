@@ -124,8 +124,6 @@ public:
 
   unsigned int id = 0;
 
-  bool from_accept_thread = false;
-
   int connectEvent(int event, void *edata);
   int acceptEvent(int event, void *edata);
   int mainEvent(int event, void *edata);

@@ -291,12 +291,12 @@ TCPNetVConnection::onError(NetAIO::ErrorSource source, int err, NetAIO::TCPConne
   }
 
   // Handle EOS
-  if (source == NetAIO::ES_RECVMSG) {
+  if (source == NetAIO::ErrorSource::ES_RECVMSG) {
     lerrno = err;
     _handle_read_error();
   }
 
-  if (source == NetAIO::ES_SENDMSG) {
+  if (source == NetAIO::ErrorSource::ES_SENDMSG) {
     lerrno = err;
     _handle_write_error();
     return;

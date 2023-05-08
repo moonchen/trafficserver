@@ -40,7 +40,7 @@ TCPListener::TCPListener(const IpEndpoint &local, const AcceptOptions &_opt, int
     // Empty the accept queue now so that epoll will wake us up when new connections arrive.
     _accept();
   } else {
-    _observer.onError(ES_LISTEN, errno);
+    _observer.onError(ErrorSource::ES_LISTEN, errno);
   }
 }
 

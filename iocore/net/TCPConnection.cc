@@ -44,13 +44,13 @@ NetAIO::TCPConnection::TCPConnection(const IpEndpoint &target, const NetVCOption
     if (_open()) {
       _connect();
     }
-    _state = TCP_CONNECTING;
+    _state = State::TCP_CONNECTING;
   } else {
     if (_register_poll()) {
-      _state = TCP_CONNECTED;
+      _state = State::TCP_CONNECTED;
     } else {
-      _observer.onError(ES_REGISTER, errno, *this);
-      _state = TCP_CLOSED;
+      _observer.onError(ErrorSource::ES_REGISTER, errno, *this);
+      _state = State::TCP_CLOSED;
     }
   }
 }
@@ -82,7 +82,7 @@ NetAIO::TCPConnection::_open()
 
   res = SocketManager::socket(family, SOCK_STREAM, 0);
   if (-1 == res) {
-    _observer.onError(ES_SOCKET, errno, *this);
+    _observer.onError(ErrorSource::ES_SOCKET, errno, *this);
     return false;
   }
 
@@ -93,7 +93,7 @@ NetAIO::TCPConnection::_open()
   // Try setting the various socket options, if requested.
 
   if (-1 == safe_setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char *>(&enable_reuseaddr), sizeof(enable_reuseaddr))) {
-    _observer.onError(ES_SETSOCKOPT, errno, *this);
+    _observer.onError(ErrorSource::ES_SETSOCKOPT, errno, *this);
     return false;
   }
 
@@ -113,7 +113,7 @@ NetAIO::TCPConnection::_open()
   }
 
   if (-1 == safe_nonblocking(_fd)) {
-    _observer.onError(ES_FCNTL, errno, *this);
+    _observer.onError(ErrorSource::ES_FCNTL, errno, *this);
     return false;
   }
 
@@ -143,7 +143,7 @@ NetAIO::TCPConnection::_open()
 
   if (local_addr.network_order_port() || !is_any_address) {
     if (-1 == SocketManager::ink_bind(_fd, &local_addr.sa, ats_ip_size(&local_addr.sa))) {
-      _observer.onError(ES_BIND, errno, *this);
+      _observer.onError(ErrorSource::ES_BIND, errno, *this);
       return false;
     }
   }
@@ -165,7 +165,7 @@ NetAIO::TCPConnection::_connect()
   ScopeGuard cleanup{[this]() { close(); }}; // mark for close until we succeed.
 
   if (!_register_poll()) {
-    _observer.onError(ES_REGISTER, errno, *this);
+    _observer.onError(ErrorSource::ES_REGISTER, errno, *this);
     return;
   }
 
@@ -181,16 +181,16 @@ NetAIO::TCPConnection::_connect()
   }
 
   if (-1 == res && !(EINPROGRESS == errno || EWOULDBLOCK == errno)) {
-    _state = TCP_CLOSED;
-    _observer.onError(ES_CONNECT, errno, *this);
+    _state = State::TCP_CLOSED;
+    _observer.onError(ErrorSource::ES_CONNECT, errno, *this);
     return;
   } else if (-1 == res && (EINPROGRESS == errno || EWOULDBLOCK == errno)) {
-    _state = TCP_CONNECTING;
+    _state = State::TCP_CONNECTING;
     Debug(TAG, "%d: connecting", _fd);
     _read_ready  = false;
     _write_ready = false;
   } else if (res == 0) {
-    _state = TCP_CONNECTED;
+    _state = State::TCP_CONNECTED;
   } else {
     ink_release_assert(!"Unexpected return value from connect()");
   }
@@ -207,7 +207,7 @@ NetAIO::TCPConnection::apply_options(const NetVCOptions *options)
   // ignore other changes
   if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_NO_DELAY) {
     safe_setsockopt(_fd, IPPROTO_TCP, TCP_NODELAY, SOCKOPT_ON, sizeof(int));
-    Debug(TAG, "::open: setsockopt() TCP_NODELAY on socket");
+    Debug(TAG, "::open: setsockopt() state::TCP_NODELAY on socket");
   }
   if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_KEEP_ALIVE) {
     safe_setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, SOCKOPT_ON, sizeof(int));
@@ -224,7 +224,7 @@ NetAIO::TCPConnection::apply_options(const NetVCOptions *options)
   if (_opt->sockopt_flags & NetVCOptions::SOCK_OPT_TCP_NOTSENT_LOWAT) {
     uint32_t lowat = _opt->packet_notsent_lowat;
     safe_setsockopt(_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, reinterpret_cast<char *>(&lowat), sizeof(lowat));
-    Debug(TAG, "::open:: setsockopt() set TCP_NOTSENT_LOWAT to %d", lowat);
+    Debug(TAG, "::open:: setsockopt() set state::TCP_NOTSENT_LOWAT to %d", lowat);
   }
 #endif
 
@@ -292,7 +292,7 @@ NetAIO::TCPConnection::recvmsg(std::unique_ptr<struct msghdr> msg, int flags)
         Debug(TAG, "poll: %d read not ready", _fd);
         _read_ready = false;
       } else {
-        _observer.onError(ES_RECVMSG, errno, *this);
+        _observer.onError(ErrorSource::ES_RECVMSG, errno, *this);
       }
     } else {
       ink_assert(res >= 0);
@@ -325,7 +325,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
     return false;
   }
 
-  if (_state == TCP_CONNECTED || (_state == TCP_CONNECTING && _opt->f_tcp_fastopen)) {
+  if (_state == State::TCP_CONNECTED || (_state == State::TCP_CONNECTING && _opt->f_tcp_fastopen)) {
     ink_release_assert(!_sendmsg_msg);
 
     if (_write_ready) {
@@ -341,7 +341,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
           Debug(TAG, "poll: %d write not ready", _fd);
           _write_ready = false;
         } else {
-          _observer.onError(ES_SENDMSG, errno, *this);
+          _observer.onError(ErrorSource::ES_SENDMSG, errno, *this);
         }
       } else {
         _observer.onSendmsg(res, std::move(_sendmsg_msg), *this);
@@ -362,7 +362,7 @@ NetAIO::TCPConnection::sendmsg(std::unique_ptr<struct msghdr> msg, int flags)
       _sendmsg_flags       = flags;
     }
   } else {
-    _observer.onError(ES_SENDMSG, ENOTCONN, *this);
+    _observer.onError(ErrorSource::ES_SENDMSG, ENOTCONN, *this);
     return false;
   }
 
@@ -375,14 +375,14 @@ NetAIO::TCPConnection::shutdown(int how)
   int res = SocketManager::shutdown(_fd, how);
   if (res == 0) {
     if (how == SHUT_RD) {
-      _state = TCP_SHUTDOWN_RD;
+      _state = State::TCP_SHUTDOWN_RD;
     } else if (how == SHUT_WR) {
-      _state = TCP_SHUTDOWN_WR;
+      _state = State::TCP_SHUTDOWN_WR;
     } else if (how == SHUT_RDWR) {
-      _state = TCP_SHUTDOWN_RDWR;
+      _state = State::TCP_SHUTDOWN_RDWR;
     }
   } else {
-    _observer.onError(ES_SHUTDOWN, errno, *this);
+    _observer.onError(ErrorSource::ES_SHUTDOWN, errno, *this);
   }
   return true;
 }
@@ -400,7 +400,7 @@ NetAIO::TCPConnection::_poll_connected(int flags)
         _rearm_read();
         return;
       } else {
-        _observer.onError(ES_RECVMSG, errno, *this);
+        _observer.onError(ErrorSource::ES_RECVMSG, errno, *this);
       }
     } else {
       _recvmsg_in_progress = false;
@@ -418,7 +418,7 @@ NetAIO::TCPConnection::_poll_connected(int flags)
         _rearm_write();
         return;
       } else {
-        _observer.onError(ES_SENDMSG, errno, *this);
+        _observer.onError(ErrorSource::ES_SENDMSG, errno, *this);
       }
     } else {
       _sendmsg_in_progress = false;
@@ -445,19 +445,19 @@ NetAIO::TCPConnection::poll(int flags)
     int error;
     socklen_t errlen = sizeof error;
     getsockopt(_fd, SOL_SOCKET, SO_ERROR, &error, &errlen);
-    _observer.onError(ES_POLL, error, *this);
+    _observer.onError(ErrorSource::ES_POLL, error, *this);
     return;
   }
 
-  if (_state == TCP_CONNECTING) {
+  if (_state == State::TCP_CONNECTING) {
     if (_write_ready) {
-      _state = TCP_CONNECTED;
+      _state = State::TCP_CONNECTED;
       _observer.onConnect(*this);
     }
   }
 
   // Fall through since we may have data to read/write.
-  if (_state == TCP_CONNECTED) {
+  if (_state == State::TCP_CONNECTED) {
     _poll_connected(flags);
   }
 }
