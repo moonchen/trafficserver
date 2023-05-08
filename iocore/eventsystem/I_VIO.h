@@ -25,9 +25,8 @@
 #pragma once
 #define I_VIO_h
 
-#if !defined(I_IOBuffer_h)
-#error "include I_IOBuffer.h"
-#endif
+#include "I_IOBuffer.h"
+#include "I_VConnection.h"
 
 class Continuation;
 class VConnection;

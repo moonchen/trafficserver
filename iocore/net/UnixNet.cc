@@ -1,10 +1,11 @@
-/** @file
+/**@file
 
-  A brief file description
+   A brief file description
 
-  @section license License
+ @section license License
 
-  Licensed to the Apache Software Foundation (ASF) under one
+   Licensed to the Apache Software
+   Foundation(ASF) under one
   or more contributor license agreements.  See the NOTICE file
   distributed with this work for additional information
   regarding copyright ownership.  The ASF licenses this file
@@ -21,8 +22,13 @@
   limitations under the License.
  */
 
-#include "P_Net.h"
+#include "AsyncSignalEventIO.h"
+#include "EventIO.h"
+#include "IOUringEventIO.h"
 #include "I_AIO.h"
+#include "P_Net.h"
+#include "P_UnixNet.h"
+#include "ReadWriteEventIO.h"
 #include "tscore/ink_hrtime.h"
 
 #if TS_USE_LINUX_IO_URING
@@ -43,8 +49,6 @@ NetHandler::Config NetHandler::global_config;
 std::bitset<std::numeric_limits<unsigned int>::digits> NetHandler::active_thread_types;
 const std::bitset<NetHandler::CONFIG_ITEM_COUNT> NetHandler::config_value_affects_per_thread_value{0x3};
 
-extern "C" void fd_reify(struct ev_loop *);
-
 // INKqa10496
 // One Inactivity cop runs on each thread once every second and
 // loops through the list of NetEvents and calls the timeouts
@@ -60,8 +64,8 @@ public:
     NetHandler &nh = *get_NetHandler(this_ethread());
 
     Debug("inactivity_cop_check", "Checking inactivity on Thread-ID #%d", this_ethread()->id);
-    // The rest NetEvents in cop_list which are not triggered between InactivityCop runs.
-    // Use pop() to catch any closes caused by callbacks.
+    // The rest NetEvents in cop_list which are not triggered between
+    // InactivityCop runs. Use pop() to catch any closes caused by callbacks.
     while (NetEvent *ne = nh.cop_list.pop()) {
       // If we cannot get the lock don't stop just keep cleaning
       MUTEX_TRY_LOCK(lock, ne->get_mutex(), this_ethread());
@@ -78,7 +82,9 @@ public:
       if (ne->default_inactivity_timeout_in == -1) {
         // If no context-specific default inactivity timeout has been set by an
         // override plugin, then use the global default.
-        Debug("inactivity_cop", "vc: %p setting the global default inactivity timeout of %d, next_inactivity_timeout_at: %" PRId64,
+        Debug("inactivity_cop",
+              "vc: %p setting the global default inactivity timeout of %d, "
+              "next_inactivity_timeout_at: %" PRId64,
               ne, nh.config.default_inactivity_timeout, ne->next_inactivity_timeout_at);
         ne->set_default_inactivity_timeout(HRTIME_SECONDS(nh.config.default_inactivity_timeout));
       }
@@ -102,7 +108,8 @@ public:
           NET_INCREMENT_DYN_STAT(default_inactivity_timeout_count_stat);
         }
         if (nh.keep_alive_queue.in(ne)) {
-          // only stat if the connection is in keep-alive, there can be other inactivity timeouts
+          // only stat if the connection is in keep-alive, there can be other
+          // inactivity timeouts
           ink_hrtime diff = (now - (ne->next_inactivity_timeout_at - ne->inactivity_timeout_in)) / HRTIME_SECOND;
           NET_SUM_DYN_STAT(keep_alive_queue_timeout_total_stat, diff);
           NET_INCREMENT_DYN_STAT(keep_alive_queue_timeout_count_stat);
@@ -125,8 +132,8 @@ public:
       }
     }
     // NetHandler will remove NetEvent from cop_list if it is triggered.
-    // As the NetHandler runs, the number of NetEvents in the cop_list is decreasing.
-    // NetHandler runs 100 times maximum between InactivityCop runs.
+    // As the NetHandler runs, the number of NetEvents in the cop_list is
+    // decreasing. NetHandler runs 100 times maximum between InactivityCop runs.
     // Therefore we don't have to check all the NetEvents as much as open_list.
 
     // Cleanup the active and keep-alive queues periodically
@@ -174,13 +181,15 @@ void
 PollCont::do_poll(ink_hrtime timeout)
 {
   if (likely(net_handler)) {
-    /* checking to see whether there are connections on the ready_queue (either read or write) that need processing [ebalsa] */
+    /* checking to see whether there are connections on the ready_queue (either
+     * read or write) that need processing [ebalsa] */
     if (likely(!net_handler->read_ready_list.empty() || !net_handler->write_ready_list.empty() ||
                !net_handler->read_enable_list.empty() || !net_handler->write_enable_list.empty())) {
       NetDebug("iocore_net_poll", "rrq: %d, wrq: %d, rel: %d, wel: %d", net_handler->read_ready_list.empty(),
                net_handler->write_ready_list.empty(), net_handler->read_enable_list.empty(),
                net_handler->write_enable_list.empty());
-      poll_timeout = 0; // poll immediately returns -- we have triggered stuff to process right now
+      poll_timeout = 0; // poll immediately returns -- we have triggered stuff
+                        // to process right now
     } else if (timeout >= 0) {
       poll_timeout = ink_hrtime_to_msec(timeout);
     } else {
@@ -201,18 +210,6 @@ PollCont::do_poll(ink_hrtime timeout)
     kevent(pollDescriptor->kqueue_fd, nullptr, 0, pollDescriptor->kq_Triggered_Events, POLL_DESCRIPTOR_SIZE, &tv);
   NetDebug("v_iocore_net_poll", "[PollCont::pollEvent] kqueue_fd: %d, timeout: %d, results: %d", pollDescriptor->kqueue_fd,
            poll_timeout, pollDescriptor->result);
-#endif
-}
-
-static void
-net_signal_hook_callback(EThread *thread)
-{
-#if HAVE_EVENTFD
-  uint64_t counter;
-  ATS_UNUSED_RETURN(read(thread->evfd, &counter, sizeof(uint64_t)));
-#else
-  char dummy[1024];
-  ATS_UNUSED_RETURN(read(thread->evpipe[0], &dummy[0], 1024));
 #endif
 }
 
@@ -238,19 +235,20 @@ initialize_thread_for_net(EThread *thread)
   thread->schedule_every(inactivityCop, HRTIME_SECONDS(cop_freq));
 
   thread->set_tail_handler(nh);
-  thread->ep = static_cast<EventIO *>(ats_malloc(sizeof(EventIO)));
-  new (thread->ep) EventIO();
-  thread->ep->type = EVENTIO_ASYNC_SIGNAL;
-#if HAVE_EVENTFD
-  thread->ep->start(pd, thread->evfd, nullptr, EVENTIO_READ);
-#else
-  thread->ep->start(pd, thread->evpipe[0], nullptr, EVENTIO_READ);
-#endif
 
+#if HAVE_EVENTFD
 #if TS_USE_LINUX_IO_URING
-  nh->uring_evio.type = EVENTIO_IO_URING;
-  nh->uring_evio.start(pd, IOUringContext::local_context()->register_eventfd(), nullptr, EVENTIO_READ);
+  auto ep = new IOUringEventIO();
+  ep->start(pd, IOUringContext::local_context());
+#else
+  auto ep = new AsyncSignalEventIO();
+  ep->start(pd, thread->evfd, EVENTIO_READ);
 #endif
+#else
+  auto ep = new AsyncSignalEventIO();
+  ep->start(pd, thread->evpipe[0], EVENTIO_READ);
+#endif
+  thread->ep = ep;
 }
 
 // NetHandler method definitions
@@ -277,10 +275,16 @@ NetHandler::update_nethandler_config(const char *str, RecDataT, RecData data, vo
     Debug("net_queue", "proxy.config.net.inactive_threshold_in updated to %" PRId64, data.rec_int);
   } else if (name == "proxy.config.net.transaction_no_activity_timeout_in"sv) {
     updated_member = &NetHandler::global_config.transaction_no_activity_timeout_in;
-    Debug("net_queue", "proxy.config.net.transaction_no_activity_timeout_in updated to %" PRId64, data.rec_int);
+    Debug("net_queue",
+          "proxy.config.net.transaction_no_activity_timeout_in updated to "
+          "%" PRId64,
+          data.rec_int);
   } else if (name == "proxy.config.net.keep_alive_no_activity_timeout_in"sv) {
     updated_member = &NetHandler::global_config.keep_alive_no_activity_timeout_in;
-    Debug("net_queue", "proxy.config.net.keep_alive_no_activity_timeout_in updated to %" PRId64, data.rec_int);
+    Debug("net_queue",
+          "proxy.config.net.keep_alive_no_activity_timeout_in updated to "
+          "%" PRId64,
+          data.rec_int);
   } else if (name == "proxy.config.net.default_inactivity_timeout"sv) {
     updated_member = &NetHandler::global_config.default_inactivity_timeout;
     Debug("net_queue", "proxy.config.net.default_inactivity_timeout updated to %" PRId64, data.rec_int);
@@ -288,9 +292,11 @@ NetHandler::update_nethandler_config(const char *str, RecDataT, RecData data, vo
 
   if (updated_member) {
     *updated_member = data.rec_int; // do the actual update.
-    // portable form of the update, an index converted to <void*> so it can be passed as an event cookie.
+    // portable form of the update, an index converted to <void*> so it can be
+    // passed as an event cookie.
     void *idx = reinterpret_cast<void *>(static_cast<intptr_t>(updated_member - &global_config[0]));
-    // Signal the NetHandler instances, passing the index of the updated config value.
+    // Signal the NetHandler instances, passing the index of the updated config
+    // value.
     for (int i = 0; i < eventProcessor.n_thread_groups; ++i) {
       if (!active_thread_types[i]) {
         continue;
@@ -464,7 +470,6 @@ NetHandler::waitForActivity(ink_hrtime timeout)
   EventIO *epd = nullptr;
 #if AIO_MODE == AIO_MODE_IO_URING
   IOUringContext *ur = IOUringContext::local_context();
-  bool servicedh     = false;
 #endif
 
   NET_INCREMENT_DYN_STAT(net_handler_run_stat);
@@ -482,67 +487,18 @@ NetHandler::waitForActivity(ink_hrtime timeout)
 
   // Get & Process polling result
   PollDescriptor *pd = get_PollDescriptor(this->thread);
-  NetEvent *ne       = nullptr;
   for (int x = 0; x < pd->result; x++) {
-    epd = static_cast<EventIO *> get_ev_data(pd, x);
-    if (epd->type == EVENTIO_READWRITE_VC) {
-      ne = epd->data.ne;
-      // Remove triggered NetEvent from cop_list because it won't be timeout before next InactivityCop runs.
-      if (cop_list.in(ne)) {
-        cop_list.remove(ne);
-      }
-      int flags = get_ev_events(pd, x);
-      if (flags & (EVENTIO_ERROR)) {
-        ne->set_error_from_socket();
-      }
-      if (flags & (EVENTIO_READ)) {
-        ne->read.triggered = 1;
-        if (!read_ready_list.in(ne)) {
-          read_ready_list.enqueue(ne);
-        }
-      }
-      if (flags & (EVENTIO_WRITE)) {
-        ne->write.triggered = 1;
-        if (!write_ready_list.in(ne)) {
-          write_ready_list.enqueue(ne);
-        }
-      } else if (!(flags & (EVENTIO_READ))) {
-        Debug("iocore_net_main", "Unhandled epoll event: 0x%04x", flags);
-        // In practice we sometimes see EPOLLERR and EPOLLHUP through there
-        // Anything else would be surprising
-        ink_assert((flags & ~(EVENTIO_ERROR)) == 0);
-        ne->write.triggered = 1;
-        if (!write_ready_list.in(ne)) {
-          write_ready_list.enqueue(ne);
-        }
-      }
-    } else if (epd->type == EVENTIO_DNS_CONNECTION) {
-      if (epd->data.dnscon != nullptr) {
-        epd->data.dnscon->trigger(); // Make sure the DNSHandler for this con knows we triggered
-#if defined(USE_EDGE_TRIGGER)
-        epd->refresh(EVENTIO_READ);
-#endif
-      }
-    } else if (epd->type == EVENTIO_ASYNC_SIGNAL) {
-      net_signal_hook_callback(this->thread);
-    } else if (epd->type == EVENTIO_NETACCEPT) {
-      this->thread->schedule_imm(epd->data.na);
-#if AIO_MODE == AIO_MODE_IO_URING
-    } else if (epd->type == EVENTIO_IO_URING) {
-      servicedh = true;
-#endif
-    }
+    epd       = static_cast<EventIO *> get_ev_data(pd, x);
+    int flags = get_ev_events(pd, x);
+    epd->process_event(flags);
     ev_next_event(pd, x);
   }
 
   pd->result = 0;
 
   process_ready_list();
-
 #if AIO_MODE == AIO_MODE_IO_URING
-  if (servicedh) {
-    ur->service();
-  }
+  ur->service();
 #endif
 
   return EVENT_CONT;
@@ -565,7 +521,8 @@ NetHandler::manage_active_queue(NetEvent *enabling_ne, bool ignore_queue_size = 
 {
   const int total_connections_in = active_queue_size + keep_alive_queue_size;
   Debug("v_net_queue",
-        "max_connections_per_thread_in: %d max_requests_per_thread_in: %d total_connections_in: %d "
+        "max_connections_per_thread_in: %d max_requests_per_thread_in: %d "
+        "total_connections_in: %d "
         "active_queue_size: %d keep_alive_queue_size: %d",
         max_connections_per_thread_in, max_requests_per_thread_in, total_connections_in, active_queue_size, keep_alive_queue_size);
 
@@ -613,7 +570,8 @@ NetHandler::manage_active_queue(NetEvent *enabling_ne, bool ignore_queue_size = 
 void
 NetHandler::configure_per_thread_values()
 {
-  // figure out the number of threads and calculate the number of connections per thread
+  // figure out the number of threads and calculate the number of connections
+  // per thread
   int threads                   = eventProcessor.thread_group[ET_NET]._count;
   max_connections_per_thread_in = config.max_connections_in / threads;
   max_requests_per_thread_in    = config.max_requests_in / threads;
@@ -627,7 +585,9 @@ NetHandler::manage_keep_alive_queue()
   uint32_t total_connections_in = active_queue_size + keep_alive_queue_size;
   ink_hrtime now                = Thread::get_hrtime();
 
-  Debug("v_net_queue", "max_connections_per_thread_in: %d total_connections_in: %d active_queue_size: %d keep_alive_queue_size: %d",
+  Debug("v_net_queue",
+        "max_connections_per_thread_in: %d total_connections_in: %d "
+        "active_queue_size: %d keep_alive_queue_size: %d",
         max_connections_per_thread_in, total_connections_in, active_queue_size, keep_alive_queue_size);
 
   if (!max_connections_per_thread_in || total_connections_in <= max_connections_per_thread_in) {
@@ -651,7 +611,9 @@ NetHandler::manage_keep_alive_queue()
   }
 
   if (total_idle_count > 0) {
-    Debug("net_queue", "max cons: %d active: %d idle: %d already closed: %d, close event: %d mean idle: %d",
+    Debug("net_queue",
+          "max cons: %d active: %d idle: %d already closed: %d, close event: "
+          "%d mean idle: %d",
           max_connections_per_thread_in, total_connections_in, keep_alive_queue_size, closed, handle_event,
           total_idle_time / total_idle_count);
   }
@@ -733,7 +695,9 @@ bool
 NetHandler::add_to_active_queue(NetEvent *ne)
 {
   Debug("net_queue", "NetEvent: %p", ne);
-  Debug("net_queue", "max_connections_per_thread_in: %d active_queue_size: %d keep_alive_queue_size: %d",
+  Debug("net_queue",
+        "max_connections_per_thread_in: %d active_queue_size: %d "
+        "keep_alive_queue_size: %d",
         max_connections_per_thread_in, active_queue_size, keep_alive_queue_size);
   ink_assert(mutex->thread_holding == this_ethread());
 
@@ -772,4 +736,61 @@ NetHandler::remove_from_active_queue(NetEvent *ne)
     active_queue.remove(ne);
     --active_queue_size;
   }
+}
+
+int
+ReadWriteEventIO::start(EventLoop l, NetEvent *ne, NetHandler *nh, int events)
+{
+  _ne = ne;
+  _nh = nh;
+  return start_common(l, ne->get_fd(), events);
+}
+
+int
+ReadWriteEventIO::start(EventLoop l, int afd, NetEvent *ne, NetHandler *nh, int events)
+{
+  _ne = ne;
+  _nh = nh;
+  return start_common(l, afd, events);
+}
+
+void
+ReadWriteEventIO::process_event(int flags)
+{
+  // Remove triggered NetEvent from cop_list because it won't be timeout before
+  // next InactivityCop runs.
+  if (_nh->cop_list.in(_ne)) {
+    _nh->cop_list.remove(_ne);
+  }
+  if (flags & (EVENTIO_ERROR)) {
+    _ne->set_error_from_socket();
+  }
+  if (flags & (EVENTIO_READ)) {
+    _ne->read.triggered = 1;
+    if (!_nh->read_ready_list.in(_ne)) {
+      _nh->read_ready_list.enqueue(_ne);
+    }
+  }
+  if (flags & (EVENTIO_WRITE)) {
+    _ne->write.triggered = 1;
+    if (!_nh->write_ready_list.in(_ne)) {
+      _nh->write_ready_list.enqueue(_ne);
+    }
+  } else if (!(flags & (EVENTIO_READ))) {
+    Debug("iocore_net_main", "Unhandled epoll event: 0x%04x", flags);
+    // In practice we sometimes see EPOLLERR and EPOLLHUP through there
+    // Anything else would be surprising
+    ink_assert((flags & ~(EVENTIO_ERROR)) == 0);
+    _ne->write.triggered = 1;
+    if (!_nh->write_ready_list.in(_ne)) {
+      _nh->write_ready_list.enqueue(_ne);
+    }
+  }
+}
+
+int
+ReadWriteEventIO::close()
+{
+  EventIO::close(); // discard retval
+  return _ne->close();
 }

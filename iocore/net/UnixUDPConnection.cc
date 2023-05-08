@@ -31,6 +31,7 @@
 
 #include "P_Net.h"
 #include "P_UDPNet.h"
+#include "P_UnixUDPConnection.h"
 
 UnixUDPConnection::~UnixUDPConnection()
 {

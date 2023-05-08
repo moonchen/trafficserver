@@ -22,6 +22,7 @@
  */
 
 #include "HttpDebugNames.h"
+#include "I_DNSProcessor.h"
 #include "P_EventSystem.h"
 #include "StatPages.h"
 #include "HttpTunnel.h"

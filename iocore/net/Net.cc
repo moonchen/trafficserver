@@ -29,6 +29,7 @@
 ************************************************************************/
 
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include <utility>
 
 RecRawStatBlock *net_rsb = nullptr;

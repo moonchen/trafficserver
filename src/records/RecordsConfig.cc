@@ -21,6 +21,7 @@
   limitations under the License.
  */
 
+#include "records/I_RecDefs.h"
 #include "tscore/ink_config.h"
 #include "tscore/Filenames.h"
 #include "records/I_RecordsConfig.h"
@@ -778,6 +779,8 @@ static const RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.net.tcp_congestion_control_in", RECD_STRING, "", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.net.tcp_congestion_control_out", RECD_STRING, "", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.net.io_uring", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
 
   //##############################################################################

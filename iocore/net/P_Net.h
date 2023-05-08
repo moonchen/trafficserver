@@ -91,18 +91,12 @@ extern RecRawStatBlock *net_rsb;
 #define NET_SUM_GLOBAL_DYN_STAT(_x, _r)   RecIncrGlobalRawStatSum(net_rsb, (_x), (_r))
 #define NET_READ_GLOBAL_DYN_SUM(_x, _sum) RecGetGlobalRawStatSum(net_rsb, _x, &_sum)
 
-#include "tscore/ink_platform.h"
-#include "P_EventSystem.h"
 #include "I_Net.h"
-#include "P_NetVConnection.h"
-#include "P_UnixNet.h"
-#include "P_UnixNetProcessor.h"
-#include "P_NetAccept.h"
-#include "P_UnixNetVConnection.h"
-#include "P_UnixPollDescriptor.h"
-#include "P_Socks.h"
 #include "P_CompletionUtil.h"
-#include "P_NetVCTest.h"
+#include "P_EventSystem.h"
+#include "P_NetVConnection.h"
+#include "P_Socks.h"
+#include "tscore/ink_platform.h"
 
 static constexpr ts::ModuleVersion NET_SYSTEM_MODULE_INTERNAL_VERSION(NET_SYSTEM_MODULE_PUBLIC_VERSION, ts::ModuleVersion::PRIVATE);
 
@@ -113,6 +107,6 @@ static constexpr ts::ModuleVersion NET_SYSTEM_MODULE_INTERNAL_VERSION(NET_SYSTEM
 #define NetDebug(tag, fmt, ...) Debug(tag, fmt, ##__VA_ARGS__)
 #endif
 
-/// Default amount of buffer space to use for the initial read on an incoming connection.
-/// This is an IOBufferBlock index, not the size in bytes.
+/// Default amount of buffer space to use for the initial read on an incoming
+/// connection. This is an IOBufferBlock index, not the size in bytes.
 static size_t const CLIENT_CONNECTION_FIRST_READ_BUFFER_SIZE_INDEX = BUFFER_SIZE_INDEX_4K;

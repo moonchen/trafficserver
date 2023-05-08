@@ -26,8 +26,10 @@
 #include "Main.h"
 #include "P_HostDB.h"
 #include "P_RefCountCacheSerializer.h"
+#include "P_UnixNet.h"
 #include "tscore/I_Layout.h"
 #include "Show.h"
+#include "tscore/Regression.h"
 #include "tscore/ink_apidefs.h"
 #include "tscore/bwf_std_format.h"
 #include "MgmtDefs.h" // MgmtInt, MgmtFloat, etc

@@ -25,116 +25,21 @@
 
 #include <bitset>
 
+#include "EventIO.h"
+#include "NetAIO.h"
 #include "tscore/ink_platform.h"
 
-#define USE_EDGE_TRIGGER_EPOLL  1
-#define USE_EDGE_TRIGGER_KQUEUE 1
-#define USE_EDGE_TRIGGER_PORT   1
-
-#define EVENTIO_NETACCEPT      1
-#define EVENTIO_READWRITE_VC   2
-#define EVENTIO_DNS_CONNECTION 3
-#define EVENTIO_UDP_CONNECTION 4
-#define EVENTIO_ASYNC_SIGNAL   5
-#define EVENTIO_IO_URING       6
-
-#if TS_USE_EPOLL
-#ifndef EPOLLEXCLUSIVE
-#define EPOLLEXCLUSIVE 0
-#endif
-#ifdef USE_EDGE_TRIGGER_EPOLL
-#define USE_EDGE_TRIGGER 1
-#define EVENTIO_READ     (EPOLLIN | EPOLLET)
-#define EVENTIO_WRITE    (EPOLLOUT | EPOLLET)
-#else
-#define EVENTIO_READ  EPOLLIN
-#define EVENTIO_WRITE EPOLLOUT
-#endif
-#define EVENTIO_ERROR (EPOLLERR | EPOLLPRI | EPOLLHUP)
-#endif
-
-#if TS_USE_KQUEUE
-#ifdef USE_EDGE_TRIGGER_KQUEUE
-#define USE_EDGE_TRIGGER    1
-#define INK_EV_EDGE_TRIGGER EV_CLEAR
-#else
-#define INK_EV_EDGE_TRIGGER 0
-#endif
-#define EVENTIO_READ  INK_EVP_IN
-#define EVENTIO_WRITE INK_EVP_OUT
-#define EVENTIO_ERROR (0x010 | 0x002 | 0x020) // ERR PRI HUP
+#if TS_USE_LINUX_IO_URING
+#include "IOUringEventIO.h"
 #endif
 
 struct PollDescriptor;
-using EventLoop = PollDescriptor *;
 
-class NetEvent;
-class UnixUDPConnection;
-class DiskHandler;
-struct DNSConnection;
-struct NetAccept;
-
-/// Unified API for setting and clearing kernel and epoll events.
-struct EventIO {
-  int fd = -1; ///< file descriptor, often a system port
-#if TS_USE_KQUEUE || TS_USE_EPOLL && !defined(USE_EDGE_TRIGGER)
-  int events = 0; ///< a bit mask of enabled events
-#endif
-  EventLoop event_loop = nullptr; ///< the assigned event loop
-  bool syscall         = true;    ///< if false, disable all functionality (for QUIC)
-  int type             = 0;       ///< class identifier of union data.
-  union {
-    void *untyped;
-    NetEvent *ne;
-    DNSConnection *dnscon;
-    NetAccept *na;
-    UnixUDPConnection *uc;
-    DiskHandler *dh;
-  } data; ///< a kind of continuation
-
-  /** The start methods all logically Setup a class to be called
-     when a file descriptor is available for read or write.
-     The type of the classes vary.  Generally the file descriptor
-     is pulled from the class, but there is one option that lets
-     the file descriptor be expressed directly.
-     @param l the event loop
-     @param events a mask of flags (for details `man epoll_ctl`)
-     @return int the number of events created, -1 is error
-   */
-  int start(EventLoop l, DNSConnection *vc, int events);
-  int start(EventLoop l, NetAccept *vc, int events);
-  int start(EventLoop l, NetEvent *ne, int events);
-  int start(EventLoop l, UnixUDPConnection *vc, int events);
-  int start(EventLoop l, int fd, NetEvent *ne, int events);
-  int start_common(EventLoop l, int fd, int events);
-
-  /** Alter the events that will trigger the continuation, for level triggered I/O.
-     @param events add with positive mask(+EVENTIO_READ), or remove with negative mask (-EVENTIO_READ)
-     @return int the number of events created, -1 is error
-   */
-  int modify(int events);
-
-  /** Refresh the existing events (i.e. KQUEUE EV_CLEAR), for edge triggered I/O
-     @param events mask of events
-     @return int the number of events created, -1 is error
-   */
-  int refresh(int events);
-
-  /// Remove the kernel or epoll event. Returns 0 on success.
-  int stop();
-
-  /// Remove the epoll event and close the connection. Returns 0 on success.
-  int close();
-
-  EventIO() { data.untyped = nullptr; }
-};
-
+#include "P_DNSConnection.h"
 #include "P_Net.h"
+#include "P_NetAccept.h"
 #include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
-#include "P_NetAccept.h"
-#include "P_DNSConnection.h"
-#include "P_UnixUDPConnection.h"
 #include "P_UnixPollDescriptor.h"
 #include <limits>
 
@@ -213,10 +118,11 @@ struct PollCont : public Continuation {
 
   The NetHandler should be viewed as multi-threaded schedulers which process
   NetEvents from their queues. If vc wants to be managed by NetHandler, the vc
-  should be derived from NetEvent. The vc can be made of NetProcessor (allocate_vc)
-  either by directly adding a NetEvent to the queue (NetHandler::startIO), or more
-  conveniently, calling a method service call (NetProcessor::connect_re) which
-  synthesizes the NetEvent and places it in the queue.
+  should be derived from NetEvent. The vc can be made of NetProcessor
+  (allocate_vc) either by directly adding a NetEvent to the queue
+  (NetHandler::startIO), or more conveniently, calling a method service call
+  (NetProcessor::connect_re) which synthesizes the NetEvent and places it in the
+  queue.
 
   Callback event codes:
 
@@ -253,8 +159,9 @@ class NetHandler : public Continuation, public EThread::LoopTailHandler
 {
   using self_type = NetHandler; ///< Self reference type.
 public:
-  // @a thread and @a trigger_event are redundant - you can get the former from the latter.
-  // If we don't get rid of @a trigger_event we should remove @a thread.
+  // @a thread and @a trigger_event are redundant - you can get the former from
+  // the latter. If we don't get rid of @a trigger_event we should remove @a
+  // thread.
   EThread *thread      = nullptr;
   Event *trigger_event = nullptr;
   QueM(NetEvent, NetState, read, ready_link) read_ready_list;
@@ -267,10 +174,6 @@ public:
   uint32_t keep_alive_queue_size = 0;
   Que(NetEvent, active_queue_link) active_queue;
   uint32_t active_queue_size = 0;
-
-#ifdef TS_USE_LINUX_IO_URING
-  EventIO uring_evio;
-#endif
 
   /// configuration settings for managing the active and keep-alive queues
   struct Config {
@@ -295,15 +198,17 @@ public:
   };
   /** Static global config, set and updated per process.
 
-      This is updated asynchronously and then events are sent to the NetHandler instances per thread
-      to copy to the per thread config at a convenient time. Because these are updated independently
-      from the command line, the update events just copy a single value from the global to the
-      local. This mechanism relies on members being identical types.
+      This is updated asynchronously and then events are sent to the NetHandler
+     instances per thread to copy to the per thread config at a convenient time.
+     Because these are updated independently from the command line, the update
+     events just copy a single value from the global to the local. This
+     mechanism relies on members being identical types.
   */
   static Config global_config;
   Config config; ///< Per thread copy of the @c global_config
-  // Active and keep alive queue values that depend on other configuration values.
-  // These are never updated directly, they are computed from other config values.
+  // Active and keep alive queue values that depend on other configuration
+  // values. These are never updated directly, they are computed from other
+  // config values.
   uint32_t max_connections_per_thread_in = 0;
   uint32_t max_requests_per_thread_in    = 0;
   /// Number of configuration items in @c Config.
@@ -312,8 +217,9 @@ public:
   /// If one of these is updated, the per thread values must also be updated.
   static const std::bitset<CONFIG_ITEM_COUNT> config_value_affects_per_thread_value;
   /// Set of thread types in which nethandlers are active.
-  /// This enables signaling the correct instances when the configuration is updated.
-  /// Event type threads that use @c NetHandler must set the corresponding bit.
+  /// This enables signaling the correct instances when the configuration is
+  /// updated. Event type threads that use @c NetHandler must set the
+  /// corresponding bit.
   static std::bitset<std::numeric_limits<unsigned int>::digits> active_thread_types;
 
   int mainNetEvent(int event, Event *data);
@@ -329,7 +235,8 @@ public:
 
   /// Per process initialization logic.
   static void init_for_process();
-  /// Update configuration values that are per thread and depend on other configuration values.
+  /// Update configuration values that are per thread and depend on other
+  /// configuration values.
   void configure_per_thread_values();
 
   /**
@@ -345,7 +252,8 @@ public:
   /**
     Stop to handle read & write event on a NetEvent.
     Remove the socket fd of ne from polling system.
-    Only be called when holding the mutex of this NetHandler and must call stopCop(ne) first.
+    Only be called when holding the mutex of this NetHandler and must call
+    stopCop(ne) first.
 
     @param ne NetEvent to be released.
     @return ne->nh set to nullptr.
@@ -354,8 +262,9 @@ public:
 
   /**
     Start to handle active timeout and inactivity timeout on a NetEvent.
-    Put the ne into open_list. All NetEvents in the open_list is checked for timeout by InactivityCop.
-    Only be called when holding the mutex of this NetHandler and must call startIO(ne) first.
+    Put the ne into open_list. All NetEvents in the open_list is checked for
+    timeout by InactivityCop. Only be called when holding the mutex of this
+    NetHandler and must call startIO(ne) first.
 
     @param ne NetEvent to be managed by InactivityCop
    */
@@ -363,8 +272,8 @@ public:
   /**
     Stop to handle active timeout and inactivity on a NetEvent.
     Remove the ne from open_list and cop_list.
-    Also remove the ne from keep_alive_queue and active_queue if its context is IN.
-    Only be called when holding the mutex of this NetHandler.
+    Also remove the ne from keep_alive_queue and active_queue if its context is
+    IN. Only be called when holding the mutex of this NetHandler.
 
     @param ne NetEvent to be released.
    */
@@ -453,7 +362,8 @@ check_throttle_warning(ThrottleType type)
   if (t - last_throttle_warning > NET_THROTTLE_MESSAGE_EVERY) {
     last_throttle_warning = t;
     int connections       = net_connections_to_throttle(type);
-    Warning("too many connections, throttling.  connection_type=%s, current_connections=%d, net_connections_throttle=%d",
+    Warning("too many connections, throttling.  connection_type=%s, "
+            "current_connections=%d, net_connections_throttle=%d",
             type == ACCEPT ? "ACCEPT" : "CONNECT", connections, net_connections_throttle);
   }
 }
@@ -548,8 +458,9 @@ static inline void
 read_disable(NetHandler *nh, NetEvent *ne)
 {
   if (!ne->write.enabled) {
-    // Clear the next scheduled inactivity time, but don't clear inactivity_timeout_in,
-    // so the current timeout is used when the NetEvent is reenabled and not the default inactivity timeout
+    // Clear the next scheduled inactivity time, but don't clear
+    // inactivity_timeout_in, so the current timeout is used when the NetEvent
+    // is reenabled and not the default inactivity timeout
     ne->next_inactivity_timeout_at = 0;
     Debug("socket", "read_disable updating inactivity_at %" PRId64 ", NetEvent=%p", ne->next_inactivity_timeout_at, ne);
   }
@@ -571,205 +482,15 @@ static inline void
 write_disable(NetHandler *nh, NetEvent *ne)
 {
   if (!ne->read.enabled) {
-    // Clear the next scheduled inactivity time, but don't clear inactivity_timeout_in,
-    // so the current timeout is used when the NetEvent is reenabled and not the default inactivity timeout
+    // Clear the next scheduled inactivity time, but don't clear
+    // inactivity_timeout_in, so the current timeout is used when the NetEvent
+    // is reenabled and not the default inactivity timeout
     ne->next_inactivity_timeout_at = 0;
     Debug("socket", "write_disable updating inactivity_at %" PRId64 ", NetEvent=%p", ne->next_inactivity_timeout_at, ne);
   }
   ne->write.enabled = 0;
   nh->write_ready_list.remove(ne);
   ne->ep.modify(-EVENTIO_WRITE);
-}
-
-TS_INLINE int
-EventIO::start(EventLoop l, DNSConnection *vc, int events)
-{
-  type        = EVENTIO_DNS_CONNECTION;
-  data.dnscon = vc;
-  return start_common(l, vc->fd, events);
-}
-TS_INLINE int
-EventIO::start(EventLoop l, NetAccept *vc, int events)
-{
-  type    = EVENTIO_NETACCEPT;
-  data.na = vc;
-  return start_common(l, vc->server.fd, events);
-}
-TS_INLINE int
-EventIO::start(EventLoop l, NetEvent *ne, int events)
-{
-  type    = EVENTIO_READWRITE_VC;
-  data.ne = ne;
-  return start_common(l, ne->get_fd(), events);
-}
-
-TS_INLINE int
-EventIO::start(EventLoop l, UnixUDPConnection *vc, int events)
-{
-  type    = EVENTIO_UDP_CONNECTION;
-  data.uc = vc;
-  return start_common(l, vc->fd, events);
-}
-
-TS_INLINE int
-EventIO::close()
-{
-  if (!this->syscall) {
-    return 0;
-  }
-
-  stop();
-  switch (type) {
-  default:
-    ink_assert(!"case");
-  // fallthrough
-  case EVENTIO_DNS_CONNECTION:
-    return data.dnscon->close();
-    break;
-  case EVENTIO_NETACCEPT:
-    return data.na->server.close();
-    break;
-  case EVENTIO_READWRITE_VC:
-    return data.ne->close();
-    break;
-  }
-  return -1;
-}
-
-TS_INLINE int
-EventIO::start(EventLoop l, int afd, NetEvent *ne, int e)
-{
-  data.ne = ne;
-  return start_common(l, afd, e);
-}
-
-TS_INLINE int
-EventIO::start_common(EventLoop l, int afd, int e)
-{
-  if (!this->syscall) {
-    return 0;
-  }
-
-  fd         = afd;
-  event_loop = l;
-#if TS_USE_EPOLL
-  struct epoll_event ev;
-  memset(&ev, 0, sizeof(ev));
-  ev.events   = e | EPOLLEXCLUSIVE;
-  ev.data.ptr = this;
-#ifndef USE_EDGE_TRIGGER
-  events = e;
-#endif
-  return epoll_ctl(event_loop->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-#endif
-#if TS_USE_KQUEUE
-  events = e;
-  struct kevent ev[2];
-  int n = 0;
-  if (e & EVENTIO_READ)
-    EV_SET(&ev[n++], fd, EVFILT_READ, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-  if (e & EVENTIO_WRITE)
-    EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-  return kevent(l->kqueue_fd, &ev[0], n, nullptr, 0, nullptr);
-#endif
-}
-
-TS_INLINE int
-EventIO::modify(int e)
-{
-  if (!this->syscall) {
-    return 0;
-  }
-
-  ink_assert(event_loop);
-#if TS_USE_EPOLL && !defined(USE_EDGE_TRIGGER)
-  struct epoll_event ev;
-  memset(&ev, 0, sizeof(ev));
-  int new_events = events, old_events = events;
-  if (e < 0)
-    new_events &= ~(-e);
-  else
-    new_events |= e;
-  events      = new_events;
-  ev.events   = new_events;
-  ev.data.ptr = this;
-  if (!new_events)
-    return epoll_ctl(event_loop->epoll_fd, EPOLL_CTL_DEL, fd, &ev);
-  else if (!old_events)
-    return epoll_ctl(event_loop->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-  else
-    return epoll_ctl(event_loop->epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-#endif
-#if TS_USE_KQUEUE && !defined(USE_EDGE_TRIGGER)
-  int n = 0;
-  struct kevent ev[2];
-  int ee = events;
-  if (e < 0) {
-    ee &= ~(-e);
-    if ((-e) & EVENTIO_READ)
-      EV_SET(&ev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, this);
-    if ((-e) & EVENTIO_WRITE)
-      EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, this);
-  } else {
-    ee |= e;
-    if (e & EVENTIO_READ)
-      EV_SET(&ev[n++], fd, EVFILT_READ, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-    if (e & EVENTIO_WRITE)
-      EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-  }
-  events = ee;
-  if (n)
-    return kevent(event_loop->kqueue_fd, &ev[0], n, nullptr, 0, nullptr);
-  else
-    return 0;
-#endif
-  (void)e; // ATS_UNUSED
-  return 0;
-}
-
-TS_INLINE int
-EventIO::refresh(int e)
-{
-  if (!this->syscall) {
-    return 0;
-  }
-
-  ink_assert(event_loop);
-#if TS_USE_KQUEUE && defined(USE_EDGE_TRIGGER)
-  e = e & events;
-  struct kevent ev[2];
-  int n = 0;
-  if (e & EVENTIO_READ)
-    EV_SET(&ev[n++], fd, EVFILT_READ, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-  if (e & EVENTIO_WRITE)
-    EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | INK_EV_EDGE_TRIGGER, 0, 0, this);
-  if (n)
-    return kevent(event_loop->kqueue_fd, &ev[0], n, nullptr, 0, nullptr);
-  else
-    return 0;
-#endif
-  (void)e; // ATS_UNUSED
-  return 0;
-}
-
-TS_INLINE int
-EventIO::stop()
-{
-  if (!this->syscall) {
-    return 0;
-  }
-  if (event_loop) {
-    int retval = 0;
-#if TS_USE_EPOLL
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(struct epoll_event));
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-    retval    = epoll_ctl(event_loop->epoll_fd, EPOLL_CTL_DEL, fd, &ev);
-#endif
-    event_loop = nullptr;
-    return retval;
-  }
-  return 0;
 }
 
 TS_INLINE int
@@ -780,9 +501,10 @@ NetHandler::startIO(NetEvent *ne)
   int res = 0;
 
   PollDescriptor *pd = get_PollDescriptor(this->thread);
-  if (ne->ep.start(pd, ne, EVENTIO_READ | EVENTIO_WRITE) < 0) {
+  if (ne->ep.start(pd, ne, get_NetHandler(this->thread), EVENTIO_READ | EVENTIO_WRITE) < 0) {
     res = errno;
-    // EEXIST should be ok, though it should have been cleared before we got back here
+    // EEXIST should be ok, though it should have been cleared before we got
+    // back here
     if (errno != EEXIST) {
       Debug("iocore_net", "NetHandler::startIO : failed on EventIO::start, errno = [%d](%s)", errno, strerror(errno));
       return -res;

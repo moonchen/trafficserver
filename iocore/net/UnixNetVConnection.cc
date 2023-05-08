@@ -22,8 +22,10 @@
 */
 
 #include "P_Net.h"
-#include "tscore/ink_platform.h"
+#include "P_UnixNet.h"
+#include "P_UnixNetVConnection.h"
 #include "tscore/InkErrno.h"
+#include "tscore/ink_platform.h"
 
 #include <termios.h>
 
@@ -31,7 +33,7 @@
 #define STATE_FROM_VIO(_x) ((NetState *)(((char *)(_x)) - STATE_VIO_OFFSET))
 
 // Global
-ClassAllocator<UnixNetVConnection> netVCAllocator("netVCAllocator");
+ClassAllocator<UnixNetVConnection> unixNetVCAllocator("unixNetVCAllocator");
 
 //
 // Reschedule a UnixNetVConnection by moving it
@@ -199,8 +201,8 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   }
 
   // It is possible that the closed flag got set from HttpSessionManager in the
-  // global session pool case.  If so, the closed flag should be stable once we get the
-  // s->vio.mutex (the global session pool mutex).
+  // global session pool case.  If so, the closed flag should be stable once we
+  // get the s->vio.mutex (the global session pool mutex).
   if (vc->closed) {
     vc->nh->free_netevent(vc);
     return;
@@ -525,8 +527,9 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
     if (!signalled || (s->vio.ntodo() > 0 && !buf.writer()->high_water())) {
       e = VC_EVENT_WRITE_READY;
     } else if (wbe_event != vc->write_buffer_empty_event) {
-      // @a signalled means we won't send an event, and the event values differing means we
-      // had a write buffer trap and cleared it, so we need to send it now.
+      // @a signalled means we won't send an event, and the event values
+      // differing means we had a write buffer trap and cleared it, so we need
+      // to send it now.
       e = wbe_event;
     }
 
@@ -776,23 +779,21 @@ UnixNetVConnection::reenable(VIO *vio)
       } else if (nh->trigger_event) {
         nh->trigger_event->ethread->tail_cb->signalActivity();
       }
-    } else {
-      if (vio == &read.vio) {
-        ep.modify(EVENTIO_READ);
-        ep.refresh(EVENTIO_READ);
-        if (read.triggered) {
-          nh->read_ready_list.in_or_enqueue(this);
-        } else {
-          nh->read_ready_list.remove(this);
-        }
+    } else if (vio == &read.vio) {
+      ep.modify(EVENTIO_READ);
+      ep.refresh(EVENTIO_READ);
+      if (read.triggered) {
+        nh->read_ready_list.in_or_enqueue(this);
       } else {
-        ep.modify(EVENTIO_WRITE);
-        ep.refresh(EVENTIO_WRITE);
-        if (write.triggered) {
-          nh->write_ready_list.in_or_enqueue(this);
-        } else {
-          nh->write_ready_list.remove(this);
-        }
+        nh->read_ready_list.remove(this);
+      }
+    } else {
+      ep.modify(EVENTIO_WRITE);
+      ep.refresh(EVENTIO_WRITE);
+      if (write.triggered) {
+        nh->write_ready_list.in_or_enqueue(this);
+      } else {
+        nh->write_ready_list.remove(this);
       }
     }
   }
@@ -1180,10 +1181,12 @@ UnixNetVConnection::connectUp(EThread *t, int fd)
           NetVCOptions::toString(options.addr_binding));
   }
 
-  // If this is getting called from the TS API, then we are wiring up a file descriptor
-  // provided by the caller. In that case, we know that the socket is already connected.
+  // If this is getting called from the TS API, then we are wiring up a file
+  // descriptor provided by the caller. In that case, we know that the socket is
+  // already connected.
   if (fd == NO_FD) {
-    // Due to multi-threads system, the fd returned from con.open() may exceed the limitation of check_net_throttle().
+    // Due to multi-threads system, the fd returned from con.open() may exceed
+    // the limitation of check_net_throttle().
     res = con.open(options);
     if (res != 0) {
       goto fail;
@@ -1302,9 +1305,9 @@ UnixNetVConnection::free(EThread *t)
   ink_assert(t == this_ethread());
 
   if (from_accept_thread) {
-    netVCAllocator.free(this);
+    unixNetVCAllocator.free(this);
   } else {
-    THREAD_FREE(this, netVCAllocator, t);
+    THREAD_FREE(this, unixNetVCAllocator, t);
   }
 }
 
@@ -1356,8 +1359,8 @@ UnixNetVConnection::migrateToCurrentThread(Continuation *cont, EThread *t)
 
   // Do_io_close will signal the VC to be freed on the original thread
   // Since we moved the con context, the fd will not be closed
-  // Go ahead and remove the fd from the original thread's epoll structure, so it is not
-  // processed on two threads simultaneously
+  // Go ahead and remove the fd from the original thread's epoll structure, so
+  // it is not processed on two threads simultaneously
   this->ep.stop();
 
   // Create new VC:
@@ -1372,7 +1375,8 @@ UnixNetVConnection::migrateToCurrentThread(Continuation *cont, EThread *t)
     newvc->options = this->options;
   }
 
-  // Do not mark this closed until the end so it does not get freed by the other thread too soon
+  // Do not mark this closed until the end so it does not get freed by the other
+  // thread too soon
   this->do_io_close();
   return newvc;
 }
@@ -1396,7 +1400,8 @@ UnixNetVConnection::add_to_keep_alive_queue()
   if (lock.is_locked()) {
     nh->add_to_keep_alive_queue(this);
   } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on keep_alive_queue.");
+    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock "
+                        "before doing anything on keep_alive_queue.");
   }
 }
 
@@ -1407,7 +1412,8 @@ UnixNetVConnection::remove_from_keep_alive_queue()
   if (lock.is_locked()) {
     nh->remove_from_keep_alive_queue(this);
   } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on keep_alive_queue.");
+    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock "
+                        "before doing anything on keep_alive_queue.");
   }
 }
 
@@ -1420,7 +1426,8 @@ UnixNetVConnection::add_to_active_queue()
   if (lock.is_locked()) {
     result = nh->add_to_active_queue(this);
   } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on active_queue.");
+    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock "
+                        "before doing anything on active_queue.");
   }
   return result;
 }
@@ -1432,7 +1439,8 @@ UnixNetVConnection::remove_from_active_queue()
   if (lock.is_locked()) {
     nh->remove_from_active_queue(this);
   } else {
-    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock before doing anything on active_queue.");
+    ink_release_assert(!"BUG: It must have acquired the NetHandler's lock "
+                        "before doing anything on active_queue.");
   }
 }
 
@@ -1457,7 +1465,8 @@ const char *
 UnixNetVConnection::protocol_contains(std::string_view tag) const
 {
   std::string_view retval = options.get_proto_string();
-  if (!IsNoCasePrefixOf(tag, retval)) { // didn't match IP level, check TCP level
+  if (!IsNoCasePrefixOf(tag,
+                        retval)) { // didn't match IP level, check TCP level
     retval = options.get_family_string();
     if (!IsNoCasePrefixOf(tag, retval)) { // no match here either, return empty.
       ink_zero(retval);
@@ -1467,7 +1476,7 @@ UnixNetVConnection::protocol_contains(std::string_view tag) const
 }
 
 int
-UnixNetVConnection::set_tcp_congestion_control(int side)
+UnixNetVConnection::set_tcp_congestion_control(tcp_congestion_control_t side)
 {
 #ifdef TCP_CONGESTION
   std::string_view ccp;
@@ -1482,8 +1491,9 @@ UnixNetVConnection::set_tcp_congestion_control(int side)
     int rv = setsockopt(con.fd, IPPROTO_TCP, TCP_CONGESTION, reinterpret_cast<const void *>(ccp.data()), ccp.size());
 
     if (rv < 0) {
-      Error("Unable to set TCP congestion control on socket %d to \"%s\", errno=%d (%s)", con.fd, ccp.data(), errno,
-            strerror(errno));
+      Error("Unable to set TCP congestion control on socket %d to \"%s\", "
+            "errno=%d (%s)",
+            con.fd, ccp.data(), errno, strerror(errno));
     } else {
       Debug("socket", "Setting TCP congestion control on socket [%d] to \"%s\" -> %d", con.fd, ccp.data(), rv);
     }

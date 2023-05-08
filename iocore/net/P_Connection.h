@@ -49,7 +49,10 @@
 
 #pragma once
 
+#include "I_SocketManager.h"
 #include "tscore/ink_platform.h"
+#include "tscore/ink_inet.h"
+#include "I_NetProcessor.h"
 
 struct NetVCOptions;
 

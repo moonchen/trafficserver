@@ -23,8 +23,10 @@
 
 #include "tscore/ink_platform.h"
 #include "P_Net.h"
+#include "P_UnixNet.h"
 #include "Show.h"
 #include "I_Tasks.h"
+#include "NetEvent.h"
 
 struct ShowNet;
 using ShowNetEventHandler = int (ShowNet::*)(int, Event *);

@@ -22,7 +22,9 @@
  */
 
 #include "P_DNS.h"
+#include "P_UnixNet.h"
 #include "tscore/ink_inet.h"
+#include "tscore/Regression.h"
 
 #include "I_SplitDNS.h"
 
@@ -528,7 +530,7 @@ DNSHandler::open_con(sockaddr const *target, bool failed, int icon, bool over_tc
     }
     return false;
   } else {
-    if (cur_con.eio.start(pd, &cur_con, EVENTIO_READ) < 0) {
+    if (cur_con.eio.start(pd, cur_con.fd, EVENTIO_READ) < 0) {
       Error("[iocore_dns] open_con: Failed to add %d server to epoll list\n", icon);
     } else {
       cur_con.num   = icon;

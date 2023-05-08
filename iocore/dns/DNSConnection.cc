@@ -31,6 +31,7 @@
 #include "P_DNS.h"
 #include "P_DNSConnection.h"
 #include "P_DNSProcessor.h"
+#include "tscore/ink_sock.h"
 
 #define SET_TCP_NO_DELAY
 #define SET_NO_LINGER
@@ -212,4 +213,24 @@ Lerror:
     close();
   }
   return res;
+}
+
+int
+DNSEventIO::start(EventLoop l, int fd, int events)
+{
+  return start_common(l, fd, events);
+}
+
+void
+DNSEventIO::process_event(int flags)
+{
+  _c.trigger(); // Make sure the DNSHandler for this con knows we triggered
+  refresh(EVENTIO_READ);
+}
+
+int
+DNSEventIO::close()
+{
+  EventIO::close(); // discard retval
+  return _c.close();
 }

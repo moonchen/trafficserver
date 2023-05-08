@@ -35,6 +35,7 @@
 #include "swoc/bwf_ex.h"
 
 #include "P_Net.h"
+#include "P_UnixNetVConnection.h"
 #include "tscore/I_Layout.h"
 #include "tscore/ink_sock.h"
 #include "tscore/InkErrno.h"

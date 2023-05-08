@@ -34,12 +34,17 @@
 #define __APPLE_USE_RFC_3542
 #endif
 
+#include "AsyncSignalEventIO.h"
+#include "I_AIO.h"
 #include "P_Net.h"
 #include "P_UDPNet.h"
+#include "P_UnixNet.h"
+#include "tscore/ink_sock.h"
 
 #include "netinet/udp.h"
 #ifndef UDP_SEGMENT
-// This is needed because old glibc may not have the constant even if Kernel supports it.
+// This is needed because old glibc may not have the constant even if Kernel
+// supports it.
 #define UDP_SEGMENT 103
 #endif
 
@@ -166,7 +171,8 @@ initialize_thread_for_udp_net(EThread *thread)
   new (reinterpret_cast<ink_dummy_for_new *>(nh)) UDPNetHandler(enable_gso);
   new (reinterpret_cast<ink_dummy_for_new *>(get_UDPPollCont(thread))) PollCont(thread->mutex);
   // The UDPNetHandler cannot be accessed across EThreads.
-  // Because the UDPNetHandler should be called back immediately after UDPPollCont.
+  // Because the UDPNetHandler should be called back immediately after
+  // UDPPollCont.
   nh->mutex  = thread->mutex.get();
   nh->thread = thread;
 
@@ -179,25 +185,31 @@ initialize_thread_for_udp_net(EThread *thread)
   // If it is set to 0, then cleanup never occurs.
   REC_ReadConfigInt32(g_udp_periodicFreeCancelledPkts, "proxy.config.udp.free_cancelled_pkts_sec");
 
-  // This variable controls how many "slots" of the udp calendar queue we cleanup.
-  // If it is set to 0, then cleanup never occurs.  This value makes sense
-  // only if the above variable is set.
+  // This variable controls how many "slots" of the udp calendar queue we
+  // cleanup. If it is set to 0, then cleanup never occurs.  This value makes
+  // sense only if the above variable is set.
   REC_ReadConfigInt32(g_udp_periodicCleanupSlots, "proxy.config.udp.periodic_cleanup");
 
   // UDP sends can fail with errno=EAGAIN.  This variable determines the # of
-  // times the UDP thread retries before giving up.  Set to 0 to keep trying forever.
+  // times the UDP thread retries before giving up.  Set to 0 to keep trying
+  // forever.
   REC_ReadConfigInt32(g_udp_numSendRetries, "proxy.config.udp.send_retries");
   g_udp_numSendRetries = g_udp_numSendRetries < 0 ? 0 : g_udp_numSendRetries;
 
   thread->set_tail_handler(nh);
-  thread->ep = static_cast<EventIO *>(ats_malloc(sizeof(EventIO)));
-  new (thread->ep) EventIO();
-  thread->ep->type = EVENTIO_ASYNC_SIGNAL;
 #if HAVE_EVENTFD
-  thread->ep->start(upd, thread->evfd, nullptr, EVENTIO_READ);
+#if TS_USE_LINUX_IO_URING
+  auto ep = new IOUringEventIO();
+  ep->start(upd, IOUringContext::local_context());
 #else
-  thread->ep->start(upd, thread->evpipe[0], nullptr, EVENTIO_READ);
+  auto ep = new AsyncSignalEventIO();
+  ep->start(upd, thread->evfd, EVENTIO_READ);
 #endif
+#else
+  auto ep = new AsyncSignalEventIO();
+  ep->start(upd, thread->evpipe[0], EVENTIO_READ);
+#endif
+  thread->ep = ep;
 }
 
 EventType
@@ -241,7 +253,8 @@ UDPNetProcessorInternal::udp_read_from_net(UDPNetHandler *nh, UDPConnection *xuc
   int64_t buffer_size = BUFFER_SIZE_FOR_INDEX(size_index);
   // The max length of receive buffer is 32 * buffer_size (2048) = 65536 bytes.
   // Because the 'UDP Length' is type of uint16_t defined in RFC 768.
-  // And there is 8 octets in 'User Datagram Header' which means the max length of payload is no more than 65527 bytes.
+  // And there is 8 octets in 'User Datagram Header' which means the max length
+  // of payload is no more than 65527 bytes.
   do {
     // create IOBufferBlock chain to receive data
     unsigned int niov;
@@ -949,7 +962,7 @@ UDPNetProcessor::UDPBind(Continuation *cont, sockaddr const *addr, int fd, int s
   pc = get_UDPPollCont(n->ethread);
   pd = pc->pollDescriptor;
 
-  n->ep.start(pd, n, EVENTIO_READ);
+  n->ep.start(pd, n, get_UDPNetHandler(cont->getThreadAffinity()), EVENTIO_READ);
 
   cont->handleEvent(NET_EVENT_DATAGRAM_OPEN, n);
   return ACTION_RESULT_DONE;
@@ -1257,13 +1270,15 @@ UDPQueue::SendMultipleUDPPackets(UDPPacket **p, uint16_t n)
 #else
   msgvec_size = sizeof(struct mmsghdr) * n * 64;
 #endif
-  // The sizeof(struct msghdr) is 56 bytes or so. It can be too big to stack (alloca).
+  // The sizeof(struct msghdr) is 56 bytes or so. It can be too big to stack
+  // (alloca).
   IOBufferBlock *tmp = new_IOBufferBlock();
   tmp->alloc(iobuffer_size_to_index(msgvec_size, BUFFER_SIZE_INDEX_1M));
   msgvec = reinterpret_cast<struct mmsghdr *>(tmp->buf());
   memset(msgvec, 0, msgvec_size);
 
-  // The sizeof(struct iove) is 16 bytes or so. It can be too big to stack (alloca).
+  // The sizeof(struct iove) is 16 bytes or so. It can be too big to stack
+  // (alloca).
   int iovec_size      = sizeof(struct iovec) * n * 64;
   IOBufferBlock *tmp2 = new_IOBufferBlock();
   tmp2->alloc(iobuffer_size_to_index(iovec_size, BUFFER_SIZE_INDEX_1M));
@@ -1407,18 +1422,6 @@ UDPQueue::SendMultipleUDPPackets(UDPPacket **p, uint16_t n)
 
 #undef LINK
 
-static void
-net_signal_hook_callback(EThread *thread)
-{
-#if HAVE_EVENTFD
-  uint64_t counter;
-  ATS_UNUSED_RETURN(read(thread->evfd, &counter, sizeof(uint64_t)));
-#else
-  char dummy[1024];
-  ATS_UNUSED_RETURN(read(thread->evpipe[0], &dummy[0], 1024));
-#endif
-}
-
 UDPNetHandler::UDPNetHandler(bool enable_gso) : udpOutQueue(enable_gso)
 {
   nextCheck = Thread::get_hrtime_updated() + HRTIME_MSECONDS(1000);
@@ -1453,11 +1456,13 @@ UDPNetHandler::waitForActivity(ink_hrtime timeout)
   /* Notice: the race between traversal of newconn_list and UDPBind()
    *
    * If the UDPBind() is called after the traversal of newconn_list,
-   * the UDPConnection, the one from the pollDescriptor->result, did not push into the open_list.
+   * the UDPConnection, the one from the pollDescriptor->result, did not push
+   * into the open_list.
    *
    * TODO:
    *
-   * Take UnixNetVConnection::acceptEvent() as reference to create UnixUDPConnection::newconnEvent().
+   * Take UnixNetVConnection::acceptEvent() as reference to create
+   * UnixUDPConnection::newconnEvent().
    */
 
   // handle new UDP connection
@@ -1479,34 +1484,9 @@ UDPNetHandler::waitForActivity(ink_hrtime timeout)
   int i        = 0;
   EventIO *epd = nullptr;
   for (i = 0; i < pc->pollDescriptor->result; i++) {
-    epd = static_cast<EventIO *> get_ev_data(pc->pollDescriptor, i);
-    if (epd->type == EVENTIO_UDP_CONNECTION) {
-      // TODO: handle EVENTIO_ERROR
-      if (get_ev_events(pc->pollDescriptor, i) & EVENTIO_READ) {
-        uc = epd->data.uc;
-        ink_assert(uc && uc->mutex && uc->continuation);
-        ink_assert(uc->refcount >= 1);
-        open_list.in_or_enqueue(uc); // due to the above race
-        if (uc->shouldDestroy()) {
-          open_list.remove(uc);
-          uc->Release();
-        } else {
-          udpNetInternal.udp_read_from_net(this, uc);
-        }
-      } else {
-        Debug("iocore_udp_main", "Unhandled epoll event: 0x%04x", get_ev_events(pc->pollDescriptor, i));
-      }
-    } else if (epd->type == EVENTIO_DNS_CONNECTION) {
-      // TODO: handle DNS conn if there is ET_UDP
-      if (epd->data.dnscon != nullptr) {
-        epd->data.dnscon->trigger();
-#if defined(USE_EDGE_TRIGGER)
-        epd->refresh(EVENTIO_READ);
-#endif
-      }
-    } else if (epd->type == EVENTIO_ASYNC_SIGNAL) {
-      net_signal_hook_callback(this->thread);
-    }
+    epd       = static_cast<EventIO *> get_ev_data(pc->pollDescriptor, i);
+    int flags = get_ev_events(pc->pollDescriptor, i);
+    epd->process_event(flags);
   } // end for
 
   // remove dead UDP connections

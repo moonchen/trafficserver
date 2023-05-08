@@ -32,12 +32,27 @@
 
 #include "I_EventSystem.h"
 #include "I_DNSProcessor.h"
+#include "EventIO.h"
 
 //
 // Connection
 //
 struct DNSHandler;
 enum class DNS_CONN_MODE { UDP_ONLY, TCP_RETRY, TCP_ONLY };
+
+struct DNSConnection;
+
+class DNSEventIO : public EventIO
+{
+public:
+  DNSEventIO(DNSConnection &c) : EventIO(), _c(c) {}
+  int start(EventLoop l, int fd, int events);
+  void process_event(int flags) override;
+  int close() override;
+
+private:
+  DNSConnection &_c;
+};
 
 struct DNSConnection {
   /// Options for connecting.
@@ -78,7 +93,7 @@ struct DNSConnection {
   int num = 0;
   Options opt;
   LINK(DNSConnection, link);
-  EventIO eio;
+  DNSEventIO eio{*this};
   InkRand generator;
   DNSHandler *handler = nullptr;
 

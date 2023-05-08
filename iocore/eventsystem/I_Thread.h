@@ -58,15 +58,12 @@
 
 #pragma once
 
-#if !defined(_I_EventSystem_h) && !defined(_P_EventSystem_h)
-#error "include I_EventSystem.h or P_EventSystem.h"
-#endif
-
 #include <functional>
 
+#include "I_ProxyAllocator.h"
+#include "tscore/Ptr.h"
 #include "tscore/ink_platform.h"
 #include "tscore/ink_thread.h"
-#include "I_ProxyAllocator.h"
 
 class ProxyMutex;
 
@@ -116,7 +113,8 @@ public:
 
   // For THREAD_ALLOC
   ProxyAllocator eventAllocator;
-  ProxyAllocator netVCAllocator;
+  ProxyAllocator unixNetVCAllocator;
+  ProxyAllocator tcpNetVCAllocator;
   ProxyAllocator sslNetVCAllocator;
   ProxyAllocator quicNetVCAllocator;
   ProxyAllocator http1ClientSessionAllocator;
@@ -145,27 +143,31 @@ public:
 
   /** Start the underlying thread.
 
-      The thread name is set to @a name. The stack for the thread is either @a stack or, if that is
-      @c nullptr a stack of size @a stacksize is allocated and used. If @a f is present and valid it
-      is called in the thread context. Otherwise the method @c execute is invoked.
+      The thread name is set to @a name. The stack for the thread is either @a
+     stack or, if that is
+      @c nullptr a stack of size @a stacksize is allocated and used. If @a f is
+     present and valid it is called in the thread context. Otherwise the method
+     @c execute is invoked.
   */
   void start(const char *name, void *stack, size_t stacksize, ThreadFunction const &f = ThreadFunction());
 
   virtual void execute() = 0;
 
   /** Get the current ATS high resolution time.
-      This gets a cached copy of the time so it is very fast and reasonably accurate.
-      The cached time is updated every time the actual operating system time is fetched which is
-      at least every 10ms and generally more frequently.
+      This gets a cached copy of the time so it is very fast and reasonably
+     accurate. The cached time is updated every time the actual operating system
+     time is fetched which is at least every 10ms and generally more frequently.
 
-      @note The cached copy is thread local which means each thread need to update the cached copy by itself.
+      @note The cached copy is thread local which means each thread need to
+     update the cached copy by itself.
   */
   static ink_hrtime get_hrtime();
 
   /** Get the operating system high resolution time.
 
-      Get the current time at high resolution from the operating system.  This is more expensive
-      than @c get_hrtime and should be used only where very precise timing is required.
+      Get the current time at high resolution from the operating system.  This
+     is more expensive than @c get_hrtime and should be used only where very
+     precise timing is required.
 
       @note This also updates the cached time.
   */

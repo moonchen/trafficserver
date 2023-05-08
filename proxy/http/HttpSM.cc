@@ -33,6 +33,7 @@
 #include "Http2ServerSession.h"
 #include "HttpDebugNames.h"
 #include "HttpSessionManager.h"
+#include "I_NetProcessor.h"
 #include "P_Cache.h"
 #include "P_Net.h"
 #include "PreWarmConfig.h"
@@ -1896,11 +1897,11 @@ HttpSM::state_http_server_open(int event, void *data)
     // Since the UnixNetVConnection::action_ or SocksEntry::action_ may be returned from netProcessor.connect_re, and the
     // SocksEntry::action_ will be copied into UnixNetVConnection::action_ before call back NET_EVENT_OPEN from
     // SocksEntry::free(), so we just compare the Continuation between pending_action and VC's action_.
-    _netvc                 = static_cast<NetVConnection *>(data);
-    _netvc_read_buffer     = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
-    _netvc_reader          = _netvc_read_buffer->alloc_reader();
-    UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(_netvc);
-    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
+    _netvc             = static_cast<NetVConnection *>(data);
+    _netvc_read_buffer = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
+    _netvc_reader      = _netvc_read_buffer->alloc_reader();
+    // We should do this without breaking encapsulation
+    // ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
     pending_action = nullptr;
 
     if (this->plugin_tunnel_type == HTTP_NO_PLUGIN_TUNNEL) {
@@ -2325,8 +2326,9 @@ HttpSM::add_to_existing_request()
   if (nullptr == ethread->connecting_pool) {
     initialize_thread_for_connecting_pools(ethread);
   }
-  auto my_nh = ((UnixNetVConnection *)(this)->ua_txn->get_netvc())->nh;
-  ink_release_assert(my_nh == nullptr /* PluginVC */ || my_nh == get_NetHandler(this_ethread()));
+  // We shouldn't break encapsulation here
+  // auto my_nh = ((UnixNetVConnection *)(this)->ua_txn->get_netvc())->nh;
+  // ink_release_assert(my_nh == nullptr /* PluginVC */ || my_nh == get_NetHandler(this_ethread()));
 
   HTTP_SM_SET_DEFAULT_HANDLER(&HttpSM::state_http_server_open);
 
@@ -3346,6 +3348,10 @@ HttpSM::tunnel_handler_server(int event, HttpTunnelProducer *p)
   // The server session has been released. Clean all pointer
   // Calling remove_entry instead of server_entry because we don't
   // want to close the server VC at this point
+  // Stop read/write so that HttpSM doesn't get events after the entry is removed.
+  // This can happen if the vc has async behavior.
+  server_entry->vc->do_io_read();
+  server_entry->vc->do_io_write();
   vc_table.remove_entry(server_entry);
 
   if (close_connection) {
@@ -5546,7 +5552,6 @@ HttpSM::do_http_server_open(bool raw, bool only_direct)
 
   // We did not manage to get an existing session and need to open a new connection
   NetVCOptions opt;
-  opt.f_blocking_connect = false;
   opt.set_sock_param(t_state.txn_conf->sock_recv_buffer_size_out, t_state.txn_conf->sock_send_buffer_size_out,
                      t_state.txn_conf->sock_option_flag_out, t_state.txn_conf->sock_packet_mark_out,
                      t_state.txn_conf->sock_packet_tos_out, t_state.txn_conf->sock_packet_notsent_lowat);
@@ -6133,7 +6138,7 @@ HttpSM::handle_server_setup_error(int event, void *data)
     }
   }
 
-  [[maybe_unused]] UnixNetVConnection *dbg_vc = nullptr;
+  // [[maybe_unused]] UnixNetVConnection *dbg_vc = nullptr;
   switch (event) {
   case VC_EVENT_EOS:
     t_state.current.state = HttpTransact::CONNECTION_CLOSED;
@@ -6584,7 +6589,7 @@ HttpSM::attach_server_session()
   server_entry->vc_type          = HTTP_SERVER_VC;
   server_entry->vc_write_handler = &HttpSM::state_send_server_request_header;
 
-  UnixNetVConnection *server_vc = static_cast<UnixNetVConnection *>(server_txn->get_netvc());
+  NetVConnection *server_vc = server_txn->get_netvc();
 
   // set flag for server session is SSL
   TLSBasicSupport *tbs = dynamic_cast<TLSBasicSupport *>(server_vc);

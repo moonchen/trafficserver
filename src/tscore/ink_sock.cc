@@ -59,21 +59,21 @@ check_valid_sockaddr(sockaddr *sa, char *file, int line)
 #endif
 
 int
-safe_setsockopt(int s, int level, int optname, const void *optval, int optlevel)
+safe_setsockopt(int s, int level, int optname, const void *optval, int optlen)
 {
   int r;
   do {
-    r = setsockopt(s, level, optname, optval, optlevel);
+    r = setsockopt(s, level, optname, optval, optlen);
   } while (r < 0 && (errno == EAGAIN || errno == EINTR));
   return r;
 }
 
 int
-safe_getsockopt(int s, int level, int optname, void *optval, int *optlevel)
+safe_getsockopt(int s, int level, int optname, void *optval, int *optlen)
 {
   int r;
   do {
-    r = getsockopt(s, level, optname, optval, reinterpret_cast<socklen_t *>(optlevel));
+    r = getsockopt(s, level, optname, optval, reinterpret_cast<socklen_t *>(optlen));
   } while (r < 0 && (errno == EAGAIN || errno == EINTR));
   return r;
 }

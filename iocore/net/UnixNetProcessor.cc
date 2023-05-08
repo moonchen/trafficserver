@@ -21,40 +21,29 @@
   limitations under the License.
  */
 
+#include "I_NetVConnection.h"
+#include "I_ProxyAllocator.h"
 #include "P_Net.h"
-#include "tscore/InkErrno.h"
-#include "tscore/ink_sock.h"
-#include "tscore/TSSystemState.h"
+#include "P_NetAccept.h"
 #include "P_SSLNextProtocolAccept.h"
+#include "TCPNetVConnection.h"
+#include "tscore/InkErrno.h"
+#include "tscore/TSSystemState.h"
+#include "tscore/ink_assert.h"
+#include "tscore/ink_inet.h"
+#include "tscore/ink_sock.h"
 
 // For Stat Pages
 #include "StatPages.h"
 
+#define USE_TCP_NETVC
+
+#ifdef USE_TCP_NETVC
+#include "TCPNetVConnection.h"
+#endif
+
 int net_accept_number = 0;
 NetProcessor::AcceptOptions const NetProcessor::DEFAULT_ACCEPT_OPTIONS;
-
-NetProcessor::AcceptOptions &
-NetProcessor::AcceptOptions::reset()
-{
-  local_port = 0;
-  local_ip.invalidate();
-  accept_threads        = -1;
-  ip_family             = AF_INET;
-  etype                 = ET_NET;
-  localhost_only        = false;
-  frequent_accept       = true;
-  recv_bufsize          = 0;
-  send_bufsize          = 0;
-  sockopt_flags         = 0;
-  packet_mark           = 0;
-  packet_tos            = 0;
-  packet_notsent_lowat  = 0;
-  tfo_queue_length      = 0;
-  f_inbound_transparent = false;
-  f_mptcp               = false;
-  f_proxy_protocol      = false;
-  return *this;
-}
 
 int net_connection_number = 1;
 
@@ -71,8 +60,10 @@ net_next_connection_number()
 Action *
 NetProcessor::accept(Continuation *cont, AcceptOptions const &opt)
 {
-  Debug("iocore_net_processor", "NetProcessor::accept - port %d,recv_bufsize %d, send_bufsize %d, sockopt 0x%0x", opt.local_port,
-        opt.recv_bufsize, opt.send_bufsize, opt.sockopt_flags);
+  Debug("iocore_net_processor",
+        "NetProcessor::accept - port %d,recv_bufsize %d, send_bufsize %d, "
+        "sockopt 0x%0x",
+        opt.local_port, opt.recv_bufsize, opt.send_bufsize, opt.sockopt_flags);
 
   return ((UnixNetProcessor *)this)->accept_internal(cont, NO_FD, opt);
 }
@@ -81,7 +72,9 @@ Action *
 NetProcessor::main_accept(Continuation *cont, SOCKET fd, AcceptOptions const &opt)
 {
   UnixNetProcessor *this_unp = static_cast<UnixNetProcessor *>(this);
-  Debug("iocore_net_processor", "NetProcessor::main_accept - port %d,recv_bufsize %d, send_bufsize %d, sockopt 0x%0x",
+  Debug("iocore_net_processor",
+        "NetProcessor::main_accept - port %d,recv_bufsize %d, send_bufsize %d, "
+        "sockopt 0x%0x",
         opt.local_port, opt.recv_bufsize, opt.send_bufsize, opt.sockopt_flags);
   return this_unp->accept_internal(cont, fd, opt);
 }
@@ -149,10 +142,11 @@ UnixNetProcessor::accept_internal(Continuation *cont, int fd, AcceptOptions cons
     }
 #if !TS_USE_POSIX_CAP
     if (fd == ts::NO_FD && opt.local_port < 1024 && 0 != geteuid()) {
-      // TS-2054 - we can fail to bind a privileged port if we waited for cache and we tried
-      // to open the socket in do_listen and we're not using libcap (POSIX_CAP) and so have reduced
-      // privilege. Mention this to the admin.
-      Warning("Failed to open reserved port %d due to lack of process privilege. Use POSIX capabilities if possible or disable "
+      // TS-2054 - we can fail to bind a privileged port if we waited for cache
+      // and we tried to open the socket in do_listen and we're not using libcap
+      // (POSIX_CAP) and so have reduced privilege. Mention this to the admin.
+      Warning("Failed to open reserved port %d due to lack of process "
+              "privilege. Use POSIX capabilities if possible or disable "
               "wait_for_cache.",
               opt.local_port);
     }
@@ -177,14 +171,83 @@ NetProcessor::stop_accept()
   }
 }
 
+// Remove this once NetAccept can use TCPNetVConnection, and unify to
+// allocate_vc
+#ifdef USE_TCP_NETVC
+static TCPNetVConnection *
+allocate_tcp_vc(EThread *t)
+{
+  TCPNetVConnection *vc;
+
+  if (t) {
+    vc = THREAD_ALLOC_INIT(tcpNetVCAllocator, t);
+  } else {
+    if (likely(vc = tcpNetVCAllocator.alloc())) {
+    }
+  }
+
+  return vc;
+}
+#endif
+
+#ifdef USE_TCP_NETVC
 Action *
-UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
+UnixNetProcessor::connect_re_io_uring(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
+{
+  EThread *t            = eventProcessor.assign_affinity_by_type(cont, opt->etype);
+  TCPNetVConnection *vc = allocate_tcp_vc(t);
+
+  if (opt) {
+    vc->options = *opt;
+  } else {
+    opt = &vc->options;
+  }
+
+  vc->set_context(NET_VCONNECTION_OUT);
+  bool using_socks = (socks_conf_stuff->socks_needed && opt->socks_support != NO_SOCKS);
+
+  // SOCKS is not supported yet
+  ink_release_assert(!using_socks);
+
+  vc->id          = net_next_connection_number();
+  vc->submit_time = Thread::get_hrtime();
+  vc->mutex       = cont->mutex;
+  Action *result  = &vc->action_;
+  // Copy target to con.addr,
+  //   then con.addr will copy to vc->remote_addr by set_remote_addr()
+  vc->setRemote(target);
+
+  vc->action_ = cont;
+
+  MUTEX_TRY_LOCK(lock, cont->mutex, t);
+  if (lock.is_locked()) {
+    MUTEX_TRY_LOCK(lock2, get_NetHandler(t)->mutex, t);
+    if (lock2.is_locked()) {
+      vc->connectUp(t, NO_FD);
+      return ACTION_RESULT_DONE;
+    }
+  }
+
+  t->schedule_imm(vc);
+  return result;
+}
+#endif
+
+Action *
+UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOptions *opt)
 {
   if (TSSystemState::is_event_system_shut_down()) {
     return nullptr;
   }
+
+#ifdef USE_TCP_NETVC
+  if (use_io_uring) {
+    return connect_re_io_uring(cont, target, opt);
+  }
+#endif
+
   EThread *t             = eventProcessor.assign_affinity_by_type(cont, opt->etype);
-  UnixNetVConnection *vc = (UnixNetVConnection *)this->allocate_vc(t);
+  UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(this->allocate_vc(t));
 
   if (opt) {
     vc->options = *opt;
@@ -211,13 +274,14 @@ UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target
   Action *result  = &vc->action_;
   // Copy target to con.addr,
   //   then con.addr will copy to vc->remote_addr by set_remote_addr()
-  vc->con.setRemote(target);
+  vc->setRemote(target);
 
   if (using_socks) {
     char buff[INET6_ADDRPORTSTRLEN];
     Debug("Socks", "Using Socks ip: %s", ats_ip_nptop(target, buff, sizeof(buff)));
     socksEntry = socksAllocator.alloc();
-    // The socksEntry->init() will get the origin server addr by vc->get_remote_addr(),
+    // The socksEntry->init() will get the origin server addr by
+    // vc->get_remote_addr(),
     //   and save it to socksEntry->req_data.dest_ip.
     socksEntry->init(cont->mutex, vc, opt->socks_support, opt->socks_version); /*XXXX remove last two args */
     socksEntry->action_ = cont;
@@ -227,9 +291,10 @@ UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target
       socksEntry->free();
       return ACTION_RESULT_DONE;
     }
-    // At the end of socksEntry->init(), a socks server will be selected and saved to socksEntry->server_addr.
-    // Therefore, we should set the remote to socks server in order to establish a connection with socks server.
-    vc->con.setRemote(&socksEntry->server_addr.sa);
+    // At the end of socksEntry->init(), a socks server will be selected and
+    // saved to socksEntry->server_addr. Therefore, we should set the remote to
+    // socks server in order to establish a connection with socks server.
+    vc->setRemote(&socksEntry->server_addr.sa);
     result      = &socksEntry->action_;
     vc->action_ = socksEntry;
   } else {
@@ -260,12 +325,6 @@ UnixNetProcessor::connect_re_internal(Continuation *cont, sockaddr const *target
   }
 }
 
-Action *
-UnixNetProcessor::connect(Continuation *cont, UnixNetVConnection ** /* avc */, sockaddr const *target, NetVCOptions *opt)
-{
-  return connect_re(cont, target, opt);
-}
-
 struct PollCont;
 
 // This needs to be called before the ET_NET threads are started.
@@ -276,6 +335,8 @@ UnixNetProcessor::init()
 
   netHandler_offset = eventProcessor.allocate(sizeof(NetHandler));
   pollCont_offset   = eventProcessor.allocate(sizeof(PollCont));
+
+  REC_ReadConfigInteger(use_io_uring, "proxy.config.net.use_io_uring");
 
   if (0 == accept_mss) {
     REC_ReadConfigInteger(accept_mss, "proxy.config.net.sock_mss_in");
@@ -328,13 +389,14 @@ UnixNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 NetVConnection *
 UnixNetProcessor::allocate_vc(EThread *t)
 {
-  UnixNetVConnection *vc;
+  NetVConnection *vc;
 
   if (t) {
-    vc = THREAD_ALLOC_INIT(netVCAllocator, t);
+    vc = THREAD_ALLOC_INIT(unixNetVCAllocator, t);
   } else {
-    if (likely(vc = netVCAllocator.alloc())) {
-      vc->from_accept_thread = true;
+    if (likely(vc = unixNetVCAllocator.alloc())) {
+      auto unvc                = static_cast<UnixNetVConnection *>(vc);
+      unvc->from_accept_thread = true;
     }
   }
 

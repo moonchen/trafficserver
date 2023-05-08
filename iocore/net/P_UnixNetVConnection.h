@@ -31,18 +31,16 @@
 
 #pragma once
 
-#include "tscore/ink_sock.h"
 #include "I_NetVConnection.h"
-#include "P_UnixNetState.h"
+#include "NetEvent.h"
 #include "P_Connection.h"
 #include "P_NetAccept.h"
-#include "NetEvent.h"
+#include "P_UnixNetState.h"
+#include "tscore/ink_sock.h"
 
 class UnixNetVConnection;
 class NetHandler;
 struct PollDescriptor;
-
-enum tcp_congestion_control_t { CLIENT_SIDE, SERVER_SIDE };
 
 class UnixNetVConnection : public NetVConnection, public NetEvent
 {
@@ -100,6 +98,12 @@ public:
   // The constructor is public just to avoid compile errors.      //
   /////////////////////////////////////////////////////////////////
   UnixNetVConnection();
+
+  void
+  setRemote(sockaddr const *remote)
+  {
+    con.setRemote(remote);
+  }
 
   int populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
@@ -187,8 +191,8 @@ public:
   void netActivity(EThread *lthread);
   /**
    * If the current object's thread does not match the t argument, create a new
-   * NetVC in the thread t context based on the socket and ssl information in the
-   * current NetVC and mark the current NetVC to be closed.
+   * NetVC in the thread t context based on the socket and ssl information in
+   * the current NetVC and mark the current NetVC to be closed.
    */
   UnixNetVConnection *migrateToCurrentThread(Continuation *c, EThread *t);
 
@@ -208,7 +212,8 @@ public:
   /**
    * Populate the current object based on the socket information in the
    * con parameter.
-   * This is logic is invoked when the NetVC object is created in a new thread context
+   * This is logic is invoked when the NetVC object is created in a new thread
+   * context
    */
   virtual int populate(Connection &con, Continuation *c, void *arg);
   virtual void clear();
@@ -220,7 +225,7 @@ public:
   void set_mptcp_state() override;
   virtual void set_remote_addr() override;
   void set_remote_addr(const sockaddr *) override;
-  int set_tcp_congestion_control(int side) override;
+  int set_tcp_congestion_control(tcp_congestion_control_t side) override;
   void apply_options() override;
 
   friend void write_to_net_io(NetHandler *, UnixNetVConnection *, EThread *);
@@ -230,7 +235,7 @@ private:
   virtual NetProcessor *_getNetProcessor();
 };
 
-extern ClassAllocator<UnixNetVConnection> netVCAllocator;
+extern ClassAllocator<UnixNetVConnection> unixNetVCAllocator;
 
 using NetVConnHandler = int (UnixNetVConnection::*)(int, void *);
 
