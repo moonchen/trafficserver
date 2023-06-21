@@ -122,9 +122,11 @@ test_libinknet_LDADD = \
 	@HWLOC_LIBS@ @OPENSSL_LIBS@ @LIBPCRE@ @YAMLCPP_LIBS@ @SWOC_LIBS@
 
 libinknet_a_SOURCES = \
-	AcceptOptions.cc \
-	AcceptOptions.h \
+  AcceptOptions.cc \
+  AcceptOptions.h \
 	ALPNSupport.cc \
+	AsyncSignalEventIO.cc \
+	AsyncSignalEventIO.h \
 	BIO_fastopen.cc \
 	BIO_fastopen.h \
 	BoringSSLUtils.cc \
@@ -144,6 +146,8 @@ libinknet_a_SOURCES = \
 	YamlSNIConfig.h \
 	YamlSNIConfig.cc \
 	Net.cc \
+	NetAcceptEventIO.h \
+	NetAcceptEventIO.cc \
 	NetHandler.h \
 	NetHandler.cc \
 	NetVCOptions.h \
@@ -184,6 +188,8 @@ libinknet_a_SOURCES = \
 	PollCont.cc \
 	ProxyProtocol.h \
 	ProxyProtocol.cc \
+	ReadWriteEventIO.h \
+	ReadWriteEventIO.cc \
 	Socks.cc \
 	SSLCertLookup.cc \
 	SSLClientCoordinator.cc \
@@ -211,6 +217,8 @@ libinknet_a_SOURCES = \
 	TLSSNISupport.cc \
 	TLSTunnelSupport.cc \
 	TLSCertSwitchSupport.cc \
+	UDPEventIO.h \
+	UDPEventIO.cc \
 	UDPIOEvent.cc \
 	UnixConnection.cc \
 	UnixNet.cc \
@@ -225,18 +233,18 @@ libinknet_a_SOURCES = \
 
 if ENABLE_QUIC
 libinknet_a_SOURCES += \
-	P_QUICClosedConCollector.h \
-	P_QUICPacketHandler.h \
-	P_QUICNetProcessor.h \
-	P_QUICNetVConnection.h \
-	P_QUICNextProtocolAccept.h \
-	QUICClosedConCollector.cc \
-	QUICMultiCertConfigLoader.cc \
-	QUICNet.cc \
-	QUICNetProcessor_quiche.cc \
-	QUICNetVConnection_quiche.cc \
-	QUICNextProtocolAccept_quiche.cc \
-	QUICPacketHandler_quiche.cc
+  P_QUICClosedConCollector.h \
+  P_QUICPacketHandler.h \
+  P_QUICNetProcessor.h \
+  P_QUICNetVConnection.h \
+  P_QUICNextProtocolAccept.h \
+  QUICClosedConCollector.cc \
+  QUICMultiCertConfigLoader.cc \
+  QUICNet.cc \
+  QUICNetProcessor_quiche.cc \
+  QUICNetVConnection_quiche.cc \
+  QUICNextProtocolAccept_quiche.cc \
+  QUICPacketHandler_quiche.cc
 endif
 
 if BUILD_TESTS
