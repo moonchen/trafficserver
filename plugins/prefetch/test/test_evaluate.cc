@@ -24,6 +24,7 @@
 #define CATCH_CONFIG_MAIN
 #include <catch.hpp>
 #include "../evaluate.h"
+#include <limits>
 
 TEST_CASE("Basic computation works", "[evaluate]")
 {
@@ -38,13 +39,25 @@ TEST_CASE("Empty expression", "[empty]")
 
 TEST_CASE("64-bit result works", "[evaluate64]")
 {
-  REQUIRE(evaluate("4294967295+4294967295") == "8589934590");
+  const uint32_t max32  = std::numeric_limits<uint32_t>::max();
+  const String max32str = std::to_string(max32);
+  REQUIRE(evaluate(max32str + "+" + max32str) == "8589934590");
 }
 
-TEST_CASE("Larger number saturation", "[saturation]")
+TEST_CASE("Larger number 32-bit saturation", "[saturation]")
 {
-  REQUIRE(evaluate("3842948374928374982374982374") == "18446744073709551615");
-  REQUIRE(evaluate("3248739487239847298374738924-18446744073709551615") == "0");
+  const uint32_t max32  = std::numeric_limits<uint32_t>::max();
+  const String max32str = std::to_string(max32);
+  REQUIRE(evaluate("3842948374928374982374982374") == max32str);
+  REQUIRE(evaluate("3248739487239847298374738924-" + max32str) == "0");
+}
+
+TEST_CASE("Larger number 64-bit saturation", "[saturation]")
+{
+  const uint64_t max64  = std::numeric_limits<uint64_t>::max();
+  const String max64str = std::to_string(max64);
+  REQUIRE(evaluate("3842948374928374982374982374", EvalPolicy::Overflow64) == max64str);
+  REQUIRE(evaluate("3248739487239847298374738924-" + max64str, EvalPolicy::Overflow64) == "0");
 }
 
 TEST_CASE("Negative subtraction", "[negative]")
