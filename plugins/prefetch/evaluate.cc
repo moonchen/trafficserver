@@ -22,11 +22,41 @@
  */
 
 #include "evaluate.h"
+#include <limits>
 #include <sstream>
 #include <istream>
 #include <iomanip>
 #include <cstdint>
 #include <cinttypes>
+#include <charconv>
+
+static uint32_t
+to_uint32(StringView s)
+{
+  uint32_t value;
+  std::from_chars_result result = std::from_chars(s.begin(), s.end(), value);
+  if (result.ec == std::errc{}) {
+    return value;
+  } else if (result.ec == std::errc::result_out_of_range) {
+    return std::numeric_limits<uint32_t>::max();
+  } else {
+    return 0;
+  }
+}
+
+static uint64_t
+to_uint64(StringView s)
+{
+  uint64_t value;
+  std::from_chars_result result = std::from_chars(s.begin(), s.end(), value);
+  if (result.ec == std::errc{}) {
+    return value;
+  } else if (result.ec == std::errc::result_out_of_range) {
+    return std::numeric_limits<uint64_t>::max();
+  } else {
+    return 0;
+  }
+}
 
 /**
  * @brief Evaluate a math addition or subtraction expression.
@@ -44,60 +74,50 @@ evaluate(const StringView view, const EvalPolicy policy)
   StringView v = view;
 
   /* Find out if width is specified (hence leading zeros are required if the width is bigger then the result width) */
-  String stmt;
+  StringView stmt;
   uint32_t len              = 0;
   StringView::size_type pos = v.find_first_of(':');
   if (StringView::npos != pos) {
-    stmt.assign(v.substr(0, pos));
-    std::istringstream iss(stmt);
-    iss >> len;
-    v = v.substr(pos + 1);
+    stmt = v.substr(0, pos);
+    len  = to_uint32(stmt);
+    v    = v.substr(pos + 1);
   }
-  PrefetchDebug("statement: '%s', formatting length: %" PRIu32, stmt.c_str(), len);
+  PrefetchDebug("statement: '%.*s', formatting length: %" PRIu32, static_cast<int>(stmt.length()), stmt.data(), len);
 
   uint64_t result = 0;
   pos             = v.find_first_of("+-");
 
   if (String::npos == pos) {
-    stmt.assign(v.substr(0, pos));
-    std::istringstream iss(stmt);
-
+    // The whole statement is a number
+    stmt = v.substr(0, pos);
     if (policy == EvalPolicy::Overflow64) {
-      iss >> result;
+      result = to_uint64(stmt);
     } else {
-      uint32_t tmp32;
-      iss >> tmp32;
-      result = tmp32;
+      result = to_uint32(stmt);
     }
 
-    PrefetchDebug("Single-operand expression: %s -> %" PRIu64, stmt.c_str(), result);
+    PrefetchDebug("Single-operand expression: %.*s -> %" PRIu64, static_cast<int>(stmt.length()), stmt.data(), result);
   } else {
-    const String leftOperand(v.substr(0, pos));
-    std::istringstream liss(leftOperand);
+    const StringView leftOperand(v.substr(0, pos));
     uint64_t a64 = 0;
 
     if (policy == EvalPolicy::Overflow64) {
-      liss >> a64;
+      a64 = to_uint64(leftOperand);
     } else {
-      uint32_t a32;
-      liss >> a32;
-      a64 = a32;
+      a64 = to_uint32(leftOperand);
     }
-    PrefetchDebug("Left-operand expression: %s -> %" PRIu64, leftOperand.c_str(), a64);
+    PrefetchDebug("Left-operand expression: %.*s -> %" PRIu64, static_cast<int>(leftOperand.length()), leftOperand.data(), a64);
 
-    const String rightOperand(v.substr(pos + 1));
-    std::istringstream riss(rightOperand);
+    const StringView rightOperand(v.substr(pos + 1));
     uint64_t b64 = 0;
 
     if (policy == EvalPolicy::Overflow64) {
-      riss >> b64;
+      b64 = to_uint64(rightOperand);
     } else {
-      uint32_t b32;
-      riss >> b32;
-      b64 = b32;
+      b64 = to_uint32(rightOperand);
     }
 
-    PrefetchDebug("Right-operand expression: %s -> %" PRIu64, rightOperand.c_str(), b64);
+    PrefetchDebug("Right-operand expression: %.*s -> %" PRIu64, static_cast<int>(rightOperand.length()), rightOperand.data(), b64);
 
     if ('+' == v[pos]) {
       result = a64 + b64;
@@ -112,6 +132,7 @@ evaluate(const StringView view, const EvalPolicy policy)
 
   std::ostringstream convert;
   convert << std::setw(len) << std::setfill('0') << result;
-  PrefetchDebug("evaluation of '%.*s' resulted in '%s'", (int)view.length(), view.data(), convert.str().c_str());
-  return convert.str();
+  const String &ret = convert.str();
+  PrefetchDebug("evaluation of '%.*s' resulted in '%s'", static_cast<int>(view.length()), view.data(), ret.c_str());
+  return ret;
 }
