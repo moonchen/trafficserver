@@ -137,7 +137,7 @@ CacheVC::derefRead(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
   if (!buf) {
     goto Lcollision;
   }
-  if (static_cast<int>(io.aio_result) != static_cast<int>(io.aiocb.aio_nbytes)) {
+  if (!io.ok()) {
     goto Ldone;
   }
   if (!dir_agg_valid(vol, &dir)) {
