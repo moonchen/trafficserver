@@ -2007,9 +2007,6 @@ int
 AIO_failure_handler::handle_disk_failure(int /* event ATS_UNUSED */, void *data)
 {
   /* search for the matching file descriptor */
-  if (!CacheProcessor::cache_ready) {
-    return EVENT_DONE;
-  }
   int disk_no     = 0;
   AIOCallback *cb = static_cast<AIOCallback *>(data);
 
