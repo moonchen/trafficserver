@@ -303,6 +303,7 @@ ServerSessionPool::eventHandler(int event, void *data)
       Warning("Connection leak from http keep-alive system fd=%d closed=%d peer_ip_port=%s", unix_net_vc->con.fd,
               unix_net_vc->closed, peer_ip);
     }
+    // TODO: TCPNetVConnection
     ink_assert(0);
   }
   return 0;
@@ -438,6 +439,9 @@ HttpSessionManager::_acquire_session(sockaddr const *ip, CryptoHash const &hostn
         retval = ethread->server_session_pool->acquireSession(ip, hostname_hash, match_style, sm, to_return);
         Debug("http_ss", "[acquire session] thread pool search %s", to_return ? "successful" : "failed");
       } else {
+#ifdef USE_TCP_NETVC
+        ink_release_assert(!"Migrating to another thread is not supported!");
+#else
         retval = m_g_pool->acquireSession(ip, hostname_hash, match_style, sm, to_return);
         Debug("http_ss", "[acquire session] global pool search %s", to_return ? "successful" : "failed");
         // At this point to_return has been removed from the pool. Do we need to move it
@@ -470,6 +474,7 @@ HttpSessionManager::_acquire_session(sockaddr const *ip, CryptoHash const &hostn
             }
           }
         }
+#endif
       }
     } else { // Didn't get the lock.  to_return is still NULL
       retval = HSM_RETRY;

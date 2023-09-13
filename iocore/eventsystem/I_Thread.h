@@ -113,7 +113,8 @@ public:
 
   // For THREAD_ALLOC
   ProxyAllocator eventAllocator;
-  ProxyAllocator netVCAllocator;
+  ProxyAllocator unixNetVCAllocator;
+  ProxyAllocator tcpNetVCAllocator;
   ProxyAllocator sslNetVCAllocator;
   ProxyAllocator quicNetVCAllocator;
   ProxyAllocator http1ClientSessionAllocator;

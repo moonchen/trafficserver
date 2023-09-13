@@ -53,6 +53,9 @@ add_library(inknet STATIC
         SSLSessionTicket.cc
         SSLUtils.cc
         OCSPStapling.cc
+        TCPConnection.cc
+        TCPNetVConnection.cc
+        TCPListener.cc
         TLSBasicSupport.cc
         TLSCertSwitchSupport.cc
         TLSEarlyDataSupport.cc
