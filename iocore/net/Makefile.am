@@ -37,7 +37,7 @@ AM_CPPFLAGS += \
 TESTS = $(check_PROGRAMS)
 TESTS_ENVIRONMENT = LSAN_OPTIONS=suppressions=$(abs_top_srcdir)/ci/asan_leak_suppression/regression.txt
 
-check_PROGRAMS = test_certlookup test_UDPNet test_libinknet
+check_PROGRAMS = test_certlookup test_UDPNet test_libinknet test_TCPConnection
 noinst_LIBRARIES = libinknet.a
 
 test_certlookup_LDFLAGS = \
@@ -138,6 +138,34 @@ test_libinknet_LDADD += \
 	$(top_builddir)/iocore/net/quic/libquic.a
 endif
 
+test_TCPConnection_SOURCES = \
+	unit_tests/test_TCPConnection.cc \
+	TCPListener.cc \
+	TCPConnection.cc \
+	AcceptOptions.cc \
+	AcceptOptions.h \
+	EventIO.cc \
+	EventIO.h \
+	NetVCOptions.h \
+	NetVCOptions.cc
+
+test_TCPConnection_CPPFLAGS = \
+	$(AM_CPPFLAGS) \
+	$(iocore_include_dirs) \
+	-I$(abs_top_srcdir)/tests/include \
+	-I$(abs_top_srcdir)/include
+
+test_TCPConnection_LDFLAGS = \
+	@AM_LDFLAGS@ \
+	@OPENSSL_LDFLAGS@ \
+	@YAMLCPP_LDFLAGS@ \
+	@SWOC_LDFLAGS@
+
+test_TCPConnection_LDADD = \
+	$(top_builddir)/lib/swoc/libtsswoc.la \
+	$(top_builddir)/iocore/eventsystem/libinkevent.a \
+	$(top_builddir)/src/tscore/libtscore.la
+
 libinknet_a_SOURCES = \
 	AcceptOptions.h \
 	ALPNSupport.cc \
@@ -227,6 +255,10 @@ libinknet_a_SOURCES = \
 	SSLSessionTicket.cc \
 	SSLUtils.cc \
 	OCSPStapling.cc \
+	TCPConnection.cc \
+	TCPNetVConnection.h \
+	TCPNetVConnection.cc \
+	TCPListener.cc \
 	TLSBasicSupport.cc \
 	TLSEarlyDataSupport.cc \
 	TLSKeyLogger.cc \

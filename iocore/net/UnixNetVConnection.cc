@@ -31,7 +31,7 @@
 #define STATE_FROM_VIO(_x) ((NetState *)(((char *)(_x)) - STATE_VIO_OFFSET))
 
 // Global
-ClassAllocator<UnixNetVConnection> netVCAllocator("netVCAllocator");
+ClassAllocator<UnixNetVConnection> unixNetVCAllocator("unixNetVCAllocator");
 
 //
 // Reschedule a UnixNetVConnection by moving it
@@ -1298,9 +1298,9 @@ UnixNetVConnection::free_thread(EThread *t)
   ink_assert(t == this_ethread());
 
   if (from_accept_thread) {
-    netVCAllocator.free(this);
+    unixNetVCAllocator.free(this);
   } else {
-    THREAD_FREE(this, netVCAllocator, t);
+    THREAD_FREE(this, unixNetVCAllocator, t);
   }
 }
 

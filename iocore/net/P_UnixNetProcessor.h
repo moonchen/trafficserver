@@ -35,8 +35,8 @@ class UnixNetVConnection;
 //
 //////////////////////////////////////////////////////////////////
 struct UnixNetProcessor : public NetProcessor {
-private:
-  Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
+public:
+  virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
 
 protected:
   virtual NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt);
@@ -47,7 +47,7 @@ public:
 
   void stop_accept() override;
 
-  Action *connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &options) override;
+  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts) override;
   NetVConnection *allocate_vc(EThread *t) override;
 
   void init() override;
@@ -56,6 +56,14 @@ public:
   // offsets for per thread data structures
   off_t netHandler_offset;
   off_t pollCont_offset;
+
+  // we probably won't need these members
+  int n_netthreads;
+  EThread **netthreads;
+
+private:
+  bool use_io_uring;
+  Action *connect_re_io_uring(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts);
 };
 
 extern UnixNetProcessor unix_netProcessor;

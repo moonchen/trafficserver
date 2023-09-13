@@ -535,7 +535,6 @@ PreWarmSM::_connect(const IpEndpoint &addr)
 
   NetVCOptions opt;
   opt.reset();
-  opt.f_blocking_connect = false;
   opt.set_sock_param(http_conf_params->oride.sock_recv_buffer_size_out, http_conf_params->oride.sock_send_buffer_size_out,
                      http_conf_params->oride.sock_option_flag_out, http_conf_params->oride.sock_packet_mark_out,
                      http_conf_params->oride.sock_packet_tos_out);
