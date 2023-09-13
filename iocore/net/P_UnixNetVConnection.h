@@ -101,6 +101,12 @@ public:
   /////////////////////////////////////////////////////////////////
   UnixNetVConnection();
 
+  void
+  setRemote(sockaddr const *remote)
+  {
+    con.setRemote(remote);
+  }
+
   int populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
 
@@ -230,7 +236,7 @@ private:
   virtual NetProcessor *_getNetProcessor();
 };
 
-extern ClassAllocator<UnixNetVConnection> netVCAllocator;
+extern ClassAllocator<UnixNetVConnection> unixNetVCAllocator;
 
 using NetVConnHandler = int (UnixNetVConnection::*)(int, void *);
 

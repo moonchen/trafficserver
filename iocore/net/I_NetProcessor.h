@@ -182,7 +182,7 @@ public:
 
   */
 
-  Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *options = nullptr);
+  virtual Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions *options = nullptr) = 0;
 
   /**
     Initializes the net processor. This must be called before the event threads are started.
@@ -258,3 +258,4 @@ extern NetProcessor &netProcessor;
 */
 extern NetProcessor &sslNetProcessor;
 extern NetProcessor &quicNetProcessor;
+extern NetProcessor &tcpNetProcessor;
