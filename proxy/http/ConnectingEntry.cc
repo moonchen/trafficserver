@@ -40,9 +40,10 @@ ConnectingEntry::state_http_server_open(int event, void *data)
 
   switch (event) {
   case NET_EVENT_OPEN: {
-    netvc                  = static_cast<NetVConnection *>(data);
-    UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(netvc);
-    ink_release_assert(_pending_action == nullptr || _pending_action->continuation == vc->get_action()->continuation);
+    netvc = static_cast<NetVConnection *>(data);
+    // We should not break encapsulation here
+    // UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(netvc);
+    // ink_release_assert(_pending_action == nullptr || _pending_action->continuation == vc->get_action()->continuation);
     _pending_action = nullptr;
     Debug("http_connect", "ConnectingEntrysetting handler for connection handshake");
     // Just want to get a write-ready event so we know that the connection handshake is complete.
@@ -57,7 +58,7 @@ ConnectingEntry::state_http_server_open(int event, void *data)
     netvc->do_io_read(this, 0, _netvc_reader->mbuf);
     int64_t nbytes = 1;
     if (is_no_plugin_tunnel && prime_connect_sm->t_state.txn_conf->proxy_protocol_out >= 0) {
-      nbytes = do_outbound_proxy_protocol(_netvc_reader->mbuf, vc, ua_txn->get_netvc(),
+      nbytes = do_outbound_proxy_protocol(_netvc_reader->mbuf, netvc, ua_txn->get_netvc(),
                                           prime_connect_sm->t_state.txn_conf->proxy_protocol_out);
     }
     netvc->do_io_write(this, nbytes, _netvc_reader);
