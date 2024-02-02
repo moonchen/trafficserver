@@ -123,6 +123,8 @@ public:
 
   Action action_;
 
+  bool from_accept_thread = false;
+
   unsigned int id = 0;
 
   int connectEvent(int event, void *edata);

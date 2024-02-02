@@ -34,12 +34,6 @@
 Ptr<ProxyMutex> naVecMutex;
 std::vector<NetAccept *> naVec;
 
-#define USE_TCP_NETVC
-
-#ifdef USE_TCP_NETVC
-#include "TCPNetVConnection.h"
-#endif
-
 int net_accept_number = 0;
 NetProcessor::AcceptOptions const NetProcessor::DEFAULT_ACCEPT_OPTIONS;
 
@@ -174,76 +168,12 @@ UnixNetProcessor::stop_accept()
   }
 }
 
-// Remove this once NetAccept can use TCPNetVConnection, and unify to
-// allocate_vc
-#ifdef USE_TCP_NETVC
-static TCPNetVConnection *
-allocate_tcp_vc(EThread *t)
-{
-  TCPNetVConnection *vc;
-
-  if (t) {
-    vc = THREAD_ALLOC_INIT(tcpNetVCAllocator, t);
-  } else {
-    if (likely(vc = tcpNetVCAllocator.alloc())) {
-    }
-  }
-
-  return vc;
-}
-#endif
-
-#ifdef USE_TCP_NETVC
-Action *
-UnixNetProcessor::connect_re_io_uring(Continuation *cont, sockaddr const *target, NetVCOptions const &opt)
-{
-  EThread *t            = eventProcessor.assign_affinity_by_type(cont, opt.etype);
-  TCPNetVConnection *vc = allocate_tcp_vc(t);
-
-  vc->options = opt;
-
-  vc->set_context(NET_VCONNECTION_OUT);
-  bool using_socks = (socks_conf_stuff->socks_needed && opt.socks_support != NO_SOCKS);
-
-  // SOCKS is not supported yet
-  ink_release_assert(!using_socks);
-
-  vc->id          = net_next_connection_number();
-  vc->submit_time = ink_get_hrtime();
-  vc->mutex       = cont->mutex;
-  Action *result  = &vc->action_;
-  // Copy target to con.addr,
-  //   then con.addr will copy to vc->remote_addr by set_remote_addr()
-  vc->setRemote(target);
-
-  vc->action_ = cont;
-
-  MUTEX_TRY_LOCK(lock, cont->mutex, t);
-  if (lock.is_locked()) {
-    MUTEX_TRY_LOCK(lock2, get_NetHandler(t)->mutex, t);
-    if (lock2.is_locked()) {
-      vc->connectUp(t, NO_FD);
-      return ACTION_RESULT_DONE;
-    }
-  }
-
-  t->schedule_imm(vc);
-  return result;
-}
-#endif
-
 Action *
 UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &opt)
 {
   if (TSSystemState::is_event_system_shut_down()) {
     return nullptr;
   }
-
-#ifdef USE_TCP_NETVC
-  if (use_io_uring) {
-    return connect_re_io_uring(cont, target, opt);
-  }
-#endif
 
   EThread *t             = eventProcessor.assign_affinity_by_type(cont, opt.etype);
   UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(this->allocate_vc(t));
@@ -325,8 +255,6 @@ UnixNetProcessor::init()
 
   netHandler_offset = eventProcessor.allocate(sizeof(NetHandler));
   pollCont_offset   = eventProcessor.allocate(sizeof(PollCont));
-
-  REC_ReadConfigInteger(use_io_uring, "proxy.config.net.use_io_uring");
 
   if (0 == accept_mss) {
     REC_ReadConfigInteger(accept_mss, "proxy.config.net.sock_mss_in");

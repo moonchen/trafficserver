@@ -54,6 +54,7 @@ add_library(inknet STATIC
         SSLUtils.cc
         OCSPStapling.cc
         TCPConnection.cc
+        TCPNetProcessor.cc
         TCPNetVConnection.cc
         TCPListener.cc
         TLSBasicSupport.cc

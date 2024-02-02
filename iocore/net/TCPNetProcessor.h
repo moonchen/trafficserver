@@ -26,43 +26,31 @@
 #include "I_NetProcessor.h"
 #include "I_SessionAccept.h"
 #include "P_NetAccept.h"
+#include "P_UnixNetProcessor.h"
 
-class UnixNetVConnection;
+class TCPNetVConnection;
 
 //////////////////////////////////////////////////////////////////
 //
-//  class UnixNetProcessor
+//  class TCPNetProcessor
 //
 //////////////////////////////////////////////////////////////////
-struct UnixNetProcessor : public NetProcessor {
+struct TCPNetProcessor : public UnixNetProcessor {
 public:
-  virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
+  Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt) override;
 
 protected:
-  virtual NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt);
+  NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
 
 public:
-  Action *accept(Continuation *cont, AcceptOptions const &opt = DEFAULT_ACCEPT_OPTIONS) override;
-  Action *main_accept(Continuation *cont, SOCKET listen_socket_in, AcceptOptions const &opt = DEFAULT_ACCEPT_OPTIONS) override;
-
-  void stop_accept() override;
-
   Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts) override;
   NetVConnection *allocate_vc(EThread *t) override;
 
-  void init() override;
-  void init_socks() override;
-
-  // offsets for per thread data structures
-  off_t netHandler_offset;
-  off_t pollCont_offset;
-
-  // we probably won't need these members
-  int n_netthreads;
-  EThread **netthreads;
+private:
+  Action *connect_re_io_uring(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts);
 };
 
-extern UnixNetProcessor unix_netProcessor;
+extern TCPNetProcessor tcp_netProcessor;
 
 //
 // Set up a thread to receive events from the NetProcessor
@@ -70,3 +58,4 @@ extern UnixNetProcessor unix_netProcessor;
 // accept such events by the EventProcessor.
 //
 extern void initialize_thread_for_net(EThread *thread);
+extern bool net_use_io_uring;
