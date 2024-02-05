@@ -54,6 +54,7 @@
 #include "TLSTunnelSupport.h"
 #include "HttpPages.h"
 #include "IPAllow.h"
+#include "TCPNetProcessor.h"
 
 #include "ProxyProtocol.h"
 
@@ -5656,9 +5657,14 @@ HttpSM::do_http_server_open(bool raw, bool only_direct)
                                                 opt);
   } else {
     SMDebug("http", "calling netProcessor.connect_re");
+    /* TODO: change this when unifying netProcessor
     pending_action = netProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
                                              &t_state.current.server->dst_addr.sa, // addr + port
                                              opt);
+                                             */
+    pending_action = tcp_netProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
+                                                 &t_state.current.server->dst_addr.sa, // addr + port
+                                                 opt);
   }
 
   return;

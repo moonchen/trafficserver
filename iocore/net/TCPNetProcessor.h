@@ -22,10 +22,7 @@
  */
 
 #pragma once
-#include "I_Net.h"
 #include "I_NetProcessor.h"
-#include "I_SessionAccept.h"
-#include "P_NetAccept.h"
 #include "P_UnixNetProcessor.h"
 
 class TCPNetVConnection;
@@ -37,17 +34,8 @@ class TCPNetVConnection;
 //////////////////////////////////////////////////////////////////
 struct TCPNetProcessor : public UnixNetProcessor {
 public:
-  Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt) override;
-
-protected:
-  NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
-
-public:
   Action *connect_re(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts) override;
   NetVConnection *allocate_vc(EThread *t) override;
-
-private:
-  Action *connect_re_io_uring(Continuation *cont, sockaddr const *addr, NetVCOptions const &opts);
 };
 
 extern TCPNetProcessor tcp_netProcessor;
