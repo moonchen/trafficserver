@@ -47,6 +47,8 @@
 #include "tscore/List.h"
 #include "tscore/Ptr.h"
 
+#include "iocore/cache/Cache.h"
+
 #include <cstdint>
 
 class Stripe;

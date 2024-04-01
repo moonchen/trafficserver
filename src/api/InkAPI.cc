@@ -5712,7 +5712,7 @@ TSVConnFdCreate(int fd)
   UnixNetVConnection *vc;
   EThread *t = this_ethread();
 
-  if (unlikely(fd == NO_FD)) {
+  if (unlikely(fd == ::NO_FD)) {
     return nullptr;
   }
 

@@ -30,8 +30,8 @@
 
 #include <cstring>
 
-#define AGG_SIZE       (4 * 1024 * 1024) // 4MB
-#define AGG_HIGH_WATER (AGG_SIZE / 2)    // 2MB
+constexpr off_t AGG_SIZE       = 4 * 1024 * 1024; // 4MB
+constexpr off_t AGG_HIGH_WATER = AGG_SIZE / 2;    // 2MB
 
 struct CacheVC;
 

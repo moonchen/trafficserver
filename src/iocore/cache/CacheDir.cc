@@ -21,10 +21,10 @@
   limitations under the License.
  */
 
-#include "P_Cache.h"
 #include "P_CacheDir.h"
 #include "P_CacheDoc.h"
 
+#include "iocore/cache/CacheVC.h"
 #include "tscore/hugepages.h"
 #include "tscore/Random.h"
 

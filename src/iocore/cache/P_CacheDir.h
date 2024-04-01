@@ -23,9 +23,9 @@
 
 #pragma once
 
-#include "P_CacheDoc.h"
-
 #include "iocore/cache/CacheDefs.h"
+#include "P_CacheConstants.h"
+#include "P_CacheHelpers.h"
 #include "P_CacheHttp.h"
 #include "iocore/eventsystem/EventSystem.h"
 #include "iocore/eventsystem/Continuation.h"
@@ -40,31 +40,6 @@ class CacheEvacuateDocVC;
 
 // #define LOOP_CHECK_MODE 1
 
-/*
-  Directory layout
-*/
-
-// Constants
-
-#define DIR_TAG_WIDTH         12
-#define DIR_MASK_TAG(_t)      ((_t) & ((1 << DIR_TAG_WIDTH) - 1))
-#define SIZEOF_DIR            10
-#define ESTIMATED_OBJECT_SIZE 8000
-
-#define MAX_DIR_SEGMENTS        (32 * (1 << 16))
-#define DIR_DEPTH               4
-#define MAX_ENTRIES_PER_SEGMENT (1 << 16)
-#define MAX_BUCKETS_PER_SEGMENT (MAX_ENTRIES_PER_SEGMENT / DIR_DEPTH)
-#define DIR_SIZE_WIDTH          6
-#define DIR_BLOCK_SIZES         4
-#define DIR_BLOCK_SHIFT(_i)     (3 * (_i))
-#define DIR_BLOCK_SIZE(_i)      (CACHE_BLOCK_SIZE << DIR_BLOCK_SHIFT(_i))
-#define DIR_SIZE_WITH_BLOCK(_i) ((1 << DIR_SIZE_WIDTH) * DIR_BLOCK_SIZE(_i))
-#define DIR_OFFSET_BITS         40
-#define DIR_OFFSET_MAX          ((((off_t)1) << DIR_OFFSET_BITS) - 1)
-
-#define SYNC_MAX_WRITE     (2 * 1024 * 1024)
-#define SYNC_DELAY         HRTIME_MSECONDS(500)
 #define DO_NOT_REMOVE_THIS 0
 
 // Debugging Options
@@ -150,8 +125,11 @@ struct Dir {
 #endif
 };
 
-#define dir_offset(_e) \
-  ((int64_t)(((uint64_t)(_e)->w[0]) | (((uint64_t)((_e)->w[1] & 0xFF)) << 16) | (((uint64_t)(_e)->w[4]) << 24)))
+constexpr off_t
+dir_offset(const Dir *_e)
+{
+  return ((int64_t)(((uint64_t)(_e)->w[0]) | (((uint64_t)((_e)->w[1] & 0xFF)) << 16) | (((uint64_t)(_e)->w[4]) << 24)));
+}
 #define dir_set_offset(_e, _o)                                              \
   do {                                                                      \
     (_e)->w[0] = (uint16_t)_o;                                              \
@@ -181,12 +159,7 @@ struct Dir {
     }                                                 \
   } while (0)
 #define dir_approx_size(_e) ((dir_size(_e) + 1) * DIR_BLOCK_SIZE(dir_big(_e)))
-#define round_to_approx_dir_size(_s)      \
-  (_s <= DIR_SIZE_WITH_BLOCK(0) ?         \
-     ROUND_TO(_s, DIR_BLOCK_SIZE(0)) :    \
-     (_s <= DIR_SIZE_WITH_BLOCK(1) ?      \
-        ROUND_TO(_s, DIR_BLOCK_SIZE(1)) : \
-        (_s <= DIR_SIZE_WITH_BLOCK(2) ? ROUND_TO(_s, DIR_BLOCK_SIZE(2)) : ROUND_TO(_s, DIR_BLOCK_SIZE(3)))))
+
 #define dir_tag(_e) ((uint32_t)((_e)->w[2] & ((1 << DIR_TAG_WIDTH) - 1)))
 #define dir_set_tag(_e, _t) \
   (_e)->w[2] = (uint16_t)(((_e)->w[2] & ~((1 << DIR_TAG_WIDTH) - 1)) | ((_t) & ((1 << DIR_TAG_WIDTH) - 1)))
@@ -255,7 +228,7 @@ struct CacheSync : public Continuation {
   size_t buflen    = 0;
   bool buf_huge    = false;
   off_t writepos   = 0;
-  AIOCallbackInternal io;
+  AIOCallback io;
   Event *trigger        = nullptr;
   ink_hrtime start_time = 0;
   int mainEvent(int event, Event *e);

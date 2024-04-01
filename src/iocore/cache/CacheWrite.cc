@@ -23,6 +23,7 @@
 
 #include "P_Cache.h"
 #include "P_CacheDoc.h"
+#include "Stripe.h"
 #include "iocore/cache/AggregateWriteBuffer.h"
 #include "iocore/cache/CacheEvacuateDocVC.h"
 

@@ -23,25 +23,25 @@
 
 #pragma once
 
-#include "iocore/eventsystem/IOBuffer.h"
-#include "tscore/CryptoHash.h"
+#include <cstdint>
+#include <ctime>
+#include <sys/types.h>
+#include "tscore/Version.h"
 
-class Stripe;
-
-// Generic Ram Cache interface
-
-class RamCache
-{
-public:
-  // returns 1 on found/stored, 0 on not found/stored, if provided auxkey1 and auxkey2 must match
-  virtual int get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t auxkey = 0)                         = 0;
-  virtual int put(CryptoHash *key, IOBufferData *data, uint32_t len, bool copy = false, uint64_t auxkey = 0) = 0;
-  virtual int fixup(const CryptoHash *key, uint64_t old_auxkey, uint64_t new_auxkey)                         = 0;
-  virtual int64_t size() const                                                                               = 0;
-
-  virtual void init(int64_t max_bytes, Stripe *stripe) = 0;
-  virtual ~RamCache(){};
+struct StripteHeaderFooter {
+  unsigned int magic;
+  ts::VersionNumber version;
+  time_t create_time;
+  off_t write_pos;
+  off_t last_write_pos;
+  off_t agg_pos;
+  uint32_t generation; // token generation (vary), this cannot be 0
+  uint32_t phase;
+  uint32_t cycle;
+  uint32_t sync_serial;
+  uint32_t write_serial;
+  uint32_t dirty;
+  uint32_t sector_size;
+  uint32_t unused; // pad out to 8 byte boundary
+  uint16_t freelist[1];
 };
-
-RamCache *new_RamCacheLRU();
-RamCache *new_RamCacheCLFUS();

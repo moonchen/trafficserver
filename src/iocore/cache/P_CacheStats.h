@@ -23,6 +23,10 @@
 
 #pragma once
 
+#include "tsutil/Metrics.h"
+
+using namespace ts;
+
 // cache stats definitions, for both global cache metrics, as well as per volume metrics.
 enum class CacheOpType { Lookup = 0, Read, Write, Update, Remove, Evacuate, Scan, Last };
 

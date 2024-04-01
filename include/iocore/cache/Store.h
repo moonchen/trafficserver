@@ -30,10 +30,10 @@
 
 #pragma once
 
-#include "tscore/ink_platform.h"
 #include "tscore/Result.h"
+#include "tscore/List.h"
 
-#define STORE_BLOCK_SIZE       8192
+constexpr size_t STORE_BLOCK_SIZE = 8192;
 #define STORE_BLOCK_SHIFT      13
 #define DEFAULT_HW_SECTOR_SIZE 512
 
