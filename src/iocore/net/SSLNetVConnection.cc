@@ -37,11 +37,15 @@
 #include "iocore/net/SSLDiags.h"
 #include "iocore/net/SSLSNIConfig.h"
 #include "iocore/net/TLSALPNSupport.h"
+#include "tscore/ink_assert.h"
 #include "tscore/ink_config.h"
 #include "tscore/Layout.h"
 #include "tscore/InkErrno.h"
 #include "tscore/TSSystemState.h"
+#include "tsutil/DbgCtl.h"
 
+#include <cerrno>
+#include <cstddef>
 #include <netinet/in.h>
 #include <string>
 #include <cstring>
@@ -302,40 +306,45 @@ int64_t
 SSLNetVConnection::read_raw_data()
 {
   // read data
-  int64_t        r          = 0;
-  int64_t        total_read = 0;
-  int64_t        rattempted = 0;
-  char          *buffer     = nullptr;
+  int64_t        r               = 0;
+  int64_t        total_attempted = 0;
+  int64_t        last_attempted  = 0;
+  char          *buffer          = nullptr;
   int            buf_len;
-  IOBufferBlock *b = this->handShakeBuffer->first_write_block();
+  int64_t        last_read_result = 0;
+  IOBufferBlock *b                = this->handShakeBuffer->first_write_block();
 
-  rattempted = b->write_avail();
-  while (rattempted) {
+  last_attempted = b->write_avail();
+  while (last_attempted) {
     buffer  = b->_end;
-    buf_len = rattempted;
+    buf_len = last_attempted;
     b       = b->next.get();
 
-    r = this->con.sock.read(buffer, buf_len);
+    last_read_result = this->con.sock.read(buffer, buf_len);
+    if (last_read_result == -EAGAIN || last_read_result == -EWOULDBLOCK) {
+      read.triggered = 0;
+      nh->read_ready_list.remove(this);
+    }
     Metrics::Counter::increment(net_rsb.calls_to_read);
-    total_read += rattempted;
+    total_attempted += last_attempted;
 
-    Dbg(dbg_ctl_ssl, "read_raw_data r=%" PRId64 " rattempted=%" PRId64 " total_read=%" PRId64 " fd=%d", r, rattempted, total_read,
-        con.sock.get_fd());
+    Dbg(dbg_ctl_ssl, "read_raw_data last_read_result=%" PRId64 " last_attempted=%" PRId64 " total_attempted=%" PRId64 " fd=%d",
+        last_read_result, last_attempted, total_attempted, con.sock.get_fd());
     // last read failed or was incomplete
-    if (r != rattempted || !b) {
+    if (last_read_result != last_attempted || !b) {
       break;
     }
 
-    rattempted = b->write_avail();
+    last_attempted = b->write_avail();
   }
   // If we have already moved some bytes successfully, adjust total_read to reflect reality
   // If any read succeeded, we should return success
-  if (r != rattempted) {
+  if (last_read_result != last_attempted) {
     // If the first read fails, we should return error
-    if (r <= 0 && total_read > rattempted) {
-      r = total_read - rattempted;
+    if (last_read_result <= 0 && total_attempted > last_attempted) {
+      r = total_attempted - last_attempted;
     } else {
-      r = total_read - rattempted + r;
+      r = total_attempted - last_attempted + last_read_result;
     }
   }
   Metrics::Counter::increment(net_rsb.read_bytes, r);
@@ -388,67 +397,26 @@ SSLNetVConnection::read_raw_data()
 
 proxy_protocol_bypass:
 
+  intptr_t handShakeBioStored = 0;
   if (r > 0) {
     this->handShakeBuffer->fill(r);
 
-    char *start              = this->handShakeReader->start();
-    char *end                = this->handShakeReader->end();
-    this->handShakeBioStored = end - start;
+    char *start        = this->handShakeReader->start();
+    char *end          = this->handShakeReader->end();
+    handShakeBioStored = end - start;
 
-    // Sets up the buffer as a read only bio target
-    // Must be reset on each read
-    BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
-    BIO_set_mem_eof_return(rbio, -1);
-    SSL_set0_rbio(this->ssl, rbio);
-  } else {
-    this->handShakeBioStored = 0;
-  }
-
-  Dbg(dbg_ctl_ssl, "%p read r=%" PRId64 " total=%" PRId64 " bio=%d\n", this, r, total_read, this->handShakeBioStored);
-
-  // check for errors
-  if (r <= 0) {
+    BIO *rbio    = SSL_get_rbio(ssl);
+    int  bio_ret = BIO_write(rbio, start, handShakeBioStored);
+    ink_release_assert(bio_ret == handShakeBioStored);
+    handShakeReader->consume(bio_ret);
+  } else if (r <= 0) { // check for errors
     if (r == -EAGAIN || r == -ENOTCONN) {
       Metrics::Counter::increment(net_rsb.calls_to_read_nodata);
     }
   }
+  Dbg(dbg_ctl_ssl, "%p read r=%" PRId64 " total=%" PRId64 " stored=%" PRIdPTR "\n", this, r, total_attempted, handShakeBioStored);
 
   return r;
-}
-
-//
-// Return true if we updated the rbio with another
-// memory chunk (should be ready for another read right away)
-//
-bool
-SSLNetVConnection::update_rbio(bool move_to_socket)
-{
-  bool retval = false;
-  if (BIO_eof(SSL_get_rbio(this->ssl)) && this->handShakeReader != nullptr) {
-    this->handShakeReader->consume(this->handShakeBioStored);
-    this->handShakeBioStored = 0;
-    // Load up the next block if present
-    if (this->handShakeReader->is_read_avail_more_than(0)) {
-      // Setup the next iobuffer block to drain
-      char *start              = this->handShakeReader->start();
-      char *end                = this->handShakeReader->end();
-      this->handShakeBioStored = end - start;
-
-      // Sets up the buffer as a read only bio target
-      // Must be reset on each read
-      BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
-      BIO_set_mem_eof_return(rbio, -1);
-      SSL_set0_rbio(this->ssl, rbio);
-      retval = true;
-      // Handshake buffer is empty but we have read something, move to the socket rbio
-    } else if (move_to_socket && this->handShakeHolder->is_read_avail_more_than(0)) {
-      BIO *rbio = BIO_new_socket(this->get_socket(), BIO_NOCLOSE);
-      BIO_set_mem_eof_return(rbio, -1);
-      SSL_set0_rbio(this->ssl, rbio);
-      free_handshake_buffers();
-    }
-  }
-  return retval;
 }
 
 // changed by YTS Team, yamsat
@@ -567,14 +535,8 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
         }
       }
       // move over to the socket if we haven't already
-      if (this->handShakeBuffer != nullptr) {
-        read.triggered = update_rbio(true);
-      } else {
-        read.triggered = 0;
-      }
-      if (!read.triggered) {
-        nh->read_ready_list.remove(this);
-      }
+      read.triggered = 0;
+      nh->read_ready_list.remove(this);
       readReschedule(nh);
     } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
       write.triggered = 0;
@@ -646,6 +608,15 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
       }
       return;
     }
+
+    /*
+    if (ret == SSL_READ_WOULD_BLOCK) {
+      readReschedule(nh);
+    } else {
+      writeReschedule(nh);
+    }
+      */
+
     // reset the trigger and remove from the ready queue
     // we will need to be retriggered to read from this socket again
     read.triggered = 0;
@@ -1214,7 +1185,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   if (this->handShakeReader) {
     if (BIO_eof(SSL_get_rbio(this->ssl))) { // No more data in the buffer
       // Is this the first read?
-      if (!this->handShakeReader->is_read_avail_more_than(0) && !this->handShakeHolder->is_read_avail_more_than(0)) {
+      if (!this->handShakeReader->is_read_avail_more_than(0)) {
 #if TS_USE_TLS_ASYNC
         if (SSLConfigParams::async_handshake_enabled) {
           SSL_set_mode(ssl, SSL_MODE_ASYNC);
@@ -1240,8 +1211,6 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
           SSLVCDebug(this, "SSL handshake error: EOF");
           return EVENT_ERROR;
         }
-      } else {
-        update_rbio(false);
       }
     } // Still data in the BIO
   }
@@ -2307,12 +2276,42 @@ SSLNetVConnection::_ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread)
   }
 #endif
 
-  int ret = SSL_read(ssl, buf, static_cast<int>(nbytes));
+  int ssl_error;
+  int ret = -1;
+  if (SSL_pending(ssl)) {
+    ret = SSL_read(ssl, buf, static_cast<int>(nbytes));
+    if (ret > 0) {
+      nread = ret;
+      return SSL_ERROR_NONE;
+    } else if (ret < 0) {
+      int ssl_error = SSL_get_error(ssl, ret);
+      if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+        return ssl_error;
+      }
+    }
+  }
+
+  ink_release_assert(handShakeBuffer);
+  // Use the same technique - BIO mem buf on handShakeBuffer.  these mem bufs can't be written to
+  int rsize = read_raw_data();
+
+  // ink_release_assert(rsize != 0);
+  if (rsize == 0) {
+  } else if (rsize == -EAGAIN || rsize == -EWOULDBLOCK) {
+    return SSL_ERROR_WANT_READ;
+  } else if (rsize < 0) {
+    // FIXME
+    nread = rsize;
+    return SSL_ERROR_SYSCALL;
+  }
+  ret = SSL_read(ssl, buf, static_cast<int>(nbytes));
+  Dbg(dbg_ctl_ssl, "SSL_read returned %d", ret);
+
   if (ret > 0) {
     nread = ret;
     return SSL_ERROR_NONE;
   }
-  int ssl_error = SSL_get_error(ssl, ret);
+  ssl_error = SSL_get_error(ssl, ret);
   if (ssl_error == SSL_ERROR_SSL && dbg_ctl_ssl_error_read.on()) {
     char          tempbuf[512];
     unsigned long e = ERR_peek_last_error();

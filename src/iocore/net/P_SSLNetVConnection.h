@@ -192,10 +192,9 @@ public:
   void
   initialize_handshake_buffers()
   {
-    this->handShakeBuffer    = new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index);
-    this->handShakeReader    = this->handShakeBuffer->alloc_reader();
-    this->handShakeHolder    = this->handShakeReader->clone();
-    this->handShakeBioStored = 0;
+    this->handShakeBuffer = new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index);
+    this->handShakeReader = this->handShakeBuffer->alloc_reader();
+    this->handShakeHolder = this->handShakeReader->clone();
   }
 
   void
@@ -210,10 +209,9 @@ public:
     if (this->handShakeBuffer) {
       free_MIOBuffer(this->handShakeBuffer);
     }
-    this->handShakeReader    = nullptr;
-    this->handShakeHolder    = nullptr;
-    this->handShakeBuffer    = nullptr;
-    this->handShakeBioStored = 0;
+    this->handShakeReader = nullptr;
+    this->handShakeHolder = nullptr;
+    this->handShakeBuffer = nullptr;
   }
 
   int         populate_protocol(std::string_view *results, int n) const override;
@@ -332,7 +330,6 @@ protected:
 
 private:
   std::string_view map_tls_protocol_to_tag(const char *proto_string) const;
-  bool             update_rbio(bool move_to_socket);
   void             increment_ssl_version_metric(int version) const;
   NetProcessor    *_getNetProcessor() override;
   void            *_prepareForMigration() override;
@@ -343,7 +340,6 @@ private:
   MIOBuffer              *handShakeBuffer             = nullptr;
   IOBufferReader         *handShakeHolder             = nullptr;
   IOBufferReader         *handShakeReader             = nullptr;
-  int                     handShakeBioStored          = 0;
 
   bool transparentPassThrough = false;
   bool allowPlain             = false;
