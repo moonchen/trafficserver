@@ -23,6 +23,7 @@
 
 #pragma once
 #include "iocore/eventsystem/VIO.h"
+#include "iocore/eventsystem/VConnection.h"
 
 TS_INLINE
 VIO::VIO(int aop) : op(aop), buffer(), mutex(nullptr) {}
@@ -95,6 +96,7 @@ VIO::set_continuation(Continuation *acont)
 TS_INLINE void
 VIO::reenable()
 {
+  // TODO: should we check if the VIO is already enabled?
   this->_disabled = false;
   if (vc_server) {
     vc_server->reenable(this);

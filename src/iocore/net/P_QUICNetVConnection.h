@@ -138,7 +138,7 @@ public:
   int in_closed_queue = 0;
 
   // TLSEventSupport
-  void            reenable(int event) override;
+  void            reenable_with_event(int event) override;
   Continuation   *getContinuationForTLSEvents() override;
   EThread        *getThreadForTLSEvents() override;
   Ptr<ProxyMutex> getMutexForTLSEvents() override;

@@ -21,8 +21,9 @@
   limitations under the License.
  */
 
-#include "BIO_fastopen.h"
+#include "BIO_MIOBuffer.h"
 #include "P_UnixNet.h"
+#include "P_UnixNetVConnection.h"
 #include "SSLStats.h"
 #include "P_Net.h"
 #include "P_SSLUtils.h"
@@ -31,20 +32,29 @@
 #include "P_SSLClientUtils.h"
 #include "P_SSLNetVConnection.h"
 #include "P_UnixNetProcessor.h"
+#include "iocore/eventsystem/Continuation.h"
+#include "iocore/eventsystem/Event.h"
+#include "iocore/eventsystem/EventSystem.h"
+#include "iocore/eventsystem/IOBuffer.h"
+#include "iocore/eventsystem/Lock.h"
 #include "iocore/net/NetHandler.h"
 #include "iocore/net/NetVConnection.h"
 #include "iocore/net/ProxyProtocol.h"
 #include "iocore/net/SSLDiags.h"
 #include "iocore/net/SSLSNIConfig.h"
 #include "iocore/net/TLSALPNSupport.h"
+#include "ts/apidefs.h"
+#include "tscore/ink_assert.h"
 #include "tscore/ink_config.h"
 #include "tscore/Layout.h"
 #include "tscore/InkErrno.h"
 #include "tscore/TSSystemState.h"
 
+#include <cerrno>
 #include <netinet/in.h>
 #include <string>
 #include <cstring>
+#include <memory>
 
 #if TS_USE_TLS_ASYNC
 #include <openssl/async.h>
@@ -89,39 +99,85 @@ DbgCtl dbg_ctl_ssl_shutdown{"ssl-shutdown"};
 DbgCtl dbg_ctl_ssl_alpn{"ssl_alpn"};
 DbgCtl dbg_ctl_ssl_origin_session_cache{"ssl.origin_session_cache"};
 DbgCtl dbg_ctl_proxyprotocol{"proxyprotocol"};
+DbgCtl dbg_ctl_inactivity_cop{"inactivity_cop"};
+DbgCtl dbg_ctl_ssl_io{"ssl_io"};
 
 } // namespace
 
 //
 // Private
 //
+template <typename T, typename Deleter>
+std::unique_ptr<T, Deleter>
+make_resource(T *raw, Deleter d)
+{
+  return std::unique_ptr<T, Deleter>{raw, d};
+}
 
 void
 SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
 {
-  if (likely(this->ssl = SSL_new(ctx))) {
-    // Only set up the bio stuff for the server side
-    if (this->get_context() == NET_VCONNECTION_OUT) {
-      BIO *bio = BIO_new(const_cast<BIO_METHOD *>(BIO_s_fastopen()));
-      BIO_set_fd(bio, this->get_socket(), BIO_NOCLOSE);
+  std::unique_ptr<SSL, decltype(&SSL_free)> temp_ssl = make_resource(SSL_new(ctx), SSL_free);
+  if (temp_ssl == nullptr) {
+    return;
+  }
 
-      BIO_fastopen_set_dest_addr(bio,
-                                 this->options.f_tcp_fastopen ? this->get_remote_addr() : static_cast<const sockaddr *>(nullptr));
+  // Only set up the bio stuff for the server side
+  this->initialize_handshake_buffers();
 
-      SSL_set_bio(ssl, bio, bio);
-    } else {
-      this->initialize_handshake_buffers();
-      BIO *rbio = BIO_new(BIO_s_mem());
-      BIO *wbio = BIO_new_socket(this->get_socket(), BIO_NOCLOSE);
-      BIO_set_mem_eof_return(wbio, -1);
-      SSL_set_bio(ssl, rbio, wbio);
+  std::unique_ptr<BIO, decltype(&BIO_vfree)> rbio = make_resource(BIO_new(BIO_s_miobuffer()), BIO_vfree);
+  if (rbio == nullptr) {
+    return;
+  }
+
+  auto rbuf = make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer);
+  if (rbuf == nullptr) {
+    return;
+  }
+
+  miobuffer_set_buffer(rbio.get(), rbuf.get());
+
+  std::unique_ptr<BIO, decltype(&BIO_vfree)> wbio = make_resource(BIO_new(BIO_s_miobuffer()), BIO_vfree);
+  if (wbio == nullptr) {
+    return;
+  }
+
+  auto wbuf = make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer);
+  if (wbuf == nullptr) {
+    return;
+  }
+
+  auto write_buf_reader = make_resource(wbuf->alloc_reader(), [](IOBufferReader *r) { r->dealloc(); });
+  if (write_buf_reader == nullptr) {
+    return;
+  }
+
+  miobuffer_set_buffer(wbio.get(), wbuf.get());
+  SSL_set_bio(temp_ssl.get(), rbio.get(), wbio.get());
 
 #if TS_HAS_TLS_EARLY_DATA
-      update_early_data_config(ssl, SSLConfigParams::server_max_early_data, SSLConfigParams::server_recv_max_early_data);
+  update_early_data_config(temp_ssl.get(), SSLConfigParams::server_max_early_data, SSLConfigParams::server_recv_max_early_data);
 #endif
-    }
-    this->_bindSSLObject();
-  }
+
+  this->_write_buf = wbuf.get();
+  wbuf.release();
+
+  this->_write_buf_reader = write_buf_reader.get();
+  write_buf_reader.release();
+
+  this->_wbio = wbio.get();
+  wbio.release();
+
+  this->_read_buf = rbuf.get();
+  rbuf.release();
+
+  this->_rbio = rbio.get();
+  rbio.release();
+
+  this->ssl = temp_ssl.get();
+  temp_ssl.release();
+
+  this->_bindSSLObject();
 }
 
 void
@@ -179,17 +235,16 @@ debug_certificate_name(const char *msg, X509_NAME *name)
 int
 SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
 {
-  NetState          *s          = &this->read;
-  MIOBufferAccessor &buf        = s->vio.buffer;
+  MIOBufferAccessor &buf        = _user_read_vio.buffer;
   int                event      = SSL_READ_ERROR_NONE;
   int64_t            bytes_read = 0;
   ssl_error_t        sslErr     = SSL_ERROR_NONE;
 
+  // Find out the max we can read, based on buffer size and user's request size
   int64_t toread = buf.writer()->write_avail();
   ink_release_assert(toread > 0);
-  if (toread > s->vio.ntodo()) {
-    toread = s->vio.ntodo();
-  }
+  int64_t read_available = _user_read_vio.ntodo();
+  toread                 = std::min(toread, read_available);
 
   bytes_read = 0;
   while (sslErr == SSL_ERROR_NONE && bytes_read < toread) {
@@ -220,7 +275,6 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
       bytes_read += nread;
       if (nread > 0) {
         buf.writer()->fill(nread); // Tell the buffer, we've used the bytes
-        this->netActivity();
       }
       break;
     case SSL_ERROR_WANT_WRITE:
@@ -273,17 +327,11 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
   if (bytes_read > 0) {
     Dbg(dbg_ctl_ssl, "bytes_read=%" PRId64, bytes_read);
 
-    s->vio.ndone += bytes_read;
-    this->netActivity();
-
-    ret = bytes_read;
+    _user_read_vio.ndone += bytes_read;
+    ret                   = bytes_read;
 
     // If we read it all, don't worry about the other events and just send read complete
-    event = (s->vio.ntodo() <= 0) ? SSL_READ_COMPLETE : SSL_READ_READY;
-    if (sslErr == SSL_ERROR_NONE && s->vio.ntodo() > 0) {
-      // We stopped with data on the wire (to avoid overbuffering).  Make sure we are triggered
-      this->read.triggered = 1;
-    }
+    event = (_user_read_vio.ntodo() <= 0) ? SSL_READ_COMPLETE : SSL_READ_READY;
   } else { // if( bytes_read > 0 )
 #if defined(_DEBUG)
     if (bytes_read == 0) {
@@ -294,69 +342,30 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
   return event;
 }
 
-/** Read from socket directly for handshake data.  Store the data in an MIOBuffer.  Place the data in
- * the read BIO so the openssl library has access to it. If for some reason we must abort out of the
- * handshake, the stored data can be replayed (e.g. back out to blind tunneling)
+/**
+ * @brief Proxy Protocol header processing
+ *
+ * Checks for the Proxy Protocol header (v1 or v2) and consumes it if appropriate.
+ *
+ * @param reader MIOBuffer with read data.  This buffer will be advanced to consume the header.
+ * @return > 0: A proxy protocol header was successfully parsed.
+ * @return 0: No header found.
+ * @return -ENOTCONN: Source IP is not in the allowlist.
+ * @return -EAGAIN: Not enough data to determine if the header is present.
  */
-int64_t
-SSLNetVConnection::read_raw_data()
+int
+SSLNetVConnection::_parse_proxy_protocol(IOBufferReader *reader)
 {
-  // read data
-  int64_t        r          = 0;
-  int64_t        total_read = 0;
-  int64_t        rattempted = 0;
-  char          *buffer     = nullptr;
-  int            buf_len;
-  IOBufferBlock *b = this->handShakeBuffer->first_write_block();
-
-  rattempted = b->write_avail();
-  while (rattempted) {
-    buffer  = b->_end;
-    buf_len = rattempted;
-    b       = b->next.get();
-
-    r = this->con.sock.read(buffer, buf_len);
-    Metrics::Counter::increment(net_rsb.calls_to_read);
-    total_read += rattempted;
-
-    Dbg(dbg_ctl_ssl, "read_raw_data r=%" PRId64 " rattempted=%" PRId64 " total_read=%" PRId64 " fd=%d", r, rattempted, total_read,
-        con.sock.get_fd());
-    // last read failed or was incomplete
-    if (r != rattempted || !b) {
-      break;
-    }
-
-    rattempted = b->write_avail();
-  }
-  // If we have already moved some bytes successfully, adjust total_read to reflect reality
-  // If any read succeeded, we should return success
-  if (r != rattempted) {
-    // If the first read fails, we should return error
-    if (r <= 0 && total_read > rattempted) {
-      r = total_read - rattempted;
-    } else {
-      r = total_read - rattempted + r;
-    }
-  }
-  Metrics::Counter::increment(net_rsb.read_bytes, r);
-  Metrics::Counter::increment(net_rsb.read_bytes_count);
-
   swoc::IPRangeSet *pp_ipmap;
   pp_ipmap = SSLConfigParams::proxy_protocol_ip_addrs;
 
   if (this->get_is_proxy_protocol() && this->get_proxy_protocol_version() == ProxyProtocolVersion::UNDEFINED) {
     Dbg(dbg_ctl_proxyprotocol, "proxy protocol is enabled on this port");
-    if (pp_ipmap->count() > 0) {
+    if (pp_ipmap != nullptr && pp_ipmap->count() > 0) {
       Dbg(dbg_ctl_proxyprotocol, "proxy protocol has a configured allowlist of trusted IPs - checking");
-
-      // At this point, using get_remote_addr() will return the ip of the
-      // proxy source IP, not the Proxy Protocol client ip. Since we are
-      // checking the ip of the actual source of this connection, this is
-      // what we want now.
       if (!pp_ipmap->contains(swoc::IPAddr(get_remote_addr()))) {
         Dbg(dbg_ctl_proxyprotocol, "Source IP is NOT in the configured allowlist of trusted IPs - closing connection");
-        r = -ENOTCONN; // Need a quick close/exit here to refuse the connection!!!!!!!!!
-        goto proxy_protocol_bypass;
+        return -ENOTCONN; // Need a quick close/exit here to refuse the connection!!!!!!!!!
       } else {
         char new_host[INET6_ADDRSTRLEN];
         Dbg(dbg_ctl_proxyprotocol, "Source IP [%s] is in the trusted allowlist for proxy protocol",
@@ -367,8 +376,9 @@ SSLNetVConnection::read_raw_data()
                                  "proxy protocol is enabled on this port - processing all connections");
     }
 
-    auto const stored_r = r;
-    if (this->has_proxy_protocol(buffer, &r)) {
+    // FIXME: if there isn't enough data to determine if the header is present, we should return -EAGAIN.
+    // This will require refactoring has_proxy_protocol.
+    if (has_proxy_protocol(reader)) {
       Dbg(dbg_ctl_proxyprotocol, "ssl has proxy protocol header");
       if (dbg_ctl_proxyprotocol.on()) {
         IpEndpoint dst;
@@ -377,110 +387,72 @@ SSLNetVConnection::read_raw_data()
         ats_ip_nptop(&dst, ipb1, sizeof(ipb1));
         DbgPrint(dbg_ctl_proxyprotocol, "ssl_has_proxy_v1, dest IP received [%s]", ipb1);
       }
+      return 1;
     } else {
       Dbg(dbg_ctl_proxyprotocol, "proxy protocol was enabled, but Proxy Protocol header was not present");
-      // We are flexible with the Proxy Protocol designation. Maybe not all
-      // connections include Proxy Protocol. Revert to the stored value of r so
-      // we can process the bytes that are on the wire (likely a CLIENT_HELLO).
-      r = stored_r;
-    }
-  } // end of Proxy Protocol processing
-
-proxy_protocol_bypass:
-
-  if (r > 0) {
-    this->handShakeBuffer->fill(r);
-
-    char *start              = this->handShakeReader->start();
-    char *end                = this->handShakeReader->end();
-    this->handShakeBioStored = end - start;
-
-    // Sets up the buffer as a read only bio target
-    // Must be reset on each read
-    BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
-    BIO_set_mem_eof_return(rbio, -1);
-    SSL_set0_rbio(this->ssl, rbio);
-  } else {
-    this->handShakeBioStored = 0;
-  }
-
-  Dbg(dbg_ctl_ssl, "%p read r=%" PRId64 " total=%" PRId64 " bio=%d\n", this, r, total_read, this->handShakeBioStored);
-
-  // check for errors
-  if (r <= 0) {
-    if (r == -EAGAIN || r == -ENOTCONN) {
-      Metrics::Counter::increment(net_rsb.calls_to_read_nodata);
     }
   }
-
-  return r;
+  return 0;
 }
 
 //
-// Return true if we updated the rbio with another
-// memory chunk (should be ready for another read right away)
+// Signal an event
 //
-bool
-SSLNetVConnection::update_rbio(bool move_to_socket)
+int
+SSLNetVConnection::_signal_user(SignalSide side, int event)
 {
-  bool retval = false;
-  if (BIO_eof(SSL_get_rbio(this->ssl)) && this->handShakeReader != nullptr) {
-    this->handShakeReader->consume(this->handShakeBioStored);
-    this->handShakeBioStored = 0;
-    // Load up the next block if present
-    if (this->handShakeReader->is_read_avail_more_than(0)) {
-      // Setup the next iobuffer block to drain
-      char *start              = this->handShakeReader->start();
-      char *end                = this->handShakeReader->end();
-      this->handShakeBioStored = end - start;
-
-      // Sets up the buffer as a read only bio target
-      // Must be reset on each read
-      BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
-      BIO_set_mem_eof_return(rbio, -1);
-      SSL_set0_rbio(this->ssl, rbio);
-      retval = true;
-      // Handshake buffer is empty but we have read something, move to the socket rbio
-    } else if (move_to_socket && this->handShakeHolder->is_read_avail_more_than(0)) {
-      BIO *rbio = BIO_new_socket(this->get_socket(), BIO_NOCLOSE);
-      BIO_set_mem_eof_return(rbio, -1);
-      SSL_set0_rbio(this->ssl, rbio);
-      free_handshake_buffers();
+  bool closed = false;
+  recursion++;
+  VIO        &vio      = side == SignalSide::READ ? _user_read_vio : _user_write_vio;
+  const char *side_str = side == SignalSide::READ ? "read" : "write";
+  if (vio.cont && _user_read_vio.mutex == vio.cont->mutex) {
+    vio.cont->handleEvent(event, &vio);
+  } else {
+    if (vio.cont) {
+      Note("signal %s: mutexes are different? vc=%p, event=%d", side_str, this, event);
+    }
+    switch (event) {
+    case VC_EVENT_EOS:
+    case VC_EVENT_ERROR:
+    case VC_EVENT_ACTIVE_TIMEOUT:
+    case VC_EVENT_INACTIVITY_TIMEOUT:
+      Dbg(dbg_ctl_inactivity_cop, "%s event %d: null vio cont, closing vc %p", side_str, event, this);
+      closed = true;
+      break;
+    default:
+      Error("Unexpected %s event %d for vc %p", side_str, event, this);
+      ink_release_assert(0);
+      break;
     }
   }
-  return retval;
+  if (!--recursion && closed) {
+    /* BZ  31932 */
+    ink_assert(thread == this_ethread());
+    // FIXME: delete this
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
 }
 
 // changed by YTS Team, yamsat
 void
-SSLNetVConnection::net_read_io(NetHandler *nh)
+SSLNetVConnection::_trigger_ssl_read()
 {
-  int       ret;
-  int64_t   r     = 0;
-  int64_t   bytes = 0;
-  NetState *s     = &this->read;
+  int     ret;
+  int64_t r     = 0;
+  int64_t bytes = 0;
 
-  if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
-    this->super::net_read_io(nh);
-    return;
-  }
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _trigger_ssl_read called", this);
+  ink_release_assert(HttpProxyPort::TRANSPORT_BLIND_TUNNEL != this->attributes);
 
-  MUTEX_TRY_LOCK(lock, s->vio.mutex, nh->thread);
-  if (!lock.is_locked()) {
-    readReschedule(nh);
-    return;
-  }
-  // Got closed by the HttpSessionManager thread during a migration
-  // The closed flag should be stable once we get the s->vio.mutex in that case
-  // (the global session pool mutex).
-  if (this->closed) {
-    this->super::net_read_io(nh);
-    return;
-  }
+  MUTEX_TRY_LOCK(lock, _user_read_vio.mutex, this_ethread());
+  // vio.mutex should be the same as the UnixNetVConnection's vio.mutex, so it should always be locked
+  ink_release_assert(lock.is_locked());
+
   // If the key renegotiation failed it's over, just signal the error and finish.
   if (sslClientRenegotiationAbort == true) {
-    this->read.triggered = 0;
-    readSignalError(nh, -ENET_SSL_FAILED);
+    _signal_user(SignalSide::READ, -ENET_SSL_FAILED);
     Dbg(dbg_ctl_ssl, "client renegotiation setting read signal error");
     return;
   }
@@ -488,13 +460,13 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
   // If it is not enabled, lower its priority.  This allows
   // a fast connection to speed match a slower connection by
   // shifting down in priority even if it could read.
-  if (!s->enabled || s->vio.op != VIO::READ || s->vio.is_disabled()) {
-    read_disable(nh, this);
+  if (_user_read_vio.op != VIO::READ || _user_read_vio.is_disabled()) {
+    _transport_read_vio->disable();
     return;
   }
 
-  MIOBufferAccessor &buf   = s->vio.buffer;
-  int64_t            ntodo = s->vio.ntodo();
+  MIOBufferAccessor &buf   = _user_read_vio.buffer;
+  int64_t            ntodo = _user_read_vio.ntodo();
   ink_assert(buf.writer());
 
   // Continue on if we are still in the handshake
@@ -516,18 +488,22 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
     // non-error return first, though, because if TLS has already failed with
     // the CLIENT_HELLO, then there is no need to continue toward the origin
     // with the blind tunnel.
-    if (ret != EVENT_ERROR && this->handShakeReader && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+    if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
       // Now in blind tunnel. Set things up to read what is in the buffer
       // Must send the READ_COMPLETE here before considering
       // forwarding on the handshake buffer, so the
       // SSLNextProtocolTrampoline has a chance to do its
       // thing before forwarding the buffers.
-      this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
+      _signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE);
 
       // If the handshake isn't set yet, this means the tunnel
       // decision was make in the SNI callback.  We must move
-      // the client hello message back into the standard read.vio
+      // the client hello message back into the standard read_vio
       // so it will get forwarded onto the origin server
+
+      // TODO: Need to do something for tunneling.  Maybe give the transport VIO to our user and peace out?
+      ink_release_assert(false);
+#if 0
       if (!this->getSSLHandShakeComplete()) {
         this->sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
 
@@ -548,62 +524,56 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
           this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
         }
       }
+#endif
       return; // Leave if we are tunneling
     }
-    if (ret == EVENT_ERROR) {
-      this->read.triggered = 0;
-      readSignalError(nh, err);
-    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+    switch (ret) {
+    case EVENT_ERROR:
+      lerrno = err;
+      _signal_user(SignalSide::READ, VC_EVENT_ERROR);
+      break;
+    case SSL_HANDSHAKE_WANT_READ:
+    case SSL_HANDSHAKE_WANT_ACCEPT:
       if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
         double handshake_time = (static_cast<double>(ink_get_hrtime() - this->get_tls_handshake_begin_time()) / 1000000000);
         Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, took %.3f seconds, configured handshake_timer: %d", this, handshake_time,
             SSLConfigParams::ssl_handshake_timeout_in);
         if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
           Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, expired, release the connection", this);
-          read.triggered = 0;
-          nh->read_ready_list.remove(this);
-          readSignalError(nh, ETIMEDOUT);
+          lerrno = ETIMEDOUT;
+          _signal_user(SignalSide::READ, VC_EVENT_ERROR);
           return;
         }
       }
-      // move over to the socket if we haven't already
-      if (this->handShakeBuffer != nullptr) {
-        read.triggered = update_rbio(true);
-      } else {
-        read.triggered = 0;
-      }
-      if (!read.triggered) {
-        nh->read_ready_list.remove(this);
-      }
-      readReschedule(nh);
-    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
-      write.triggered = 0;
-      nh->write_ready_list.remove(this);
-      writeReschedule(nh);
-    } else if (ret == EVENT_DONE) {
-      Dbg(dbg_ctl_ssl, "ssl handshake EVENT_DONE ntodo=%" PRId64, ntodo);
+      break;
+    case SSL_HANDSHAKE_WANT_CONNECT:
+      Dbg(dbg_ctl_ssl, "ssl wants to connect for vc %p", this);
+      break;
+    case SSL_HANDSHAKE_WANT_WRITE:
+      Dbg(dbg_ctl_ssl, "ssl wants to write for vc %p", this);
+      break;
+    case EVENT_DONE:
+      Dbg(dbg_ctl_ssl, "ssl handshake EVENT_DONE vc %p ntodo=%" PRId64, this, ntodo);
       // If this was driven by a zero length read, signal complete when
-      // the handshake is complete. Otherwise set up for continuing read
-      // operations.
+      // the handshake is complete.
       if (ntodo <= 0) {
-        readSignalDone(VC_EVENT_READ_COMPLETE, nh);
-      } else {
-        read.triggered = 1;
-        if (read.enabled) {
-          nh->read_ready_list.in_or_enqueue(this);
-        }
+        _signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE);
       }
-    } else if (ret == SSL_WAIT_FOR_HOOK || ret == SSL_WAIT_FOR_ASYNC) {
-      // avoid readReschedule - done when the plugin calls us back to reenable
-    } else {
-      readReschedule(nh);
+      break;
+    case SSL_WAIT_FOR_HOOK:
+      Dbg(dbg_ctl_ssl, "ssl wait for hook for vc %p", this);
+    case SSL_WAIT_FOR_ASYNC:
+      Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
+      break;
+    default:
+      break;
     }
     return;
   }
 
   // If there is nothing to do or no space available, disable connection
-  if (ntodo <= 0 || !buf.writer()->write_avail() || s->vio.is_disabled()) {
-    read_disable(nh, this);
+  if (ntodo <= 0 || !buf.writer()->write_avail() || _user_read_vio.is_disabled()) {
+    _transport_read_vio->disable();
     return;
   }
 
@@ -623,7 +593,7 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
 
   if (bytes > 0) {
     if (ret == SSL_READ_WOULD_BLOCK || ret == SSL_READ_READY) {
-      if (readSignalAndUpdate(VC_EVENT_READ_READY) != EVENT_CONT) {
+      if (_signal_user(SignalSide::READ, VC_EVENT_READ_READY) != EVENT_CONT) {
         Dbg(dbg_ctl_ssl, "readSignal != EVENT_CONT");
         return;
       }
@@ -632,54 +602,34 @@ SSLNetVConnection::net_read_io(NetHandler *nh)
 
   switch (ret) {
   case SSL_READ_READY:
-    readReschedule(nh);
+    _transport_read_vio->reenable();
     return;
     break;
   case SSL_WRITE_WOULD_BLOCK:
+    _transport_write_vio->reenable();
+    Dbg(dbg_ctl_ssl, "read finished - would block - need write");
   case SSL_READ_WOULD_BLOCK:
-    if (lock.get_mutex() != s->vio.mutex.get()) {
-      Dbg(dbg_ctl_ssl, "mutex switched");
-      if (ret == SSL_READ_WOULD_BLOCK) {
-        readReschedule(nh);
-      } else {
-        writeReschedule(nh);
-      }
-      return;
-    }
-    // reset the trigger and remove from the ready queue
-    // we will need to be retriggered to read from this socket again
-    read.triggered = 0;
-    nh->read_ready_list.remove(this);
-    Dbg(dbg_ctl_ssl, "read finished - would block");
+    _transport_read_vio->reenable();
+    Dbg(dbg_ctl_ssl, "read finished - would block - need read");
     break;
 
   case SSL_READ_EOS:
-    // close the connection if we have SSL_READ_EOS, this is the return value from ssl_read_from_net() if we get an
-    // SSL_ERROR_ZERO_RETURN from SSL_get_error()
-    // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
-    read.triggered = 0;
-    readSignalDone(VC_EVENT_EOS, nh);
-
-    if (bytes > 0) {
-      Dbg(dbg_ctl_ssl, "read finished - EOS");
-    } else {
-      Dbg(dbg_ctl_ssl, "read finished - 0 useful bytes read, bytes used by SSL layer");
-    }
+    ink_release_assert(!"Shouldn't get EOS from our buffer.");
     break;
   case SSL_READ_COMPLETE:
-    readSignalDone(VC_EVENT_READ_COMPLETE, nh);
     Dbg(dbg_ctl_ssl, "read finished - signal done");
+    _signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE);
     break;
   case SSL_READ_ERROR:
-    this->read.triggered = 0;
-    readSignalError(nh, (ssl_read_errno) ? ssl_read_errno : -ENET_SSL_FAILED);
     Dbg(dbg_ctl_ssl, "read finished - read error");
+    _signal_user(SignalSide::READ, VC_EVENT_ERROR);
+    _unvc->do_io_close(ssl_read_errno);
     break;
   }
 }
 
 int64_t
-SSLNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs)
+SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs)
 {
   int64_t     try_to_write;
   int64_t     num_really_written      = 0;
@@ -702,7 +652,8 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf
   }
 
   if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
-    return this->super::load_buffer_and_write(towrite, buf, total_written, needs);
+    // TODO: do something for tunneling
+    // return this->super::load_buffer_and_write(towrite, buf, total_written, needs);
   }
 
   Dbg(dbg_ctl_ssl, "towrite=%" PRId64, towrite);
@@ -820,7 +771,7 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf
   return num_really_written;
 }
 
-SSLNetVConnection::SSLNetVConnection()
+SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc)
 {
   this->_set_service(static_cast<ALPNSupport *>(this));
   this->_set_service(static_cast<TLSBasicSupport *>(this));
@@ -830,10 +781,12 @@ SSLNetVConnection::SSLNetVConnection()
   this->_set_service(static_cast<TLSSNISupport *>(this));
   this->_set_service(static_cast<TLSSessionResumptionSupport *>(this));
   this->_set_service(static_cast<TLSTunnelSupport *>(this));
+  this->_unvc = unvc;
+  SET_HANDLER(&SSLNetVConnection::mainEvent);
 }
 
 void
-SSLNetVConnection::do_io_close(int lerrno)
+SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
   if (this->ssl != nullptr) {
     if (get_context() == NET_VCONNECTION_OUT) {
@@ -854,18 +807,11 @@ SSLNetVConnection::do_io_close(int lerrno)
         SSL_set_shutdown(ssl, new_shutdown_mode);
       }
 
-      // If the peer has already sent a FIN, don't bother with the shutdown
-      // They will just send us a RST for our troubles
-      // This test is not foolproof.  The client's fin could be on the wire
-      // at the same time we send the close-notify.  If so, the client will likely
-      // send RST anyway
-      char    c;
-      ssize_t x = this->con.sock.recv(&c, 1, MSG_PEEK);
-      // x < 0 means error.  x == 0 means fin sent
-      bool do_shutdown = (x > 0);
-      if (x < 0) {
-        do_shutdown = (errno == EAGAIN || errno == EWOULDBLOCK);
-      }
+      // Check if the peer has already sent a FIN
+      // Do this by checking if our read buffer has data
+      // TODO: is this possible after the refactor?
+      bool do_shutdown = true;
+
       if (do_shutdown) {
         // Send the close-notify
         int ret = SSL_shutdown(ssl);
@@ -878,8 +824,9 @@ SSLNetVConnection::do_io_close(int lerrno)
       }
     }
   }
-  // Go on and do the unix socket cleanups
-  super::do_io_close(lerrno);
+
+  // TODO: do_io_read and do_io_write on the remaining bytes
+  // do_io_close() on the unvc will happen when SSL data has fully finished
 }
 
 void
@@ -912,7 +859,7 @@ SSLNetVConnection::clear()
   TLSTunnelSupport::_clear();
   TLSCertSwitchSupport::_clear();
 
-  sslHandshakeStatus          = SSLHandshakeStatus::SSL_HANDSHAKE_ONGOING;
+  _sslState                   = SslState::INIT;
   sslLastWriteTime            = 0;
   sslTotalBytesSent           = 0;
   sslClientRenegotiationAbort = false;
@@ -920,21 +867,15 @@ SSLNetVConnection::clear()
   hookOpRequested = SslVConnOp::SSL_HOOK_OP_DEFAULT;
   free_handshake_buffers();
 
-  super::clear();
+  _unvc     = nullptr;
+  _sslState = SslState::INIT;
 }
 void
 SSLNetVConnection::free_thread(EThread *t)
 {
   ink_release_assert(t == this_ethread());
 
-  // close socket fd
-  if (con.sock.is_ok()) {
-    release_inbound_connection_tracking();
-    Metrics::Gauge::decrement(net_rsb.connections_currently_open);
-  }
-  con.close();
-
-  if (is_tunnel_endpoint()) {
+  if (_is_tunnel_endpoint) {
     ink_assert(get_context() != NET_VCONNECTION_UNSET);
 
     Metrics::Gauge::decrement(([&]() -> Metrics::Gauge::AtomicType * {
@@ -972,13 +913,11 @@ SSLNetVConnection::free_thread(EThread *t)
 
   clear();
   SET_CONTINUATION_HANDLER(this, &SSLNetVConnection::startEvent);
-  ink_assert(!con.sock.is_ok());
   ink_assert(t == this_ethread());
 
   if (from_accept_thread) {
     sslNetVCAllocator.free(this);
   } else {
-    ink_assert(!con.sock.is_ok());
     THREAD_FREE(this, sslNetVCAllocator, t);
   }
 }
@@ -1027,8 +966,8 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 
       if (cc && SSLCertContextOption::OPT_TUNNEL == cc->opt) {
         if (this->is_transparent) {
-          this->attributes   = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-          sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
+          this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+          _sslState        = SslState::HANDSHAKE_DONE;
           SSL_free(this->ssl);
           this->ssl = nullptr;
           return EVENT_DONE;
@@ -1203,47 +1142,35 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     // over the buffered handshake packets to the O.S.
     return EVENT_DONE;
   } else if (SslVConnOp::SSL_HOOK_OP_TERMINATE == hookOpRequested) {
-    sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
+    _sslState = SslState::HANDSHAKE_DONE;
     return EVENT_DONE;
   }
 
   Dbg(dbg_ctl_ssl, "Go on with the handshake state=%s",
       TLSEventSupport::get_ssl_handshake_hook_state_name(this->get_handshake_hook_state()));
 
-  // All the pre-accept hooks have completed, proceed with the actual accept.
-  if (this->handShakeReader) {
-    if (BIO_eof(SSL_get_rbio(this->ssl))) { // No more data in the buffer
-      // Is this the first read?
-      if (!this->handShakeReader->is_read_avail_more_than(0) && !this->handShakeHolder->is_read_avail_more_than(0)) {
+  if (!this->handShakeHolder->is_read_avail_more_than(0)) {
 #if TS_USE_TLS_ASYNC
-        if (SSLConfigParams::async_handshake_enabled) {
-          SSL_set_mode(ssl, SSL_MODE_ASYNC);
-        }
+    if (SSLConfigParams::async_handshake_enabled) {
+      SSL_set_mode(ssl, SSL_MODE_ASYNC);
+    }
 #endif
-
-        Dbg(dbg_ctl_ssl, "%p first read\n", this);
-        // Read from socket to fill in the BIO buffer with the
-        // raw handshake data before calling the ssl accept calls.
-        int retval = this->read_raw_data();
-        if (retval < 0) {
-          if (retval == -EAGAIN) {
-            // No data at the moment, hang tight
-            SSLVCDebug(this, "SSL handshake: EAGAIN");
-            return SSL_HANDSHAKE_WANT_READ;
-          } else {
-            // An error, make us go away
-            SSLVCDebug(this, "SSL handshake error: read_retval=%d", retval);
-            return EVENT_ERROR;
-          }
-        } else if (retval == 0) {
-          // EOF, go away, we stopped in the handshake
-          SSLVCDebug(this, "SSL handshake error: EOF");
-          return EVENT_ERROR;
-        }
+    Dbg(dbg_ctl_ssl, "%p first read\n", this);
+    // Read from socket to fill in the BIO buffer with the
+    // raw handshake data before calling the ssl accept calls.
+    auto reader = make_resource(this->_read_buf->alloc_reader(), [](IOBufferReader *reader) { reader->dealloc(); });
+    int  retval = this->_parse_proxy_protocol(reader.get());
+    if (retval < 0) {
+      if (retval == -EAGAIN) {
+        // No data at the moment, hang tight
+        SSLVCDebug(this, "Proxy protocol: need more data");
+        return SSL_HANDSHAKE_WANT_READ;
       } else {
-        update_rbio(false);
+        // An error, make us go away
+        SSLVCDebug(this, "Proxy protocol error: _parse_proxy_protocol() returned %d", retval);
+        return EVENT_ERROR;
       }
-    } // Still data in the BIO
+    }
   }
 
   ssl_error_t ssl_error = this->_ssl_accept();
@@ -1256,22 +1183,18 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       // Set up the epoll entry for the signalling
       if (SSL_get_all_async_fds(ssl, nullptr, &numfds) && numfds > 0) {
         // Allocate space for the waitfd on the stack, should only be one most all of the time
-        waitfds = reinterpret_cast<OSSL_ASYNC_FD *>(alloca(sizeof(OSSL_ASYNC_FD) * numfds));
+        async_fds.reserve(numfds);
+        waitfds = async_fds.data();
         if (SSL_get_all_async_fds(ssl, waitfds, &numfds) && numfds > 0) {
-          this->read.triggered  = false;
-          this->write.triggered = false;
-          // Have to have the read NetState enabled because we are using it for the signal vc
-          read.enabled       = true;
           PollDescriptor *pd = get_PollDescriptor(this_ethread());
-          this->async_ep.start(pd, waitfds[0], static_cast<NetEvent *>(this), get_NetHandler(this->thread), EVENTIO_READ);
+          this->async_ep.start(pd, {waitfds, numfds});
         }
       }
     }
   } else if (SSLConfigParams::async_handshake_enabled) {
     // Make sure the net fd read vio is in the right state
     if (ssl_error == SSL_ERROR_WANT_READ) {
-      this->reenable(&read.vio);
-      this->read.triggered = 1;
+      _transport_read_vio->reenable();
     }
   }
 #endif
@@ -1279,20 +1202,20 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     err = errno;
     SSLVCDebug(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
 
-    char *buf = handShakeBuffer ? handShakeBuffer->buf() : nullptr;
+    char *buf = _read_buf->buf();
     if (buf && *buf != SSL_OP_HANDSHAKE) {
       SSLVCDebug(this, "SSL hanshake error with bad HS buffer");
       if (getAllowPlain()) {
         SSLVCDebug(this, "Try plain");
         // If this doesn't look like a ClientHello, convert this connection to a UnixNetVC and send the
         // packet for Http Processing
-        this->_migrateFromSSL();
+        this->_downgradeToPlain();
         return SSL_RESTART;
       } else if (getTransparentPassThrough()) {
         // start a blind tunnel if tr-pass is set and data does not look like ClientHello
         SSLVCDebug(this, "Data does not look like SSL handshake, starting blind tunnel");
-        this->attributes   = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-        sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_ONGOING;
+        this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+        _sslState        = SslState::HANDSHAKE_IN_PROGRESS;
         return EVENT_CONT;
       } else {
         SSLVCDebug(this, "Give up");
@@ -1317,7 +1240,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       }
     }
 
-    sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
+    _sslState = SslState::HANDSHAKE_DONE;
 
     if (this->get_tls_handshake_begin_time()) {
       this->_record_tls_handshake_end_time();
@@ -1395,8 +1318,8 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 #endif
 #if defined(SSL_ERROR_WANT_SNI_RESOLVE) || defined(SSL_ERROR_WANT_X509_LOOKUP) || defined(SSL_ERROR_PENDING_CERTIFICATE)
     if (this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL || SslVConnOp::SSL_HOOK_OP_TUNNEL == hookOpRequested) {
-      this->attributes   = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-      sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_ONGOING;
+      this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+      _sslState        = SslState::HANDSHAKE_IN_PROGRESS;
       return EVENT_CONT;
     } else {
       //  Stopping for some other reason, perhaps loading certificate
@@ -1438,7 +1361,7 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
   if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE) {
     if (this->pp_info.version != ProxyProtocolVersion::UNDEFINED) {
       // Outbound PROXY Protocol
-      VIO    &vio     = this->write.vio;
+      VIO    &vio     = this->_user_write_vio;
       int64_t ntodo   = vio.ntodo();
       int64_t towrite = vio.get_reader()->read_avail();
 
@@ -1446,7 +1369,7 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
         MIOBufferAccessor &buf           = vio.buffer;
         int                needs         = 0;
         int64_t            total_written = 0;
-        int64_t            r             = super::load_buffer_and_write(towrite, buf, total_written, needs);
+        int64_t            r             = _encrypt_data_for_transport(towrite, buf, total_written, needs);
 
         if (total_written > 0) {
           vio.ndone += total_written;
@@ -1510,15 +1433,11 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
       Dbg(dbg_ctl_ssl_alpn, "Negotiated ALPN: %.*s", len, proto);
       this->set_negotiated_protocol_id({reinterpret_cast<const char *>(proto), static_cast<size_t>(len)});
     }
-
-    // if the handshake is complete and write is enabled reschedule the write
-    if (closed == 0 && write.enabled) {
-      writeReschedule(nh);
-    }
+    // TODO: if we ever turn off transport write, turn it on here
 
     Metrics::Counter::increment(ssl_rsb.total_success_handshake_count_out);
 
-    sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
+    _sslState = SslState::HANDSHAKE_DONE;
     return EVENT_DONE;
 
   case SSL_ERROR_WANT_WRITE:
@@ -1580,32 +1499,23 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 }
 
 void
-SSLNetVConnection::reenable(int event)
+SSLNetVConnection::reenable_with_event(int event)
 {
-  Dbg(dbg_ctl_ssl, "Handshake reenable from state=%s",
-      TLSEventSupport::get_ssl_handshake_hook_state_name(this->get_handshake_hook_state()));
+  if (event != TS_EVENT_ERROR && event != TS_EVENT_CONTINUE) {
+    Error("SSLNetVConnection::reenable_with_event called with invalid event: %d", event);
+  }
 
-  // Mark as error to stop the Handshake
   if (event == TS_EVENT_ERROR) {
-    sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_ERROR;
+    _sslState = SslState::ERROR;
   }
 
-  this->resume_tls_event();
+  resume_tls_event();
 
-  // Reenabling from the handshake callback
-  //
-  // Originally, we would wait for the callback to go again to execute additional
-  // hooks, but since the callbacks are associated with the context and the context
-  // can be replaced by the plugin, it didn't seem reasonable to assume that the
-  // callback would be executed again.  So we walk through the rest of the hooks
-  // here in the reenable.
-  if (this->invoke_tls_event() == 2) {
-    this->write.triggered = true;
-    this->write.enabled   = true;
-    this->writeReschedule(nh);
+  if (invoke_tls_event() == 2) {
+    _transport_write_vio->reenable();
   }
 
-  this->readReschedule(nh);
+  _transport_read_vio->reenable();
 }
 
 Continuation *
@@ -1623,23 +1533,7 @@ SSLNetVConnection::getThreadForTLSEvents()
 Ptr<ProxyMutex>
 SSLNetVConnection::getMutexForTLSEvents()
 {
-  return this->nh->mutex;
-}
-
-int
-SSLNetVConnection::populate(Connection &con, Continuation *c, void *arg)
-{
-  int retval = super::populate(con, c, arg);
-  if (retval != EVENT_DONE) {
-    return retval;
-  }
-  // Add in the SSL data
-  this->ssl = static_cast<SSL *>(arg);
-  // Maybe bring over the stats?
-
-  sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
-  this->_bindSSLObject();
-  return EVENT_DONE;
+  return Ptr<ProxyMutex>{nullptr};
 }
 
 void
@@ -1752,7 +1646,7 @@ SSLNetVConnection::populate_protocol(std::string_view *results, int n) const
       ++retval;
     }
     if (n > retval) {
-      retval += super::populate_protocol(results + retval, n - retval);
+      retval += _unvc->populate_protocol(results + retval, n - retval);
     }
   }
   return retval;
@@ -1766,7 +1660,7 @@ SSLNetVConnection::protocol_contains(std::string_view prefix) const
   if (prefix.size() <= tag.size() && strncmp(tag.data(), prefix.data(), prefix.size()) == 0) {
     retval = tag.data();
   } else {
-    retval = super::protocol_contains(prefix);
+    retval = _unvc->protocol_contains(prefix);
   }
   return retval;
 }
@@ -1800,7 +1694,7 @@ SSLNetVConnection::_lookupContextByName(const std::string &servername, SSLCertCo
 
   if (cc && ctx && SSLCertContextOption::OPT_TUNNEL == cc->opt && this->get_is_transparent()) {
     this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-    this->setSSLHandShakeComplete(SSLHandshakeStatus::SSL_HANDSHAKE_DONE);
+    _sslState        = SslState::HANDSHAKE_DONE;
     return nullptr;
   } else {
     return ctx;
@@ -1865,22 +1759,23 @@ SSLNetVConnection::set_ca_cert_file(std::string_view file, std::string_view dir)
     _ca_cert_dir.reset(n);
   }
 }
-
-void *
-SSLNetVConnection::_prepareForMigration()
+/*
+ * Close down the current netVC.  Save aside the socket and SSL information
+ * and create new netVC in the current thread/netVC
+ */
+NetVConnection *
+SSLNetVConnection::migrateToCurrentThread(Continuation *, EThread *)
 {
+  /*
   SSL *save_ssl = this->ssl;
 
   this->_unbindSSLObject();
   this->ssl = nullptr;
+  */
 
-  return save_ssl;
-}
-
-NetProcessor *
-SSLNetVConnection::_getNetProcessor()
-{
-  return &sslNetProcessor;
+  // FIXME
+  ink_release_assert(false);
+  return nullptr;
 }
 
 void
@@ -1888,18 +1783,15 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
 {
   Dbg(dbg_ctl_ssl, "allow-plain, handshake buffer ready to read=%" PRId64, this->handShakeHolder->read_avail());
   // Take ownership of the handShake buffer
-  this->sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
-  NetState *s              = &target->read;
-  s->vio.set_writer(this->handShakeBuffer);
+  _sslState   = SslState::HANDSHAKE_DONE;
+  NetState *s = &target->read;
+  s->vio.set_writer(this->_read_buf);
   s->vio.set_reader(this->handShakeHolder);
   this->handShakeHolder = nullptr;
-  this->handShakeBuffer = nullptr;
+  this->_read_buf       = nullptr;
   s->vio.vc_server      = target;
-  s->vio.cont           = this->read.vio.cont;
-  s->vio.mutex          = this->read.vio.cont->mutex;
-  // Passing along the buffer, don't keep a reading holding early in the buffer
-  this->handShakeReader->dealloc();
-  this->handShakeReader = nullptr;
+  s->vio.cont           = this->_user_read_vio.cont;
+  s->vio.mutex          = this->_user_read_vio.cont->mutex;
 
   // Kick things again, so the data that was copied into the
   // vio.read buffer gets processed
@@ -1912,45 +1804,24 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
  * by the UnixNetVConnection logic
  */
 UnixNetVConnection *
-SSLNetVConnection::_migrateFromSSL()
+SSLNetVConnection::_downgradeToPlain()
 {
   EThread    *t         = this_ethread();
   NetHandler *client_nh = get_NetHandler(t);
   ink_assert(client_nh);
 
-  Connection hold_con;
-  hold_con.move(this->con);
-
-  // We will leave the SSL object with the original SSLNetVC to be
-  // cleaned up.  Only moving the socket and handShakeBuffer
-  // So no need to call _prepareMigration
-
-  // Do_io_close will signal the VC to be freed on the original thread
-  // Since we moved the con context, the fd will not be closed
-  // Go ahead and remove the fd from the original thread's epoll structure, so it is not
-  // processed on two threads simultaneously
-  this->ep.stop();
-
-  // Create new VC:
-  UnixNetVConnection *newvc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(t));
-  ink_assert(newvc != nullptr);
-  if (newvc != nullptr && newvc->populate(hold_con, this->read.vio.cont, nullptr) != EVENT_DONE) {
-    newvc->do_io_close();
-    Dbg(dbg_ctl_ssl, "Failed to populate unixvc for allow-plain");
-    newvc = nullptr;
-  }
-  if (newvc != nullptr) {
-    newvc->attributes = HttpProxyPort::TRANSPORT_DEFAULT;
-    newvc->set_is_transparent(this->is_transparent);
-    newvc->set_context(get_context());
-    newvc->options = this->options;
+  if (_unvc != nullptr) {
+    _unvc->attributes = HttpProxyPort::TRANSPORT_DEFAULT;
+    _unvc->set_is_transparent(this->is_transparent);
+    _unvc->set_context(get_context());
+    _unvc->options = this->options;
     Dbg(dbg_ctl_ssl, "Move to unixvc for allow-plain");
-    this->_propagateHandShakeBuffer(newvc, t);
+    _propagateHandShakeBuffer(_unvc, t);
   }
 
   // Do not mark this closed until the end so it does not get freed by the other thread too soon
-  this->do_io_close();
-  return newvc;
+  do_io_close();
+  return _unvc;
 }
 
 ssl_curve_id
@@ -1977,7 +1848,7 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
     this->callHooks(TS_EVENT_SSL_VERIFY_SERVER /* , ctx */);
   }
 
-  if (this->sslHandshakeStatus == SSLHandshakeStatus::SSL_HANDSHAKE_ERROR) {
+  if (_sslState == SslState::ERROR) {
     return 1;
   }
 
@@ -2321,4 +2192,434 @@ SSLNetVConnection::_ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread)
   }
 
   return ssl_error;
+}
+
+void
+SSLNetVConnection::mark_as_tunnel_endpoint()
+{
+  Dbg(dbg_ctl_ssl, "Entering SSLNetVConnection::mark_as_tunnel_endpoint()");
+
+  ink_assert(!_is_tunnel_endpoint);
+
+  _is_tunnel_endpoint = true;
+
+  switch (get_context()) {
+  case NET_VCONNECTION_IN:
+    _in_context_tunnel();
+    break;
+  case NET_VCONNECTION_OUT:
+    _out_context_tunnel();
+    break;
+  default:
+    ink_release_assert(false);
+  }
+}
+
+int
+SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
+{
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport read ready/complete (VIO: %p)", this, vio);
+
+  ink_release_assert(vio == _transport_read_vio);
+
+  if (isTerminated(_sslState)) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: terminated, ignoring read ready", this);
+    return EVENT_DONE;
+  }
+
+  if (isTerminated(_transport_state)) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: transport closed, but we have data to read", this);
+  }
+
+  if (_transport_read_vio->is_disabled()) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: transport read VIO is disabled", this);
+    return EVENT_CONT;
+  }
+
+  _trigger_ssl_read();
+
+  if (isTerminated(_sslState)) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Closed during _trigger_ssl_read", this);
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
+}
+
+int
+SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
+{
+  ink_release_assert(vio == _transport_write_vio);
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
+
+  MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
+  if (!lock.is_locked()) {
+    _transport_write_vio->reenable(); // Retry later
+    return EVENT_CONT;
+  }
+
+  if (isTerminated(_sslState) || isTerminated(_transport_state)) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: terminated, ignoring write ready", this);
+    _transport_write_vio->disable();
+    return EVENT_DONE;
+  }
+
+  Continuation *user_cont = _user_write_vio.cont; // Save original continuation for reentrancy check
+  if (_user_write_vio.op != VIO::WRITE || _user_write_vio.is_disabled()) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO not active or disabled.", this);
+    return EVENT_CONT; // Or EVENT_DONE? Let's stick with CONT.
+  }
+
+  int64_t ntodo = _user_write_vio.ntodo();
+
+  // Give user a chance to fill buffer
+  bool signalled_ready = false;
+  // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
+  // SSL transport is unable to send.
+  if (ntodo > 0) {
+    if (_signal_user(SignalSide::WRITE, VC_EVENT_WRITE_READY) == EVENT_DONE) {
+      // User closed connection in the handler
+      return EVENT_DONE;
+    }
+    signalled_ready = true;
+
+    // The user may have stopped a do_io_write, or even started a new one
+    if (_user_write_vio.cont != user_cont || _user_write_vio.op != VIO::WRITE || _user_write_vio.is_disabled()) {
+      Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User VIO changed during WRITE_READY signal.", this);
+      // User changed the VIO, stop processing for this event.
+      // The next event or reenable call will handle the new state.
+      return EVENT_CONT;
+    }
+    ntodo = _user_write_vio.ntodo(); // Update ntodo after potential user action
+  }
+
+  // User reduced amount of data to write.
+  if (ntodo <= 0) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO ntodo <= 0.", this);
+    // If we signalled ready but now there's nothing to do, signal complete.
+    if (signalled_ready) {
+      if (_signal_user(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE) == EVENT_DONE) {
+        return EVENT_DONE;
+      }
+    }
+    // There might be data left in _write_buf.  Don't disable the transport write.
+    return EVENT_DONE;
+  }
+
+  MIOBufferAccessor &buf                     = _user_write_vio.buffer;
+  int64_t            total_plaintext_written = 0; // Bytes of *plaintext* consumed from user buffer
+  int                needs                   = 0; // Flags for transport read/write needed by SSL layer/BIOs
+  int64_t            ret                     = _encrypt_data_for_transport(ntodo, buf, total_plaintext_written, needs);
+
+  if (total_plaintext_written > 0) {
+    _user_write_vio.ndone += total_plaintext_written;
+  }
+
+  if (ret < 0) {
+    // ret < 0 from _encrypt_data_for_transport indicates an SSL error (not WANT_READ/WRITE)
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _encrypt_data_for_transport failed: %" PRId64, this, ret);
+    // TODO: Map 'ret' or internal SSL error code to lerrno if possible
+    this->lerrno = EIO; // Generic I/O error for now
+    _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+    return EVENT_DONE;
+  }
+
+  // Even if user is complete, the write MIOBuffer might still contain data that needs to be sent by the transport. Check 'needs'.
+  ink_release_assert(!_transport_write_vio->is_disabled());
+  if (needs & EVENTIO_WRITE) {
+    // Write buffer full
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Re-enabling transport write to flush BIO after user complete.", this);
+    // We never disable transport write, so reenabling shouldn't be needed.
+    // _transport_write_vio->reenable();
+  }
+
+  // Even if the user has disabled read, we still need to read in order to complete the write.
+  if (needs & EVENTIO_READ) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Re-enabling transport read (WANT_READ) after user complete.", this);
+    _transport_read_vio->reenable(); // Signal transport to read
+  }
+
+  if (_user_write_vio.ntodo() <= 0) {
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO complete after encryption.", this);
+    _signal_user(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE);
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
+}
+
+int
+SSLNetVConnection::_handle_transport_eos(VIO *vio)
+{
+  ink_release_assert(vio == _transport_read_vio);
+  _transport_state = TransportState::TRANSPORT_CLOSED;
+  return EVENT_DONE;
+}
+
+int
+SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
+{
+  ink_release_assert(vio == _transport_read_vio || vio == _transport_write_vio);
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport error (VIO: %p, err: %d)", this, vio, err);
+
+  // Mark the connection as closed.
+  _transport_state = TransportState::TRANSPORT_ERROR;
+  return EVENT_DONE;
+}
+
+int
+SSLNetVConnection::startEvent(int event, void *data)
+{
+  UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
+  switch (event) {
+  case NET_EVENT_OPEN:
+  case NET_EVENT_ACCEPT:
+    // Successful establishment of TCP connection
+    // This is where we would set up the SSL context and start the handshake.
+    _transport_state = TransportState::TRANSPORT_CONNECTED;
+    ink_release_assert(_unvc == nullptr);
+    ink_release_assert(unvc != nullptr);
+    _unvc = unvc;
+  }
+
+  return EVENT_CONT;
+}
+
+int
+SSLNetVConnection::mainEvent(int event, void *data)
+{
+  VIO *transport_vio = static_cast<VIO *>(data);
+  ink_release_assert(transport_vio == _transport_read_vio || transport_vio == _transport_write_vio);
+
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: handle_event received event %d from transport VIO %p", this, event, transport_vio);
+
+  if (isTerminated(_sslState)) {
+    return EVENT_DONE;
+  }
+
+  switch (event) {
+  case VC_EVENT_READ_READY:
+  case VC_EVENT_READ_COMPLETE:
+    return _handle_transport_read_ready(transport_vio); // Call helper
+  case VC_EVENT_WRITE_READY:
+  case VC_EVENT_WRITE_COMPLETE:
+    return _handle_transport_write_ready(transport_vio); // Call helper
+  case VC_EVENT_EOS:
+    return _handle_transport_eos(transport_vio); // Call helper
+  case VC_EVENT_ERROR:
+    return _handle_transport_error(transport_vio, _unvc->lerrno); // Call helper
+  default:
+    Warning("SSLNetVConnection %p: Unexpected event %d in handle_event", this, event);
+    return EVENT_CONT;
+  }
+}
+
+VIO *
+SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
+{
+  if (isTerminated(_sslState) && !(c == nullptr && nbytes == 0 && buf == nullptr)) {
+    Error("do_io_read invoked on closed vc %p, cont %p, nbytes %" PRId64 ", buf %p", this, c, nbytes, buf);
+    return nullptr;
+  }
+
+  _user_read_vio.op        = VIO::READ;
+  _user_read_vio.mutex     = c ? c->mutex : this->mutex;
+  _user_read_vio.cont      = c;
+  _user_read_vio.nbytes    = nbytes;
+  _user_read_vio.ndone     = 0;
+  _user_read_vio.vc_server = this;
+  if (buf) {
+    _user_read_vio.set_writer(buf);
+    if (!_transport_read_vio || _transport_read_vio->op != VIO::READ) {
+      _transport_read_vio = _unvc->do_io_read(this, INT64_MAX, _read_buf);
+    }
+  } else {
+    // No transport read VIO, disable user read VIO
+    _user_read_vio.disable();
+    _user_read_vio.buffer.clear();
+  }
+  return &_user_read_vio;
+}
+
+VIO *
+SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner)
+{
+  if (isTerminated(_sslState) && !(c == nullptr && nbytes == 0 && reader == nullptr)) {
+    Error("do_io_write invoked on closed vc %p, cont %p, nbytes %" PRId64 ", reader %p", this, c, nbytes, reader);
+    return nullptr;
+  }
+  _user_write_vio.op        = VIO::WRITE;
+  _user_write_vio.mutex     = c ? c->mutex : this->mutex;
+  _user_write_vio.cont      = c;
+  _user_write_vio.nbytes    = nbytes;
+  _user_write_vio.ndone     = 0;
+  _user_write_vio.vc_server = this;
+  if (reader) {
+    ink_assert(!owner);
+    _user_write_vio.set_reader(reader);
+    if (!_transport_write_vio || _transport_write_vio->op != VIO::WRITE) {
+      _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader, false);
+    }
+  } else {
+    _user_write_vio.disable();
+  }
+  return &_user_write_vio;
+}
+
+void
+SSLNetVConnection::set_action(Continuation *a)
+{
+  ink_assert(a != nullptr);
+  _action = a;
+}
+
+void
+SSLNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->do_io_shutdown(howto);
+}
+
+void
+SSLNetVConnection::set_active_timeout(ink_hrtime timeout_in)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_active_timeout(timeout_in);
+}
+
+void
+SSLNetVConnection::set_inactivity_timeout(ink_hrtime timeout_in)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_inactivity_timeout(timeout_in);
+}
+
+void
+SSLNetVConnection::set_default_inactivity_timeout(ink_hrtime timeout_in)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_default_inactivity_timeout(timeout_in);
+}
+
+bool
+SSLNetVConnection::is_default_inactivity_timeout()
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->is_default_inactivity_timeout();
+}
+
+void
+SSLNetVConnection::cancel_active_timeout()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->cancel_active_timeout();
+}
+void
+SSLNetVConnection::cancel_inactivity_timeout()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->cancel_inactivity_timeout();
+}
+
+void
+SSLNetVConnection::add_to_keep_alive_queue()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->add_to_keep_alive_queue();
+}
+
+void
+SSLNetVConnection::remove_from_keep_alive_queue()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->remove_from_keep_alive_queue();
+}
+
+bool
+SSLNetVConnection::add_to_active_queue()
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->add_to_active_queue();
+}
+
+ink_hrtime
+SSLNetVConnection::get_active_timeout()
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->get_active_timeout();
+}
+
+ink_hrtime
+SSLNetVConnection::get_inactivity_timeout()
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->get_inactivity_timeout();
+}
+
+void
+SSLNetVConnection::apply_options()
+{
+  // TODO
+}
+
+void
+SSLNetVConnection::reenable(VIO *vio)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->reenable(vio);
+}
+
+void
+SSLNetVConnection::reenable_re(VIO *vio)
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->reenable_re(vio);
+}
+
+SOCKET
+SSLNetVConnection::get_socket()
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->get_socket();
+}
+
+int
+SSLNetVConnection::set_tcp_congestion_control(NetVConnection::tcp_congestion_control_side side)
+{
+  ink_assert(_unvc != nullptr);
+  return _unvc->set_tcp_congestion_control(side);
+}
+
+void
+SSLNetVConnection::set_local_addr()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_local_addr();
+  ats_ip_copy(&local_addr, _unvc->get_local_addr());
+}
+
+void
+SSLNetVConnection::set_remote_addr()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_remote_addr();
+  ats_ip_copy(&remote_addr, _unvc->get_remote_addr());
+}
+
+void
+SSLNetVConnection::set_remote_addr(const sockaddr *addr)
+{
+  ats_ip_copy(&remote_addr, addr);
+}
+
+void
+SSLNetVConnection::set_mptcp_state()
+{
+  ink_assert(_unvc != nullptr);
+  _unvc->set_mptcp_state();
+}
+
+void
+SSLNetVConnection::handle_async_tls_ready()
+{
 }

@@ -25,6 +25,7 @@
 
 #include "iocore/eventsystem/IOBuffer.h"
 #include "iocore/eventsystem/Thread.h"
+#include "P_Thread.h"
 #include "tscore/ink_memory.h"
 #include "tscore/ink_resource.h"
 

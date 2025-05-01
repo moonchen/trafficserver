@@ -124,63 +124,40 @@ public:
 
   void get_local_sa();
 
-  // these are not part of the pure virtual interface.  They were
-  // added to reduce the amount of duplicate code in classes inherited
-  // from NetVConnection (SSL).
-  virtual int
-  sslStartHandShake(int event, int &err)
-  {
-    (void)event;
-    (void)err;
-    return EVENT_ERROR;
-  }
-
-  virtual bool
-  getSSLHandShakeComplete() const
-  {
-    return (true);
-  }
-
-  virtual bool
-  trackFirstHandshake()
-  {
-    return false;
-  }
-
   // NetEvent
-  virtual void net_read_io(NetHandler *nh) override;
-  virtual void net_write_io(NetHandler *nh) override;
-  virtual void free_thread(EThread *t) override;
-  virtual int
+  void net_read_io(NetHandler *nh) override;
+  void net_write_io(NetHandler *nh) override;
+  void free_thread(EThread *t) override;
+  int
   close() override
   {
     return this->con.close();
   }
-  virtual int
+  int
   get_fd() override
   {
     return this->con.sock.get_fd();
   }
 
-  virtual EThread *
+  EThread *
   get_thread() override
   {
     return this->thread;
   }
 
-  virtual int
+  int
   callback(int event = CONTINUATION_EVENT_NONE, void *data = nullptr) override
   {
     return this->handleEvent(event, data);
   }
 
-  virtual Ptr<ProxyMutex> &
+  Ptr<ProxyMutex> &
   get_mutex() override
   {
     return this->mutex;
   }
 
-  virtual ContFlags &
+  ContFlags &
   get_control_flags() override
   {
     return this->control_flags;
@@ -199,7 +176,7 @@ public:
    * NetVC in the thread t context based on the socket and ssl information in the
    * current NetVC and mark the current NetVC to be closed.
    */
-  UnixNetVConnection *migrateToCurrentThread(Continuation *c, EThread *t);
+  NetVConnection *migrateToCurrentThread(Continuation *c, EThread *t) override;
 
   Action action_;
 
@@ -242,8 +219,8 @@ public:
   }
 
 private:
-  virtual void         *_prepareForMigration();
-  virtual NetProcessor *_getNetProcessor();
+  void         *_prepareForMigration();
+  NetProcessor *_getNetProcessor();
 
   bool _is_tunnel_endpoint{false};
 

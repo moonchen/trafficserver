@@ -465,16 +465,17 @@ HttpSessionManager::_acquire_session(sockaddr const *ip, CryptoHash const &hostn
         // At this point to_return has been removed from the pool. Do we need to move it
         // to the same thread?
         if (to_return) {
-          UnixNetVConnection *server_vc = dynamic_cast<UnixNetVConnection *>(to_return->get_netvc());
+          Fatal("Migration is not implemented!");
+          NetVConnection *server_vc = to_return->get_netvc();
           if (server_vc) {
             // Disable i/o on this vc now, but, hold onto the g_pool cont
             // and the mutex to stop any stray events from getting in
             server_vc->do_io_read(m_g_pool, 0, nullptr);
             server_vc->do_io_write(m_g_pool, 0, nullptr);
-            UnixNetVConnection *new_vc = server_vc->migrateToCurrentThread(sm, ethread);
+            NetVConnection *new_vc = server_vc->migrateToCurrentThread(sm, ethread);
             // The VC moved, free up the original one
             if (new_vc != server_vc) {
-              ink_assert(new_vc == nullptr || new_vc->nh != nullptr);
+              ink_assert(new_vc == nullptr);
               if (!new_vc) {
                 // Close out to_return, we were't able to get a connection
                 Metrics::Counter::increment(http_rsb.origin_shutdown_migration_failure);

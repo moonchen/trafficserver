@@ -496,6 +496,12 @@ public:
 
   template <typename S> S *get_service() const;
 
+  virtual NetVConnection *
+  migrateToCurrentThread(Continuation *, EThread *)
+  {
+    return nullptr;
+  }
+
 protected:
   enum class Service : uint8_t {
     TLS_ALPN,

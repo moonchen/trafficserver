@@ -69,7 +69,8 @@ TEST_CASE("tcp_reused should be set correctly when a session is attached.")
   TransactionMilestones milestones;
 
   Http1ClientTestSession ssn;
-  SSLNetVConnection      netvc;
+  UnixNetVConnection     unvc;
+  SSLNetVConnection      netvc{&unvc};
   ssn.set_vc(&netvc);
   HttpSessionAccept::Options options;
   ssn.accept_options = &options;

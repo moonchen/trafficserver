@@ -774,7 +774,7 @@ QUICNetVConnection::get_quic_connection()
 }
 
 void
-QUICNetVConnection::reenable(int event)
+QUICNetVConnection::reenable_with_event(int event)
 {
   this->_is_verifying_cert = false;
 

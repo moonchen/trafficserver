@@ -38,6 +38,7 @@
 
 #pragma once
 
+#include "P_SSLNetVConnection.h"
 #include "P_UnixNetProcessor.h"
 #include <openssl/ssl.h>
 
@@ -56,11 +57,13 @@ public:
   SSLNetProcessor();
   ~SSLNetProcessor() override;
 
-  NetVConnection *allocate_vc(EThread *t) override;
+  SSLNetVConnection *allocate_vc_with_unvc(EThread *t, UnixNetVConnection *unvc);
 
   // noncopyable
   SSLNetProcessor(const SSLNetProcessor &)            = delete;
   SSLNetProcessor &operator=(const SSLNetProcessor &) = delete;
+
+  Action *connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &options) override;
 
 protected:
   NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;

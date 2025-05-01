@@ -21,11 +21,14 @@
 
 #include "P_SSLUtils.h"
 #include "P_OCSPStapling.h"
+#include "P_UnixNetProcessor.h"
+#include "P_UnixNetVConnection.h"
 #include "SSLStats.h"
 #include "P_SSLNetProcessor.h"
 #include "P_SSLNetAccept.h"
 #include "P_SSLNetVConnection.h"
 #include "P_SSLClientCoordinator.h"
+#include "tscore/TSSystemState.h"
 
 //
 // Global Data
@@ -84,15 +87,15 @@ SSLNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
   return new SSLNetAccept(opt);
 }
 
-NetVConnection *
-SSLNetProcessor::allocate_vc(EThread *t)
+SSLNetVConnection *
+SSLNetProcessor::allocate_vc_with_unvc(EThread *t, UnixNetVConnection *unvc)
 {
   SSLNetVConnection *vc;
 
   if (t) {
-    vc = THREAD_ALLOC_INIT(sslNetVCAllocator, t);
+    vc = THREAD_ALLOC_INIT(sslNetVCAllocator, t, unvc);
   } else {
-    if (likely(vc = sslNetVCAllocator.alloc())) {
+    if (likely(vc = sslNetVCAllocator.alloc(unvc))) {
       vc->from_accept_thread = true;
     }
   }
@@ -103,3 +106,11 @@ SSLNetProcessor::allocate_vc(EThread *t)
 SSLNetProcessor::SSLNetProcessor() {}
 
 SSLNetProcessor::~SSLNetProcessor() {}
+
+Action *
+SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &opt)
+{
+  Action *action = UnixNetProcessor::connect_re(cont, target, opt);
+  // TODO: need to connect an SSLNetVConnection to this resultant UnixNetVConnection.
+  return action;
+}
