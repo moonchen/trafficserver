@@ -304,9 +304,9 @@ VerifyClient::SNIAction(SSL &ssl, const Context & /* ctx ATS_UNUSED */) const
 
   const char *servername = snis->get_sni_server_name();
   Dbg(dbg_ctl_ssl_sni, "action verify param %d, fqdn [%s]", this->mode, servername);
-  setClientCertLevel(ssl_vc->ssl, this->mode);
+  setClientCertLevel(ssl_vc->get_tls_handle(), this->mode);
   ssl_vc->set_ca_cert_file(ca_file, ca_dir);
-  setClientCertCACerts(ssl_vc->ssl, ssl_vc->get_ca_cert_file(), ssl_vc->get_ca_cert_dir());
+  setClientCertCACerts(ssl_vc->get_tls_handle(), ssl_vc->get_ca_cert_file(), ssl_vc->get_ca_cert_dir());
 
   return SSL_TLSEXT_ERR_OK;
 }

@@ -119,7 +119,7 @@ new_HdrHeap(int size)
   HdrHeap *h;
   if (size <= HdrHeap::DEFAULT_SIZE) {
     size = HdrHeap::DEFAULT_SIZE;
-    h    = static_cast<HdrHeap *>(THREAD_ALLOC(hdrHeapAllocator, this_ethread()));
+    h    = static_cast<HdrHeap *>(thread_alloc(::hdrHeapAllocator, this_ethread()->hdrHeapAllocator));
   } else {
     h = static_cast<HdrHeap *>(ats_malloc(size));
   }

@@ -47,7 +47,6 @@
 #include "iocore/net/TLSEventSupport.h"
 #include "iocore/net/TLSCertSwitchSupport.h"
 #include "P_SSLUtils.h"
-#include "P_SSLConfig.h"
 
 #include <netinet/in.h>
 #include <openssl/ssl.h>
@@ -183,7 +182,7 @@ public:
   ////////////////////////////////////////////////////////////
   explicit SSLNetVConnection(UnixNetVConnection *unvc);
   SSLNetVConnection() = delete;
-  ~SSLNetVConnection() override {}
+  ~SSLNetVConnection() override;
 
   bool
   getSSLClientRenegotiationAbort() const
@@ -236,14 +235,11 @@ public:
     if (this->handShakeHolder) {
       this->handShakeHolder->dealloc();
     }
-    this->handShakeHolder    = nullptr;
-    this->handShakeBioStored = 0;
   }
 
   int         populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
 
-  SSL       *ssl               = nullptr;
   ink_hrtime sslLastWriteTime  = 0;
   int64_t    sslTotalBytesSent = 0;
 
@@ -265,7 +261,7 @@ public:
   peer_provided_cert() const override
   {
 #ifdef OPENSSL_IS_OPENSSL3
-    X509 *cert = SSL_get1_peer_certificate(this->ssl);
+    X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
 #else
     X509 *cert = SSL_get_peer_certificate(this->ssl);
 #endif
@@ -318,7 +314,7 @@ protected:
   SSL *
   _get_ssl_object() const override
   {
-    return this->ssl;
+    return this->_ssl.get();
   }
   ssl_curve_id _get_tls_curve() const override;
   int          _verify_certificate(X509_STORE_CTX *ctx) override;
@@ -399,29 +395,36 @@ private:
   void _in_context_tunnel();
   void _out_context_tunnel();
 
-  UnixNetVConnection *_unvc = nullptr; // underlying TCP connection
+  // underlying TCP connection
+  UnixNetVConnection *_unvc = nullptr;
+
   // We give these VIOs to our consumer
   VIO _user_read_vio;
   VIO _user_write_vio;
+
   // The transport protocol (usually TCP) gives these to us
-  VIO *_transport_read_vio;
-  VIO *_transport_write_vio;
+  VIO *_transport_read_vio  = nullptr;
+  VIO *_transport_write_vio = nullptr;
+
   enum class SignalSide { READ, WRITE };
   int _signal_user(SignalSide side, int event);
 
   // TODO: is this actually needed?
   int recursion = 0;
 
-  MIOBuffer      *_read_buf         = nullptr;
-  MIOBuffer      *_write_buf        = nullptr;
-  IOBufferReader *_write_buf_reader = nullptr;
-  BIO            *_rbio             = nullptr;
-  BIO            *_wbio             = nullptr;
+  std::unique_ptr<SSL, decltype(&SSL_free)>                              _ssl{nullptr, &SSL_free};
+  std::unique_ptr<MIOBuffer, void (*)(MIOBuffer *)>                      _read_buf;
+  std::unique_ptr<MIOBuffer, void (*)(MIOBuffer *)>                      _write_buf;
+  std::unique_ptr<IOBufferReader, std::function<void(IOBufferReader *)>> _write_buf_reader;
+  std::unique_ptr<BIO, decltype(&BIO_vfree)>                             _rbio;
+  std::unique_ptr<BIO, decltype(&BIO_vfree)>                             _wbio;
 
 public:
   void mark_as_tunnel_endpoint() override;
   bool from_accept_thread{false};
 
+  // Retry for initial trampoline
+  int acceptEvent(int event, void *data);
   // initial connect or accept event handler
   int startEvent(int event, void *data);
   // transport events handling function
@@ -452,4 +455,4 @@ private:
   Action _action;
 };
 
-extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
+extern ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator;

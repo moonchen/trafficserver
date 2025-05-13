@@ -28,7 +28,7 @@
 #include "P_SSLNetAccept.h"
 #include "P_SSLNetVConnection.h"
 #include "P_SSLClientCoordinator.h"
-#include "tscore/TSSystemState.h"
+#include "P_SSLConfig.h"
 
 //
 // Global Data

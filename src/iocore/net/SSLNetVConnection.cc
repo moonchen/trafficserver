@@ -37,6 +37,7 @@
 #include "iocore/eventsystem/EventSystem.h"
 #include "iocore/eventsystem/IOBuffer.h"
 #include "iocore/eventsystem/Lock.h"
+#include "iocore/net/Net.h"
 #include "iocore/net/NetHandler.h"
 #include "iocore/net/NetVConnection.h"
 #include "iocore/net/ProxyProtocol.h"
@@ -51,6 +52,7 @@
 #include "tscore/TSSystemState.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <netinet/in.h>
 #include <string>
 #include <cstring>
@@ -82,7 +84,7 @@ using namespace std::literals;
 #define SSL_WAIT_FOR_ASYNC         12
 #define SSL_RESTART                13
 
-ClassAllocator<SSLNetVConnection> sslNetVCAllocator("sslNetVCAllocator");
+ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator("sslNetVCAllocator");
 
 namespace
 {
@@ -130,52 +132,27 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
     return;
   }
 
-  auto rbuf = make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer);
-  if (rbuf == nullptr) {
+  if (miobuffer_set_buffer(rbio.get(), _read_buf.get()) == 0) {
     return;
   }
-
-  miobuffer_set_buffer(rbio.get(), rbuf.get());
 
   std::unique_ptr<BIO, decltype(&BIO_vfree)> wbio = make_resource(BIO_new(BIO_s_miobuffer()), BIO_vfree);
   if (wbio == nullptr) {
     return;
   }
 
-  auto wbuf = make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer);
-  if (wbuf == nullptr) {
+  if (miobuffer_set_buffer(wbio.get(), _write_buf.get()) == 0) {
     return;
   }
-
-  auto write_buf_reader = make_resource(wbuf->alloc_reader(), [](IOBufferReader *r) { r->dealloc(); });
-  if (write_buf_reader == nullptr) {
-    return;
-  }
-
-  miobuffer_set_buffer(wbio.get(), wbuf.get());
   SSL_set_bio(temp_ssl.get(), rbio.get(), wbio.get());
 
 #if TS_HAS_TLS_EARLY_DATA
   update_early_data_config(temp_ssl.get(), SSLConfigParams::server_max_early_data, SSLConfigParams::server_recv_max_early_data);
 #endif
 
-  this->_write_buf = wbuf.get();
-  wbuf.release();
-
-  this->_write_buf_reader = write_buf_reader.get();
-  write_buf_reader.release();
-
-  this->_wbio = wbio.get();
-  wbio.release();
-
-  this->_read_buf = rbuf.get();
-  rbuf.release();
-
-  this->_rbio = rbio.get();
-  rbio.release();
-
-  this->ssl = temp_ssl.get();
-  temp_ssl.release();
+  this->_wbio = std::move(wbio);
+  this->_rbio = std::move(rbio);
+  this->_ssl  = std::move(temp_ssl);
 
   this->_bindSSLObject();
 }
@@ -183,29 +160,29 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
 void
 SSLNetVConnection::_bindSSLObject()
 {
-  SSLNetVCAttach(this->ssl, this);
-  TLSBasicSupport::bind(this->ssl, this);
-  TLSEventSupport::bind(this->ssl, this);
-  ALPNSupport::bind(this->ssl, this);
-  TLSSessionResumptionSupport::bind(this->ssl, this);
-  TLSSNISupport::bind(this->ssl, this);
-  TLSEarlyDataSupport::bind(this->ssl, this);
-  TLSTunnelSupport::bind(this->ssl, this);
-  TLSCertSwitchSupport::bind(this->ssl, this);
+  SSLNetVCAttach(this->_ssl.get(), this);
+  TLSBasicSupport::bind(this->_ssl.get(), this);
+  TLSEventSupport::bind(this->_ssl.get(), this);
+  ALPNSupport::bind(this->_ssl.get(), this);
+  TLSSessionResumptionSupport::bind(this->_ssl.get(), this);
+  TLSSNISupport::bind(this->_ssl.get(), this);
+  TLSEarlyDataSupport::bind(this->_ssl.get(), this);
+  TLSTunnelSupport::bind(this->_ssl.get(), this);
+  TLSCertSwitchSupport::bind(this->_ssl.get(), this);
 }
 
 void
 SSLNetVConnection::_unbindSSLObject()
 {
-  SSLNetVCDetach(this->ssl);
-  TLSBasicSupport::unbind(this->ssl);
-  TLSEventSupport::unbind(this->ssl);
-  ALPNSupport::unbind(this->ssl);
-  TLSSessionResumptionSupport::unbind(this->ssl);
-  TLSSNISupport::unbind(this->ssl);
-  TLSEarlyDataSupport::unbind(this->ssl);
-  TLSTunnelSupport::unbind(this->ssl);
-  TLSCertSwitchSupport::unbind(this->ssl);
+  SSLNetVCDetach(this->_ssl.get());
+  TLSBasicSupport::unbind(this->_ssl.get());
+  TLSEventSupport::unbind(this->_ssl.get());
+  ALPNSupport::unbind(this->_ssl.get());
+  TLSSessionResumptionSupport::unbind(this->_ssl.get());
+  TLSSNISupport::unbind(this->_ssl.get());
+  TLSEarlyDataSupport::unbind(this->_ssl.get());
+  TLSTunnelSupport::unbind(this->_ssl.get());
+  TLSCertSwitchSupport::unbind(this->_ssl.get());
 }
 
 static void
@@ -505,7 +482,7 @@ SSLNetVConnection::_trigger_ssl_read()
       ink_release_assert(false);
 #if 0
       if (!this->getSSLHandShakeComplete()) {
-        this->sslHandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
+        this->ssl.get()HandshakeStatus = SSLHandshakeStatus::SSL_HANDSHAKE_DONE;
 
         // Copy over all data already read in during the SSL_accept
         // (the client hello message)
@@ -600,6 +577,8 @@ SSLNetVConnection::_trigger_ssl_read()
     }
   }
 
+  int wants = SSL_want(this->_ssl.get());
+  Dbg(dbg_ctl_ssl, "SSL_want=%d", wants);
   switch (ret) {
   case SSL_READ_READY:
     _transport_read_vio->reenable();
@@ -651,10 +630,8 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
         msec_since_last_write);
   }
 
-  if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
-    // TODO: do something for tunneling
-    // return this->super::load_buffer_and_write(towrite, buf, total_written, needs);
-  }
+  // Blind tunnel should have been downgraded to UnixNetVConnection
+  ink_release_assert(this->attributes != HttpProxyPort::TRANSPORT_BLIND_TUNNEL);
 
   Dbg(dbg_ctl_ssl, "towrite=%" PRId64, towrite);
 
@@ -772,6 +749,12 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
 }
 
 SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc)
+  : _ssl{nullptr, SSL_free},
+    _read_buf{make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer)},
+    _write_buf{make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer)},
+    _write_buf_reader{make_resource(_write_buf->alloc_reader(), [](IOBufferReader *r) { r->dealloc(); })},
+    _rbio{nullptr, BIO_vfree},
+    _wbio{nullptr, BIO_vfree}
 {
   this->_set_service(static_cast<ALPNSupport *>(this));
   this->_set_service(static_cast<TLSBasicSupport *>(this));
@@ -782,13 +765,13 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc)
   this->_set_service(static_cast<TLSSessionResumptionSupport *>(this));
   this->_set_service(static_cast<TLSTunnelSupport *>(this));
   this->_unvc = unvc;
-  SET_HANDLER(&SSLNetVConnection::mainEvent);
+  SET_HANDLER(&SSLNetVConnection::startEvent);
 }
 
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
-  if (this->ssl != nullptr) {
+  if (this->_ssl.get() != nullptr) {
     if (get_context() == NET_VCONNECTION_OUT) {
       callHooks(TS_EVENT_VCONN_OUTBOUND_CLOSE);
     } else {
@@ -796,7 +779,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
     }
 
     if (getSSLHandShakeComplete()) {
-      int shutdown_mode = SSL_get_shutdown(ssl);
+      int shutdown_mode = SSL_get_shutdown(this->_ssl.get());
       Dbg(dbg_ctl_ssl_shutdown, "previous shutdown state 0x%x", shutdown_mode);
       int new_shutdown_mode = shutdown_mode | SSL_RECEIVED_SHUTDOWN;
 
@@ -804,7 +787,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
         // We do not need to sit around and wait for the client's close-notify if
         // they have not already sent it.  We will still be standards compliant
         Dbg(dbg_ctl_ssl_shutdown, "new SSL_set_shutdown 0x%x", new_shutdown_mode);
-        SSL_set_shutdown(ssl, new_shutdown_mode);
+        SSL_set_shutdown(this->_ssl.get(), new_shutdown_mode);
       }
 
       // Check if the peer has already sent a FIN
@@ -814,12 +797,12 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 
       if (do_shutdown) {
         // Send the close-notify
-        int ret = SSL_shutdown(ssl);
+        int ret = SSL_shutdown(this->_ssl.get());
         Dbg(dbg_ctl_ssl_shutdown, "SSL_shutdown %s", (ret) ? "success" : "failed");
       } else {
         // Request a quiet shutdown to OpenSSL
-        SSL_set_quiet_shutdown(ssl, 1);
-        SSL_set_shutdown(ssl, SSL_RECEIVED_SHUTDOWN | SSL_SENT_SHUTDOWN);
+        SSL_set_quiet_shutdown(this->_ssl.get(), 1);
+        SSL_set_shutdown(this->_ssl.get(), SSL_RECEIVED_SHUTDOWN | SSL_SENT_SHUTDOWN);
         Dbg(dbg_ctl_ssl_shutdown, "Enable quiet shutdown");
       }
     }
@@ -846,10 +829,7 @@ SSLNetVConnection::clear()
   // resetting here will decrement the ref-counter.
   client_sess.reset();
 
-  if (ssl != nullptr) {
-    SSL_free(ssl);
-    ssl = nullptr;
-  }
+  _ssl = nullptr;
 
   ALPNSupport::clear();
   TLSBasicSupport::clear();
@@ -859,22 +839,22 @@ SSLNetVConnection::clear()
   TLSTunnelSupport::_clear();
   TLSCertSwitchSupport::_clear();
 
-  _sslState                   = SslState::INIT;
-  sslLastWriteTime            = 0;
-  sslTotalBytesSent           = 0;
-  sslClientRenegotiationAbort = false;
-
   hookOpRequested = SslVConnOp::SSL_HOOK_OP_DEFAULT;
   free_handshake_buffers();
-
-  _unvc     = nullptr;
-  _sslState = SslState::INIT;
 }
+
 void
 SSLNetVConnection::free_thread(EThread *t)
 {
-  ink_release_assert(t == this_ethread());
+  if (from_accept_thread) {
+    sslNetVCAllocator.free(this);
+  } else {
+    THREAD_FREE(this, sslNetVCAllocator, t);
+  }
+}
 
+SSLNetVConnection::~SSLNetVConnection()
+{
   if (_is_tunnel_endpoint) {
     ink_assert(get_context() != NET_VCONNECTION_UNSET);
 
@@ -912,14 +892,6 @@ SSLNetVConnection::free_thread(EThread *t)
 #endif
 
   clear();
-  SET_CONTINUATION_HANDLER(this, &SSLNetVConnection::startEvent);
-  ink_assert(t == this_ethread());
-
-  if (from_accept_thread) {
-    sslNetVCAllocator.free(this);
-  } else {
-    THREAD_FREE(this, sslNetVCAllocator, t);
-  }
 }
 
 int
@@ -937,7 +909,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
   SSLConfig::scoped_config params;
   switch (event) {
   case SSL_EVENT_SERVER:
-    if (this->ssl == nullptr) {
+    if (this->_ssl.get() == nullptr) {
       SSLCertificateConfig::scoped_config lookup;
       IpEndpoint                          dst;
       int                                 namelen = sizeof(dst);
@@ -968,8 +940,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
         if (this->is_transparent) {
           this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
           _sslState        = SslState::HANDSHAKE_DONE;
-          SSL_free(this->ssl);
-          this->ssl = nullptr;
+          this->_ssl       = nullptr;
           return EVENT_DONE;
         } else {
           hookOpRequested = SslVConnOp::SSL_HOOK_OP_TUNNEL;
@@ -982,7 +953,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       this->_make_ssl_connection(lookup->defaultContext());
     }
 
-    if (this->ssl == nullptr) {
+    if (this->_ssl.get() == nullptr) {
       SSLErrorVC(this, "failed to create SSL server session");
       return EVENT_ERROR;
     }
@@ -992,7 +963,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 
     char buff[INET6_ADDRSTRLEN];
 
-    if (this->ssl == nullptr) {
+    if (this->_ssl.get() == nullptr) {
       // Making the check here instead of later, so we only
       // do this setting immediately after we create the SSL object
       SNIConfig::scoped_config sniParam;
@@ -1065,7 +1036,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       }
 
       this->_make_ssl_connection(clientCTX);
-      if (this->ssl == nullptr) {
+      if (this->_ssl.get() == nullptr) {
         SSLErrorVC(this, "failed to create SSL client session");
         return EVENT_ERROR;
       }
@@ -1073,19 +1044,19 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       // If it is negative, we are consciously not setting ALPN (e.g. for private server sessions)
       if (options.alpn_protocols_array_size >= 0) {
         if (options.alpn_protocols_array_size > 0) {
-          SSL_set_alpn_protos(this->ssl, options.alpn_protocols_array, options.alpn_protocols_array_size);
+          SSL_set_alpn_protos(this->_ssl.get(), options.alpn_protocols_array, options.alpn_protocols_array_size);
         } else if (params->alpn_protocols_array_size > 0) {
           // Set the ALPN protocols we are requesting.
-          SSL_set_alpn_protos(this->ssl, params->alpn_protocols_array, params->alpn_protocols_array_size);
+          SSL_set_alpn_protos(this->_ssl.get(), params->alpn_protocols_array, params->alpn_protocols_array_size);
         }
       }
 
-      SSL_set_verify(this->ssl, SSL_VERIFY_PEER, verify_callback);
+      SSL_set_verify(this->_ssl.get(), SSL_VERIFY_PEER, verify_callback);
 
       // SNI
       ats_scoped_str &tlsext_host_name = this->options.sni_hostname ? this->options.sni_hostname : this->options.sni_servername;
       if (tlsext_host_name) {
-        if (this->set_sni_server_name(this->ssl, tlsext_host_name)) {
+        if (this->set_sni_server_name(this->_ssl.get(), tlsext_host_name)) {
           Dbg(dbg_ctl_ssl, "using SNI name '%s' for client handshake", tlsext_host_name.get());
         } else {
           Dbg(dbg_ctl_ssl_error, "failed to set SNI name '%s' for client handshake", tlsext_host_name.get());
@@ -1095,7 +1066,7 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 
       // ALPN
       if (!this->options.alpn_protos.empty()) {
-        if (int res = SSL_set_alpn_protos(this->ssl, reinterpret_cast<const uint8_t *>(this->options.alpn_protos.data()),
+        if (int res = SSL_set_alpn_protos(this->_ssl.get(), reinterpret_cast<const uint8_t *>(this->options.alpn_protos.data()),
                                           this->options.alpn_protos.size());
             res != 0) {
           Dbg(dbg_ctl_ssl_error, "failed to set ALPN '%.*s' for client handshake",
@@ -1134,8 +1105,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 
   if (SslVConnOp::SSL_HOOK_OP_TUNNEL == hookOpRequested) {
     this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-    SSL_free(this->ssl);
-    this->ssl = nullptr;
+    this->_ssl       = nullptr;
     // Don't mark the handshake as complete yet,
     // Will be checking for that flag not being set after
     // we get out of this callback, and then will shuffle
@@ -1152,7 +1122,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   if (!this->handShakeHolder->is_read_avail_more_than(0)) {
 #if TS_USE_TLS_ASYNC
     if (SSLConfigParams::async_handshake_enabled) {
-      SSL_set_mode(ssl, SSL_MODE_ASYNC);
+      SSL_set_mode(this->_ssl.get(), SSL_MODE_ASYNC);
     }
 #endif
     Dbg(dbg_ctl_ssl, "%p first read\n", this);
@@ -1173,6 +1143,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     }
   }
 
+  _sslState             = SslState::HANDSHAKE_IN_PROGRESS;
   ssl_error_t ssl_error = this->_ssl_accept();
 #if TS_USE_TLS_ASYNC
   if (ssl_error == SSL_ERROR_WANT_ASYNC) {
@@ -1181,11 +1152,11 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       size_t         numfds;
       OSSL_ASYNC_FD *waitfds;
       // Set up the epoll entry for the signalling
-      if (SSL_get_all_async_fds(ssl, nullptr, &numfds) && numfds > 0) {
+      if (SSL_get_all_async_fds(this->_ssl.get(), nullptr, &numfds) && numfds > 0) {
         // Allocate space for the waitfd on the stack, should only be one most all of the time
         async_fds.reserve(numfds);
         waitfds = async_fds.data();
-        if (SSL_get_all_async_fds(ssl, waitfds, &numfds) && numfds > 0) {
+        if (SSL_get_all_async_fds(this->_ssl.get(), waitfds, &numfds) && numfds > 0) {
           PollDescriptor *pd = get_PollDescriptor(this_ethread());
           this->async_ep.start(pd, {waitfds, numfds});
         }
@@ -1227,9 +1198,9 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   case SSL_ERROR_NONE:
     if (dbg_ctl_ssl.on()) {
 #ifdef OPENSSL_IS_OPENSSL3
-      X509 *cert = SSL_get1_peer_certificate(ssl);
+      X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
 #else
-      X509 *cert = SSL_get_peer_certificate(ssl);
+      X509 *cert = SSL_get_peer_certificate(this->ssl.get());
 #endif
 
       DbgPrint(dbg_ctl_ssl, "SSL server handshake completed successfully");
@@ -1259,15 +1230,15 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       const unsigned char *proto = nullptr;
       unsigned             len   = 0;
 
-      increment_ssl_version_metric(SSL_version(ssl));
+      increment_ssl_version_metric(SSL_version(this->_ssl.get()));
 
       // If it's possible to negotiate both NPN and ALPN, then ALPN
       // is preferred since it is the server's preference.  The server
       // preference would not be meaningful if we let the client
       // preference have priority.
-      SSL_get0_alpn_selected(ssl, &proto, &len);
+      SSL_get0_alpn_selected(this->_ssl.get(), &proto, &len);
       if (len == 0) {
-        SSL_get0_next_proto_negotiated(ssl, &proto, &len);
+        SSL_get0_next_proto_negotiated(this->_ssl.get(), &proto, &len);
       }
 
       if (len) {
@@ -1284,7 +1255,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 
 #if TS_USE_TLS_ASYNC
     if (SSLConfigParams::async_handshake_enabled) {
-      SSL_clear_mode(ssl, SSL_MODE_ASYNC);
+      SSL_clear_mode(this->_ssl.get(), SSL_MODE_ASYNC);
       if (async_ep.fd >= 0) {
         async_ep.stop();
       }
@@ -1355,7 +1326,7 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 {
   ssl_error_t ssl_error;
 
-  ink_assert(TLSBasicSupport::getInstance(ssl) == this);
+  ink_assert(TLSBasicSupport::getInstance(this->_ssl.get()) == this);
 
   // Initialize properly for a client connection
   if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE) {
@@ -1409,9 +1380,9 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
   case SSL_ERROR_NONE:
     if (dbg_ctl_ssl.on()) {
 #ifdef OPENSSL_IS_OPENSSL3
-      X509 *cert = SSL_get1_peer_certificate(ssl);
+      X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
 #else
-      X509 *cert = SSL_get_peer_certificate(ssl);
+      X509 *cert = SSL_get_peer_certificate(this->ssl.get());
 #endif
 
       DbgPrint(dbg_ctl_ssl, "SSL client handshake completed successfully");
@@ -1426,9 +1397,9 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
       unsigned char const *proto = nullptr;
       unsigned int         len   = 0;
       // Make note of the negotiated protocol
-      SSL_get0_alpn_selected(ssl, &proto, &len);
+      SSL_get0_alpn_selected(this->_ssl.get(), &proto, &len);
       if (len == 0) {
-        SSL_get0_next_proto_negotiated(ssl, &proto, &len);
+        SSL_get0_next_proto_negotiated(this->_ssl.get(), &proto, &len);
       }
       Dbg(dbg_ctl_ssl_alpn, "Negotiated ALPN: %.*s", len, proto);
       this->set_negotiated_protocol_id({reinterpret_cast<const char *>(proto), static_cast<size_t>(len)});
@@ -1767,10 +1738,10 @@ NetVConnection *
 SSLNetVConnection::migrateToCurrentThread(Continuation *, EThread *)
 {
   /*
-  SSL *save_ssl = this->ssl;
+  SSL *save_ssl = this->ssl.get();
 
   this->_unbindSSLObject();
-  this->ssl = nullptr;
+  this->ssl.get() = nullptr;
   */
 
   // FIXME
@@ -1785,7 +1756,7 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
   // Take ownership of the handShake buffer
   _sslState   = SslState::HANDSHAKE_DONE;
   NetState *s = &target->read;
-  s->vio.set_writer(this->_read_buf);
+  s->vio.set_writer(this->_read_buf.get());
   s->vio.set_reader(this->handShakeHolder);
   this->handShakeHolder = nullptr;
   this->_read_buf       = nullptr;
@@ -1830,7 +1801,7 @@ SSLNetVConnection::_get_tls_curve() const
   if (getSSLSessionCacheHit()) {
     return getSSLCurveNID();
   } else {
-    return SSLGetCurveNID(ssl);
+    return SSLGetCurveNID(this->_ssl.get());
   }
 }
 
@@ -1878,7 +1849,7 @@ SSLNetVConnection::_ssl_accept()
       block->alloc(BUFFER_SIZE_INDEX_16K);
 
 #if HAVE_SSL_READ_EARLY_DATA
-      ret = SSL_read_early_data(ssl, block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K), &nread);
+      ret = SSL_read_early_data(this->_ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K), &nread);
       if (ret == SSL_READ_EARLY_DATA_ERROR) {
         had_error_on_reading_early_data = true;
       } else if (ret == SSL_READ_EARLY_DATA_FINISH) {
@@ -1887,13 +1858,13 @@ SSLNetVConnection::_ssl_accept()
 #else
       // If SSL_read_early_data is unavailable, it's probably BoringSSL,
       // and SSL_in_early_data should be available.
-      ret = SSL_accept(ssl);
+      ret = SSL_accept(this->ssl.get());
       if (ret <= 0) {
         had_error_on_reading_early_data = true;
       } else {
-        if (SSL_in_early_data(ssl)) {
-          ret                         = SSL_read(ssl, block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K));
-          finished_reading_early_data = !SSL_in_early_data(ssl);
+        if (SSL_in_early_data(this->ssl.get())) {
+          ret                         = SSL_read(this->ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K));
+          finished_reading_early_data = !SSL_in_early_data(this->ssl.get());
           if (ret < 0) {
             nread = 0;
             if (finished_reading_early_data) {
@@ -1950,7 +1921,7 @@ SSLNetVConnection::_ssl_accept()
           if (this->_early_data_reader == nullptr || this->_early_data_reader->read_avail() == 0) {
             Dbg(dbg_ctl_ssl_early_data, "no data in early data buffer");
             ERR_clear_error();
-            ret = SSL_accept(ssl);
+            ret = SSL_accept(this->_ssl.get());
           }
           break;
         }
@@ -1958,16 +1929,16 @@ SSLNetVConnection::_ssl_accept()
       }
     }
   } else {
-    ret = SSL_accept(ssl);
+    ret = SSL_accept(this->_ssl.get());
   }
 #else
-  ret = SSL_accept(ssl);
+  ret = SSL_accept(this->ssl.get());
 #endif
 
   if (ret > 0) {
     return SSL_ERROR_NONE;
   }
-  ssl_error = SSL_get_error(ssl, ret);
+  ssl_error = SSL_get_error(this->_ssl.get(), ret);
   if (ssl_error == SSL_ERROR_SSL && dbg_ctl_ssl_error_accept.on()) {
     char          buf[512];
     unsigned long e = ERR_peek_last_error();
@@ -1983,20 +1954,21 @@ SSLNetVConnection::_ssl_connect()
 {
   ERR_clear_error();
 
-  SSL_SESSION *sess = SSL_get_session(ssl);
+  SSL_SESSION *sess = SSL_get_session(this->_ssl.get());
   if (first_ssl_connect) {
     first_ssl_connect = false;
     if (!sess && SSLConfigParams::origin_session_cache == 1 && SSLConfigParams::origin_session_cache_size > 0) {
-      std::string sni_addr = get_sni_addr(ssl);
+      std::string sni_addr = get_sni_addr(this->_ssl.get());
       if (!sni_addr.empty()) {
         std::string lookup_key;
-        swoc::bwprint(lookup_key, "{}:{}:{}", sni_addr.c_str(), SSL_get_SSL_CTX(ssl), get_verify_str(ssl));
+        swoc::bwprint(lookup_key, "{}:{}:{}", sni_addr.c_str(), SSL_get_SSL_CTX(this->_ssl.get()),
+                      get_verify_str(this->_ssl.get()));
 
         Dbg(dbg_ctl_ssl_origin_session_cache, "origin session cache lookup key = %s", lookup_key.c_str());
 
         std::shared_ptr<SSL_SESSION> shared_sess = this->getOriginSession(lookup_key);
 
-        if (shared_sess && SSL_set_session(ssl, shared_sess.get())) {
+        if (shared_sess && SSL_set_session(this->_ssl.get(), shared_sess.get())) {
           // Keep a reference of this shared pointer in the connection
           this->client_sess = shared_sess;
         }
@@ -2004,10 +1976,10 @@ SSLNetVConnection::_ssl_connect()
     }
   }
 
-  int ret = SSL_connect(ssl);
+  int ret = SSL_connect(this->_ssl.get());
 
   if (ret > 0) {
-    if (SSL_session_reused(ssl)) {
+    if (SSL_session_reused(this->_ssl.get())) {
       Metrics::Counter::increment(ssl_rsb.origin_session_reused_count);
       Dbg(dbg_ctl_ssl_origin_session_cache, "reused session to origin server");
     } else {
@@ -2015,7 +1987,7 @@ SSLNetVConnection::_ssl_connect()
     }
     return SSL_ERROR_NONE;
   }
-  int ssl_error = SSL_get_error(ssl, ret);
+  int ssl_error = SSL_get_error(this->_ssl.get(), ret);
   if (ssl_error == SSL_ERROR_SSL && dbg_ctl_ssl_error_connect.on()) {
     char          buf[512];
     unsigned long e = ERR_peek_last_error();
@@ -2041,36 +2013,36 @@ SSLNetVConnection::_ssl_write_buffer(const void *buf, int64_t nbytes, int64_t &n
   // If SSL_write_early_data is unavailable, its' probably BoringSSL,
   // and we can use SSL_write to send early data.
 #if TS_HAS_TLS_EARLY_DATA
-  if (SSL_version(ssl) >= TLS1_3_VERSION) {
+  if (SSL_version(this->_ssl.get()) >= TLS1_3_VERSION) {
 #ifdef HAVE_SSL_WRITE_EARLY_DATA
-    if (SSL_is_init_finished(ssl)) {
+    if (SSL_is_init_finished(this->ssl.get())) {
 #endif
-      ret = SSL_write(ssl, buf, static_cast<int>(nbytes));
+      ret = SSL_write(this->_ssl.get(), buf, static_cast<int>(nbytes));
 #ifdef HAVE_SSL_WRITE_EARLY_DATA
     } else {
       size_t nwrite;
-      ret = SSL_write_early_data(ssl, buf, static_cast<size_t>(nbytes), &nwrite);
+      ret = SSL_write_early_data(this->ssl.get(), buf, static_cast<size_t>(nbytes), &nwrite);
       if (ret == 1) {
         ret = nwrite;
       }
     }
 #endif
   } else {
-    ret = SSL_write(ssl, buf, static_cast<int>(nbytes));
+    ret = SSL_write(this->_ssl.get(), buf, static_cast<int>(nbytes));
   }
 #else
-  ret = SSL_write(ssl, buf, static_cast<int>(nbytes));
+  ret = SSL_write(this->ssl.get(), buf, static_cast<int>(nbytes));
 #endif
 
   if (ret > 0) {
     nwritten = ret;
-    BIO *bio = SSL_get_wbio(ssl);
+    BIO *bio = SSL_get_wbio(this->_ssl.get());
     if (bio != nullptr) {
       (void)BIO_flush(bio);
     }
     return SSL_ERROR_NONE;
   }
-  int ssl_error = SSL_get_error(ssl, ret);
+  int ssl_error = SSL_get_error(this->_ssl.get(), ret);
   if (ssl_error == SSL_ERROR_SSL && dbg_ctl_ssl_error_write.on()) {
     char          tempbuf[512];
     unsigned long e = ERR_peek_last_error();
@@ -2091,7 +2063,7 @@ SSLNetVConnection::_ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread)
   ERR_clear_error();
 
 #if TS_HAS_TLS_EARLY_DATA
-  if (SSL_version(ssl) >= TLS1_3_VERSION) {
+  if (SSL_version(this->_ssl.get()) >= TLS1_3_VERSION) {
     int64_t early_data_len = 0;
     if (this->_early_data_reader != nullptr) {
       early_data_len = this->_early_data_reader->read_avail();
@@ -2126,23 +2098,23 @@ SSLNetVConnection::_ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread)
 #endif
 
 #if HAVE_SSL_READ_EARLY_DATA
-      ret = SSL_read_early_data(ssl, buf, static_cast<size_t>(nbytes), &read_bytes);
+      ret = SSL_read_early_data(this->_ssl.get(), buf, static_cast<size_t>(nbytes), &read_bytes);
       if (ret == SSL_READ_EARLY_DATA_ERROR) {
         had_error_on_reading_early_data = true;
-        ssl_error                       = SSL_get_error(ssl, ret);
+        ssl_error                       = SSL_get_error(this->_ssl.get(), ret);
       } else if (ret == SSL_READ_EARLY_DATA_FINISH) {
         finished_reading_early_data = true;
       }
 #else
       // If SSL_read_early_data is unavailable, it's probably OpenSSL,
       // and SSL_in_early_data should be available.
-      if (SSL_in_early_data(ssl)) {
-        ret                         = SSL_read(ssl, buf, nbytes);
-        finished_reading_early_data = !SSL_in_early_data(ssl);
+      if (SSL_in_early_data(this->ssl.get())) {
+        ret                         = SSL_read(this->ssl.get(), buf, nbytes);
+        finished_reading_early_data = !SSL_in_early_data(this->ssl.get());
         if (ret < 0) {
           if (!finished_reading_early_data) {
             had_error_on_reading_early_data = true;
-            ssl_error                       = SSL_get_error(ssl, ret);
+            ssl_error                       = SSL_get_error(this->ssl.get(), ret);
           }
           read_bytes = 0;
         } else {
@@ -2178,12 +2150,12 @@ SSLNetVConnection::_ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread)
   }
 #endif
 
-  int ret = SSL_read(ssl, buf, static_cast<int>(nbytes));
+  int ret = SSL_read(this->_ssl.get(), buf, static_cast<int>(nbytes));
   if (ret > 0) {
     nread = ret;
     return SSL_ERROR_NONE;
   }
-  int ssl_error = SSL_get_error(ssl, ret);
+  int ssl_error = SSL_get_error(this->_ssl.get(), ret);
   if (ssl_error == SSL_ERROR_SSL && dbg_ctl_ssl_error_read.on()) {
     char          tempbuf[512];
     unsigned long e = ERR_peek_last_error();
@@ -2252,6 +2224,11 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   ink_release_assert(vio == _transport_write_vio);
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
 
+  if (_sslState == SslState::HANDSHAKE_IN_PROGRESS) {
+    // FIXME: continue handshake
+    return EVENT_CONT;
+  }
+
   MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
   if (!lock.is_locked()) {
     _transport_write_vio->reenable(); // Retry later
@@ -2267,7 +2244,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   Continuation *user_cont = _user_write_vio.cont; // Save original continuation for reentrancy check
   if (_user_write_vio.op != VIO::WRITE || _user_write_vio.is_disabled()) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO not active or disabled.", this);
-    return EVENT_CONT; // Or EVENT_DONE? Let's stick with CONT.
+    return EVENT_DONE;
   }
 
   int64_t ntodo = _user_write_vio.ntodo();
@@ -2306,10 +2283,9 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     return EVENT_DONE;
   }
 
-  MIOBufferAccessor &buf                     = _user_write_vio.buffer;
-  int64_t            total_plaintext_written = 0; // Bytes of *plaintext* consumed from user buffer
-  int                needs                   = 0; // Flags for transport read/write needed by SSL layer/BIOs
-  int64_t            ret                     = _encrypt_data_for_transport(ntodo, buf, total_plaintext_written, needs);
+  int64_t total_plaintext_written = 0; // Bytes of *plaintext* consumed from user buffer
+  int     needs                   = 0; // Flags for transport read/write needed by SSL layer/BIOs
+  int64_t ret                     = _encrypt_data_for_transport(ntodo, _user_write_vio.buffer, total_plaintext_written, needs);
 
   if (total_plaintext_written > 0) {
     _user_write_vio.ndone += total_plaintext_written;
@@ -2325,12 +2301,11 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   }
 
   // Even if user is complete, the write MIOBuffer might still contain data that needs to be sent by the transport. Check 'needs'.
-  ink_release_assert(!_transport_write_vio->is_disabled());
   if (needs & EVENTIO_WRITE) {
-    // Write buffer full
+    // Write buffer may have be previously emptied by the transport, which causes the transport to disable the write vio.
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Re-enabling transport write to flush BIO after user complete.", this);
-    // We never disable transport write, so reenabling shouldn't be needed.
-    // _transport_write_vio->reenable();
+    // _unvc->trapWriteBufferEmpty();
+    _transport_write_vio->reenable();
   }
 
   // Even if the user has disabled read, we still need to read in order to complete the write.
@@ -2368,18 +2343,48 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
 }
 
 int
+SSLNetVConnection::acceptEvent(int event, void *data)
+{
+  MUTEX_TRY_LOCK(trylock, this->mutex, this_ethread());
+  if (!trylock.is_locked()) {
+    this_ethread()->schedule_in(this, net_retry_delay);
+  }
+  SET_HANDLER(&SSLNetVConnection::startEvent);
+
+  return handleEvent(event, data);
+}
+
+int
 SSLNetVConnection::startEvent(int event, void *data)
 {
   UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
+  thread                   = this_ethread();
   switch (event) {
   case NET_EVENT_OPEN:
   case NET_EVENT_ACCEPT:
     // Successful establishment of TCP connection
     // This is where we would set up the SSL context and start the handshake.
     _transport_state = TransportState::TRANSPORT_CONNECTED;
-    ink_release_assert(_unvc == nullptr);
     ink_release_assert(unvc != nullptr);
-    _unvc = unvc;
+    ink_release_assert(_unvc == unvc);
+    SET_HANDLER(&SSLNetVConnection::mainEvent);
+    ink_release_assert(_sslState == SslState::INIT);
+    _sslState = SslState::HANDSHAKE_WANTED;
+    // Once the handshake starts, we will need to be ready to write
+    // _unvc->trapWriteBufferEmpty();
+    _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
+    if (_transport_write_vio == nullptr) {
+      // Failed to create transport write VIO
+      Error("SSLNetVConnection %p: Failed to start writing", this);
+      _sslState        = SslState::ERROR;
+      _transport_state = TransportState::TRANSPORT_ERROR;
+      return EVENT_DONE;
+    }
+    break;
+  default:
+    Warning("SSLNetVConnection %p: Unexpected event %d in startEvent", this, event);
+    ink_assert(false);
+    break;
   }
 
   return EVENT_CONT;
@@ -2422,6 +2427,8 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
     return nullptr;
   }
 
+  ink_assert(_transport_state == TransportState::TRANSPORT_CONNECTED);
+
   _user_read_vio.op        = VIO::READ;
   _user_read_vio.mutex     = c ? c->mutex : this->mutex;
   _user_read_vio.cont      = c;
@@ -2429,14 +2436,14 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
   _user_read_vio.ndone     = 0;
   _user_read_vio.vc_server = this;
   if (buf) {
+    // User wants to start a read
     _user_read_vio.set_writer(buf);
-    if (!_transport_read_vio || _transport_read_vio->op != VIO::READ) {
-      _transport_read_vio = _unvc->do_io_read(this, INT64_MAX, _read_buf);
-    }
+    _user_read_vio.reenable();
   } else {
-    // No transport read VIO, disable user read VIO
+    // User wants to stop reading
     _user_read_vio.disable();
     _user_read_vio.buffer.clear();
+    _transport_read_vio->disable();
   }
   return &_user_read_vio;
 }
@@ -2457,9 +2464,7 @@ SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
   if (reader) {
     ink_assert(!owner);
     _user_write_vio.set_reader(reader);
-    if (!_transport_write_vio || _transport_write_vio->op != VIO::WRITE) {
-      _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader, false);
-    }
+    _user_write_vio.reenable();
   } else {
     _user_write_vio.disable();
   }
@@ -2469,7 +2474,6 @@ SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
 void
 SSLNetVConnection::set_action(Continuation *a)
 {
-  ink_assert(a != nullptr);
   _action = a;
 }
 
@@ -2566,6 +2570,32 @@ void
 SSLNetVConnection::reenable(VIO *vio)
 {
   ink_assert(_unvc != nullptr);
+  if (vio == &_user_read_vio) {
+    // Reenable read
+    if (!_transport_read_vio) {
+      // Initiate transport read
+      ink_assert(_read_buf != nullptr);
+      _transport_read_vio = _unvc->do_io_read(this, INT64_MAX, this->_read_buf.get());
+    } else {
+      // Reenable existing transport read
+      ink_assert(_transport_read_vio->op == VIO::READ);
+      _transport_read_vio->reenable();
+    }
+  } else if (vio == &_user_write_vio) {
+    // Reenable write
+    if (!_transport_write_vio) {
+      // Initiate transport write
+      ink_assert(_write_buf_reader != nullptr);
+      _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, this->_write_buf_reader.get(), false);
+    } else {
+      // Reenable existing transport write
+      ink_assert(_transport_write_vio->op == VIO::WRITE);
+      _transport_write_vio->reenable();
+    }
+  } else {
+    ink_assert(false); // Unknown VIO
+  }
+
   _unvc->reenable(vio);
 }
 

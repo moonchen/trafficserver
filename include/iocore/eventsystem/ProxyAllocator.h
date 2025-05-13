@@ -49,6 +49,8 @@ struct ProxyAllocator {
   ProxyAllocator() {}
 };
 
+// For allocators that have a global ClassAllocators counterpart to their thread ProxyAllocator - most of them do
+// (ClassAllocators have Value_type)
 template <class CAlloc, typename... Args>
 typename CAlloc::Value_type *
 thread_alloc(CAlloc &a, ProxyAllocator &l, Args &&...args)
@@ -63,9 +65,9 @@ thread_alloc(CAlloc &a, ProxyAllocator &l, Args &&...args)
   return a.alloc(std::forward<Args>(args)...);
 }
 
+// For allocators that are not ClassAllocators, e.g. ???
 void *thread_alloc(Allocator &a, ProxyAllocator &l);
-
-void thread_freeup(Allocator &a, ProxyAllocator &l);
+void  thread_freeup(Allocator &a, ProxyAllocator &l);
 
 #if 1
 

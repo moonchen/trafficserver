@@ -396,7 +396,7 @@ DebugInterface::generate_format_string(swoc::LocalBufferWriter<1024> &format_wri
   format_writer.print("{} {}: ", DiagThreadname{}, level_name(diags_level));
 
   if (location(loc, show_location, diags_level)) {
-    format_writer.print("<{}> ", *loc);
+    format_writer.print("{} ", *loc);
   }
 
   if (debug_tag) {

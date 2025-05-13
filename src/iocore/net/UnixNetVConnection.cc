@@ -37,6 +37,13 @@
 #define STATE_VIO_OFFSET   ((uintptr_t) & ((NetState *)0)->vio)
 #define STATE_FROM_VIO(_x) ((NetState *)(((char *)(_x)) - STATE_VIO_OFFSET))
 
+constexpr std::size_t state_vio_offset = offsetof(NetState, vio);
+NetState *
+state_from_vio(VIO *vio)
+{
+  return reinterpret_cast<NetState *>(reinterpret_cast<char *>(vio) - state_vio_offset);
+}
+
 // Global
 ClassAllocator<UnixNetVConnection> netVCAllocator("netVCAllocator");
 
@@ -677,7 +684,7 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
   int signalled = 0;
 
   // signal write ready to allow user to fill the buffer
-  if (towrite != ntodo && !buf.writer()->high_water()) {
+  if (towrite != ntodo && (!buf.writer()->high_water() || towrite == 0)) {
     if (write_signal_and_update(VC_EVENT_WRITE_READY, this) != EVENT_CONT) {
       return;
     } else if (c != s->vio.cont) { /* The write vio was updated in the handler */
@@ -707,9 +714,8 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
     return;
   }
 
-  int     needs         = 0;
   int64_t total_written = 0;
-  int64_t r             = this->load_buffer_and_write(towrite, buf, total_written, needs);
+  int64_t r             = this->load_buffer_and_write(towrite, buf, total_written);
 
   if (total_written > 0) {
     Metrics::Counter::increment(net_rsb.write_bytes, total_written);
@@ -725,17 +731,9 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
   if (r < 0) { // if the socket was not ready, add to WaitList
     if (r == -EAGAIN || r == -ENOTCONN || -r == EINPROGRESS) {
       Metrics::Counter::increment(net_rsb.calls_to_write_nodata);
-      if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
-        this->write.triggered = 0;
-        nh->write_ready_list.remove(this);
-        write_reschedule(nh, this);
-      }
-
-      if ((needs & EVENTIO_READ) == EVENTIO_READ) {
-        this->read.triggered = 0;
-        nh->read_ready_list.remove(this);
-        read_reschedule(nh, this);
-      }
+      this->write.triggered = 0;
+      nh->write_ready_list.remove(this);
+      write_reschedule(nh, this);
 
       return;
     }
@@ -779,18 +777,12 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
       }
     }
 
-    if ((needs & EVENTIO_READ) == EVENTIO_READ) {
-      read_reschedule(nh, this);
-    }
-
     if (!(buf.reader()->is_read_avail_more_than(0))) {
       write_disable(nh, this);
       return;
     }
 
-    if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
-      write_reschedule(nh, this);
-    }
+    write_reschedule(nh, this);
 
     return;
   }
@@ -801,7 +793,7 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
 // (SSL read does not support overlapped i/o)
 // without duplicating all the code in write_to_net.
 int64_t
-UnixNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs)
+UnixNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written)
 {
   int64_t         r            = 0;
   int64_t         try_to_write = 0;
@@ -882,8 +874,6 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, MIOBufferAccessor &bu
 
   tmp_reader->dealloc();
 
-  needs |= EVENTIO_WRITE;
-
   return r;
 }
 
@@ -909,21 +899,6 @@ int
 UnixNetVConnection::readSignalAndUpdate(int event)
 {
   return (read_signal_and_update(event, this));
-}
-
-// Interface so SSL inherited class can call some static in-line functions
-// without affecting regular net stuff or copying a bunch of code into
-// the header files.
-void
-UnixNetVConnection::readReschedule(NetHandler *nh)
-{
-  read_reschedule(nh, this);
-}
-
-void
-UnixNetVConnection::writeReschedule(NetHandler *nh)
-{
-  write_reschedule(nh, this);
 }
 
 void

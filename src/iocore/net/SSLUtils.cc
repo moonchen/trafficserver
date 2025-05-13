@@ -1028,7 +1028,7 @@ ssl_callback_info(const SSL *ssl, int where, int ret)
 
   SSLNetVConnection *netvc = SSLNetVCAccess(ssl);
 
-  if (!netvc || netvc->ssl != ssl) {
+  if (!netvc || netvc->get_tls_handle() != ssl) {
     Dbg(dbg_ctl_ssl_error, "ssl_callback_info call back on stale netvc");
     return;
   }

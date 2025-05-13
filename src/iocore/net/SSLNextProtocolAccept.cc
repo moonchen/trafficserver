@@ -21,12 +21,15 @@
   limitations under the License.
  */
 
+#include "P_SSLConfig.h"
 #include "P_SSLNetProcessor.h"
 #include "P_SSLNextProtocolAccept.h"
 #include "P_SSLNetVConnection.h"
 #include "P_UnixNet.h"
 #include "P_UnixNetVConnection.h"
 #include "iocore/eventsystem/Continuation.h"
+#include "iocore/eventsystem/Lock.h"
+#include "iocore/net/Net.h"
 #include "iocore/net/NetVConnection.h"
 #include "tscore/ink_assert.h"
 
@@ -136,12 +139,22 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
     netvc->set_action(ssl_netvc);
     ssl_netvc->setTransparentPassThrough(transparent_passthrough);
     ssl_netvc->setAllowPlain(allow_plain);
+    ssl_netvc->mutex = netvc->mutex; // Tie the mutexes together for the entire protocol stack so handlers can take the fast path
 
     // Register our protocol set with the VC and kick off a zero-length read to
     // force the SSLNetVConnection to complete the SSL handshake. Don't tell
     // the endpoint that there is an accept to handle until the read completes
     // and we know which protocol was negotiated.
     ssl_netvc->registerNextProtocolSet(&this->protoset, this->protoenabled);
+    MUTEX_TRY_LOCK(trylock, ssl_netvc->mutex, this_ethread());
+    if (!trylock.is_locked()) {
+      // At this point, the UnixNetVConnection should have its own mutex, rather than sharing the NetHandler's mutex.
+      // Not sure how we can get here.
+      SET_CONTINUATION_HANDLER(ssl_netvc, &SSLNetVConnection::acceptEvent);
+      ink_assert(this_ethread()->is_event_type(ET_NET));
+      this_ethread()->schedule_in(ssl_netvc, net_retry_delay, NET_EVENT_ACCEPT, netvc);
+    }
+    ssl_netvc->handleEvent(NET_EVENT_ACCEPT, netvc);
     ssl_netvc->do_io_read(new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer);
     return EVENT_CONT;
   }
