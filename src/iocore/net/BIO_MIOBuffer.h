@@ -27,4 +27,4 @@
 #include <openssl/bio.h>
 
 const BIO_METHOD *BIO_s_miobuffer();
-int               miobuffer_set_buffer(BIO *bio, MIOBuffer *buffer);
+int               miobuffer_set_buffer(BIO *bio, MIOBuffer *write_buffer, IOBufferReader *read_reader);

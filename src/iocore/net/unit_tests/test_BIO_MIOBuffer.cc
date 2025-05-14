@@ -25,7 +25,7 @@ TEST_CASE("BIO_MIOBuffer set buffer", "[BIO_MIOBuffer]")
 
   REQUIRE(buffer != nullptr);
 
-  int result = miobuffer_set_buffer(bio, buffer);
+  int result = miobuffer_set_buffer(bio, buffer, nullptr);
   REQUIRE(result == 1);
 
   result = BIO_free(bio);
@@ -42,7 +42,7 @@ TEST_CASE("BIO_MIOBuffer reading and writing", "[BIO_MIOBuffer]")
   MIOBuffer *buffer = new_MIOBuffer(BUFFER_SIZE_INDEX_32K);
   REQUIRE(buffer != nullptr);
 
-  int result = miobuffer_set_buffer(bio, buffer);
+  int result = miobuffer_set_buffer(bio, buffer, buffer->alloc_reader());
   REQUIRE(result == 1);
 
   const char *data    = "Hello, MIOBuffer!";
@@ -97,7 +97,7 @@ TEST_CASE("BIO_MIOBuffer retry flags", "[BIO_MIOBuffer]")
   MIOBuffer *buffer = new_MIOBuffer(BUFFER_SIZE_INDEX_32K);
   REQUIRE(buffer != nullptr);
 
-  int result = miobuffer_set_buffer(bio, buffer);
+  int result = miobuffer_set_buffer(bio, nullptr, buffer->alloc_reader());
   REQUIRE(result == 1);
 
   // Set the buffer to empty

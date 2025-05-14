@@ -132,7 +132,7 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
     return;
   }
 
-  if (miobuffer_set_buffer(rbio.get(), _read_buf.get()) == 0) {
+  if (miobuffer_set_buffer(rbio.get(), nullptr, _read_buf->alloc_reader()) == 0) {
     return;
   }
 
@@ -141,7 +141,7 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
     return;
   }
 
-  if (miobuffer_set_buffer(wbio.get(), _write_buf.get()) == 0) {
+  if (miobuffer_set_buffer(wbio.get(), _write_buf.get(), nullptr) == 0) {
     return;
   }
   SSL_set_bio(temp_ssl.get(), rbio.get(), wbio.get());
@@ -593,7 +593,16 @@ SSLNetVConnection::_trigger_ssl_read()
     break;
 
   case SSL_READ_EOS:
-    ink_release_assert(!"Shouldn't get EOS from our buffer.");
+    // close the connection if we have SSL_READ_EOS, this is the return value from ssl_read_from_net() if we get an
+    // SSL_ERROR_ZERO_RETURN from SSL_get_error()
+    // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
+    _signal_user(SignalSide::READ, VC_EVENT_EOS);
+
+    if (bytes > 0) {
+      Dbg(dbg_ctl_ssl, "read finished - EOS");
+    } else {
+      Dbg(dbg_ctl_ssl, "read finished - 0 useful bytes read, bytes used by SSL layer");
+    }
     break;
   case SSL_READ_COMPLETE:
     Dbg(dbg_ctl_ssl, "read finished - signal done");
@@ -1217,6 +1226,10 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       this->_record_tls_handshake_end_time();
       this->_update_end_of_handshake_stats();
     }
+
+    // We're fully SSL now, so we can throw away the downgrade buffer
+    this->handShakeHolder->dealloc();
+    this->handShakeHolder = nullptr;
 
     if (this->get_tunnel_type() != SNIRoutingType::NONE) {
       // Foce to use HTTP/1.1 endpoint for SNI Routing

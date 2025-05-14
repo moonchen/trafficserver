@@ -22,6 +22,7 @@
  */
 
 #include "BIO_MIOBuffer.h"
+#include "iocore/eventsystem/IOBuffer.h"
 #include "tscore/Diags.h"
 #include "tsutil/DbgCtl.h"
 
@@ -46,22 +47,16 @@ miobuffer_create(BIO *bio)
   return 1;
 }
 
-// Set the MIOBuffer for the BIO
 int
-miobuffer_set_buffer(BIO *bio, MIOBuffer *buffer)
+miobuffer_set_buffer(BIO *bio, MIOBuffer *write_buffer, IOBufferReader *read_reader)
 {
   BIO_MIOBuffer_Context *ctx = static_cast<BIO_MIOBuffer_Context *>(BIO_get_data(bio));
   if (!ctx) {
     return 0; // Context not initialized
   }
 
-  if (buffer == nullptr) {
-    Error("miobuffer_set_buffer: null buffer");
-    return 0;
-  }
-
-  ctx->buffer = buffer;
-  ctx->reader = ctx->buffer->alloc_reader();
+  ctx->buffer = write_buffer;
+  ctx->reader = read_reader;
   BIO_set_init(bio, 1);
   BIO_set_retry_read(bio);
   BIO_set_retry_write(bio);
@@ -89,43 +84,6 @@ miobuffer_destroy(BIO *bio)
   return 1;
 }
 
-// Write data into MIOBuffer
-/*
-static int
-miobuffer_write_ex(BIO *bio, const char *in, size_t inlen, size_t *written)
-{
-  BIO_MIOBuffer_Context *ctx = static_cast<BIO_MIOBuffer_Context *>(BIO_get_data(bio));
-
-  if (inlen == 0) {
-    *written = 0;
-    return 1;
-  }
-
-  if (!ctx) {
-    Error("miobuffer_write_ex: null context");
-    return 0;
-  }
-
-  if (!ctx->buffer) {
-    Error("miobuffer_write_ex: null buffer");
-    return 0;
-  }
-
-  if (!in) {
-    Error("miobuffer_write_ex: null input");
-    return 0;
-  }
-
-  int bytes_written = ctx->buffer->write(in, inlen);
-  if (bytes_written > 0) {
-    *written = bytes_written;
-    return 1;
-  } else {
-    *written = 0;
-    return 0;
-  }
-}
-  */
 static int
 miobuffer_write_ex(BIO *bio, const char *in, size_t inlen, size_t *written)
 {
@@ -165,55 +123,6 @@ miobuffer_write_ex(BIO *bio, const char *in, size_t inlen, size_t *written)
   }
 }
 
-// Read data from MIOBuffer
-/*
-static int
-miobuffer_read_ex(BIO *bio, char *out, size_t outlen, size_t *readbytes)
-{
-  BIO_MIOBuffer_Context *ctx = static_cast<BIO_MIOBuffer_Context *>(BIO_get_data(bio));
-
-  if (!ctx) {
-    Error("miobuffer_read_ex: null context");
-    *readbytes = 0;
-    return 0;
-  }
-
-  if (!ctx->reader) {
-    Error("miobuffer_read_ex: null reader");
-    *readbytes = 0;
-    return 0;
-  }
-
-  if (!out) {
-    Error("miobuffer_read_ex: null output buffer");
-    *readbytes = 0;
-    return 0;
-  }
-
-  if (outlen == 0) {
-    Error("miobuffer_read_ex: output length is zero");
-    *readbytes = 0;
-    return 0;
-  }
-
-  int64_t avail = ctx->reader->read_avail();
-  if (avail <= 0) {
-    *readbytes = 0;
-    return -1;
-  }
-
-  int64_t bytes_to_read = std::min<int64_t>(avail, outlen);
-  int64_t bytes_copied  = ctx->reader->read(out, bytes_to_read);
-
-  if (bytes_copied > 0) {
-    *readbytes = bytes_copied;
-    return 1;
-  } else {
-    *readbytes = 0;
-    return 0;
-  }
-}
-*/
 static int
 miobuffer_read_ex(BIO *bio, char *out, size_t outlen, size_t *readbytes)
 {

@@ -684,7 +684,8 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
   int signalled = 0;
 
   // signal write ready to allow user to fill the buffer
-  if (towrite != ntodo && (!buf.writer()->high_water() || towrite == 0)) {
+  // if (towrite != ntodo && (!buf.writer()->high_water() || towrite == 0)) {
+  if (towrite != ntodo && !buf.writer()->high_water()) {
     if (write_signal_and_update(VC_EVENT_WRITE_READY, this) != EVENT_CONT) {
       return;
     } else if (c != s->vio.cont) { /* The write vio was updated in the handler */
