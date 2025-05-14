@@ -65,7 +65,7 @@ thread_alloc(CAlloc &a, ProxyAllocator &l, Args &&...args)
   return a.alloc(std::forward<Args>(args)...);
 }
 
-// For allocators that are not ClassAllocators, e.g. ???
+// For allocators that are not ClassAllocators, e.g. hdrHeapAllocator, strHeapAllocator
 void *thread_alloc(Allocator &a, ProxyAllocator &l);
 void  thread_freeup(Allocator &a, ProxyAllocator &l);
 
