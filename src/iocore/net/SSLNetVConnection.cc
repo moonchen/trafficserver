@@ -539,6 +539,7 @@ SSLNetVConnection::_trigger_ssl_read()
       break;
     case SSL_WAIT_FOR_HOOK:
       Dbg(dbg_ctl_ssl, "ssl wait for hook for vc %p", this);
+      break;
     case SSL_WAIT_FOR_ASYNC:
       Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
       break;
@@ -587,6 +588,7 @@ SSLNetVConnection::_trigger_ssl_read()
   case SSL_WRITE_WOULD_BLOCK:
     _transport_write_vio->reenable();
     Dbg(dbg_ctl_ssl, "read finished - would block - need write");
+    break;
   case SSL_READ_WOULD_BLOCK:
     _transport_read_vio->reenable();
     Dbg(dbg_ctl_ssl, "read finished - would block - need read");
@@ -2234,7 +2236,10 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
 int
 SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
 {
-  ink_release_assert(vio == _transport_write_vio);
+  ink_assert(vio == _transport_write_vio);
+  ink_assert(vio->mutex->thread_holding == this_ethread());
+  ink_assert(vio->buffer.reader() == _write_buf_reader.get());
+
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
 
   if (_sslState == SslState::HANDSHAKE_IN_PROGRESS) {
@@ -2260,13 +2265,17 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     return EVENT_DONE;
   }
 
-  int64_t ntodo = _user_write_vio.ntodo();
+  int64_t ntodo   = _user_write_vio.ntodo();
+  int64_t towrite = _write_buf_reader->read_avail();
+  if (towrite > ntodo) {
+    towrite = ntodo;
+  }
 
   // Give user a chance to fill buffer
   bool signalled_ready = false;
   // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
   // SSL transport is unable to send.
-  if (ntodo > 0) {
+  if (towrite != ntodo && !_write_buf->high_water()) {
     if (_signal_user(SignalSide::WRITE, VC_EVENT_WRITE_READY) == EVENT_DONE) {
       // User closed connection in the handler
       return EVENT_DONE;
