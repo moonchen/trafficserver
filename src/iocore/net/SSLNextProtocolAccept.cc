@@ -130,7 +130,13 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
   switch (event) {
   case NET_EVENT_ACCEPT: {
     ink_release_assert(netvc != nullptr);
-    SSLNetVConnection *ssl_netvc = static_cast<SSLNetVConnection *>(ssl_NetProcessor.allocate_vc_with_unvc(this_ethread(), netvc));
+    SSLNetVConnection *ssl_netvc = static_cast<SSLNetVConnection *>(ssl_NetProcessor.allocate_vc(this_ethread()));
+    if (ssl_netvc == nullptr) {
+      // We are out of memory, close the connection
+      Error("SSLNextProtocolAccept: out of memory for SSLNetVConnection");
+      netvc->do_io_close();
+      return EVENT_DONE;
+    }
     ssl_netvc->set_remote_addr(netvc->get_remote_addr());
     ssl_netvc->set_is_transparent(netvc->get_is_transparent());
     ssl_netvc->set_is_proxy_protocol(netvc->get_is_proxy_protocol());

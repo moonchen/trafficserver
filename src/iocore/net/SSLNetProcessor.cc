@@ -21,6 +21,7 @@
 
 #include "P_SSLUtils.h"
 #include "P_OCSPStapling.h"
+#include "P_UnixNet.h"
 #include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
 #include "SSLStats.h"
@@ -29,6 +30,8 @@
 #include "P_SSLNetVConnection.h"
 #include "P_SSLClientCoordinator.h"
 #include "P_SSLConfig.h"
+#include "iocore/eventsystem/Action.h"
+#include "iocore/net/NetVConnection.h"
 
 //
 // Global Data
@@ -88,14 +91,14 @@ SSLNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 }
 
 SSLNetVConnection *
-SSLNetProcessor::allocate_vc_with_unvc(EThread *t, UnixNetVConnection *unvc)
+SSLNetProcessor::allocate_vc(EThread *t)
 {
   SSLNetVConnection *vc;
 
   if (t) {
-    vc = THREAD_ALLOC_INIT(sslNetVCAllocator, t, unvc);
+    vc = THREAD_ALLOC_INIT(sslNetVCAllocator, t);
   } else {
-    if (likely(vc = sslNetVCAllocator.alloc(unvc))) {
+    if (likely(vc = sslNetVCAllocator.alloc())) {
       vc->from_accept_thread = true;
     }
   }
@@ -110,7 +113,16 @@ SSLNetProcessor::~SSLNetProcessor() {}
 Action *
 SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &opt)
 {
-  Action *action = UnixNetProcessor::connect_re(cont, target, opt);
-  // TODO: need to connect an SSLNetVConnection to this resultant UnixNetVConnection.
+  SSLNetVConnection *ssl_netvc = static_cast<SSLNetVConnection *>(ssl_NetProcessor.allocate_vc(nullptr));
+  if (ssl_netvc == nullptr) {
+    Error("SSLNetProcessor: out of memory for SSLNetVConnection");
+    return ACTION_RESULT_DONE;
+  }
+  ssl_netvc->set_remote_addr(target);
+  ssl_netvc->options = opt;
+  ssl_netvc->set_context(NET_VCONNECTION_OUT);
+  ssl_netvc->set_action(cont);
+  ssl_netvc->mutex = cont->mutex;
+  Action *action   = unix_netProcessor.connect_re(ssl_netvc, target, opt);
   return action;
 }

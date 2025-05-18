@@ -24,6 +24,7 @@
 #include "P_Net.h"
 #include "P_NetAccept.h"
 #include "P_UnixNet.h"
+#include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
 #include "iocore/net/ConnectionTracker.h"
 #include "iocore/net/NetHandler.h"
@@ -1298,7 +1299,7 @@ UnixNetVConnection::migrateToCurrentThread(Continuation *cont, EThread *t)
   this->ep.stop();
 
   // Create new VC:
-  UnixNetVConnection *newvc = static_cast<UnixNetVConnection *>(this->_getNetProcessor()->allocate_vc(t));
+  UnixNetVConnection *newvc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(t));
   ink_assert(newvc != nullptr);
   if (newvc->populate(hold_con, cont, arg) != EVENT_DONE) {
     newvc->do_io_close();
@@ -1318,12 +1319,6 @@ void *
 UnixNetVConnection::_prepareForMigration()
 {
   return nullptr;
-}
-
-NetProcessor *
-UnixNetVConnection::_getNetProcessor()
-{
-  return &netProcessor;
 }
 
 void

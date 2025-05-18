@@ -24,6 +24,7 @@
 #include "P_NetAccept.h"
 #include "P_Net.h"
 #include "P_UnixNet.h"
+#include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
 #include "iocore/net/ConnectionTracker.h"
 #include "iocore/net/NetHandler.h"
@@ -124,7 +125,7 @@ net_accept(NetAccept *na, void *ep, bool blockable)
       continue;
     }
 
-    vc = static_cast<UnixNetVConnection *>(na->getNetProcessor()->allocate_vc(e->ethread));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(e->ethread));
     if (!vc) {
       goto Ldone; // note: @a con will clean up the socket when it goes out of scope.
     }
@@ -411,7 +412,7 @@ NetAccept::do_blocking_accept(EThread *t)
     Metrics::Counter::increment(net_rsb.tcp_accept);
 
     // Use 'nullptr' to Bypass thread allocator
-    vc = static_cast<UnixNetVConnection *>(this->getNetProcessor()->allocate_vc(nullptr));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(nullptr));
     if (unlikely(!vc)) {
       return -1;
     }
@@ -579,7 +580,7 @@ NetAccept::acceptFastEvent(int event, void *ep)
       goto Lerror;
     }
 
-    vc = static_cast<UnixNetVConnection *>(this->getNetProcessor()->allocate_vc(e->ethread));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(e->ethread));
     ink_release_assert(vc);
     vc->enable_inbound_connection_tracking(conn_track_group);
 

@@ -448,6 +448,8 @@ SSLNetVConnection::_trigger_ssl_read()
 
   // Continue on if we are still in the handshake
   if (!getSSLHandShakeComplete()) {
+    this->_trackFirstHandshake();
+
     int err = 0;
 
     if (get_context() == NET_VCONNECTION_OUT) {
@@ -759,7 +761,7 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
   return num_really_written;
 }
 
-SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc)
+SSLNetVConnection::SSLNetVConnection()
   : _ssl{nullptr, SSL_free},
     _read_buf{make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer)},
     _write_buf{make_resource(new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index), free_MIOBuffer)},
@@ -775,7 +777,6 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc)
   this->_set_service(static_cast<TLSSNISupport *>(this));
   this->_set_service(static_cast<TLSSessionResumptionSupport *>(this));
   this->_set_service(static_cast<TLSTunnelSupport *>(this));
-  this->_unvc = unvc;
   SET_HANDLER(&SSLNetVConnection::startEvent);
 }
 
@@ -821,37 +822,6 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 
   // TODO: do_io_read and do_io_write on the remaining bytes
   // do_io_close() on the unvc will happen when SSL data has fully finished
-}
-
-void
-SSLNetVConnection::clear()
-{
-  _ca_cert_file.reset();
-  _ca_cert_dir.reset();
-
-  // SSL_SESSION_free() must only be called for SSL_SESSION objects,
-  // for which the reference count was explicitly incremented (e.g.
-  // by calling SSL_get1_session(), see SSL_get_session(3)) or when
-  // the SSL_SESSION object was generated outside a TLS handshake
-  // operation, e.g. by using d2i_SSL_SESSION(3). It must not be called
-  // on other SSL_SESSION objects, as this would cause incorrect
-  // reference counts and therefore program failures.
-  // Since we created the shared pointer with a custom deleter,
-  // resetting here will decrement the ref-counter.
-  client_sess.reset();
-
-  _ssl = nullptr;
-
-  ALPNSupport::clear();
-  TLSBasicSupport::clear();
-  TLSEventSupport::clear();
-  TLSSessionResumptionSupport::clear();
-  TLSSNISupport::_clear();
-  TLSTunnelSupport::_clear();
-  TLSCertSwitchSupport::_clear();
-
-  hookOpRequested = SslVConnOp::SSL_HOOK_OP_DEFAULT;
-  free_handshake_buffers();
 }
 
 void
@@ -902,7 +872,52 @@ SSLNetVConnection::~SSLNetVConnection()
   _early_data_buf    = nullptr;
 #endif
 
-  clear();
+  // clear variables for reuse
+  this->mutex.clear();
+  _action.mutex.clear();
+  _user_read_vio.mutex.clear();
+  _user_read_vio.cont = nullptr;
+  _user_write_vio.mutex.clear();
+  _user_write_vio.cont = nullptr;
+  if (netvc_context == NET_VCONNECTION_OUT) {
+    _user_read_vio.buffer.clear();
+    _user_write_vio.buffer.clear();
+  }
+  got_remote_addr = false;
+  got_local_addr  = false;
+  attributes      = 0;
+  options.reset();
+  _sslState = SslState::INIT;
+
+  netvc_context = NET_VCONNECTION_UNSET;
+  ink_assert(!link.next && !link.prev);
+
+  _ca_cert_file.reset();
+  _ca_cert_dir.reset();
+
+  // SSL_SESSION_free() must only be called for SSL_SESSION objects,
+  // for which the reference count was explicitly incremented (e.g.
+  // by calling SSL_get1_session(), see SSL_get_session(3)) or when
+  // the SSL_SESSION object was generated outside a TLS handshake
+  // operation, e.g. by using d2i_SSL_SESSION(3). It must not be called
+  // on other SSL_SESSION objects, as this would cause incorrect
+  // reference counts and therefore program failures.
+  // Since we created the shared pointer with a custom deleter,
+  // resetting here will decrement the ref-counter.
+  client_sess.reset();
+
+  _ssl = nullptr;
+
+  ALPNSupport::clear();
+  TLSBasicSupport::clear();
+  TLSEventSupport::clear();
+  TLSSessionResumptionSupport::clear();
+  TLSSNISupport::_clear();
+  TLSTunnelSupport::_clear();
+  TLSCertSwitchSupport::_clear();
+
+  hookOpRequested = SslVConnOp::SSL_HOOK_OP_DEFAULT;
+  free_handshake_buffers();
 }
 
 int
@@ -2242,14 +2257,44 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
 
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
 
-  if (_sslState == SslState::HANDSHAKE_IN_PROGRESS) {
-    // FIXME: continue handshake
-    return EVENT_CONT;
-  }
-
   MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
   if (!lock.is_locked()) {
     _transport_write_vio->reenable(); // Retry later
+    return EVENT_CONT;
+  }
+
+  if (!this->getSSLHandShakeComplete()) {
+    this->_trackFirstHandshake();
+
+    int err, ret;
+
+    if (this->get_context() == NET_VCONNECTION_OUT) {
+      ret = this->sslStartHandShake(SSL_EVENT_CLIENT, err);
+    } else {
+      ret = this->sslStartHandShake(SSL_EVENT_SERVER, err);
+    }
+
+    if (ret == EVENT_ERROR) {
+      lerrno = err;
+      _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+      _sslState = SslState::ERROR;
+      return EVENT_DONE;
+    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+      _transport_read_vio->reenable();
+    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
+      _transport_write_vio->reenable();
+    } else if (ret == EVENT_DONE) {
+      // If this was driven by a zero length read, signal complete when
+      // the handshake is complete. Otherwise set up for continuing read
+      // operations.
+      if (_user_write_vio.ntodo() <= 0) {
+        // Read side is on purpose
+        _signal_user(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
+      }
+    } else {
+      _transport_write_vio->reenable();
+    }
+
     return EVENT_CONT;
   }
 
@@ -2370,9 +2415,9 @@ SSLNetVConnection::acceptEvent(int event, void *data)
   MUTEX_TRY_LOCK(trylock, this->mutex, this_ethread());
   if (!trylock.is_locked()) {
     this_ethread()->schedule_in(this, net_retry_delay);
+    return EVENT_CONT;
   }
   SET_HANDLER(&SSLNetVConnection::startEvent);
-
   return handleEvent(event, data);
 }
 
@@ -2380,7 +2425,14 @@ int
 SSLNetVConnection::startEvent(int event, void *data)
 {
   UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
-  thread                   = this_ethread();
+
+  this->thread = this_ethread();
+  if (_action.cancelled) {
+    unvc->action_.cancel_action(this);
+    this->free_thread(this->thread);
+    return EVENT_DONE;
+  }
+
   switch (event) {
   case NET_EVENT_OPEN:
   case NET_EVENT_ACCEPT:
@@ -2388,12 +2440,11 @@ SSLNetVConnection::startEvent(int event, void *data)
     // This is where we would set up the SSL context and start the handshake.
     _transport_state = TransportState::TRANSPORT_CONNECTED;
     ink_release_assert(unvc != nullptr);
-    ink_release_assert(_unvc == unvc);
-    SET_HANDLER(&SSLNetVConnection::mainEvent);
     ink_release_assert(_sslState == SslState::INIT);
+    this->_unvc = unvc;
+    SET_HANDLER(&SSLNetVConnection::mainEvent);
     _sslState = SslState::HANDSHAKE_WANTED;
     // Once the handshake starts, we will need to be ready to write
-    // _unvc->trapWriteBufferEmpty();
     _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
     if (_transport_write_vio == nullptr) {
       // Failed to create transport write VIO
@@ -2402,7 +2453,21 @@ SSLNetVConnection::startEvent(int event, void *data)
       _transport_state = TransportState::TRANSPORT_ERROR;
       return EVENT_DONE;
     }
+    // This should already be held by whoever requested the connect, so no blocking
+    if (_action.continuation->mutex != nullptr) {
+      MUTEX_TAKE_LOCK(_action.continuation->mutex, this_ethread());
+      _action.continuation->handleEvent(event, this);
+    } else {
+      _action.continuation->handleEvent(event, this);
+    }
     break;
+  case NET_EVENT_OPEN_FAILED: {
+    // Failed to establish TCP connection
+    int res = reinterpret_cast<intptr_t>(data);
+    lerrno  = -res;
+    _action.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    this->free_thread(thread);
+  } break;
   default:
     Warning("SSLNetVConnection %p: Unexpected event %d in startEvent", this, event);
     ink_assert(false);
@@ -2674,4 +2739,13 @@ SSLNetVConnection::set_mptcp_state()
 void
 SSLNetVConnection::handle_async_tls_ready()
 {
+}
+
+void
+SSLNetVConnection::_trackFirstHandshake()
+{
+  bool is_first = this->get_tls_handshake_begin_time() == 0;
+  if (is_first) {
+    this->_record_tls_handshake_begin_time();
+  }
 }

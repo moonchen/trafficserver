@@ -217,8 +217,7 @@ public:
   }
 
 private:
-  void         *_prepareForMigration();
-  NetProcessor *_getNetProcessor();
+  void *_prepareForMigration();
 
   bool _is_tunnel_endpoint{false};
 

@@ -23,7 +23,9 @@
  */
 
 #include "iocore/net/AsyncSignalEventIO.h"
+#include "tscore/Diags.h"
 #include "tscore/ink_assert.h"
+#include <cstdio>
 
 int
 AsyncSignalEventIO::start(EventLoop l, int fd, int events)
@@ -33,16 +35,18 @@ AsyncSignalEventIO::start(EventLoop l, int fd, int events)
 }
 
 void
-AsyncSignalEventIO::process_event(int /* flags ATS_UNUSED */)
+AsyncSignalEventIO::process_event([[maybe_unused]] int flags)
 {
-  [[maybe_unused]] ssize_t ret;
+  ssize_t ret;
+  ink_assert(flags & EVENTIO_READ);
 #if HAVE_EVENTFD
   uint64_t counter;
   ret = read(_fd, &counter, sizeof(uint64_t));
-  ink_assert(ret >= 0);
 #else
   char dummy[1024];
   ret = read(_fd, &dummy[0], 1024);
-  ink_assert(ret >= 0);
+  if (ret < 0) {
+    Error("AsyncSignalEventIO::process_event: read failed, errno = %d (%s)", errno, strerror(errno));
+  }
 #endif
 }

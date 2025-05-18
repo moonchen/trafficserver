@@ -38,7 +38,6 @@
  ****************************************************************************/
 #pragma once
 
-#include "iocore/net/ConnectionTracker.h"
 #include "iocore/net/Net.h"
 #include "iocore/net/NetProcessor.h"
 #include "iocore/net/NetAcceptEventIO.h"

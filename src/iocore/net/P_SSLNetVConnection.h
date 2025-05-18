@@ -125,10 +125,10 @@ private:
   {
     return state == SslState::CLOSED || state == SslState::ERROR;
   }
+  void _trackFirstHandshake();
 
 public:
   int  sslStartHandShake(int event, int &err);
-  void clear();
   void free_thread(EThread *t);
   UnixNetVConnection *
   getUnixNetVC() const
@@ -180,8 +180,7 @@ public:
   // only from the free list using NetVConnection::alloc(). //
   // The constructor is public just to avoid compile errors.//
   ////////////////////////////////////////////////////////////
-  explicit SSLNetVConnection(UnixNetVConnection *unvc);
-  SSLNetVConnection() = delete;
+  SSLNetVConnection();
   ~SSLNetVConnection() override;
 
   bool

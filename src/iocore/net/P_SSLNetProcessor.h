@@ -57,7 +57,7 @@ public:
   SSLNetProcessor();
   ~SSLNetProcessor() override;
 
-  SSLNetVConnection *allocate_vc_with_unvc(EThread *t, UnixNetVConnection *unvc);
+  SSLNetVConnection *allocate_vc(EThread *t) override;
 
   // noncopyable
   SSLNetProcessor(const SSLNetProcessor &)            = delete;
