@@ -149,7 +149,7 @@ usdt:*:trafficserver:milestone_ua_begin_write
  * arg0 = State*, arg1 = status_code (enum class HTTPStatus, int-sized).
  * We use arg1 directly — no DWARF/debug-info dependency.
  */
-uprobe:/opt/ats/bin/traffic_server:*HttpTransact*build_error_response*
+uprobe:*:*HttpTransact*build_error_response*
 {
   $status = (int16)arg1;
   if ($status == 502 || $status == 504) {
