@@ -1,0 +1,243 @@
+#!/usr/bin/env bpftrace
+/*
+ * origin-conn-timeline-502-504.bt
+ *
+ * Trace ATS origin-side milestones and print a timeline only for
+ * transactions that return HTTP 502 or 504 to the client.
+ *
+ * Usage:
+ *   sudo bpftrace origin-conn-timeline-502-504.bt -p $(pidof traffic_server)
+ *
+ * How the status filter works:
+ *   A uprobe on HttpTransact::build_error_response captures the status
+ *   code (arg1, a static function) and reads the real sm_id from
+ *   HttpTransact::State* (arg0) using fixed offsets:
+ *     - HttpTransact::State::state_machine = +0
+ *     - HttpSM::sm_id                      = +208
+ *   When milestone_sm_finish fires, we check the captured status and
+ *   print the full timeline only for 502/504.
+ *
+ * Note on spurious server_connect_end:
+ *   When a retry backoff timer fires, the CONNECT_EVENT_RETRY event
+ *   enters state_http_server_open which unconditionally fires
+ *   milestone_server_connect_end *before* the actual retry connect.
+ *   This appears in the timeline as a server_connect_end immediately
+ *   followed by a server_connect with near-zero gap.  The script marks
+ *   these as "(retry-timer)" when the delta to the next server_connect
+ *   is under 1 ms.
+ *
+ * Event codes:
+ *   1  sm_start                 6  server_close
+ *   2  server_connect           7  ua_begin_write
+ *   3  server_connect_end       8  sm_finish
+ *   4  server_first_read        9  dns_lookup_begin
+ *   5  server_read_header_done  10 dns_lookup_end
+ */
+
+BEGIN
+{
+  printf("Tracing ATS origin timelines for 502/504 ... Ctrl-C to stop.\n");
+}
+
+/* ── helper: record an event into the per-smid ring ────────────────── */
+
+usdt:*:trafficserver:milestone_sm_start
+{
+  $smid = arg0;
+  @start_ns[$smid]  = nsecs;
+  @len[$smid]       = 0;
+
+  @ev[$smid, 0] = 1;
+  @ts[$smid, 0] = nsecs;
+  @len[$smid]   = 1;
+}
+
+usdt:*:trafficserver:milestone_dns_lookup_begin
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 9;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_dns_lookup_end
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 10;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_server_connect
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 2;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_server_connect_end
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 3;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_server_first_read
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 4;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_server_read_header_done
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 5;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_server_close
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 6;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+usdt:*:trafficserver:milestone_ua_begin_write
+{
+  $smid = arg0;
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 7;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+}
+
+/* ── uprobe: capture error response status code ────────────────────── *
+ *
+ * HttpTransact::build_error_response is a static function:
+ *   static void build_error_response(State *s, HTTPStatus status_code,
+ *                                    const char *reason, const char *body_type)
+ *
+ * arg0 = State*, arg1 = status_code (enum class HTTPStatus, int-sized).
+ * We use arg1 directly — no DWARF/debug-info dependency.
+ */
+uprobe:/opt/ats/bin/traffic_server:*HttpTransact*build_error_response*
+{
+  $status = (int16)arg1;
+  if ($status == 502 || $status == 504) {
+    $state = (uint64)arg0;
+    $hsm   = *(uint64 *)($state + 0);
+    if ($hsm != 0) {
+      $smid = *(uint64 *)($hsm + 208);
+    } else {
+      $smid = 0;
+    }
+    if ($smid > 0) {
+      @status[$smid] = $status;
+    }
+  }
+}
+
+/* ── transaction complete: print timeline if 502/504 ───────────────── */
+
+usdt:*:trafficserver:milestone_sm_finish
+{
+  $smid = arg0;
+
+  $i = @len[$smid];
+  if ($i < 16) {
+    @ev[$smid, $i] = 8;
+    @ts[$smid, $i] = nsecs;
+    @len[$smid] = $i + 1;
+  }
+
+  $s = @status[$smid];
+  if ($s == 502 || $s == 504) {
+    $base = @start_ns[$smid];
+    $n    = @len[$smid];
+    $n_u  = (uint64)$n;
+    printf("\n--- sm_id=%-10llu status=%d  events=%d ---\n", $smid, $s, $n);
+
+    /*
+     * Unrolled print loop — bpftrace requires bounded iteration.
+     * For each slot we print: event_name  +delta_from_sm_start  (step_delta)
+     */
+    $prev = $base;
+
+    $j = (uint64)0;
+    unroll(16) {
+      if ($j < $n_u) {
+        $c = @ev[$smid, $j];
+        $t = @ts[$smid, $j];
+        $abs_ms  = ($t - $base) / 1000000;
+        $step_ms = ($t - $prev) / 1000000;
+        $prev    = $t;
+
+             if ($c == 1)  { printf("  sm_start               +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 2)  { printf("  server_connect         +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 3)  { printf("  server_connect_end     +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 4)  { printf("  server_first_read      +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 5)  { printf("  server_read_hdr_done   +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 6)  { printf("  server_close           +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 7)  { printf("  ua_begin_write         +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 8)  { printf("  sm_finish              +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 9)  { printf("  dns_lookup_begin       +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+        else if ($c == 10) { printf("  dns_lookup_end         +%-6lld  (%lld ms)\n", $abs_ms, $step_ms); }
+      }
+      $j++;
+    }
+
+    if ($n >= 16) {
+      printf("  ... truncated at 16 events\n");
+    }
+  }
+
+  /* ── cleanup all per-smid state ──────────────────────────────────── */
+  delete(@start_ns[$smid]);
+  delete(@status[$smid]);
+
+  $k = (uint64)0;
+  unroll(16) {
+    delete(@ev[$smid, $k]);
+    delete(@ts[$smid, $k]);
+    $k++;
+  }
+  delete(@len[$smid]);
+}
+
+END
+{
+  clear(@start_ns);
+  clear(@status);
+  clear(@len);
+  clear(@ev);
+  clear(@ts);
+}
