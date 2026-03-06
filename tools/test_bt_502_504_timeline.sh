@@ -39,15 +39,22 @@ HARNESS_LOG="${HARNESS_LOG:-/tmp/ats-origin-timeout-harness.log}"
 OK200_LOG="${OK200_LOG:-/tmp/ats-origin-ok200.log}"
 
 cleanup() {
-  if [[ -n "${BT_PID:-}" ]] && kill -0 "${BT_PID}" 2>/dev/null; then
-    kill -INT "${BT_PID}" 2>/dev/null || true
+  if [[ -n "${BT_PID:-}" ]]; then
+    echo signal bpftrace child first
+    if child="$(pgrep -P "${BT_PID}" bpftrace || true)"; then
+      [[ -n "$child" ]] && sudo kill -INT "$child" 2>/dev/null || true
+    fi
+    echo then sudo wrapper
+    sudo kill -INT "${BT_PID}" 2>/dev/null || true
     wait "${BT_PID}" 2>/dev/null || true
   fi
   if [[ -n "${HARNESS_PID:-}" ]] && kill -0 "${HARNESS_PID}" 2>/dev/null; then
+    echo kill harness
     kill "${HARNESS_PID}" 2>/dev/null || true
     wait "${HARNESS_PID}" 2>/dev/null || true
   fi
   if [[ -n "${OK200_PID:-}" ]] && kill -0 "${OK200_PID}" 2>/dev/null; then
+    echo kill 200 server
     kill "${OK200_PID}" 2>/dev/null || true
     wait "${OK200_PID}" 2>/dev/null || true
   fi
@@ -56,7 +63,7 @@ trap cleanup EXIT
 
 rm -f "${TRACE_OUT}" "${HARNESS_LOG}"
 
-# Start a local always-200 origin.
+echo Start a local always-200 origin.
 rm -f "${OK200_LOG}"
 python3 -m http.server "${OK200_PORT}" --bind "${OK200_HOST}" >"${OK200_LOG}" 2>&1 &
 OK200_PID=$!
@@ -75,7 +82,7 @@ sleep 1.5
 ok_200=0
 pids=()
 
-# Burst 200 requests (must all be 200 for this check to be meaningful).
+echo Burst 200 requests \(must all be 200 for this check to be meaningful\).
 for _ in $(seq 1 "${COUNT_200}"); do
   (
     code="$(curl -sS -o /dev/null -w '%{http_code}' "${URL_200}")"
@@ -88,7 +95,7 @@ for _ in $(seq 1 "${COUNT_200}"); do
   pids+=($!)
 done
 
-# Burst timeout paths in close succession.
+echo Burst timeout paths in close succession.
 for _ in $(seq 1 "${COUNT_502}"); do
   curl -sS -o /dev/null "${URL_502}" &
   pids+=($!)
@@ -107,24 +114,24 @@ for p in "${pids[@]}"; do
   fi
 done
 
-# Allow final sm_finish events to flush.
+echo Allow final sm_finish events to flush.
 sleep 2
 cleanup
 
-# 1) 200 filter check
+echo 1\) 200 filter check
 if grep -q "status=200" "${TRACE_OUT}"; then
   echo "FAIL: found status=200 timeline in bpftrace output" >&2
   exit 1
 fi
 
-# 2) close-succession activity check
+echo 2\) close-succession activity check
 timeline_lines="$(rg -c '^--- sm_id=' "${TRACE_OUT}" || true)"
 if [[ "${timeline_lines}" -lt 2 ]]; then
   echo "FAIL: expected multiple timelines from close-succession requests, got ${timeline_lines}" >&2
   exit 1
 fi
 
-# 3) 502/504 timeline coverage check
+echo 3\) 502/504 timeline coverage check
 lines_502="$(rg -c '^--- sm_id=.*status=502' "${TRACE_OUT}" || true)"
 lines_504="$(rg -c '^--- sm_id=.*status=504' "${TRACE_OUT}" || true)"
 if [[ "${lines_502}" -lt "${COUNT_502}" ]]; then

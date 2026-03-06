@@ -157,10 +157,6 @@ uprobe:/opt/ats/bin/traffic_server:*HttpTransact*build_error_response*
     $hsm   = *(uint64 *)($state + 0);
     if ($hsm != 0) {
       $smid = *(uint64 *)($hsm + 208);
-    } else {
-      $smid = 0;
-    }
-    if ($smid > 0) {
       @status[$smid] = $status;
     }
   }
@@ -221,13 +217,21 @@ usdt:*:trafficserver:milestone_sm_finish
   }
 
   /* ── cleanup all per-smid state ──────────────────────────────────── */
-  delete(@start_ns[$smid]);
-  delete(@status[$smid]);
+  if (has_key(@start_ns, $smid)) {
+    delete(@start_ns[$smid]);
+  }
+  if (has_key(@status, $smid)) {
+    delete(@status[$smid]);
+  }
 
   $k = (uint64)0;
   unroll(16) {
-    delete(@ev[$smid, $k]);
-    delete(@ts[$smid, $k]);
+    if (has_key(@ev, ($smid, $k))) {
+      delete(@ev[$smid, $k]);
+    }
+    if (has_key(@ts, ($smid, $k))) {
+      delete(@ts[$smid, $k]);
+    }
     $k++;
   }
   delete(@len[$smid]);
