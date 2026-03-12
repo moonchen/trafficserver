@@ -1283,6 +1283,13 @@ http_parser_parse_resp(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl *hh, const
     if (err == ParseResult::DONE) {
       err = validate_hdr_content_length(heap, hh);
     }
+    // If the scanner signals DONE but returned no data, the connection
+    // reached EOF without any response bytes. This is not a valid
+    // response — return ERROR so the caller treats it as a connection
+    // failure rather than a malformed response.
+    if (err == ParseResult::DONE && parsed.empty()) {
+      return ParseResult::ERROR;
+    }
     if ((err == ParseResult::DONE) || (err == ParseResult::CONT)) {
       return err;
     }
