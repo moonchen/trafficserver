@@ -2044,10 +2044,10 @@ HttpSM::state_read_server_response_header(int event, void *data)
   server_response_hdr_bytes += bytes_used;
 
   // Don't allow HTTP 0.9 (unparsable headers) on resued connections.
-  // And don't allow empty headers from closed connections
+  // And don't allow empty headers from closed connections.
   if ((state == ParseResult::DONE && t_state.hdr_info.server_response.version_get() == HTTP_0_9 &&
        server_txn->get_transaction_id() > 1) ||
-      (server_entry->eos && state == ParseResult::CONT)) { // No more data will be coming
+      (server_entry->eos && (state == ParseResult::CONT || server_response_hdr_bytes == 0))) { // No more data will be coming
     state = ParseResult::ERROR;
   }
   // Check to see if we are over the hdr size limit
