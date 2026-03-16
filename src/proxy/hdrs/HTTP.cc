@@ -1281,6 +1281,9 @@ http_parser_parse_resp(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl *hh, const
     }
     // Make sure the length headers are consistent
     if (err == ParseResult::DONE) {
+      if (hh->u.resp.m_status == 0) {
+        return ParseResult::ERROR;
+      }
       err = validate_hdr_content_length(heap, hh);
     }
     if ((err == ParseResult::DONE) || (err == ParseResult::CONT)) {
