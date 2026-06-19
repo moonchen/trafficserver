@@ -78,6 +78,7 @@
 #cmakedefine01 TS_HAS_TLS_KEYLOGGING
 
 #cmakedefine HAVE_BIO_METH_NEW 1
+#cmakedefine HAVE_BIO_METH_SET_WRITE_EX 1
 #cmakedefine HAVE_BIO_SET_DATA 1
 #cmakedefine HAVE_BIO_GET_DATA 1
 #cmakedefine HAVE_BIO_GET_SHUTDOWN 1

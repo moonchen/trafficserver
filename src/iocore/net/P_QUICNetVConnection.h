@@ -96,7 +96,7 @@ public:
   VIO    *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
   VIO    *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
   int     connectUp(EThread *t, int fd) override;
-  int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs) override;
+  int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written) override;
 
   // NetEvent
   virtual void net_read_io(NetHandler *nh) override;
@@ -137,7 +137,7 @@ public:
   int in_closed_queue = 0;
 
   // TLSEventSupport
-  void            reenable(int event) override;
+  void            reenable_with_event(int event) override;
   Continuation   *getContinuationForTLSEvents() override;
   EThread        *getThreadForTLSEvents() override;
   Ptr<ProxyMutex> getMutexForTLSEvents() override;

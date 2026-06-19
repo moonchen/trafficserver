@@ -1023,7 +1023,7 @@ ssl_callback_info(const SSL *ssl, int where, int ret)
 
   SSLNetVConnection *netvc = SSLNetVCAccess(ssl);
 
-  if (!netvc || netvc->ssl != ssl) {
+  if (!netvc || netvc->get_tls_handle() != ssl) {
     Dbg(dbg_ctl_ssl_error, "ssl_callback_info call back on stale netvc");
     return;
   }
@@ -2003,14 +2003,15 @@ get_sni_addr(SSL *ssl)
     if (sni_name) {
       sni_addr.assign(sni_name);
     } else {
-      int              sock_fd = SSL_get_fd(ssl);
-      sockaddr_storage addr;
-      socklen_t        addr_len = sizeof(addr);
-      if (sock_fd >= 0) {
-        getpeername(sock_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len);
-        if (addr.ss_family == AF_INET || addr.ss_family == AF_INET6) {
+      // The layered SSLNetVConnection drives the SSL through MIOBuffer-backed BIOs, so
+      // SSL_get_fd() returns -1 and getpeername() cannot be used. Fall back to the
+      // connection's already-resolved peer address (delegated to the inner transport VC).
+      SSLNetVConnection *netvc = SSLNetVCAccess(ssl);
+      if (netvc != nullptr) {
+        sockaddr const *peer = netvc->get_remote_addr();
+        if (peer != nullptr && (peer->sa_family == AF_INET || peer->sa_family == AF_INET6)) {
           char ip_addr[INET6_ADDRSTRLEN];
-          ats_ip_ntop(reinterpret_cast<sockaddr *>(&addr), ip_addr, INET6_ADDRSTRLEN);
+          ats_ip_ntop(peer, ip_addr, INET6_ADDRSTRLEN);
           sni_addr.assign(ip_addr);
         }
       }

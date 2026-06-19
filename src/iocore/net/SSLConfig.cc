@@ -60,6 +60,7 @@ int                SSLCertificateConfig::configid                    = 0;
 int                SSLTicketKeyConfig::configid                      = 0;
 int                SSLConfigParams::ssl_maxrecord                    = 0;
 int                SSLConfigParams::ssl_misc_max_iobuffer_size_index = 8;
+int                SSLConfigParams::ssl_write_buffer_water_mark      = 65536;
 bool               SSLConfigParams::ssl_allow_client_renegotiation   = false;
 bool               SSLConfigParams::ssl_ocsp_enabled                 = false;
 int                SSLConfigParams::ssl_ocsp_cache_timeout           = 3600;
@@ -73,6 +74,7 @@ size_t             SSLConfigParams::origin_session_cache_size        = 10240;
 init_ssl_ctx_func  SSLConfigParams::init_ssl_ctx_cb                  = nullptr;
 load_ssl_file_func SSLConfigParams::load_ssl_file_cb                 = nullptr;
 swoc::IPRangeSet  *SSLConfigParams::proxy_protocol_ip_addrs          = nullptr;
+int                SSLConfigParams::proxy_protocol_hdr_max_size      = 109;
 bool               SSLConfigParams::ssl_ktls_enabled                 = false;
 
 const uint32_t EARLY_DATA_DEFAULT_SIZE                         = 16384;
@@ -490,6 +492,8 @@ SSLConfigParams::initialize(ConfigContext ctx)
 
   ssl_handshake_timeout_in = RecGetRecordInt("proxy.config.ssl.handshake_timeout_in").value_or(0);
 
+  proxy_protocol_hdr_max_size = RecGetRecordInt("proxy.config.proxy_protocol.max_header_size").value_or(109);
+
   async_handshake_enabled = RecGetRecordInt("proxy.config.ssl.async.handshake.enabled").value_or(0);
   if (auto rec_str{RecGetRecordStringAlloc("proxy.config.ssl.engine.conf_file")}; rec_str) {
     engine_conf_file = ats_stringdup(rec_str);
@@ -572,6 +576,8 @@ SSLConfigParams::initialize(ConfigContext ctx)
   ssl_allow_client_renegotiation = RecGetRecordInt("proxy.config.ssl.allow_client_renegotiation").value_or(0);
 
   ssl_misc_max_iobuffer_size_index = RecGetRecordInt("proxy.config.ssl.misc.io.max_buffer_index").value_or(0);
+
+  ssl_write_buffer_water_mark = RecGetRecordInt("proxy.config.ssl.write_buffer_water_mark").value_or(65536);
 
   // Enable client regardless of config file settings as remap file
   // can cause HTTP layer to connect using SSL. But only if SSL

@@ -1223,6 +1223,12 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.ssl.max_record_size", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-16383]", RECA_NULL}
   ,
+  //# High-water mark (bytes) for the per-connection outbound ciphertext buffer. Encryption
+  //# yields once this much enciphered data is queued for the transport, bounding memory and
+  //# propagating backpressure. 0 keeps the buffer to roughly one TLS record.
+  {RECT_CONFIG, "proxy.config.ssl.write_buffer_water_mark", RECD_INT, "65536", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$",
+   RECA_NULL}
+  ,
   {RECT_CONFIG, "proxy.config.ssl.hsts_max_age", RECD_INT, "-1", RECU_DYNAMIC, RR_NULL, RECC_STR, "^-?[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.ssl.hsts_include_subdomains", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}

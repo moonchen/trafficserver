@@ -6246,7 +6246,13 @@ TSNetConnectTransparent(TSCont contp, sockaddr const *client_addr, sockaddr cons
 TSCont
 TSNetInvokingContGet(TSVConn conn)
 {
-  NetVConnection     *vc     = reinterpret_cast<NetVConnection *>(conn);
+  NetVConnection *vc = reinterpret_cast<NetVConnection *>(conn);
+  // NOTE: post-refactor an SSLNetVConnection is no longer a UnixNetVConnection,
+  // so this dynamic_cast yields null for an SSL VC and the function returns
+  // nullptr. No in-tree path hands a plugin an SSL outbound VC today (plugin
+  // connects route through unix_netProcessor), so this is latent. If a
+  // TLS-capable plugin connect API is added, give SSLNetVConnection a
+  // get_action() returning its own _action and branch here on the VC type.
   UnixNetVConnection *net_vc = dynamic_cast<UnixNetVConnection *>(vc);
   TSCont              ret    = nullptr;
   if (net_vc) {
@@ -7896,7 +7902,7 @@ public:
   int
   event_handler(int /* event ATS_UNUSED */, void *)
   {
-    m_tes->reenable(m_event);
+    m_tes->reenable_with_event(m_event);
     delete this;
     return 0;
   }
@@ -8366,9 +8372,10 @@ TSVConnProtocolDisable(TSVConn connp, const char *protocol_name)
 TSAcceptor
 TSAcceptorGet(TSVConn sslp)
 {
-  NetVConnection    *vc     = reinterpret_cast<NetVConnection *>(sslp);
-  SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(vc);
-  return ssl_vc ? reinterpret_cast<TSAcceptor>(ssl_vc->accept_object) : nullptr;
+  NetVConnection     *vc      = reinterpret_cast<NetVConnection *>(sslp);
+  SSLNetVConnection  *ssl_vc  = dynamic_cast<SSLNetVConnection *>(vc);
+  UnixNetVConnection *unix_vc = ssl_vc ? ssl_vc->getUnixNetVC() : nullptr;
+  return unix_vc ? reinterpret_cast<TSAcceptor>(unix_vc->accept_object) : nullptr;
 }
 
 TSAcceptor
@@ -8427,7 +8434,7 @@ TSVConnReenableEx(TSVConn vconn, TSEvent event)
     Ptr<ProxyMutex> m = tes->getMutexForTLSEvents();
     MUTEX_TRY_LOCK(trylock, m, eth);
     if (trylock.is_locked()) {
-      tes->reenable(event);
+      tes->reenable_with_event(event);
     } else {
       // We schedule the reenable to the home thread of ssl_vc.
       tes->getThreadForTLSEvents()->schedule_imm(new TSSslCallback(tes, event));

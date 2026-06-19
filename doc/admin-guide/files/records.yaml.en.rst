@@ -4202,6 +4202,21 @@ SSL Termination
   a single segment after ~1 second of inactivity and the record size ramping
   mechanism is repeated again.
 
+.. ts:cv:: CONFIG proxy.config.ssl.write_buffer_water_mark INT 65536
+   :reloadable:
+
+  High-water mark, in bytes, for the per-connection buffer of outbound
+  ciphertext awaiting transmission. While encrypting a response, |TS| stops
+  pulling more plaintext once at least this many bytes of enciphered data are
+  already queued for the transport, then resumes as that buffer drains. This
+  bounds the encrypted data held in memory per connection (to roughly this
+  value plus one TLS record) and propagates write backpressure to the data
+  producer instead of encrypting an entire large response into memory at once.
+
+  Larger values keep more data ready to send (smoothing throughput on
+  high-latency links) at the cost of memory per connection; a value of ``0``
+  keeps the buffer to roughly a single TLS record.
+
 .. ts:cv:: CONFIG proxy.config.ssl.origin_session_cache.enabled INT 1
 
    This configuration enables the SSL session cache for the origin server

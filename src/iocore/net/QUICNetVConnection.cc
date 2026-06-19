@@ -533,7 +533,7 @@ QUICNetVConnection::net_read_io(NetHandler * /* nh ATS_UNUSED */)
 
 int64_t
 QUICNetVConnection::load_buffer_and_write(int64_t /* towrite ATS_UNUSED */, MIOBufferAccessor & /* buf ATS_UNUSED */,
-                                          int64_t & /* total_written ATS_UNUSED */, int & /* needs ATS_UNUSED */)
+                                          int64_t & /* total_written ATS_UNUSED */)
 {
   return 0;
 }
@@ -766,7 +766,7 @@ QUICNetVConnection::get_quic_connection()
 }
 
 void
-QUICNetVConnection::reenable(int event)
+QUICNetVConnection::reenable_with_event(int event)
 {
   this->_is_verifying_cert = false;
 

@@ -19,7 +19,8 @@ add_library(
   inknet STATIC
   ALPNSupport.cc
   AsyncSignalEventIO.cc
-  BIO_fastopen.cc
+  AsyncTLSEventIO.cc
+  BIO_MIOBuffer.cc
   BoringSSLUtils.cc
   Connection.cc
   ConnectionTracker.cc
@@ -61,6 +62,7 @@ add_library(
   TLSSessionResumptionSupport.cc
   TLSSNISupport.cc
   TLSTunnelSupport.cc
+  TunnelNetVConnection.cc
   TLSCertCompression.cc
   UDPEventIO.cc
   UDPIOEvent.cc
@@ -195,6 +197,10 @@ if(BUILD_TESTING)
     # see remap_test_dlopen_leak_suppression.txt for more info.
     set_tests_properties(test_net PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_odr_violation=0")
   endif()
+
+  add_executable(test_BIO_MIOBuffer BIO_MIOBuffer.cc unit_tests/test_BIO_MIOBuffer.cc)
+  target_link_libraries(test_BIO_MIOBuffer PRIVATE ts::inkevent ts::tscore libswoc::libswoc Catch2::Catch2WithMain)
+  add_catch2_test(NAME test_BIO_MIOBuffer COMMAND test_BIO_MIOBuffer)
 endif()
 
 clang_tidy_check(inknet)

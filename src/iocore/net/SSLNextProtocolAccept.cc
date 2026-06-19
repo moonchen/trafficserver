@@ -21,8 +21,16 @@
   limitations under the License.
  */
 
+#include "P_SSLConfig.h"
+#include "P_SSLNetProcessor.h"
 #include "P_SSLNextProtocolAccept.h"
 #include "P_SSLNetVConnection.h"
+#include "P_UnixNetVConnection.h"
+#include "iocore/eventsystem/Continuation.h"
+#include "iocore/eventsystem/Lock.h"
+#include "iocore/net/Net.h"
+#include "iocore/net/NetVConnection.h"
+#include "tscore/ink_assert.h"
 
 namespace
 {
@@ -36,29 +44,6 @@ send_plugin_event(Continuation *plugin, int event, void *edata)
     plugin->handleEvent(event, edata);
   } else {
     plugin->handleEvent(event, edata);
-  }
-}
-
-SSLNetVConnection *
-ssl_netvc_cast(int event, void *edata)
-{
-  union {
-    VIO            *vio;
-    NetVConnection *vc;
-  } ptr;
-
-  switch (event) {
-  case NET_EVENT_ACCEPT:
-    ptr.vc = static_cast<NetVConnection *>(edata);
-    return dynamic_cast<SSLNetVConnection *>(ptr.vc);
-  case VC_EVENT_INACTIVITY_TIMEOUT:
-  case VC_EVENT_READ_COMPLETE:
-  case VC_EVENT_EOS:
-  case VC_EVENT_ERROR:
-    ptr.vio = static_cast<VIO *>(edata);
-    return dynamic_cast<SSLNetVConnection *>(ptr.vio->vc_server);
-  default:
-    return nullptr;
   }
 }
 
@@ -138,23 +123,44 @@ struct SSLNextProtocolTrampoline : public Continuation {
 int
 SSLNextProtocolAccept::mainEvent(int event, void *edata)
 {
-  SSLNetVConnection *netvc = ssl_netvc_cast(event, edata);
+  UnixNetVConnection *netvc = static_cast<UnixNetVConnection *>(edata);
 
   Dbg(dbg_ctl_ssl, "[SSLNextProtocolAccept:mainEvent] event %d netvc %p", event, netvc);
   switch (event) {
-  case NET_EVENT_ACCEPT:
+  case NET_EVENT_ACCEPT: {
     ink_release_assert(netvc != nullptr);
-
-    netvc->setTransparentPassThrough(transparent_passthrough);
-    netvc->setAllowPlain(allow_plain);
+    SSLNetVConnection *ssl_netvc = static_cast<SSLNetVConnection *>(ssl_NetProcessor.allocate_vc(this_ethread()));
+    if (ssl_netvc == nullptr) {
+      // We are out of memory, close the connection
+      Error("SSLNextProtocolAccept: out of memory for SSLNetVConnection");
+      netvc->do_io_close();
+      return EVENT_DONE;
+    }
+    ssl_netvc->set_remote_addr(netvc->get_remote_addr());
+    ssl_netvc->set_is_transparent(netvc->get_is_transparent());
+    ssl_netvc->set_is_proxy_protocol(netvc->get_is_proxy_protocol(), netvc->get_is_proxy_protocol_cp_src());
+    ssl_netvc->options = netvc->options;
+    ssl_netvc->set_context(NET_VCONNECTION_IN);
+    netvc->set_action(ssl_netvc);
+    ssl_netvc->setTransparentPassThrough(transparent_passthrough);
+    ssl_netvc->setAllowPlain(allow_plain);
+    ssl_netvc->mutex = netvc->mutex; // Tie the mutexes together for the entire protocol stack so handlers can take the fast path
 
     // Register our protocol set with the VC and kick off a zero-length read to
     // force the SSLNetVConnection to complete the SSL handshake. Don't tell
     // the endpoint that there is an accept to handle until the read completes
     // and we know which protocol was negotiated.
-    netvc->registerNextProtocolSet(&this->protoset, this->protoenabled);
-    netvc->do_io_read(new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer);
+    ssl_netvc->registerNextProtocolSet(&this->protoset, this->protoenabled);
+    // The VC mutex is already held by the accepting UnixNetVConnection for this whole synchronous
+    // chain; take it again (reentrant on the same thread) so the dispatch is explicitly
+    // under-lock. This replaces a trylock-and-defer fallback that could never fire under that
+    // held mutex (and would have double-dispatched -- scheduling acceptEvent and then also
+    // dispatching inline -- if it somehow had).
+    SCOPED_MUTEX_LOCK(lock, ssl_netvc->mutex, this_ethread());
+    ssl_netvc->handleEvent(NET_EVENT_ACCEPT, netvc);
+    ssl_netvc->do_io_read(new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer);
     return EVENT_CONT;
+  }
   default:
     if (netvc) {
       netvc->do_io_close();

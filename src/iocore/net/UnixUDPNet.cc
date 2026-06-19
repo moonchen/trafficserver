@@ -29,6 +29,7 @@
 
  ****************************************************************************/
 
+#include "iocore/net/ReadWriteEventIO.h"
 #if defined(darwin)
 /* This is for IPV6_PKTINFO and IPV6_RECVPKTINFO */
 #define __APPLE_USE_RFC_3542

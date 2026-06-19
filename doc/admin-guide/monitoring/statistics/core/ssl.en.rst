@@ -109,6 +109,13 @@ SSL/TLS
 .. ts:stat:: global proxy.process.ssl.ssl_origin_session_cache_timeout integer
    :type: counter
 
+.. ts:stat:: global proxy.process.ssl.origin_session_cross_thread_migration integer
+   :type: counter
+
+   The number of TLS origin connections migrated from the global server session
+   pool to the thread that reused them. See
+   :ts:cv:`proxy.config.http.server_session_sharing.pool`.
+
 .. ts:stat:: global proxy.process.ssl.ssl_session_cache_new_session integer
    :type: counter
 

@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with this
+# work for additional information regarding copyright ownership.  The ASF
+# licenses this file to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
+meta:
+  version: "1.0"
+
+# Each session is a separate HTTP/2 client connection to ATS. The origin speaks
+# HTTP/2 over TLS (the server-response version is 2). Many separate client
+# connections to a single keep-alive origin host let ATS pool the origin
+# session. Even with the global pool configured, HTTP/2 origin sessions are
+# pooled per-thread, so they are reused on their own thread and never take the
+# cross-thread migration path.
+sessions:
+- protocol:
+    stack: http2
+    tls:
+      sni: example.com
+  transactions:
+  - client-request:
+      headers:
+        fields:
+        - [ :method, GET ]
+        - [ :scheme, https ]
+        - [ :authority, example.com ]
+        - [ :path, / ]
+        - [ uuid, "1" ]
+    proxy-response:
+      status: 200
+    server-response:
+      version: "2"
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, "10" ]

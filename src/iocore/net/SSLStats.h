@@ -69,6 +69,7 @@ struct SSLStatsBlock {
   Metrics::Counter::AtomicType *origin_session_cache_hit                       = nullptr;
   Metrics::Counter::AtomicType *origin_session_cache_miss                      = nullptr;
   Metrics::Counter::AtomicType *origin_session_cache_timeout                   = nullptr;
+  Metrics::Counter::AtomicType *origin_session_cross_thread_migration          = nullptr;
   Metrics::Counter::AtomicType *origin_session_reused_count                    = nullptr;
   Metrics::Counter::AtomicType *session_cache_eviction                         = nullptr;
   Metrics::Counter::AtomicType *session_cache_hit                              = nullptr;

@@ -101,7 +101,7 @@ ServerSessionPool::validate_host_sni(HttpSM *sm, NetVConnection *netvc)
         // name (if present) matches the request hostname
         auto req_host{sm->t_state.hdr_info.server_request.host_get()};
         retval = strncasecmp(session_sni, req_host.data(), req_host.length()) == 0;
-        Dbg(dbg_ctl_http_ss, "validate_host_sni host=%*.s, sni=%s", static_cast<int>(req_host.length()), req_host.data(),
+        Dbg(dbg_ctl_http_ss, "validate_host_sni host=%.*s, sni=%s", static_cast<int>(req_host.length()), req_host.data(),
             session_sni);
       }
     } else {
@@ -466,16 +466,18 @@ HttpSessionManager::_acquire_session(sockaddr const *ip, CryptoHash const &hostn
         // At this point to_return has been removed from the pool. Do we need to move it
         // to the same thread?
         if (to_return) {
-          UnixNetVConnection *server_vc = dynamic_cast<UnixNetVConnection *>(to_return->get_netvc());
+          NetVConnection *server_vc = to_return->get_netvc();
           if (server_vc) {
             // Disable i/o on this vc now, but, hold onto the g_pool cont
             // and the mutex to stop any stray events from getting in
             server_vc->do_io_read(m_g_pool, 0, nullptr);
             server_vc->do_io_write(m_g_pool, 0, nullptr);
-            UnixNetVConnection *new_vc = server_vc->migrateToCurrentThread(sm, ethread);
-            // The VC moved, free up the original one
+            NetVConnection *new_vc = server_vc->migrateToCurrentThread(sm, ethread);
+            // The VC moved, free up the original one. new_vc is either nullptr (migration
+            // declined/failed) or a freshly migrated VC on this thread. (Master asserts
+            // new_vc->nh != nullptr here, but nh is not reachable through the NetVConnection*
+            // type this branch now uses to also cover layered SSL VCs.)
             if (new_vc != server_vc) {
-              ink_assert(new_vc == nullptr || new_vc->nh != nullptr);
               if (!new_vc) {
                 // Close out to_return, we were't able to get a connection
                 Metrics::Counter::increment(http_rsb.origin_shutdown_migration_failure);

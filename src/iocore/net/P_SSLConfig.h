@@ -111,6 +111,7 @@ struct SSLConfigParams : public ConfigInfo {
 
   static int  ssl_maxrecord;
   static int  ssl_misc_max_iobuffer_size_index;
+  static int  ssl_write_buffer_water_mark;
   static bool ssl_allow_client_renegotiation;
 
   static bool  ssl_ocsp_enabled;
@@ -126,6 +127,7 @@ struct SSLConfigParams : public ConfigInfo {
   static size_t origin_session_cache_size;
 
   static swoc::IPRangeSet *proxy_protocol_ip_addrs;
+  static int               proxy_protocol_hdr_max_size;
 
   static init_ssl_ctx_func  init_ssl_ctx_cb;
   static load_ssl_file_func load_ssl_file_cb;

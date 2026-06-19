@@ -202,6 +202,7 @@ cmake-build-*
 tests/env-test/
 tests/proxy-verifier
 tests/Pipfile.lock
+tests/uv.lock
 tests/gold_tests/bigobj/check_ramp
 tests/gold_tests/bigobj/push_request
 tests/gold_tests/chunked_encoding/smuggle-client

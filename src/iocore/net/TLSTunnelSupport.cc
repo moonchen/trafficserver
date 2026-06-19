@@ -82,6 +82,16 @@ TLSTunnelSupport::set_tunnel_destination(const std::string_view &destination, SN
   }
 }
 
+void
+TLSTunnelSupport::copy_tunnel_destination_from(const TLSTunnelSupport &src)
+{
+  _tunnel_host     = src._tunnel_host;
+  _tunnel_port     = src._tunnel_port;
+  _tunnel_type     = src._tunnel_type;
+  _tunnel_prewarm  = src._tunnel_prewarm;
+  _port_is_dynamic = src._port_is_dynamic;
+}
+
 PreWarm::SPtrConstDst
 TLSTunnelSupport::create_dst(int pid) const
 {
