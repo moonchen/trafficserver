@@ -166,6 +166,48 @@ and the stop flag must be acquire/release, not relaxed, so the join→stop chain
 gives TSan the happens-before edge for the io_uring path, whose kernel-side pipe
 reads are invisible to TSan's interceptors.)
 
+## Test matrix
+
+Correctness here depends on *which* engine and *which* sanitizer you run under,
+so testing is a grid, not a single command. The machinery makes the grid
+first-class.
+
+- **Backends** are swept automatically. Each test executable takes the backend
+  (`epoll` / `uring`) as `argv[1]`; CTest registers one test per available
+  backend. io_uring tests appear wherever liburing is found and are simply absent
+  where it is not — you never name backends by hand.
+- **Sanitizers** are a build-level axis: `-DSANITIZER=none|asan|tsan`. Each variant
+  knows how to fail a test (a regex over the output: `ThreadSanitizer`,
+  `AddressSanitizer`, `runtime error`, …) and sets the env that makes the
+  sanitizer abort on error.
+
+Sweep everything in one shot:
+
+```sh
+./run-matrix.sh                 # {none,asan,tsan} x {epoll,uring}, prints a summary
+./run-matrix.sh --repeat 20     # run each test up to 20x — race hunting under TSan
+./run-matrix.sh --sanitizers none,tsan
+./run-matrix.sh -L backend=uring        # pass-through ctest label filter
+```
+
+Or drive one configuration directly:
+
+```sh
+cmake -B build-tsan -DSANITIZER=tsan && cmake --build build-tsan
+ctest --test-dir build-tsan --output-on-failure
+```
+
+Adding a future test is **one line** in `CMakeLists.txt` — it is then run across
+the whole backend × sanitizer grid for free:
+
+```cmake
+coro_add_matrix_test(<target> "<success-marker-regex>")
+```
+
+The current grid is `{none, asan, tsan} × {coro_net, coro_net_mt} × {epoll, uring}`
+= 12 invocations, all green. (The harness is self-checked: breaking a success
+marker fails the run, and an injected cross-thread resume is caught under TSan.)
+
 ## What this spike deliberately leaves out
 
 It is an architecture probe, not a net stack. Out of scope (and exactly the work
