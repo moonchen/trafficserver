@@ -40,6 +40,7 @@
 #if TS_USE_LINUX_IO_URING
 
 #include "P_UnixNetVConnection.h"
+#include "iocore/io_uring/Coroutine.h"
 
 class IOUringNetVConnection : public UnixNetVConnection
 {
@@ -52,6 +53,34 @@ public:
   // Return the object to this subclass's own allocator. The base's free_thread
   // hardcodes netVCAllocator, which is sized/typed for UnixNetVConnection.
   void free_thread(EThread *t) override;
+
+  // The read path is driven by io_uring instead of a synchronous recvmsg on
+  // epoll readiness: net_read_io submits an asynchronous recvmsg and returns;
+  // the completion (drained by IOUringContext::service() on this EThread) fills
+  // the buffer and signals the VIO. The epoll-readiness trigger is reused as-is.
+  void net_read_io(NetHandler *nh) override;
+
+  // If a recvmsg is in flight, cancel it and defer teardown until the (cancelled)
+  // completion resumes the read coroutine --- freeing now would resume into a
+  // freed `this` (the net-iouring branch's use-after-free).
+  void do_io_close(int lerrno = -1) override;
+
+private:
+  // The asynchronous read: builds the iovec from the read VIO buffer, awaits one
+  // io_uring recvmsg, then fills + signals. Fire-and-forget (DetachedTask); its
+  // frame self-cleans at completion.
+  ts::iouring::DetachedTask _read();
+
+  // Reimplementations of the file-static read_signal_* helpers in
+  // UnixNetVConnection.cc (not visible here). Same recursion/closed/free contract.
+  int _read_signal_and_update(int event);
+  int _read_signal_done(int event);
+
+  // The in-flight recvmsg op, reachable for cancellation. Its address is the SQE
+  // user_data; non-null only while a recv is actually in flight.
+  IOUringCompletionHandler *_read_op          = nullptr;
+  bool                      _read_closing     = false;
+  int                       _read_close_errno = -1;
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
