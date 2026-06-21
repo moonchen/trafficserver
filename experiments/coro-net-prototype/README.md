@@ -220,6 +220,16 @@ The current grid is `{none, asan, tsan} × {coro_net, coro_net_mt} × {epoll, ur
 = 12 invocations, all green. (The harness is self-checked: breaking a success
 marker fails the run, and an injected cross-thread resume is caught under TSan.)
 
+## Driving this inside ATS
+
+The toy `Reactor` here stands in for an ATS `ET_NET` thread. ATS already runs the
+exact machinery a coroutine pump needs — a `thread_local` io_uring ring per net
+thread (`IOUringContext`, from the merged disk-AIO work), drained every loop
+iteration by `NetHandler::waitForActivity`. See **[ATS-INTEGRATION.md](ATS-INTEGRATION.md)**
+for the precise prototype→ATS mapping and a concrete `UringOp` awaitable that
+plugs a coroutine into the existing `IOUringContext::service()` dispatch — no new
+thread, no new loop.
+
 ## What this spike deliberately leaves out
 
 It is an architecture probe, not a net stack. Out of scope (and exactly the work
