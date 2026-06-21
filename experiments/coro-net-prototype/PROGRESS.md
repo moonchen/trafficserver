@@ -89,33 +89,42 @@ traffic-replay microserver ... `), put its bin on PATH (so the spawned
 `microserver` is found), and run `autest run -D gold_tests --ats-bin
 /tmp/ats-dev/bin --build-root build-dev --sandbox <dir> -f io_uring_netvc`.
 
-## Phase 2B — swap the read path to io_uring recvmsg — NEXT (the deep step)
+## Phase 2B — swap the read path to io_uring recvmsg — DONE (bounded first cut)
 
-The seam is `net_read_io` (UnixNetVConnection.cc): it builds an iovec from the
-read MIOBuffer's write blocks and does a synchronous `con.sock.recvmsg`, then
-fills + signals the read VIO. Reads are *triggered* by epoll readiness
-(`reenable` → `ep.modify(EVENTIO_READ)` → `read_ready_list` → `net_read_io`).
+The seam was `net_read_io` (a synchronous `con.sock.recvmsg`, triggered by epoll
+readiness). `IOUringNetVConnection` now overrides it to submit an asynchronous
+recvmsg via the coroutine runtime; the completion (drained by
+`IOUringContext::service()` on the owning EThread) fills the buffer and signals
+the read VIO. What landed (`src/iocore/net/IOUringNetVConnection.{cc,h}`, 3
+commits):
 
-Converting to io_uring is not a one-liner because it changes the control model
-(completion- vs readiness-driven). The hard problems to design for:
-1. **Trigger.** Either keep the epoll-readiness trigger and only async-ify the
-   recvmsg (submit on EPOLLIN, signal from the completion) — simplest first cut,
-   reuses the enable/backpressure machinery — or go fully completion-driven and
-   suppress epoll read interest (`ep.modify(EVENTIO_READ)`) entirely.
-2. **VIO mutex under async completion.** `net_read_io` holds `read.vio.mutex`
-   across the (synchronous) read+signal. With an async recv the mutex can only be
-   taken *after* the completion resumes; rely on thread-confinement so it is
-   uncontended (the coroutine resumes on the owning EThread under the NetHandler
-   mutex, via `IOUringContext::service()` in `waitForActivity`).
-3. **Backpressure / re-arm.** Stop reading when the buffer is full; re-arm on
-   reenable. A restart-per-episode coroutine (start on reenable, exit when it
-   can't progress) avoids a persistent parked coroutine.
-4. **Teardown re-entrancy.** A read signal can close (free) the VC; and
-   `do_io_close` may fire with a recv in flight. Use cancel-then-unwind
-   (`UringCancel` the in-flight recv, let the read coroutine unwind, free after) —
-   exactly what the Phase-1 runtime + the prototype were built for.
+- **Bounded first cut: keep the epoll-readiness trigger**, only async-ify the
+  recvmsg. Reuses the inherited enable/backpressure/reenable machinery and the
+  write path unchanged.
+- **Edge-triggered drain loop.** The net poll set is `EPOLLIN | EPOLLET`, so the
+  read coroutine drains the socket per trigger (loops recvmsg until a short read,
+  a full buffer, or the VIO is satisfied). A single read per trigger stalls — the
+  load test caught exactly this (curl error 18 + 30 s hang) before the fix.
+- **VIO mutex post-completion.** The mutex is taken only after the recv resumes;
+  thread-confinement keeps it uncontended. The buffer/msghdr/iovec live in the
+  coroutine frame, pinned across the await.
+- **Teardown = cancel-then-unwind.** `do_io_close` with a recv in flight cancels
+  the op and defers the free to the resuming coroutine (which frees once no op is
+  in flight); the `read_signal_*`/recursion contract (reimplemented, since the
+  base helpers are file-static) handles a close fired from inside a read signal.
+- **Resolver-macro fix.** `UringOp::_res` → `_result` (glibc `<resolv.h>` defines
+  `_res`, pulled in via the net layer's `ink_sock.h`).
 
-The Phase-2A autest is the regression guard across this swap.
+**Verified:** `io_uring_netvc` (basic) and `io_uring_read` (256 KB drain loop +
+`wrk -t4 -c64 -d15s` load) both pass on Debug **and ASan** with zero ASan errors.
+Load: ~1.75 M requests / 418 GB in 15 s, 0 socket errors, 0 non-2xx — the read
+and close paths are clean under heavy connection churn.
+
+**Known limits of the first cut (later work):** relies on thread-confinement for
+the post-await mutex (no fallback if contended); SQ-full on the cancel SQE is not
+retried; per-read coroutine-frame heap alloc (no pool); the deferred-close path
+is exercised incidentally by churn, not yet by a targeted close-with-recv-in-
+flight test (e.g. an inactivity timeout while a keep-alive read is armed).
 
 ## Later leaves (after 2B), in order
 
