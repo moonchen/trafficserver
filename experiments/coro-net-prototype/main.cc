@@ -30,6 +30,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 using namespace coronet;
 
@@ -131,10 +132,15 @@ accept_loop(Reactor &r, int lfd, Demo &demo)
       start_echo_session(vc);
     } else {
       // Cancellation showcase: start a read that will never get data (clientB
-      // never sends), then close it while that recv is in flight.
-      auto *vc  = new CoroNetVConnection(r, cfd, 1, [&demo] { demo.one("cancelled-on-close VC freed (no UAF)"); });
+      // never sends), then close it while that recv is in flight. The read is
+      // cancelled before its continuation runs, so the buffer is reclaimed in the
+      // VC's on_freed hook rather than the read continuation.
       auto *buf = new std::array<char, 64>;
-      vc->do_io_read(buf->data(), buf->size(), [buf](int) { delete buf; });
+      auto *vc  = new CoroNetVConnection(r, cfd, 1, [&demo, buf] {
+        delete buf;
+        demo.one("cancelled-on-close VC freed (no UAF)");
+      });
+      vc->do_io_read(buf->data(), buf->size(), [](int) {});
       r.post([vc] { vc->do_io_close(); }); // runs after the recv is submitted
     }
   }
@@ -160,13 +166,16 @@ client_echo(Reactor &r, uint16_t port, Demo &demo)
   demo.one("clientA round-trip verified");
 }
 
+// Kept alive (not leaked) for the duration of the program so the idle
+// connection stays open — its server-side recv is what the cancel-on-close path
+// cancels. Reachable at exit, so LeakSanitizer is happy.
+std::vector<std::unique_ptr<AsyncSocket>> g_keepalive;
+
 DetachedTask
 client_idle(Reactor &r, uint16_t port)
 {
-  // Leak the socket on purpose: we want the connection to stay open (server's
-  // recv stays in flight) so the cancel-on-close path has something to cancel.
-  auto *s    = new AsyncSocket(r, make_client_fd());
-  auto  addr = loopback(port);
+  AsyncSocket *s    = g_keepalive.emplace_back(std::make_unique<AsyncSocket>(r, make_client_fd())).get();
+  auto         addr = loopback(port);
   co_await s->connect(reinterpret_cast<sockaddr *>(&addr), sizeof addr);
   ::printf("  clientB: connected and idling (never sends)\n");
 }

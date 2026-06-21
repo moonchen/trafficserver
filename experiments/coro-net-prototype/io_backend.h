@@ -59,6 +59,9 @@ struct IoOp {
 
   // Who to resume when this op completes. Set by the awaitable, consumed by the
   // reactor — never by the backend (the backend only *reports* completion).
+  // Because each thread submits to its own backend, this op was submitted on the
+  // owner thread and completes on the owner thread: the resume is thread-local,
+  // no lock required (see reactor.h / README on why no per-VC mutex is needed).
   std::coroutine_handle<> waiter{};
 
   // Backend-private bookkeeping (e.g. epoll interest list membership). Opaque

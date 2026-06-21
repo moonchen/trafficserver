@@ -1,33 +1,28 @@
 /** @file
  *
- *  SEAM 3 — the NetVConnection boundary.
+ *  SEAM 3 — the NetVConnection boundary (thread-confined + migratable).
  *
- *  Everything above this line in real ATS (HttpSM, protocol state machines,
- *  session management) talks to a NetVConnection through do_io_read /
- *  do_io_write / do_io_close and gets called back via a Continuation with
- *  VC_EVENT_* events. That contract is sacred — thousands of lines depend on it.
+ *  Same sacred facade as before — do_io_read / do_io_write / do_io_close +
+ *  Continuation — driven underneath by a single coroutine, drive(). What this
+ *  version adds is an explicit ownership model that mirrors ATS net threads:
  *
- *  This class keeps that exact facade, but instead of a hand-written op_state /
- *  connect_state machine (async-net) or IOUringReader/IOUringWriter completion
- *  objects with a manual ops_in_flight counter (net-iouring), the entire read/
- *  write lifecycle is a single linear coroutine, drive(). do_io_read/do_io_write
- *  just hand a VIO to that coroutine and wake it; do_io_close cancels whatever
- *  the coroutine is awaiting and lets it unwind.
+ *    - A VC is OWNED by one reactor (_owner). Every do_io_* and every resume
+ *      happens on that reactor's thread. do_io_* assert this in debug builds.
+ *      There is no per-VC mutex: confinement IS the serialization.
  *
- *  The payoff is concentrated in two places:
- *    1. Buffers handed to the kernel live in the coroutine frame across the
- *       await, so the "buffer must outlive the in-flight op" rule that bit
- *       net-iouring is satisfied structurally.
- *    2. do_io_close() is *not* `delete this`. It requests cancellation; the
- *       in-flight op completes with -ECANCELED; the coroutine resumes, sees it
- *       is closing, and runs its cleanup as ordinary straight-line code. The VC
- *       is freed only after the coroutine has fully unwound — no use-after-free.
+ *    - A VC may be MIGRATED to another reactor/thread (migrate_to), but only at
+ *      a quiescent point — no I/O in flight. This models ATS moving an idle
+ *      keep-alive origin connection onto the client connection's thread for a
+ *      global session pool. Migration is a message-pass (post_remote), not a
+ *      lock: the source thread stops touching the VC, hands it across the one
+ *      synchronized channel, and the destination thread adopts it.
  */
 #pragma once
 
 #include "async_socket.h"
 #include "reactor.h"
 
+#include <cassert>
 #include <coroutine>
 #include <cstdint>
 #include <functional>
@@ -35,44 +30,40 @@
 namespace coronet
 {
 
-// A minimal stand-in for ATS VC_EVENT_*.
 enum VcEvent {
-  VC_READ_READY    = 1,
-  VC_READ_COMPLETE = 2,
+  VC_READ_READY     = 1,
+  VC_READ_COMPLETE  = 2,
   VC_WRITE_COMPLETE = 3,
-  VC_EOS           = 4,
-  VC_ERROR         = 5,
+  VC_EOS            = 4,
+  VC_ERROR          = 5,
 };
 
 using Continuation = std::function<void(int event)>;
 
-// An internal one-shot awaitable used to park drive() when it has no VIO work,
-// and to wake it when do_io_read/do_io_write/do_io_close arrive. This is the
-// second resume source besides the backend: API calls, not I/O completions,
-// both routed through Reactor::resume*.
+// One-shot wakeup awaitable used to park drive() between VIOs and to wake it on
+// a do_io_* call (or close, or post-migration adoption). It stores no reactor:
+// the caller passes the *current* owner at notify() time, which is what lets a
+// parked drive() be resumed on a different thread after migration.
 class Event
 {
 public:
-  explicit Event(Reactor &r) : _r(r) {}
-
   bool await_ready() const noexcept { return _signaled; }
   void await_suspend(std::coroutine_handle<> h) noexcept { _waiter = h; }
   void await_resume() noexcept { _signaled = false; }
 
   void
-  notify()
+  notify(Reactor &owner)
   {
     if (_waiter) {
-      auto h   = _waiter;
-      _waiter  = {};
-      _r.resume_soon(h);
+      auto h  = _waiter;
+      _waiter = {};
+      owner.resume_soon(h);
     } else {
       _signaled = true;
     }
   }
 
 private:
-  Reactor                &_r;
   std::coroutine_handle<> _waiter{};
   bool                    _signaled{false};
 };
@@ -80,18 +71,32 @@ private:
 class CoroNetVConnection
 {
 public:
-  CoroNetVConnection(Reactor &r, int fd, int id, std::function<void()> on_freed = {});
+  CoroNetVConnection(Reactor &owner, int fd, int id, std::function<void()> on_freed = {});
 
   CoroNetVConnection(const CoroNetVConnection &)            = delete;
   CoroNetVConnection &operator=(const CoroNetVConnection &) = delete;
 
-  // The NetVConnection facade.
+  // NetVConnection facade. Must be called on the owner thread.
   void do_io_read(void *buf, size_t len, Continuation cont);
   void do_io_write(const void *buf, size_t len, Continuation cont);
   void do_io_close();
 
-  size_t read_done() const { return _read.done; }
-  int    id() const { return _id; }
+  // Request migration to another reactor/thread. Must be called on the current
+  // owner thread at a quiescent point (no in-flight I/O — true between
+  // transactions). The actual hand-off happens inside drive(), which suspends
+  // the coroutine and resumes it on `dest`; `on_adopted` then runs on the
+  // destination thread (kick off the next transaction there). This models ATS
+  // moving an idle keep-alive origin connection onto the client's thread.
+  void request_migrate(Reactor &dest, std::function<void()> on_adopted);
+
+  // Internal: invoked by the migration awaitable while the coroutine is
+  // suspended. Re-homes the VC to `dest` and resumes `resume_me` on dest's
+  // thread. Public only so the awaitable can reach it.
+  void migrate_handoff(std::coroutine_handle<> resume_me, Reactor &dest);
+
+  size_t   read_done() const { return _read.done; }
+  int      id() const { return _id; }
+  Reactor &owner() const { return *_owner; }
 
 private:
   struct VIO {
@@ -102,19 +107,22 @@ private:
     bool     active() const { return kind != NONE && done < len; }
   };
 
-  DetachedTask drive();           // the single coroutine that owns all I/O
-  void         finalize();        // last straight-line step: free fd + self
+  DetachedTask drive();
+  void         finalize();
+  void         assert_owner() const { assert(_owner->on_owner_thread() && "VC touched off its owner thread"); }
 
-  Reactor     &_r;
-  int          _fd;
-  int          _id;
-  AsyncSocket  _sock;
-  Event        _work;             // wakes drive() on a new VIO / on close
-  VIO          _read;
-  VIO          _write;
-  Continuation _read_cont;
-  Continuation _write_cont;
-  bool         _closing{false};
+  Reactor              *_owner;   // rebindable: changes on migration
+  int                   _fd;
+  int                   _id;
+  AsyncSocket           _sock;
+  Event                 _work;
+  VIO                   _read;
+  VIO                   _write;
+  Continuation          _read_cont;
+  Continuation          _write_cont;
+  bool                  _closing{false};
+  Reactor              *_migrate_dest{nullptr};
+  std::function<void()> _migrate_cb;
   std::function<void()> _on_freed;
 };
 

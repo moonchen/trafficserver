@@ -59,10 +59,9 @@ command-line argument.
 
 ### Seam 2 — coroutine / thread-affinity boundary (`reactor.h`)
 The backend only *detects* completion; the reactor decides what resuming means.
-`Reactor::resume()` is the single chokepoint where, in real ATS, you would
-confirm you're on the owning `EThread` and take the VConnection's mutex before
-re-entering its code. Today both branches duplicate that lock/affinity dance in
-every completion handler; here it is written once.
+`Reactor::resume()` is the single chokepoint where coroutine bodies are
+re-entered. The multi-threaded model (see below) makes this a plain thread-local
+call — **no per-VC mutex** — because each connection is confined to one thread.
 
 ### Seam 3 — NetVConnection boundary (`coro_netvc.*`)
 `CoroNetVConnection` keeps the sacred `do_io_read` / `do_io_write` /
@@ -93,7 +92,8 @@ completion objects with a manual `ops_in_flight` counter (net-iouring).
 cd experiments/coro-net-prototype
 cmake -B build && cmake --build build
 ./build/coro_net epoll
-./build/coro_net uring     # requires liburing + a recent kernel
+./build/coro_net uring        # requires liburing + a recent kernel
+./build/coro_net_mt uring     # the multi-threaded / migration demo (see below)
 ```
 
 Or directly:
@@ -115,12 +115,63 @@ cancel → unwind → free sequence in the log:
 == done (3/3 checks passed) ==
 ```
 
+## Multi-threaded: the EThread-affinity model (`coro_net_mt`)
+
+The second executable takes the ATS net-thread model seriously and answers the
+obvious question: *with coroutines, where does the per-VConnection mutex go?*
+
+**Short answer: it goes away.** ATS puts a `ProxyMutex` on every VConnection
+because its event system is *general* — any `Continuation` can be scheduled onto
+any thread, so `MUTEX_TRY_LOCK` is the universal serialization primitive. But net
+VConnections are, in practice, **thread-confined**: a VC lives on one `ET_NET`
+thread, and even the origin connection is *migrated* onto the client connection's
+thread for the global session pool. If you make that confinement an explicit,
+enforced invariant, the resume path needs no lock at all — it would only ever be
+taken uncontended. The mutex's real job (serializing genuinely concurrent access)
+is instead handled by **message-passing**: the few legitimate cross-thread events
+go through one synchronized channel, `Reactor::post_remote()`.
+
+So the multi-threaded design is:
+
+- **N worker reactors, one per OS thread, each with its own backend** (its own
+  io_uring ring / epoll set). A connection is confined to one worker for its
+  lifetime. Because each thread submits to its own ring, completions are always
+  drained on the owner thread: **I/O-completion affinity is free**, no cross-thread
+  resume on the hot path.
+- **Accept hand-off** (`acceptor → worker`) is a `post_remote` of the new fd —
+  the one necessary cross-thread step to place a connection on a worker.
+- **Migration** (`worker A → worker B`, `CoroNetVConnection::request_migrate`)
+  models moving an idle keep-alive origin connection onto the client's thread.
+  It happens at a quiescent point (no I/O in flight): the coroutine *suspends* on
+  the source thread (`Handoff` awaitable), is re-homed via `post_remote`, and
+  *resumes* on the destination thread. A hand-off, not a lock.
+
+`coro_net_mt` runs 3 workers + an acceptor + a client driver, echoes over 4
+connections (2 transactions each), and migrates one connection between workers
+mid-session. The log shows the move:
+
+```
+  acceptor(reactor 0): handed conn 0 to worker reactor 1 (will migrate)
+    [VC 0 @reactor 1] request_migrate(): suspending to hand off
+    [VC 0 @reactor 2] adopted on new thread; resuming coroutine here
+    [VC 0 @reactor 2] finalize(): VC freed (no op left dangling)
+== done: clients 4/4, server VCs freed 4/4 ==
+```
+
+**Verified race-free under ThreadSanitizer** (8/8 runs, both engines) and clean
+under ASan/UBSan — with zero per-VC locks. The only synchronized cross-thread
+state is the `post_remote` queue. (Getting there surfaced two real bugs worth
+noting: `stop()` must not poke the wakeup pipe or it races teardown `close()`;
+and the stop flag must be acquire/release, not relaxed, so the join→stop chain
+gives TSan the happens-before edge for the io_uring path, whose kernel-side pipe
+reads are invisible to TSan's interceptors.)
+
 ## What this spike deliberately leaves out
 
 It is an architecture probe, not a net stack. Out of scope (and exactly the work
-a real effort would tackle next): the multi-threaded EThread-affine resume +
-per-VC mutex behind Seam 2; TLS/`SSLNetVConnection`; timeouts (which map cleanly
-to `IORING_OP_TIMEOUT` / linked timeouts); MIOBuffer instead of flat buffers;
-SQ-full backpressure as a suspending await rather than `-EAGAIN`; a pooled
-coroutine-frame allocator; UDP; connection tracking. The point here is only to
-make the **boundaries** concrete enough to argue about.
+a real effort would tackle next): TLS/`SSLNetVConnection`; timeouts (which map
+cleanly to `IORING_OP_TIMEOUT` / linked timeouts); MIOBuffer instead of flat
+buffers; SQ-full backpressure as a suspending await rather than `-EAGAIN`; a
+pooled coroutine-frame allocator; UDP; connection tracking; and mid-stream (not
+just between-transaction) migration. The point here is only to make the
+**boundaries** concrete enough to argue about.

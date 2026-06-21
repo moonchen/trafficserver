@@ -1,25 +1,26 @@
 /** @file
  *
  *  The awaitable layer: turns the backend's IoOp contract into things you can
- *  `co_await`. This is the join between Seam 1 (backend) and Seam 2 (reactor).
- *
- *  An AsyncSocket is the spiritual successor to NetAIO::TCPConnection, but where
- *  NetAIO exposed callbacks (onRecvmsg/onSendmsg/onConnect...), here every
- *  operation is an awaitable that yields its result inline:
+ *  `co_await`. The join between Seam 1 (backend) and Seam 2 (reactor).
  *
  *      ssize_t n = co_await sock.recv(buf, len);   // n bytes, or -errno
  *
  *  The op lives in the awaitable, which is a temporary in the co_await
- *  expression; per [expr.await] its lifetime is extended across the suspension
+ *  expression; per [expr.await] its lifetime extends across the suspension
  *  point. So the IoOp and the buffer it references are automatically pinned for
- *  exactly the duration of the in-flight operation. No class-scope hoisting
- *  (net-iouring), no per-I/O heap allocation (async-net).
+ *  exactly the duration of the in-flight operation — no per-I/O heap allocation,
+ *  no class-scope hoisting.
+ *
+ *  The socket holds its reactor by POINTER, not reference, so it can be rebound
+ *  to a different reactor (thread) during connection migration. Rebinding is
+ *  only legal while quiescent (no op in flight) — see rebind().
  */
 #pragma once
 
 #include "io_backend.h"
 #include "reactor.h"
 
+#include <cassert>
 #include <cerrno>
 #include <coroutine>
 #include <unistd.h>
@@ -30,17 +31,23 @@ namespace coronet
 class AsyncSocket
 {
 public:
-  AsyncSocket(Reactor &r, int fd) : _r(r), _fd(fd) {}
+  AsyncSocket(Reactor &r, int fd) : _r(&r), _fd(fd) {}
 
   AsyncSocket(const AsyncSocket &)            = delete;
   AsyncSocket &operator=(const AsyncSocket &) = delete;
 
-  int fd() const { return _fd; }
+  int      fd() const { return _fd; }
+  Reactor &reactor() const { return *_r; }
 
-  // One awaitable type drives every op. It registers itself as the socket's
-  // current in-flight op for its direction so that cancel_read()/cancel_write()
-  // can reach it, submits to the backend on suspend, and returns the result on
-  // resume.
+  // Move this socket to another reactor/thread. Only valid when nothing is in
+  // flight (migration happens at a quiescent point — see CoroNetVConnection).
+  void
+  rebind(Reactor &r)
+  {
+    assert(_in_read == nullptr && _in_write == nullptr && "cannot migrate a socket with I/O in flight");
+    _r = &r;
+  }
+
   class Op
   {
   public:
@@ -52,8 +59,8 @@ public:
     await_suspend(std::coroutine_handle<> h) noexcept
     {
       _op.waiter = h;
-      *_slot     = &_op;              // make this op reachable for cancellation
-      _s._r.backend().submit(&_op);   // Seam 1 hand-off
+      *_slot     = &_op;                 // make this op reachable for cancellation
+      _s._r->backend().submit(&_op);     // Seam 1 hand-off, on the owner thread
     }
 
     int
@@ -84,7 +91,8 @@ public:
   Op
   connect(sockaddr *addr, socklen_t addrlen)
   {
-    return {*this, IoOp{.type = IoOp::Type::Connect, .fd = _fd, .addr = addr, .addrlen = &_connect_len(addrlen)}, &_in_write};
+    _connect_addrlen = addrlen;
+    return {*this, IoOp{.type = IoOp::Type::Connect, .fd = _fd, .addr = addr, .addrlen = &_connect_addrlen}, &_in_write};
   }
 
   Op
@@ -99,15 +107,11 @@ public:
     return {*this, IoOp{.type = IoOp::Type::Close, .fd = _fd}, &_in_write};
   }
 
-  // Cancellation handles for whoever owns this socket (e.g. a NetVConnection's
-  // do_io_close). The in-flight op still completes — with -ECANCELED — and the
-  // awaiting coroutine resumes normally and unwinds. That is the safe-teardown
-  // contract.
   void
   cancel_read()
   {
     if (_in_read) {
-      _r.backend().cancel(_in_read);
+      _r->backend().cancel(_in_read);
     }
   }
 
@@ -115,23 +119,17 @@ public:
   cancel_write()
   {
     if (_in_write) {
-      _r.backend().cancel(_in_write);
+      _r->backend().cancel(_in_write);
     }
   }
 
-private:
-  // connect() needs somewhere stable to keep the address length; stash it here.
-  socklen_t &
-  _connect_len(socklen_t v)
-  {
-    _connect_addrlen = v;
-    return _connect_addrlen;
-  }
+  bool idle() const { return _in_read == nullptr && _in_write == nullptr; }
 
-  Reactor  &_r;
+private:
+  Reactor  *_r;
   int       _fd;
-  IoOp     *_in_read{nullptr};   // current in-flight read-side op (recv/accept)
-  IoOp     *_in_write{nullptr};  // current in-flight write-side op (send/connect/close)
+  IoOp     *_in_read{nullptr};
+  IoOp     *_in_write{nullptr};
   socklen_t _connect_addrlen{0};
 };
 

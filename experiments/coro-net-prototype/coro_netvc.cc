@@ -7,49 +7,88 @@ namespace coronet
 {
 
 static void
-vclog(int id, const char *what)
+vclog(int id, int reactor_id, const char *what)
 {
-  ::printf("    [VC %d] %s\n", id, what);
+  ::printf("    [VC %d @reactor %d] %s\n", id, reactor_id, what);
 }
 
-CoroNetVConnection::CoroNetVConnection(Reactor &r, int fd, int id, std::function<void()> on_freed)
-  : _r(r), _fd(fd), _id(id), _sock(r, fd), _work(r), _on_freed(std::move(on_freed))
+CoroNetVConnection::CoroNetVConnection(Reactor &owner, int fd, int id, std::function<void()> on_freed)
+  : _owner(&owner), _fd(fd), _id(id), _sock(owner, fd), _on_freed(std::move(on_freed))
 {
-  drive(); // start the driver coroutine; it immediately parks on _work
+  drive(); // start the driver; it immediately parks on _work
 }
 
 void
 CoroNetVConnection::do_io_read(void *buf, size_t len, Continuation cont)
 {
+  assert_owner();
   _read      = VIO{VIO::READ, static_cast<uint8_t *>(buf), len, 0};
   _read_cont = std::move(cont);
-  _work.notify();
+  _work.notify(*_owner);
 }
 
 void
 CoroNetVConnection::do_io_write(const void *buf, size_t len, Continuation cont)
 {
+  assert_owner();
   _write      = VIO{VIO::WRITE, static_cast<uint8_t *>(const_cast<void *>(buf)), len, 0};
   _write_cont = std::move(cont);
-  _work.notify();
+  _work.notify(*_owner);
 }
 
 void
 CoroNetVConnection::do_io_close()
 {
+  assert_owner();
   if (_closing) {
     return;
   }
   _closing = true;
-  vclog(_id, "do_io_close(): cancelling any in-flight op, then unwinding");
-  // Reach into whatever the coroutine is awaiting and cancel it. The op still
-  // completes (with -ECANCELED); drive() resumes and unwinds cleanly.
+  vclog(_id, _owner->id(), "do_io_close(): cancel any in-flight op, then unwind");
   _sock.cancel_read();
   _sock.cancel_write();
-  _work.notify(); // in case drive() is parked on _work rather than on I/O
+  _work.notify(*_owner);
 }
 
-// The whole VConnection read/write lifecycle as one straight-line coroutine.
+// A suspend-and-rehome awaitable. await_suspend hands the SUSPENDED coroutine
+// across to the destination thread; the source thread does nothing further with
+// the VC. This is what makes migration race-free without a lock: the coroutine
+// is genuinely parked between the two threads, and post_remote provides the
+// happens-before edge.
+namespace
+{
+struct Handoff {
+  CoroNetVConnection *vc;
+  Reactor            *dest;
+  bool                await_ready() const noexcept { return false; }
+  void                await_suspend(std::coroutine_handle<> h) const { vc->migrate_handoff(h, *dest); }
+  void                await_resume() const noexcept {}
+};
+} // namespace
+
+void
+CoroNetVConnection::request_migrate(Reactor &dest, std::function<void()> on_adopted)
+{
+  assert_owner();
+  assert(_sock.idle() && "migrate only at a quiescent point (no I/O in flight)");
+  _migrate_dest = &dest;
+  _migrate_cb   = std::move(on_adopted);
+  _work.notify(*_owner); // wake drive() so it reaches the migration point
+}
+
+void
+CoroNetVConnection::migrate_handoff(std::coroutine_handle<> resume_me, Reactor &dest)
+{
+  // Called while drive() is suspended. The destination thread becomes the owner
+  // and resumes the coroutine; the source thread is already done with us.
+  dest.post_remote([this, &dest, resume_me] {
+    _owner = &dest;
+    _sock.rebind(dest);
+    vclog(_id, _owner->id(), "adopted on new thread; resuming coroutine here");
+    dest.resume_soon(resume_me);
+  });
+}
+
 DetachedTask
 CoroNetVConnection::drive()
 {
@@ -57,16 +96,24 @@ CoroNetVConnection::drive()
     if (_closing) {
       break;
     }
+    if (_migrate_dest) {
+      Reactor *dest = _migrate_dest;
+      _migrate_dest = nullptr;
+      vclog(_id, _owner->id(), "request_migrate(): suspending to hand off");
+      co_await Handoff{this, dest}; // resumes on dest's thread; _owner is now dest
+      if (auto cb = std::move(_migrate_cb)) {
+        cb(); // kick off the next transaction on the new thread
+      }
+      continue;
+    }
     if (!_read.active() && !_write.active()) {
-      co_await _work; // nothing to do; park until a do_io_* call (or close)
+      co_await _work; // park until a do_io_* call (or close / adoption)
       continue;
     }
 
     if (_read.active()) {
-      // The recv buffer is _read.base, owned by the caller and pinned for the
-      // duration of this await because we are suspended here.
       int n      = co_await _sock.recv(_read.base + _read.done, _read.len - _read.done);
-      _read.kind = VIO::NONE; // one-shot: caller re-arms with another do_io_read
+      _read.kind = VIO::NONE; // one-shot
       if (_closing) {
         break;
       }
@@ -95,20 +142,16 @@ CoroNetVConnection::drive()
       } else {
         _write.done += n;
         if (_write.done >= _write.len) {
-          _write.kind = VIO::NONE; // fully written
+          _write.kind = VIO::NONE;
           if (_write_cont) {
             _write_cont(VC_WRITE_COMPLETE);
           }
         }
-        // else: partial write, stay active and loop to send the remainder.
       }
     }
   }
 
-  // Closing path. Any op we were awaiting has already completed (cancelled), so
-  // there is nothing in flight referencing this object. Now we can safely close
-  // the fd and destroy ourselves.
-  vclog(_id, "drive() unwound; closing socket asynchronously");
+  vclog(_id, _owner->id(), "drive() unwound; closing socket asynchronously");
   co_await _sock.close();
   finalize();
 }
@@ -116,14 +159,12 @@ CoroNetVConnection::drive()
 void
 CoroNetVConnection::finalize()
 {
-  // Copy out anything we need before we delete ourselves.
   auto cb = _on_freed;
-  vclog(_id, "finalize(): VC freed (no op was left dangling)");
+  vclog(_id, _owner->id(), "finalize(): VC freed (no op left dangling)");
   if (cb) {
     cb();
   }
-  delete this; // safe: last statement reachable from this object; the drive()
-               // coroutine frame is separate and self-destructs after we return.
+  delete this;
 }
 
 } // namespace coronet
