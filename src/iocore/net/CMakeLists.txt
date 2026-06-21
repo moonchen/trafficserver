@@ -68,6 +68,7 @@ add_library(
   UnixNetAccept.cc
   UnixNetProcessor.cc
   UnixNetVConnection.cc
+  IOUringNetVConnection.cc
   UnixUDPConnection.cc
   UnixUDPNet.cc
   SSLDynlock.cc
