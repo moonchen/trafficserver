@@ -34,10 +34,14 @@ public:
   explicit UringBackend(unsigned entries = 256);
   ~UringBackend() override;
 
-  void        submit(IoOp *op) override;
-  void        cancel(IoOp *op) override;
-  void        poll(int timeout_ms, std::vector<IoOp *> &completed) override;
-  const char *name() const override { return "io_uring"; }
+  void submit(IoOp *op) override;
+  void cancel(IoOp *op) override;
+  void poll(int timeout_ms, std::vector<IoOp *> &completed) override;
+  const char *
+  name() const override
+  {
+    return "io_uring";
+  }
 
 private:
   io_uring_sqe *get_sqe(); // get an SQE, flushing the ring if it is full

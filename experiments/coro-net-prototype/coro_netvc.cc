@@ -57,13 +57,24 @@ CoroNetVConnection::do_io_close()
 // happens-before edge.
 namespace
 {
-struct Handoff {
-  CoroNetVConnection *vc;
-  Reactor            *dest;
-  bool                await_ready() const noexcept { return false; }
-  void                await_suspend(std::coroutine_handle<> h) const { vc->migrate_handoff(h, *dest); }
-  void                await_resume() const noexcept {}
-};
+  struct Handoff {
+    CoroNetVConnection *vc;
+    Reactor            *dest;
+    bool
+    await_ready() const noexcept
+    {
+      return false;
+    }
+    void
+    await_suspend(std::coroutine_handle<> h) const
+    {
+      vc->migrate_handoff(h, *dest);
+    }
+    void
+    await_resume() const noexcept
+    {
+    }
+  };
 } // namespace
 
 void

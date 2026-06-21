@@ -47,9 +47,21 @@ using Continuation = std::function<void(int event)>;
 class Event
 {
 public:
-  bool await_ready() const noexcept { return _signaled; }
-  void await_suspend(std::coroutine_handle<> h) noexcept { _waiter = h; }
-  void await_resume() noexcept { _signaled = false; }
+  bool
+  await_ready() const noexcept
+  {
+    return _signaled;
+  }
+  void
+  await_suspend(std::coroutine_handle<> h) noexcept
+  {
+    _waiter = h;
+  }
+  void
+  await_resume() noexcept
+  {
+    _signaled = false;
+  }
 
   void
   notify(Reactor &owner)
@@ -94,9 +106,21 @@ public:
   // thread. Public only so the awaitable can reach it.
   void migrate_handoff(std::coroutine_handle<> resume_me, Reactor &dest);
 
-  size_t   read_done() const { return _read.done; }
-  int      id() const { return _id; }
-  Reactor &owner() const { return *_owner; }
+  size_t
+  read_done() const
+  {
+    return _read.done;
+  }
+  int
+  id() const
+  {
+    return _id;
+  }
+  Reactor &
+  owner() const
+  {
+    return *_owner;
+  }
 
 private:
   struct VIO {
@@ -104,14 +128,22 @@ private:
     uint8_t *base{nullptr};
     size_t   len{0};
     size_t   done{0};
-    bool     active() const { return kind != NONE && done < len; }
+    bool
+    active() const
+    {
+      return kind != NONE && done < len;
+    }
   };
 
   DetachedTask drive();
   void         finalize();
-  void         assert_owner() const { assert(_owner->on_owner_thread() && "VC touched off its owner thread"); }
+  void
+  assert_owner() const
+  {
+    assert(_owner->on_owner_thread() && "VC touched off its owner thread");
+  }
 
-  Reactor              *_owner;   // rebindable: changes on migration
+  Reactor              *_owner; // rebindable: changes on migration
   int                   _fd;
   int                   _id;
   AsyncSocket           _sock;

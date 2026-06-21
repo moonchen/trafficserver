@@ -36,8 +36,16 @@ public:
   AsyncSocket(const AsyncSocket &)            = delete;
   AsyncSocket &operator=(const AsyncSocket &) = delete;
 
-  int      fd() const { return _fd; }
-  Reactor &reactor() const { return *_r; }
+  int
+  fd() const
+  {
+    return _fd;
+  }
+  Reactor &
+  reactor() const
+  {
+    return *_r;
+  }
 
   // Move this socket to another reactor/thread. Only valid when nothing is in
   // flight (migration happens at a quiescent point — see CoroNetVConnection).
@@ -53,14 +61,18 @@ public:
   public:
     Op(AsyncSocket &s, IoOp op, IoOp **slot) : _s(s), _op(op), _slot(slot) {}
 
-    bool await_ready() const noexcept { return false; }
+    bool
+    await_ready() const noexcept
+    {
+      return false;
+    }
 
     void
     await_suspend(std::coroutine_handle<> h) noexcept
     {
       _op.waiter = h;
-      *_slot     = &_op;                 // make this op reachable for cancellation
-      _s._r->backend().submit(&_op);     // Seam 1 hand-off, on the owner thread
+      *_slot     = &_op;             // make this op reachable for cancellation
+      _s._r->backend().submit(&_op); // Seam 1 hand-off, on the owner thread
     }
 
     int
@@ -79,32 +91,47 @@ public:
   Op
   recv(void *buf, size_t len)
   {
-    return {*this, IoOp{.type = IoOp::Type::Recv, .fd = _fd, .buf = buf, .len = len}, &_in_read};
+    return {
+      *this, IoOp{.type = IoOp::Type::Recv, .fd = _fd, .buf = buf, .len = len},
+       &_in_read
+    };
   }
 
   Op
   send(const void *buf, size_t len)
   {
-    return {*this, IoOp{.type = IoOp::Type::Send, .fd = _fd, .buf = const_cast<void *>(buf), .len = len}, &_in_write};
+    return {
+      *this, IoOp{.type = IoOp::Type::Send, .fd = _fd, .buf = const_cast<void *>(buf), .len = len},
+       &_in_write
+    };
   }
 
   Op
   connect(sockaddr *addr, socklen_t addrlen)
   {
     _connect_addrlen = addrlen;
-    return {*this, IoOp{.type = IoOp::Type::Connect, .fd = _fd, .addr = addr, .addrlen = &_connect_addrlen}, &_in_write};
+    return {
+      *this, IoOp{.type = IoOp::Type::Connect, .fd = _fd, .addr = addr, .addrlen = &_connect_addrlen},
+       &_in_write
+    };
   }
 
   Op
   accept(sockaddr *addr, socklen_t *addrlen)
   {
-    return {*this, IoOp{.type = IoOp::Type::Accept, .fd = _fd, .addr = addr, .addrlen = addrlen}, &_in_read};
+    return {
+      *this, IoOp{.type = IoOp::Type::Accept, .fd = _fd, .addr = addr, .addrlen = addrlen},
+       &_in_read
+    };
   }
 
   Op
   close()
   {
-    return {*this, IoOp{.type = IoOp::Type::Close, .fd = _fd}, &_in_write};
+    return {
+      *this, IoOp{.type = IoOp::Type::Close, .fd = _fd},
+       &_in_write
+    };
   }
 
   void
@@ -123,7 +150,11 @@ public:
     }
   }
 
-  bool idle() const { return _in_read == nullptr && _in_write == nullptr; }
+  bool
+  idle() const
+  {
+    return _in_read == nullptr && _in_write == nullptr;
+  }
 
 private:
   Reactor  *_r;

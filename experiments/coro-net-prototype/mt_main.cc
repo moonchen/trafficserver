@@ -159,9 +159,9 @@ accept_loop(Reactor &acc, int lfd, std::vector<Reactor *> *workers, Stats *st)
       ::printf("  accept failed: %d\n", cfd);
       break;
     }
-    Reactor *w        = (*workers)[i % N_WORKERS];
-    bool     migrate  = (i == 0); // the first connection will migrate worker1 -> worker2
-    Reactor *dest     = (*workers)[1 % N_WORKERS];
+    Reactor *w       = (*workers)[i % N_WORKERS];
+    bool     migrate = (i == 0); // the first connection will migrate worker1 -> worker2
+    Reactor *dest    = (*workers)[1 % N_WORKERS];
     ::printf("  acceptor(reactor %d): handed conn %d to worker reactor %d%s\n", acc.id(), i, w->id(),
              migrate ? " (will migrate)" : "");
     // Create and drive the VC ON the worker thread.
@@ -225,8 +225,7 @@ main(int argc, char **argv)
 
   uint16_t port = 0;
   int      lfd  = make_listener(port);
-  ::printf("== coro-net MT prototype, backend = %s, %d workers, listening on 127.0.0.1:%u ==\n", which.c_str(), N_WORKERS,
-           port);
+  ::printf("== coro-net MT prototype, backend = %s, %d workers, listening on 127.0.0.1:%u ==\n", which.c_str(), N_WORKERS, port);
 
   // Acceptor thread.
   std::thread acceptor_thread([&] {
@@ -254,8 +253,7 @@ main(int argc, char **argv)
 
   // Wait for completion.
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while ((st.clients_done.load() < N_CONNS || st.server_done.load() < N_CONNS) &&
-         std::chrono::steady_clock::now() < deadline) {
+  while ((st.clients_done.load() < N_CONNS || st.server_done.load() < N_CONNS) && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
 

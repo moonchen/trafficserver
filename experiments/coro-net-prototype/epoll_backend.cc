@@ -100,7 +100,7 @@ EpollBackend::cancel(IoOp *op)
   if (it == _fds.end()) {
     return;
   }
-  FdState &st = it->second;
+  FdState &st  = it->second;
   bool     hit = false;
   if (st.read == op) {
     st.read = nullptr;

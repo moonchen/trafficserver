@@ -25,28 +25,32 @@ public:
   EpollBackend();
   ~EpollBackend() override;
 
-  void        submit(IoOp *op) override;
-  void        cancel(IoOp *op) override;
-  void        poll(int timeout_ms, std::vector<IoOp *> &completed) override;
-  const char *name() const override { return "epoll"; }
+  void submit(IoOp *op) override;
+  void cancel(IoOp *op) override;
+  void poll(int timeout_ms, std::vector<IoOp *> &completed) override;
+  const char *
+  name() const override
+  {
+    return "epoll";
+  }
 
 private:
   // Per-fd interest: at most one read-side op and one write-side op outstanding,
   // matching the one-per-direction model real net VConnections use.
   struct FdState {
-    IoOp    *read{nullptr};   // Recv or Accept
-    IoOp    *write{nullptr};  // Send or Connect
-    uint32_t interest{0};     // currently-registered epoll events
+    IoOp    *read{nullptr};  // Recv or Accept
+    IoOp    *write{nullptr}; // Send or Connect
+    uint32_t interest{0};    // currently-registered epoll events
   };
 
   // Run the syscall now. Returns true if the op completed (pushed to
   // `completed`); false if it would block and should stay armed.
   bool perform(IoOp *op, std::vector<IoOp *> &completed);
-  void rearm(int fd, FdState &st);                        // recompute epoll interest
+  void rearm(int fd, FdState &st); // recompute epoll interest
 
-  int                                _epfd{-1};
-  std::unordered_map<int, FdState>   _fds;
-  std::vector<IoOp *>                _ready;  // inline-completed (close, cancel)
+  int                              _epfd{-1};
+  std::unordered_map<int, FdState> _fds;
+  std::vector<IoOp *>              _ready; // inline-completed (close, cancel)
 };
 
 } // namespace coronet

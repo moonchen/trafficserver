@@ -52,11 +52,30 @@ namespace coronet
 // coroutines that run to completion (accept loop, client, a VC's drive()).
 struct DetachedTask {
   struct promise_type {
-    DetachedTask        get_return_object() noexcept { return {}; }
-    std::suspend_never  initial_suspend() noexcept { return {}; }
-    std::suspend_never  final_suspend() noexcept { return {}; }
-    void                return_void() noexcept {}
-    void                unhandled_exception() { std::terminate(); }
+    DetachedTask
+    get_return_object() noexcept
+    {
+      return {};
+    }
+    std::suspend_never
+    initial_suspend() noexcept
+    {
+      return {};
+    }
+    std::suspend_never
+    final_suspend() noexcept
+    {
+      return {};
+    }
+    void
+    return_void() noexcept
+    {
+    }
+    void
+    unhandled_exception()
+    {
+      std::terminate();
+    }
   };
 };
 
@@ -70,10 +89,25 @@ struct OwnedTask {
     {
       return OwnedTask{std::coroutine_handle<promise_type>::from_promise(*this)};
     }
-    std::suspend_never  initial_suspend() noexcept { return {}; }
-    std::suspend_always final_suspend() noexcept { return {}; }
-    void                return_void() noexcept {}
-    void                unhandled_exception() { std::terminate(); }
+    std::suspend_never
+    initial_suspend() noexcept
+    {
+      return {};
+    }
+    std::suspend_always
+    final_suspend() noexcept
+    {
+      return {};
+    }
+    void
+    return_void() noexcept
+    {
+    }
+    void
+    unhandled_exception()
+    {
+      std::terminate();
+    }
   };
   std::coroutine_handle<promise_type> h{};
 };
@@ -101,8 +135,16 @@ public:
     ::close(_wake[1]);
   }
 
-  IBackend &backend() { return _backend; }
-  int       id() const { return _id; }
+  IBackend &
+  backend()
+  {
+    return _backend;
+  }
+  int
+  id() const
+  {
+    return _id;
+  }
 
   // ---- same-thread scheduling (used by I/O completions and VC signals) ------
 
@@ -117,7 +159,11 @@ public:
   }
 
   // Defer a plain callable to a later turn on THIS thread.
-  void post(std::function<void()> fn) { _posts.push(std::move(fn)); }
+  void
+  post(std::function<void()> fn)
+  {
+    _posts.push(std::move(fn));
+  }
 
   // Run `fn` periodically on this thread (the inactivity-cop pattern: each net
   // thread scans its own connections). Backend-agnostic, so it works the same on
@@ -154,7 +200,11 @@ public:
     _stop.store(true);
   }
 
-  bool on_owner_thread() const { return std::this_thread::get_id() == _owner; }
+  bool
+  on_owner_thread() const
+  {
+    return std::this_thread::get_id() == _owner;
+  }
 
   void
   run()
@@ -179,14 +229,22 @@ public:
   struct RawRecv {
     Reactor &r;
     IoOp     op;
-    bool     await_ready() const noexcept { return false; }
+    bool
+    await_ready() const noexcept
+    {
+      return false;
+    }
     void
     await_suspend(std::coroutine_handle<> h) noexcept
     {
       op.waiter = h;
       r._backend.submit(&op);
     }
-    int await_resume() noexcept { return op.result; }
+    int
+    await_resume() noexcept
+    {
+      return op.result;
+    }
   };
 
 private:
@@ -280,7 +338,9 @@ private:
   {
     uint8_t scratch[64];
     while (!_stop.load()) {
-      co_await RawRecv{*this, IoOp{.type = IoOp::Type::Recv, .fd = _wake[0], .buf = scratch, .len = sizeof scratch}};
+      co_await RawRecv{
+        *this, IoOp{.type = IoOp::Type::Recv, .fd = _wake[0], .buf = scratch, .len = sizeof scratch}
+      };
       // The actual cross-thread work is drained in drain_posts() each turn; this
       // recv exists only to break the backend out of its blocking poll.
     }
@@ -288,21 +348,21 @@ private:
 
   static constexpr int POLL_BLOCK_MS = 50;
 
-  IBackend                           &_backend;
-  int                                 _id;
-  std::thread::id                     _owner;
-  int                                 _wake[2]{-1, -1};
+  IBackend       &_backend;
+  int             _id;
+  std::thread::id _owner;
+  int             _wake[2]{-1, -1};
 
   std::queue<std::coroutine_handle<>> _ready;
   std::queue<std::function<void()>>   _posts;
   std::vector<Timer>                  _timers;
   std::vector<IoOp *>                 _completed;
 
-  std::mutex                          _remote_mu;
-  std::vector<std::function<void()>>  _remote;
+  std::mutex                         _remote_mu;
+  std::vector<std::function<void()>> _remote;
 
-  OwnedTask                           _wakeup;
-  std::atomic<bool>                   _stop{false};
+  OwnedTask         _wakeup;
+  std::atomic<bool> _stop{false};
 };
 
 } // namespace coronet

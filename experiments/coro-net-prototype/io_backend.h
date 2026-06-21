@@ -43,7 +43,7 @@ struct IoOp {
   enum class Type { Recv, Send, Connect, Accept, Close };
 
   Type type{};
-  int fd{-1};
+  int  fd{-1};
 
   // Recv/Send payload.
   void  *buf{nullptr};
