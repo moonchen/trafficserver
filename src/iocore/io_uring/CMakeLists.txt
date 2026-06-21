@@ -26,7 +26,7 @@ target_link_libraries(
 
 if(BUILD_TESTING)
   add_executable(test_iouring unit_tests/test_diskIO.cc)
-  target_link_libraries(test_iouring PRIVATE inkuring libswoc::libswoc tsutil Catch2::Catch2)
+  target_link_libraries(test_iouring PRIVATE inkuring libswoc::libswoc tsutil Catch2::Catch2WithMain)
 
   target_include_directories(test_iouring PRIVATE ${CATCH_INCLUDE_DIR})
 
