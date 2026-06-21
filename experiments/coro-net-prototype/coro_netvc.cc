@@ -50,54 +50,54 @@ CoroNetVConnection::do_io_close()
   _work.notify(*_owner);
 }
 
-// A suspend-and-rehome awaitable. await_suspend hands the SUSPENDED coroutine
-// across to the destination thread; the source thread does nothing further with
-// the VC. This is what makes migration race-free without a lock: the coroutine
-// is genuinely parked between the two threads, and post_remote provides the
-// happens-before edge.
-namespace
-{
-  struct Handoff {
-    CoroNetVConnection *vc;
-    Reactor            *dest;
-    bool
-    await_ready() const noexcept
-    {
-      return false;
-    }
-    void
-    await_suspend(std::coroutine_handle<> h) const
-    {
-      vc->migrate_handoff(h, *dest);
-    }
-    void
-    await_resume() const noexcept
-    {
-    }
-  };
-} // namespace
+// Parks drive() on _work, THEN publishes the VC for adoption. The ordering
+// matters: the park (writing _work's waiter handle) happens-before the publish,
+// and the publish happens-before the adopter's pool-take (the pool lock), so the
+// adopter's later do_io_read -> _work.notify sees the parked handle. No lock on
+// the VC, no cross-thread message — the connection is bare (no armed op) while it
+// sits parked, waiting to be pulled.
+struct CoroNetVConnection::ParkAndRelease {
+  CoroNetVConnection *vc;
+  bool
+  await_ready() const noexcept
+  {
+    return false;
+  }
+  void
+  await_suspend(std::coroutine_handle<> h) const
+  {
+    vc->_work.park(h); // park first...
+    auto publish   = std::move(vc->_on_parked);
+    vc->_on_parked = nullptr;
+    publish(vc); // ...then make the parked VC visible for a destination pull
+  }
+  void
+  await_resume() const noexcept
+  {
+  }
+};
 
 void
-CoroNetVConnection::request_migrate(Reactor &dest, std::function<void()> on_adopted)
+CoroNetVConnection::park_and_release(std::function<void(CoroNetVConnection *)> on_parked)
 {
   assert_owner();
-  assert(_sock.idle() && "migrate only at a quiescent point (no I/O in flight)");
-  _migrate_dest = &dest;
-  _migrate_cb   = std::move(on_adopted);
-  _work.notify(*_owner); // wake drive() so it reaches the migration point
+  assert(_sock.idle() && "release only a quiescent connection (no in-flight op)");
+  // Called from within a continuation (drive() is running), so no notify is
+  // needed: drive() reaches the release point on its next loop turn.
+  _on_parked = std::move(on_parked);
 }
 
 void
-CoroNetVConnection::migrate_handoff(std::coroutine_handle<> resume_me, Reactor &dest)
+CoroNetVConnection::migrate_here(Reactor &dest)
 {
-  // Called while drive() is suspended. The destination thread becomes the owner
-  // and resumes the coroutine; the source thread is already done with us.
-  dest.post_remote([this, &dest, resume_me] {
-    _owner = &dest;
-    _sock.rebind(dest);
-    vclog(_id, _owner->id(), "adopted on new thread; resuming coroutine here");
-    dest.resume_soon(resume_me);
-  });
+  // Synchronous, destination-pulled (cf. ATS migrateToCurrentThread). The caller
+  // is already on dest's thread and has pulled this VC out of a synchronized pool,
+  // so the previous owner's writes are visible and nobody else touches the VC.
+  assert(dest.on_owner_thread() && "migrate_here must run on the destination thread");
+  assert(_sock.idle() && "migrate only a quiescent connection (no in-flight op)");
+  _owner = &dest;
+  _sock.rebind(dest); // adopt the bare fd onto dest's ring/poll set
+  vclog(_id, dest.id(), "migrate_here(): adopted synchronously (destination-pulled)");
 }
 
 DetachedTask
@@ -107,14 +107,12 @@ CoroNetVConnection::drive()
     if (_closing) {
       break;
     }
-    if (_migrate_dest) {
-      Reactor *dest = _migrate_dest;
-      _migrate_dest = nullptr;
-      vclog(_id, _owner->id(), "request_migrate(): suspending to hand off");
-      co_await Handoff{this, dest}; // resumes on dest's thread; _owner is now dest
-      if (auto cb = std::move(_migrate_cb)) {
-        cb(); // kick off the next transaction on the new thread
-      }
+    if (_on_parked) {
+      // Quiesce into a pool and wait to be pulled. ParkAndRelease resumes us on
+      // whichever thread later adopts us (migrate_here + do_io_read); _owner has
+      // been re-homed by then.
+      vclog(_id, _owner->id(), "park_and_release(): parking bare (no armed op), awaiting a pull");
+      co_await ParkAndRelease{this};
       continue;
     }
     if (!_read.active() && !_write.active()) {

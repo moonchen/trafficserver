@@ -10,12 +10,20 @@
  *      happens on that reactor's thread. do_io_* assert this in debug builds.
  *      There is no per-VC mutex: confinement IS the serialization.
  *
- *    - A VC may be MIGRATED to another reactor/thread (migrate_to), but only at
- *      a quiescent point — no I/O in flight. This models ATS moving an idle
- *      keep-alive origin connection onto the client connection's thread for a
- *      global session pool. Migration is a message-pass (post_remote), not a
- *      lock: the source thread stops touching the VC, hands it across the one
- *      synchronized channel, and the destination thread adopts it.
+ *    - A VC may be MIGRATED to another reactor/thread, mirroring ATS's
+ *      UnixNetVConnection::migrateToCurrentThread: SYNCHRONOUS and
+ *      DESTINATION-PULLED. The thread that wants the connection calls
+ *      migrate_here() on its own reactor and the call returns with the VC re-homed
+ *      to it — no callback, no cross-thread message. This works because migration
+ *      is only legal on a QUIESCENT connection (no in-flight op): an idle pooled
+ *      connection holds no armed io_uring SQE, so the destination can simply adopt
+ *      the fd onto its own ring. The hand-off of the VC pointer from old owner to
+ *      new owner travels through whatever synchronized structure pooled it (the
+ *      pool's lock), which supplies the happens-before edge — same as ATS relying
+ *      on the session-pool lock. (Contrast epoll's migrateToCurrentThread, which
+ *      can yank the fd off the source thread's poll set from the destination via
+ *      ep.stop(); io_uring has no thread-movable registration, so we instead
+ *      require quiescence and pull the bare fd.)
  */
 #pragma once
 
@@ -63,6 +71,16 @@ public:
     _signaled = false;
   }
 
+  // Park an externally-driven coroutine on this Event (used by ParkAndRelease so
+  // a later do_io_* on the adopting thread resumes drive()). Clears any stale
+  // signal so the next real notify is the one that resumes.
+  void
+  park(std::coroutine_handle<> h) noexcept
+  {
+    _waiter   = h;
+    _signaled = false;
+  }
+
   void
   notify(Reactor &owner)
   {
@@ -93,18 +111,20 @@ public:
   void do_io_write(const void *buf, size_t len, Continuation cont);
   void do_io_close();
 
-  // Request migration to another reactor/thread. Must be called on the current
-  // owner thread at a quiescent point (no in-flight I/O — true between
-  // transactions). The actual hand-off happens inside drive(), which suspends
-  // the coroutine and resumes it on `dest`; `on_adopted` then runs on the
-  // destination thread (kick off the next transaction there). This models ATS
-  // moving an idle keep-alive origin connection onto the client's thread.
-  void request_migrate(Reactor &dest, std::function<void()> on_adopted);
+  // Adopt this connection onto the calling thread's reactor — the synchronous,
+  // destination-pulled migration (cf. ATS migrateToCurrentThread). MUST be called
+  // on `dest`'s thread, and only on a quiescent connection (no in-flight op),
+  // which the caller must have obtained through a synchronized hand-off (e.g. a
+  // session pool) so the previous owner's writes are visible here. Returns with
+  // the VC owned by `dest`; the caller then drives the next transaction normally.
+  void migrate_here(Reactor &dest);
 
-  // Internal: invoked by the migration awaitable while the coroutine is
-  // suspended. Re-homes the VC to `dest` and resumes `resume_me` on dest's
-  // thread. Public only so the awaitable can reach it.
-  void migrate_handoff(std::coroutine_handle<> resume_me, Reactor &dest);
+  // Quiesce this connection and, once drive() has parked, invoke `on_parked(this)`
+  // to publish it (e.g. push into a session pool) for a future migrate_here().
+  // Called on the owner thread from within a continuation (drive() running). The
+  // parked connection holds NO armed io_uring op — that is what makes a later
+  // destination-pull adoption possible.
+  void park_and_release(std::function<void(CoroNetVConnection *)> on_parked);
 
   size_t
   read_done() const
@@ -135,6 +155,8 @@ private:
     }
   };
 
+  struct ParkAndRelease; // defined in .cc; parks drive() then publishes the VC
+
   DetachedTask drive();
   void         finalize();
   void
@@ -143,19 +165,19 @@ private:
     assert(_owner->on_owner_thread() && "VC touched off its owner thread");
   }
 
-  Reactor              *_owner; // rebindable: changes on migration
-  int                   _fd;
-  int                   _id;
-  AsyncSocket           _sock;
-  Event                 _work;
-  VIO                   _read;
-  VIO                   _write;
-  Continuation          _read_cont;
-  Continuation          _write_cont;
-  bool                  _closing{false};
-  Reactor              *_migrate_dest{nullptr};
-  std::function<void()> _migrate_cb;
-  std::function<void()> _on_freed;
+  Reactor    *_owner; // rebindable: changes on migration
+  int         _fd;
+  int         _id;
+  AsyncSocket _sock;
+  Event       _work;
+  VIO         _read;
+  VIO         _write;
+
+  Continuation                              _read_cont;
+  Continuation                              _write_cont;
+  bool                                      _closing{false};
+  std::function<void(CoroNetVConnection *)> _on_parked; // set by park_and_release
+  std::function<void()>                     _on_freed;
 };
 
 } // namespace coronet

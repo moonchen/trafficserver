@@ -5,18 +5,19 @@
  *    - N worker reactors, each its own thread + its own backend (per-thread ring
  *      / epoll set). A connection is confined to one worker for its lifetime.
  *    - 1 acceptor reactor (own thread). It accepts and HANDS each fd to a worker
- *      via post_remote — the one synchronized cross-thread channel.
+ *      via post_remote — one synchronized cross-thread channel.
  *    - 1 client reactor (own thread) driving the test clients.
  *
  *  What it shows:
  *    1. Accept hand-off across threads (acceptor -> worker) by message-passing.
- *    2. Connection MIGRATION across worker threads mid-session: after its first
- *       transaction, one VC is moved from worker 1 to worker 2 (modelling an
- *       idle origin connection migrating onto the client's thread). The coroutine
- *       suspends on the source thread and resumes on the destination thread —
- *       no lock, just a hand-off.
- *    3. There is NO per-VC mutex anywhere. Confinement + post_remote is the only
- *       synchronization. Run under ThreadSanitizer to confirm.
+ *    2. SYNCHRONOUS, DESTINATION-PULLED migration (cf. ATS migrateToCurrentThread).
+ *       After its first transaction, connection 0 is released into a shared
+ *       session pool, BARE (no armed io_uring op). A *different* worker later
+ *       pulls it from the pool and calls migrate_here() on its own reactor — a
+ *       synchronous adopt, no callback, no cross-thread message — then drives the
+ *       second transaction. The pool's mutex is the only synchronization, exactly
+ *       as ATS relies on the session-pool lock.
+ *    3. There is NO per-VC mutex anywhere. Run under ThreadSanitizer to confirm.
  *
  *      ./coro_net_mt epoll
  *      ./coro_net_mt uring
@@ -33,7 +34,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
@@ -53,6 +56,40 @@ constexpr int N_TXN     = 2; // transactions (round-trips) per connection
 struct Stats {
   std::atomic<int> clients_done{0};
   std::atomic<int> server_done{0};
+};
+
+// A toy session pool: holds quiescent (bare, no armed op) connections waiting to
+// be pulled onto another thread. Its mutex supplies the happens-before edge
+// between the releasing worker and the adopting worker — the same role the global
+// session-pool lock plays in ATS. This is the ONLY shared mutable state crossing
+// threads for migration.
+struct Pool {
+  std::mutex                        mu;
+  std::vector<CoroNetVConnection *> conns;
+
+  void
+  release(CoroNetVConnection *vc)
+  {
+    std::lock_guard<std::mutex> g(mu);
+    conns.push_back(vc);
+  }
+
+  // Pull a pooled connection NOT currently owned by `self`, so the demo always
+  // migrates across threads. owner() is read under the lock, after the releaser
+  // pushed under the lock, so the read is safe.
+  CoroNetVConnection *
+  take_foreign(Reactor *self)
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (auto it = conns.begin(); it != conns.end(); ++it) {
+      if (&(*it)->owner() != self) {
+        CoroNetVConnection *vc = *it;
+        conns.erase(it);
+        return vc;
+      }
+    }
+    return nullptr;
+  }
 };
 
 std::unique_ptr<IBackend>
@@ -107,48 +144,55 @@ loopback(uint16_t port)
 
 using Buf = std::array<char, 256>;
 
+// Read one request and echo it back, allocating/freeing its own buffer so no
+// buffer ever crosses the pool/migration boundary. Calls on_done after the echo
+// is fully written.
 void
-do_one_txn(CoroNetVConnection *vc, Buf *buf, std::function<void()> on_done)
+echo_once(CoroNetVConnection *vc, std::function<void()> on_done)
 {
+  auto *buf = new Buf;
   vc->do_io_read(buf->data(), buf->size(), [vc, buf, on_done = std::move(on_done)](int ev) mutable {
     if (ev != VC_READ_READY && ev != VC_READ_COMPLETE) {
+      delete buf;
       vc->do_io_close();
       return;
     }
     size_t n = vc->read_done();
-    vc->do_io_write(buf->data(), n, [on_done = std::move(on_done)](int ev2) {
+    vc->do_io_write(buf->data(), n, [vc, buf, on_done = std::move(on_done)](int ev2) mutable {
+      delete buf;
       if (ev2 == VC_WRITE_COMPLETE) {
         on_done();
+      } else {
+        vc->do_io_close();
       }
     });
   });
 }
 
-// A two-transaction echo session. If `migrate_dest` is non-null, the connection
-// migrates to that worker between the two transactions.
+// Drive transaction 2 (and close) on whatever thread just adopted the connection.
 void
-start_session(CoroNetVConnection *vc, Reactor *migrate_dest)
+serve_pooled_txn2(CoroNetVConnection *vc)
 {
-  auto *buf = new Buf;
-  do_one_txn(vc, buf, [vc, buf, migrate_dest] {
-    auto finish = [vc, buf] {
-      do_one_txn(vc, buf, [vc, buf] {
-        delete buf;
-        vc->do_io_close();
-      });
-    };
-    if (migrate_dest) {
-      vc->request_migrate(*migrate_dest, finish); // finish() runs on the new thread
-    } else {
-      finish();
-    }
-  });
+  echo_once(vc, [vc] { vc->do_io_close(); });
+}
+
+void
+start_session(CoroNetVConnection *vc, bool pooled, Pool *pool)
+{
+  if (pooled) {
+    // Transaction 1 here, then release the (now quiescent) connection into the
+    // pool to be pulled onto another thread for transaction 2.
+    echo_once(vc, [vc, pool] { vc->park_and_release([pool](CoroNetVConnection *v) { pool->release(v); }); });
+  } else {
+    // Two transactions on the owning thread, then close.
+    echo_once(vc, [vc] { echo_once(vc, [vc] { vc->do_io_close(); }); });
+  }
 }
 
 // ---- coroutines -------------------------------------------------------------
 
 DetachedTask
-accept_loop(Reactor &acc, int lfd, std::vector<Reactor *> *workers, Stats *st)
+accept_loop(Reactor &acc, int lfd, std::vector<Reactor *> *workers, Pool *pool, Stats *st)
 {
   AsyncSocket listener(acc, lfd);
   for (int i = 0; i < N_CONNS; ++i) {
@@ -159,15 +203,14 @@ accept_loop(Reactor &acc, int lfd, std::vector<Reactor *> *workers, Stats *st)
       ::printf("  accept failed: %d\n", cfd);
       break;
     }
-    Reactor *w       = (*workers)[i % N_WORKERS];
-    bool     migrate = (i == 0); // the first connection will migrate worker1 -> worker2
-    Reactor *dest    = (*workers)[1 % N_WORKERS];
+    Reactor *w      = (*workers)[i % N_WORKERS];
+    bool     pooled = (i == 0); // conn 0 is released to the pool and migrated
     ::printf("  acceptor(reactor %d): handed conn %d to worker reactor %d%s\n", acc.id(), i, w->id(),
-             migrate ? " (will migrate)" : "");
+             pooled ? " (will be pooled + migrated)" : "");
     // Create and drive the VC ON the worker thread.
-    w->post_remote([w, cfd, i, migrate, dest, st] {
+    w->post_remote([w, cfd, i, pooled, pool, st] {
       auto *vc = new CoroNetVConnection(*w, cfd, i, [st] { st->server_done.fetch_add(1); });
-      start_session(vc, migrate ? dest : nullptr);
+      start_session(vc, pooled, pool);
     });
   }
 }
@@ -203,17 +246,26 @@ main(int argc, char **argv)
   std::string which = argc > 1 ? argv[1] : "epoll";
 
   Stats                  st;
+  Pool                   pool;
   std::vector<Reactor *> workers(N_WORKERS, nullptr);
   std::atomic<Reactor *> acceptorR{nullptr};
   std::atomic<Reactor *> clientR{nullptr};
   std::atomic<int>       ready{0};
 
-  // Worker threads: each constructs its own backend + reactor ON its thread.
+  // Worker threads: each constructs its own backend + reactor ON its thread, and
+  // periodically scans the pool to adopt any connection released by another
+  // worker (the destination-pull half of migration).
   std::vector<std::thread> worker_threads;
   for (int i = 0; i < N_WORKERS; ++i) {
     worker_threads.emplace_back([&, i] {
       auto    be = make_backend(which, i + 1);
       Reactor r(*be, i + 1);
+      r.every(std::chrono::milliseconds(2), [&r, &pool] {
+        if (CoroNetVConnection *vc = pool.take_foreign(&r)) {
+          vc->migrate_here(r);   // synchronous adopt onto this thread
+          serve_pooled_txn2(vc); // ...then drive the next transaction here
+        }
+      });
       workers[i] = &r;
       ready.fetch_add(1);
       r.run();
@@ -232,7 +284,7 @@ main(int argc, char **argv)
     auto    be = make_backend(which, 0);
     Reactor r(*be, 0);
     acceptorR.store(&r);
-    accept_loop(r, lfd, &workers, &st);
+    accept_loop(r, lfd, &workers, &pool, &st);
     r.run();
   });
 

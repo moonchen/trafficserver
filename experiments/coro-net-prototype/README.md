@@ -127,9 +127,10 @@ VConnections are, in practice, **thread-confined**: a VC lives on one `ET_NET`
 thread, and even the origin connection is *migrated* onto the client connection's
 thread for the global session pool. If you make that confinement an explicit,
 enforced invariant, the resume path needs no lock at all — it would only ever be
-taken uncontended. The mutex's real job (serializing genuinely concurrent access)
-is instead handled by **message-passing**: the few legitimate cross-thread events
-go through one synchronized channel, `Reactor::post_remote()`.
+taken uncontended. The per-VC mutex's real job is instead handled by **explicit
+synchronized hand-offs**: the few legitimate cross-thread events go through a
+small number of synchronized channels — `Reactor::post_remote()` (accept
+hand-off) and a session-pool mutex (migration) — never a lock on the VC itself.
 
 So the multi-threaded design is:
 
@@ -140,31 +141,42 @@ So the multi-threaded design is:
   resume on the hot path.
 - **Accept hand-off** (`acceptor → worker`) is a `post_remote` of the new fd —
   the one necessary cross-thread step to place a connection on a worker.
-- **Migration** (`worker A → worker B`, `CoroNetVConnection::request_migrate`)
-  models moving an idle keep-alive origin connection onto the client's thread.
-  It happens at a quiescent point (no I/O in flight): the coroutine *suspends* on
-  the source thread (`Handoff` awaitable), is re-homed via `post_remote`, and
-  *resumes* on the destination thread. A hand-off, not a lock.
+- **Migration** is **synchronous and destination-pulled**, mirroring ATS's
+  `UnixNetVConnection::migrateToCurrentThread` (which is called by the thread that
+  wants the session and returns the re-homed VC). A connection that finishes a
+  transaction is `park_and_release`'d into a session pool — **bare, with no armed
+  io_uring op**. A *different* worker later pulls it from the pool and calls
+  `vc->migrate_here(*self)` on its own reactor: a synchronous adopt, **no callback,
+  no cross-thread message**. The pool's mutex supplies the happens-before edge,
+  exactly as ATS leans on the session-pool lock.
+
+  Why pulled-and-bare rather than pushed? epoll's `migrateToCurrentThread` can
+  yank the fd off the source thread's poll set from the destination (`ep.stop()`,
+  an `epoll_ctl` that is thread-safe). io_uring has **no thread-movable
+  registration** — an armed SQE lives on the source ring and can only be cancelled
+  by the source thread — so we require quiescence (a pooled connection holds no
+  op) and let the destination adopt the bare fd onto its own ring. Same
+  synchronous API as ATS; the only new constraint is "don't keep an op armed on a
+  pooled connection."
 
 `coro_net_mt` runs 3 workers + an acceptor + a client driver, echoes over 4
 connections (2 transactions each), and migrates one connection between workers
-mid-session. The log shows the move:
+between its two transactions. The log shows the pull:
 
 ```
-  acceptor(reactor 0): handed conn 0 to worker reactor 1 (will migrate)
-    [VC 0 @reactor 1] request_migrate(): suspending to hand off
-    [VC 0 @reactor 2] adopted on new thread; resuming coroutine here
-    [VC 0 @reactor 2] finalize(): VC freed (no op left dangling)
+  acceptor(reactor 0): handed conn 0 to worker reactor 1 (will be pooled + migrated)
+    [VC 0 @reactor 1] park_and_release(): parking bare (no armed op), awaiting a pull
+    [VC 0 @reactor 2] migrate_here(): adopted synchronously (destination-pulled)
 == done: clients 4/4, server VCs freed 4/4 ==
 ```
 
-**Verified race-free under ThreadSanitizer** (8/8 runs, both engines) and clean
-under ASan/UBSan — with zero per-VC locks. The only synchronized cross-thread
-state is the `post_remote` queue. (Getting there surfaced two real bugs worth
-noting: `stop()` must not poke the wakeup pipe or it races teardown `close()`;
-and the stop flag must be acquire/release, not relaxed, so the join→stop chain
-gives TSan the happens-before edge for the io_uring path, whose kernel-side pipe
-reads are invisible to TSan's interceptors.)
+**Verified race-free under ThreadSanitizer** (both engines, 10× repeat) and clean
+under ASan/UBSan — with zero per-VC locks. The two synchronized cross-thread
+channels are the `post_remote` queue (accept hand-off) and the session-pool mutex
+(migration). The park-then-publish ordering in `ParkAndRelease` is what keeps the
+pool hand-off race-free: the coroutine's resume handle is stored *before* the VC
+becomes visible in the pool, so the adopting thread's later `do_io_read` always
+finds it.
 
 ## Test matrix
 
