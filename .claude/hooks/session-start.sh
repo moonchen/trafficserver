@@ -4,8 +4,12 @@
 #
 # Installs the toolchain the coro-net prototype (experiments/coro-net-prototype)
 # needs so that its lint + test matrix can run during a web session, then smoke-
-# checks both. Runs synchronously so dependencies are guaranteed present before
-# the agent loop starts. Idempotent and non-interactive.
+# checks both. Runs in ASYNC mode: the session starts immediately while this work
+# happens in the background. Idempotent and non-interactive.
+#
+# Trade-off of async: faster session startup, but there is a window at the very
+# start where the toolchain may not be installed yet — if the first thing you do
+# is build/test the prototype, wait for "deps installed" in the log below.
 #
 # Scope: this only sets up the coro-net prototype, not the full Traffic Server
 # build (which has a much larger dependency set). Extend the apt list below if a
@@ -16,6 +20,10 @@ set -euo pipefail
 if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
+
+# Detach: let the agent loop start now; everything below runs in the background.
+# asyncTimeout caps how long that background work may take (cold apt + build).
+echo '{"async": true, "asyncTimeout": 300000}'
 
 LOG="/tmp/coro-net-session-start.log"
 : >"$LOG"
