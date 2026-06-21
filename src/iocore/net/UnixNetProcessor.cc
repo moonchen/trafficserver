@@ -27,6 +27,9 @@
 #include "P_UnixNet.h"
 #include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
+#if TS_USE_LINUX_IO_URING
+#include "P_IOUringNetVConnection.h"
+#endif
 #include "iocore/net/SessionAccept.h"
 #include "tscore/InkErrno.h"
 #include "tscore/TSSystemState.h"
@@ -305,6 +308,26 @@ UnixNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 NetVConnection *
 UnixNetProcessor::allocate_vc(EThread *t)
 {
+#if TS_USE_LINUX_IO_URING
+  // proxy.config.net.io_uring.enabled (restart-required) selects the io_uring
+  // VConnection. It is a UnixNetVConnection subclass, so this is a drop-in until
+  // its I/O seams are swapped to io_uring one at a time. Read once and announce.
+  static const bool use_io_uring = []() {
+    bool enabled = RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0;
+    if (enabled) {
+      Note("io_uring NetVConnection enabled (proxy.config.net.io_uring.enabled=1)");
+    }
+    return enabled;
+  }();
+  if (use_io_uring) {
+    IOUringNetVConnection *vc = ioUringNetVCAllocator.alloc();
+    if (vc && !t) {
+      vc->from_accept_thread = true;
+    }
+    return vc;
+  }
+#endif
+
   UnixNetVConnection *vc;
 
   if (t) {
