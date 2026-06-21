@@ -60,26 +60,69 @@ ctest --test-dir build-dev -R iouring --output-on-failure
 # ASan: cmake --preset dev-asan -DUSE_IOURING=1 && cmake --build build-dev-asan --target test_iouring_coro
 ```
 
-## Phase 2 — convert one leaf of the net path (the read path) — NEXT
+## Phase 2A — clone UnixNetVConnection, hook plain HTTP, identical baseline — DONE
 
-Bring the `net-iouring` branch's `IOUringNetVConnection` onto the current tree
-(it predates the `include/iocore` reorg — expect to relocate files and fix
-includes), then convert **reads only**:
+Per maintainer guidance (don't port the old `net-iouring` stack — it predates the
+`include/iocore` reorg and uses removed APIs throughout; instead add a new VC the
+way `SSLNetVConnection` subclasses `UnixNetVConnection`, then swap pieces to
+io_uring one at a time):
 
-1. Replace `IOUringReader` + `prep_read` + the `ops_in_flight` read bookkeeping
-   with a coroutine read loop driven by `UringOp` (`io_uring_prep_recv`/`recvmsg`).
-   Keep `do_io_read` + the VIO/`Continuation` signalling identical to callers.
-2. Buffer/iovec lives in the coroutine frame across the await (deletes the
-   class-scope `msghdr` hack).
-3. `do_io_close` = `UringCancel` + `co_await` the `-ECANCELED`, then unwind —
-   not the branch's `delete this` (the known UAF).
-4. Leave the **write** path on the old mechanism (mixed is fine; keeps the diff
-   reviewable).
+**Landed (3 commits):**
+- `src/iocore/net/{P_IOUringNetVConnection.h,IOUringNetVConnection.cc}` —
+  `IOUringNetVConnection : public UnixNetVConnection`. For now a behavioral clone
+  (all I/O inherited); own `ClassAllocator` + `free_thread` override returning to
+  it (uses the global allocator directly — no per-thread `ProxyAllocator` member
+  on `Thread`). Gated `#if TS_USE_LINUX_IO_URING`.
+- `proxy.config.net.io_uring.enabled` (record, default 0) gates
+  `UnixNetProcessor::allocate_vc`: when set, plain (non-TLS) connections are
+  minted as `IOUringNetVConnection`. Read once, announced with a NOTE.
+- `tests/gold_tests/io_uring/io_uring_netvc.test.py` — plain-HTTP transaction with
+  the flag on; checks the origin body is proxied intact **and** that the io_uring
+  VC path actually engaged (the NOTE in diags.log), not a silent fallback.
 
-Acceptance: ATS builds `-DUSE_IOURING=1`; a focused autest/unit test drives an
-inbound connection whose reads go through the coroutine path, verifying correct
-data and clean close (no UAF under ASan).
+**Verified:** autest passes (Debug, `-DUSE_IOURING=1`, install to /tmp/ats-dev),
+engagement proven. Default (flag off) path is the stock `allocate_vc`, unchanged.
 
-Later leaves, in order: write path → accept/connect → full close → then the
-bigger items the spike left out (TLS, timeouts via `IORING_OP_TIMEOUT`,
-MIOBuffer, SQ-full backpressure as a suspending await, migration).
+Autest harness gotchas (this box): `pipenv` is broken — build a uv venv
+(`uv venv /tmp/ats-autest-venv --python 3.10` + `uv pip install autest==1.10.4
+traffic-replay microserver ... `), put its bin on PATH (so the spawned
+`microserver` is found), and run `autest run -D gold_tests --ats-bin
+/tmp/ats-dev/bin --build-root build-dev --sandbox <dir> -f io_uring_netvc`.
+
+## Phase 2B — swap the read path to io_uring recvmsg — NEXT (the deep step)
+
+The seam is `net_read_io` (UnixNetVConnection.cc): it builds an iovec from the
+read MIOBuffer's write blocks and does a synchronous `con.sock.recvmsg`, then
+fills + signals the read VIO. Reads are *triggered* by epoll readiness
+(`reenable` → `ep.modify(EVENTIO_READ)` → `read_ready_list` → `net_read_io`).
+
+Converting to io_uring is not a one-liner because it changes the control model
+(completion- vs readiness-driven). The hard problems to design for:
+1. **Trigger.** Either keep the epoll-readiness trigger and only async-ify the
+   recvmsg (submit on EPOLLIN, signal from the completion) — simplest first cut,
+   reuses the enable/backpressure machinery — or go fully completion-driven and
+   suppress epoll read interest (`ep.modify(EVENTIO_READ)`) entirely.
+2. **VIO mutex under async completion.** `net_read_io` holds `read.vio.mutex`
+   across the (synchronous) read+signal. With an async recv the mutex can only be
+   taken *after* the completion resumes; rely on thread-confinement so it is
+   uncontended (the coroutine resumes on the owning EThread under the NetHandler
+   mutex, via `IOUringContext::service()` in `waitForActivity`).
+3. **Backpressure / re-arm.** Stop reading when the buffer is full; re-arm on
+   reenable. A restart-per-episode coroutine (start on reenable, exit when it
+   can't progress) avoids a persistent parked coroutine.
+4. **Teardown re-entrancy.** A read signal can close (free) the VC; and
+   `do_io_close` may fire with a recv in flight. Use cancel-then-unwind
+   (`UringCancel` the in-flight recv, let the read coroutine unwind, free after) —
+   exactly what the Phase-1 runtime + the prototype were built for.
+
+The Phase-2A autest is the regression guard across this swap.
+
+## Later leaves (after 2B), in order
+
+Write path (`load_buffer_and_write` → io_uring `sendmsg`) → `do_io_close` fully
+on cancel-then-unwind → accept/connect → then the bigger items the spike left
+out: TLS (via the layered SSLNetVConnection once that refactor lands), timeouts
+via `IORING_OP_TIMEOUT`, SQ-full backpressure as a suspending await, migration.
+
+Each leaf keeps the `do_io_*` + `Continuation`/VIO facade identical to callers
+and is guarded by the Phase-2A autest plus any leaf-specific test.
