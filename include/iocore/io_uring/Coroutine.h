@@ -230,7 +230,7 @@ public:
     if (sqe == nullptr) {
       // The submission queue is full and could not be flushed. Surface it like a
       // failed syscall rather than suspending forever; resume immediately.
-      _res = -ENOBUFS;
+      _result = -ENOBUFS;
       return false;
     }
     _prep(sqe);
@@ -242,13 +242,13 @@ public:
   int
   await_resume() const noexcept
   {
-    return _res;
+    return _result;
   }
 
   void
   handle_complete(io_uring_cqe *cqe) override
   {
-    _res = cqe->res; // bytes / accepted-fd on success, -errno (or -ECANCELED) on failure
+    _result = cqe->res; // bytes / accepted-fd on success, -errno (or -ECANCELED) on failure
     // Resume on the owning EThread (this CQE drained on the same thread that
     // submitted it). Touch nothing after this: resuming may run the coroutine
     // past the co_await and destroy *this (the awaitable temporary).
@@ -258,7 +258,7 @@ public:
 private:
   Prep                    _prep;
   std::coroutine_handle<> _waiter{};
-  int                     _res{0};
+  int                     _result{0};
 };
 
 template <typename Prep> UringOp(Prep) -> UringOp<Prep>;
@@ -295,7 +295,7 @@ public:
     _waiter           = h;
     io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(this); // user_data = this
     if (sqe == nullptr) {
-      _res = -ENOBUFS;
+      _result = -ENOBUFS;
       return false;
     }
     io_uring_prep_cancel(sqe, _target, 0);
@@ -305,20 +305,20 @@ public:
   int
   await_resume() const noexcept
   {
-    return _res;
+    return _result;
   }
 
   void
   handle_complete(io_uring_cqe *cqe) override
   {
-    _res = cqe->res;
+    _result = cqe->res;
     _waiter.resume();
   }
 
 private:
   IOUringCompletionHandler *_target;
   std::coroutine_handle<>   _waiter{};
-  int                       _res{0};
+  int                       _result{0};
 };
 
 } // namespace ts::iouring
