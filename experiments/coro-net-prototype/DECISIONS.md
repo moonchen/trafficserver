@@ -151,6 +151,28 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   notes that "the load test exercises the close path" refer to close in general;
   the op-in-flight sub-path specifically is uncovered.)
 
+## No epoll — fully completion-driven (Phase 2D)
+
+- **D22. Drop epoll for the io_uring VC; drive purely from completions.** Set
+  `ep.syscall = false` in the constructor → `startIO`'s `ep.start` is a no-op, so
+  the fd is never registered with epoll (the documented EventIO opt-out QUIC
+  uses; verified at runtime `ep.syscall == 0`). io_uring needs no readiness
+  signal. Consequence: nothing sets `read/write.triggered` (that was the epoll
+  edge), so override `reenable`/`reenable_re` to set `triggered = 1` ("io_uring is
+  always armable") before delegating — the existing ready/enable-list machinery
+  then drives `net_read_io`/`net_write_io` with no epoll edge, on both the
+  same-thread and cross-thread (enable_list) paths. The coroutines keep
+  `triggered` set and re-arm via `read/writeReschedule`; a short read/send
+  re-submits an op that waits in the kernel rather than waiting for an epoll edge.
+  This deletes the hybrid model and the entire edge-trigger-latch bug class
+  (INV-R3 no longer applies). Timeouts are unaffected (the InactivityCop uses its
+  own `open_list`/queues + `netActivity()` timestamps, not epoll). Verified
+  Debug/ASan/TSan on both autests; the load test (64 keep-alive conns) passes
+  with the fd entirely out of epoll.
+  - Note: continuous re-arming does *not* by itself make the deferred-close path
+    fire (the common close still rides the read completion: FIN → EOS → close, op
+    already drained). That path still needs an external close (Phase 2E).
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll

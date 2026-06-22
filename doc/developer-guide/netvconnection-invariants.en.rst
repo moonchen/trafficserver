@@ -231,7 +231,9 @@ How the io_uring NetVConnection honors these
 gated by ``proxy.config.net.io_uring.enabled``) is a :class:`UnixNetVConnection`
 subclass that swaps individual I/O seams to io_uring while inheriting the rest.
 The read and write paths are converted (recvmsg / sendmsg via the coroutine
-runtime); accept/connect and TLS are not. Status of each invariant:
+runtime) and the fd is driven purely by io_uring completions with no epoll
+registration; accept/connect and TLS are not yet converted. Status of each
+invariant:
 
 .. list-table::
    :header-rows: 1
@@ -254,9 +256,11 @@ runtime); accept/connect and TLS are not. Status of each invariant:
      - held
      - Inherited; reenable re-drives via ``net_read_io``.
    * - INV-R3
-     - held
-     - ``_read`` drains the socket per epoll edge (loops recvmsg until a short
-       read / full buffer / VIO satisfied).
+     - n/a (no epoll)
+     - The fd is not registered with epoll (``ep.syscall == false``); there is no
+       readiness edge to drain. Re-arm is ``reenable`` -> submit a recv directly,
+       and a short recv simply re-submits an op that waits in the kernel. The
+       edge-trigger latch is gone.
    * - INV-R4
      - n/a
      - Plain VC is not a transform (relevant once TLS layers on top).

@@ -165,13 +165,29 @@ same latent bug, fixed too.
 access in io_uring code; bodies delivered intact under all three). The response
 body now flows through io_uring sendmsg.
 
-## Later leaves (after 2C), in order
+## Phase 2D — drop epoll, fully completion-driven — DONE
 
-`do_io_close` fully on cancel-then-unwind for all cases → accept/connect via
-io_uring → then the bigger items the spike left out: TLS (via the layered
-SSLNetVConnection once that refactor lands), timeouts via `IORING_OP_TIMEOUT`,
-SQ-full backpressure as a suspending await, a pooled coroutine-frame allocator,
-migration.
+`ep.syscall = false` so the fd is never registered with epoll (verified at
+runtime `ep.syscall == 0`); io_uring completions need no readiness signal.
+`reenable`/`reenable_re` mark `triggered = 1` (always armable) and delegate, so
+the existing ready/enable-list machinery drives the coroutines with no epoll
+edge. This deletes the hybrid epoll-trigger model and the edge-trigger-latch bug
+class (INV-R3 no longer applies; see D22). Timeouts unaffected (cop uses its own
+queues). Verified Debug + ASan (0 errors) + TSan (0 races in io_uring code) on
+both autests incl. the wrk load.
+
+## Later leaves (after 2D), in order
+
+(1) **Multishot read** on a provided/ring buffer — a recv stays armed across
+completions; makes the deferred-close path the common case + needs a different
+buffer model. (2) **connect** via `io_uring_prep_connect` (outbound, no
+cross-thread; the inherited path already works, so this is an optimization).
+(3) **Phase 2E**: a deterministic deferred-close test (cross-connection teardown
+— origin RST while a client read is armed). (4) **accept** via
+`io_uring_prep_accept`, *single-shot + re-arm gated by the throttle*
+(`check_net_throttle`/`connections_throttle`/memory), since plain multishot would
+bypass the gate. Then the bigger items: TLS (layered SSLNetVConnection),
+timeouts via `IORING_OP_TIMEOUT`, a pooled coroutine-frame allocator, migration.
 
 Each leaf keeps the `do_io_*` + `Continuation`/VIO facade identical to callers
 and is guarded by the Phase-2A autest plus any leaf-specific test, and is
