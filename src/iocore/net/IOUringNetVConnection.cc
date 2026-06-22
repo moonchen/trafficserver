@@ -83,6 +83,24 @@ cancel_in_flight(IOUringCompletionHandler *op)
 void
 IOUringNetVConnection::free_thread(EThread *t)
 {
+  // Teardown can reach free_thread (via NetHandler::free_netevent) from paths that
+  // bypass our do_io_close override --- notably an inactivity/active timeout, which
+  // the inherited mainEvent routes through the base file-static read/write_signal
+  // helpers. If an io_uring op is still in flight here, a coroutine is suspended on
+  // it and will resume into a freed VC (a use-after-free; ASan is blind because VCs
+  // go to a ClassAllocator freelist, not malloc/free --- run with -F to surface it).
+  // Defer: cancel the ops and let the resuming coroutine free via
+  // _complete_deferred_close, exactly as the do_io_close-driven path does.
+  if (_read_op != nullptr || _write_op != nullptr || _connect_op != nullptr) {
+    if (!_closing) {
+      _closing = true;
+      cancel_in_flight(_read_op);
+      cancel_in_flight(_write_op);
+      cancel_in_flight(_connect_op);
+    }
+    return;
+  }
+
   // A faithful copy of UnixNetVConnection::free_thread, differing only in the
   // allocator the object is returned to. The base hardcodes netVCAllocator, so
   // it cannot be reused for a differently-typed subclass without corrupting that
