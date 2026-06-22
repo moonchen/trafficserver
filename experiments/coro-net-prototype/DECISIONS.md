@@ -134,6 +134,23 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   build-time codegen. jemalloc is already OFF in the `dev` preset (required for
   TSan). Suppressions live in `.tsan_suppressions` at the repo root.
 
+## Teardown coverage (finding, 2026-06-21)
+
+- **D21. The deferred (cancel-then-unwind) close branch is a safety net, not a hot
+  path — and is not yet hit by a test.** Added `proxy.process.net.io_uring.
+  vc_deferred_close` + a gated debug line on the branch. Observation: it fires
+  **zero** times across all current autests, including the wrk load test. Reason:
+  ATS quiesces the read/write VIOs (disable → the coroutine exits and clears
+  `_read_op`/`_write_op`) *before* `do_io_close` runs, so at close time there is
+  normally no op in flight; the normal close takes `super::do_io_close` inline.
+  The deferred branch is still reachable and correct for closes driven from
+  *outside* the coroutine's own completion (e.g. a WRITE_COMPLETE-driven close
+  while a read is armed on the same VC), but a simple HTTP test does not force it.
+  A deterministic trigger (active-timeout mid-stream, or a cross-stream close) is
+  future work. The counter makes the gap visible rather than hiding it. (Earlier
+  notes that "the load test exercises the close path" refer to close in general;
+  the op-in-flight sub-path specifically is uncovered.)
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll

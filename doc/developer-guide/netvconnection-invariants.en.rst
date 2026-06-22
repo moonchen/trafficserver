@@ -287,11 +287,13 @@ runtime); accept/connect and TLS are not. Status of each invariant:
        (``_read_signal_and_update`` / ``_read_signal_done``) because the base
        helpers are file-static.
    * - INV-L2
-     - held
+     - held (safety net)
      - ``do_io_close`` cancels whichever of the in-flight recvmsg / sendmsg is
        outstanding and defers the free until neither remains
        (``_complete_deferred_close``); the signal-unwind free is gated the same
-       way.
+       way. In practice ATS quiesces the VIOs before close, so this branch is a
+       rarely-hit safety net (counter ``proxy.process.net.io_uring.
+       vc_deferred_close``); not yet covered by a deterministic test.
    * - INV-L3
      - held
      - One ring per EThread (``thread_local``), so a recvmsg CQE drains and
