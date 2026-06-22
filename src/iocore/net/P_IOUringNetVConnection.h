@@ -77,8 +77,8 @@ public:
   void net_write_io(NetHandler *nh) override;
 
   // If a recvmsg and/or sendmsg is in flight, cancel it and defer teardown until
-  // the (cancelled) completion(s) resume the coroutine(s) --- freeing now would
-  // resume into a freed `this` (the net-iouring branch's use-after-free).
+  // the (cancelled) completion(s) resume the coroutine(s) --- freeing or clearing
+  // the I/O buffers now would corrupt an op the kernel still owns.
   void do_io_close(int lerrno = -1) override;
 
 private:
@@ -95,16 +95,19 @@ private:
   int _write_signal_and_update(int event);
   int _write_signal_done(int event);
 
-  // Deferred-close completion: free the VC once neither a read nor a write op is
-  // in flight (cancel-then-unwind, see do_io_close).
-  void _complete_deferred_close();
+  // The real teardown (the base free_thread body): close the fd, clear, and return
+  // the VC to the allocator. Deferred until no io_uring op is in flight, since an
+  // op's completion resumes a coroutine that touches `this` and its buffers.
+  void _do_free(EThread *t);
 
   // The in-flight recvmsg / sendmsg ops, reachable for cancellation. Each address
   // is the SQE user_data; non-null only while that op is actually in flight.
-  IOUringCompletionHandler *_read_op     = nullptr;
-  IOUringCompletionHandler *_write_op    = nullptr;
-  bool                      _closing     = false;
-  int                       _close_errno = -1;
+  IOUringCompletionHandler *_read_op  = nullptr;
+  IOUringCompletionHandler *_write_op = nullptr;
+  // Teardown was requested while an op was in flight; the last op completion to
+  // observe both ops drained runs _do_free. _freed guards against a double free.
+  bool _want_free = false;
+  bool _freed     = false;
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
