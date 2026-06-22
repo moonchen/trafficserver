@@ -279,6 +279,36 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   shutdown cancels the pending accept via listen-socket close (-ECANCELED →
   handle_complete returns, no re-arm) — best-effort, not a targeted test.
 
+## Frame allocator (leaf #3, 2026-06-22)
+
+- **D29. Per-thread coroutine-frame pool = the path to epoll parity.** First perf
+  baseline (cache-hit plain HTTP/1.1, ATS pinned to 4 saturated cores): the io_uring
+  net path ran **15-27% below epoll**. Root cause: each `_read`/`_write`/`_connect`
+  drive heap-allocates a ~1KB `DetachedTask` frame (an iovec array + msghdr +
+  locals) and frees it at completion — one malloc/free per op, the dominant cost at
+  saturation. A self-time profile **mis-ranks** it (malloc looks ~3%); the cost is
+  the per-op allocation *instruction stream* (verified: a frame pool cuts
+  instructions/req ~16% at near-flat IPC; an env-gated prototype, then a production
+  allocator, both recover it).
+- **Design: a bespoke thread-local bounded intrusive pool, NOT `ink_freelist`.**
+  `detail::FramePool` in `Coroutine.h`, on `DetachedTask::promise_type`
+  new/delete. Rationale for each choice: *thread_local* (no atomics) because VCs are
+  thread-confined so a frame is allocated and freed on the same EThread — a global
+  `ink_freelist` (versioned-CAS) would add needless atomics; *intrusive* free list
+  (next-ptr in the freed frame) so the pool needs no allocation of its own;
+  *bounded* (CAP=1024/size/thread, ≤8 size classes, else fall back to
+  `::operator new`) so it can't grow with peak connection count (the prototype's
+  never-free was the panel's main risk). *Honors `-f`/`-F`* via the new
+  `ink_freelist_global_disabled()` accessor: when freelists are globally disabled
+  every frame routes through malloc/free, so ASan still sees frame allocations —
+  which the D25/D28 teardown test depends on.
+- **Result:** within-campaign head-to-head, io_uring is now **−1.5% large / −2.4%
+  small req/s vs epoll (was −27%/−15%), p99 BETTER on both** — residual ≤ IQR noise
+  = effectively parity. Verified Debug + ASan (0 UAF, load + `-F` teardown) +
+  non-io_uring build + format. **Not yet done (perf scope, deferred):** ≥10k-conn
+  memory behavior, cache-MISS/origin-facing + H2/TLS scenarios, perf-stat
+  replication — see [[io-uring-perf-baseline]].
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
