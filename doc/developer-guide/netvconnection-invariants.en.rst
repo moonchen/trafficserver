@@ -214,6 +214,16 @@ must instead cancel the in-flight op and defer teardown until the (cancelled)
 completion is observed, then free. *Proven by* the original net-iouring branch's
 ``do_io_close`` doing ``delete this`` with a recvmsg still in the ring.
 
+The cancel-then-unwind must cover *every* free path, not just ``do_io_close``.
+An inactivity/active timeout closes the VC through the inherited ``mainEvent`` and
+the base read/write-signal helpers, which free via ``free_netevent`` →
+``free_thread`` --- bypassing ``do_io_close``. So ``free_thread`` itself must also
+defer when an op is in flight (cancel + return, freeing later from the resuming
+completion). This kind of UAF is invisible to ASan when VCs are freed to a
+``ClassAllocator`` freelist rather than ``malloc``/``free``; surface it by running
+with ``-F`` (disable the ProxyAllocator freelist) under ASan, or with a transient
+``ink_release_assert`` that no op is in flight at the free.
+
 .. rubric:: INV-L3 --- a NetVConnection is thread-confined; cross-thread moves go through one serialized channel
 
 A VC lives on one ``ET_NET`` thread for its lifetime; its I/O completes and its
@@ -291,13 +301,15 @@ invariant:
        (``_read_signal_and_update`` / ``_read_signal_done``) because the base
        helpers are file-static.
    * - INV-L2
-     - held (safety net)
-     - ``do_io_close`` cancels whichever of the in-flight recvmsg / sendmsg is
-       outstanding and defers the free until neither remains
-       (``_complete_deferred_close``); the signal-unwind free is gated the same
-       way. In practice ATS quiesces the VIOs before close, so this branch is a
-       rarely-hit safety net (counter ``proxy.process.net.io_uring.
-       vc_deferred_close``); not yet covered by a deterministic test.
+     - held
+     - ``do_io_close`` *and* ``free_thread`` both cancel whichever of the in-flight
+       recvmsg / sendmsg / connect is outstanding and defer the free until none
+       remain (``_complete_deferred_close``); covering ``free_thread`` closes the
+       timeout/``mainEvent`` path that bypasses ``do_io_close``. Exercised
+       deterministically by ``io_uring_origin_timeout`` (origin hangs → recv in
+       flight when the inactivity timeout closes), which runs under ``-F`` so an
+       ASan build catches the UAF; counter
+       ``proxy.process.net.io_uring.vc_deferred_close``.
    * - INV-L3
      - held
      - One ring per EThread (``thread_local``), so a recvmsg CQE drains and

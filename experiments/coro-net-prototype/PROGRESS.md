@@ -200,12 +200,21 @@ accept. Verified Debug + ASan + TSan incl. the wrk load (64 conns). See D27.
 With this, the whole inbound+outbound socket lifecycle — accept, connect, read,
 write, close — runs on io_uring with no epoll for the io_uring VC.
 
+## D25 — defer the free when an op is in flight — FIXED (TDD)
+
+`free_thread` (reached by the inactivity/active-timeout close via the inherited
+`mainEvent` → base signal → `free_netevent`, bypassing `do_io_close`) freed the VC
+with a recvmsg in flight → the cancelled recv resumed into a freed VC. Reproduced
+deterministically (`io_uring_origin_timeout`: origin accepts + hangs → recv in
+flight at the inactivity timeout), surfaced via `-F` + ASan (freelist off, so ASan
+sees the VC free) plus a transient free-time assert. Fix: `free_thread` defers like
+`do_io_close` (cancel + return; the resuming coroutine frees). No-op path
+unchanged. Verified: `-F`+ASan UAF without the fix, clean with it, no load-test
+regression. See D28.
+
 ## Later leaves, in order
 
-(1) The **D25 free_thread-choke teardown** redo,
-done properly with a deterministic deferred-path test first (TDD) — the general
-mid-transaction-timeout-with-op-in-flight case (the connect case is now handled).
-(3) **Multishot read** on a provided/ring buffer (deferred — hard to reconcile
+(1) **Multishot read** on a provided/ring buffer (deferred — hard to reconcile
 provided-buffer lifetime with MIOBuffer; single-shot stays for now). Then the
 bigger items: TLS (layered SSLNetVConnection),
 timeouts via `IORING_OP_TIMEOUT`, a pooled coroutine-frame allocator, migration.

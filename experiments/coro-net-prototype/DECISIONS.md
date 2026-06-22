@@ -237,6 +237,25 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   the free_thread-choke properly, but only with a deterministic deferred-path test
   first (TDD)** — the blind refactor was the mistake.
 
+- **D28. FIXED D25 (2026-06-22), TDD this time.** The concern in D25 is real and
+  now reproduced deterministically: an origin that accepts but never responds keeps
+  an io_uring recvmsg in flight; the server inactivity timeout then closes the VC
+  via `mainEvent` → base `read/write_signal` → `free_netevent` → `free_thread`,
+  freeing it with the recv in flight → the cancelled recv resumes into a freed VC.
+  **Detector:** this UAF is invisible to ASan by default (VCs go to a ClassAllocator
+  freelist, not malloc/free). Two ways surfaced it — (a) a temporary
+  `ink_release_assert(no op in flight)` at the top of `free_thread` *fired*; (b)
+  running with **`-F`** (disable the ProxyAllocator freelist → real malloc/free)
+  made ASan report `heap-use-after-free`. **Fix:** make `free_thread` itself defer —
+  if an op is in flight, cancel it and return, letting the resuming coroutine free
+  via `_complete_deferred_close` (reusing the do_io_close path; the no-op path is
+  byte-identical to before, so the load-test close path is untouched — that's what
+  the prior blind refactor got wrong). **Verified:** new `io_uring_origin_timeout`
+  autest runs with `-F`; without the fix → `-F`+ASan UAF, with it → 504 + clean;
+  no regression on the wrk load test under `-F`+ASan. The deciding lesson vs the
+  D25 revert: a deterministic failing test under a *real* detector (`-F`+ASan) first,
+  then the minimal fix, verified on both the new test and the prior regression point.
+
 ## Accept (Phase 2G, 2026-06-22)
 
 - **D27. io_uring accept = per-thread, single-shot, throttle-gated re-arm.** New
