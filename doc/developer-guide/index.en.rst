@@ -54,6 +54,7 @@ duplicate bugs is encouraged, but not required.
    documentation/index.en
    host-resolution-proposal.en
    client-session-architecture.en
+   netvconnection-invariants.en
    core-architecture/index.en
    design-documents/index.en
    layout/index.en
