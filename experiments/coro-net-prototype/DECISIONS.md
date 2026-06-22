@@ -88,6 +88,38 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   preserve the `recursion`/`closed`/`free_netevent` contract verbatim so a
   do_io_close fired from inside a read signal defers correctly (INV-L1).
 
+## Write path (Phase 2C)
+
+- **D16. Symmetric to the read path: async sendmsg + per-edge drain loop.**
+  `net_write_io` launches a `_write` coroutine doing `io_uring_prep_sendmsg`; the
+  completion consumes the reader and signals. EPOLLOUT is also edge-triggered, so
+  it drains per writable edge (loop until short send / empty buffer / VIO done).
+
+- **D17. Demand-driven, not buffer-ahead (INV-W1).** Before sending, if the
+  buffer does not hold all requested bytes and is not at high water, signal
+  `WRITE_READY` so the user produces more. We do not stage ciphertext ahead (that
+  matters for the layered TLS VC; for a plain VC there is no staging buffer, so
+  `WRITE_COMPLETE` inline after the sendmsg completion is safe — same as base).
+
+- **D18. Build the send iovec from a *clone* of the reader.** The real reader is
+  consumed only after the sendmsg completes (`consume(wr)`), so a cancelled or
+  short send never loses bytes. iovec + msghdr live in the coroutine frame.
+
+- **D19. Unified two-op teardown.** `do_io_close` cancels whichever of recvmsg /
+  sendmsg is in flight and defers the free until *neither* remains
+  (`_complete_deferred_close`). The signal-unwind free (`_*_signal_and_update`) is
+  likewise gated on `_read_op == nullptr && _write_op == nullptr`, so a close
+  fired from inside a read signal cannot free the VC while a sendmsg is still in
+  the kernel (INV-L2).
+
+- **D20. `net_*_io` must NOT clear `triggered` (INV-R3) — bug found + fixed.** The
+  edge-trigger latch `read.triggered`/`write.triggered` is the buffer-full →
+  reenable re-drive mechanism (`ep.modify` is a no-op under EPOLLET). Clearing it
+  in `net_read_io`/`net_write_io` strands a backpressured flow. Clear it ONLY on
+  the genuinely-drained paths inside the coroutine (EAGAIN / short read / short
+  send). The write conversion surfaced this (a body never re-armed after the
+  consumer drained); the read path had the same latent bug, now fixed too.
+
 ## Testing / sanitizers
 
 - **D14. Verify every phase under ASan and TSan, plus a real load test.** Unit test
@@ -104,9 +136,9 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
 
 ## Open / pending decisions
 
-- Write path (Phase 2C): demand-driven sendmsg via the coroutine runtime
-  (INV-W1/INV-W2); extend cancel-then-unwind to an in-flight send.
-- Whether/when to go fully completion-driven for reads (drop epoll read interest).
+- Whether/when to go fully completion-driven for reads/writes (drop epoll
+  interest entirely and rely only on io_uring completions).
+- accept/connect via io_uring (`io_uring_prep_accept` / `_connect`).
 - Cross-thread migration (`migrateToCurrentThread`) for the global session pool.
 - A pooled coroutine-frame allocator (currently one heap alloc per read episode).
 - Targeted close-with-recv-in-flight test (e.g. inactivity timeout while a

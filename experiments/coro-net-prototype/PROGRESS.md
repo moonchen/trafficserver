@@ -137,16 +137,42 @@ GCC TSan), run autests against the TSan install with
 
 **Known limits of the first cut (later work):** relies on thread-confinement for
 the post-await mutex (no fallback if contended); SQ-full on the cancel SQE is not
-retried; per-read coroutine-frame heap alloc (no pool); the deferred-close path
-is exercised incidentally by churn, not yet by a targeted close-with-recv-in-
-flight test (e.g. an inactivity timeout while a keep-alive read is armed).
+retried; per-episode coroutine-frame heap alloc (no pool); the deferred-close
+path is exercised incidentally by churn, not yet by a targeted
+close-with-op-in-flight test (e.g. an inactivity timeout while a keep-alive read
+is armed).
 
-## Later leaves (after 2B), in order
+## Phase 2C — swap the write path to io_uring sendmsg — DONE
 
-Write path (`load_buffer_and_write` → io_uring `sendmsg`) → `do_io_close` fully
-on cancel-then-unwind → accept/connect → then the bigger items the spike left
-out: TLS (via the layered SSLNetVConnection once that refactor lands), timeouts
-via `IORING_OP_TIMEOUT`, SQ-full backpressure as a suspending await, migration.
+`net_write_io` now launches a `_write` coroutine (symmetric to `_read`):
+`io_uring_prep_sendmsg`, per-writable-edge drain loop, demand-driven
+`WRITE_READY` before sending (INV-W1), iovec built from a *clone* of the reader
+so bytes are consumed only after the send completes. Teardown generalized to
+both directions: `do_io_close` cancels whichever of recvmsg/sendmsg is in flight
+and defers the free until neither remains (`_complete_deferred_close`); the
+signal-unwind free is gated the same way (INV-L2). Write still selected by the
+same `proxy.config.net.io_uring.enabled`.
+
+While converting writes, found + fixed a latent **edge-trigger latch** bug
+(INV-R3 / decision D20): `net_*_io` must not clear `triggered` (it is the
+reenable re-drive mechanism under EPOLLET); clear it only on the drained paths
+(EAGAIN / short read / short send) inside the coroutine. The write path exposed
+it (a body never re-armed after the consumer drained); the read path had the
+same latent bug, fixed too.
+
+**Verified (read + write):** `io_uring_netvc` + `io_uring_read` (256 KB drain +
+`wrk` load) pass on Debug, ASan (0 errors), and TSan (no race with its racing
+access in io_uring code; bodies delivered intact under all three). The response
+body now flows through io_uring sendmsg.
+
+## Later leaves (after 2C), in order
+
+`do_io_close` fully on cancel-then-unwind for all cases → accept/connect via
+io_uring → then the bigger items the spike left out: TLS (via the layered
+SSLNetVConnection once that refactor lands), timeouts via `IORING_OP_TIMEOUT`,
+SQ-full backpressure as a suspending await, a pooled coroutine-frame allocator,
+migration.
 
 Each leaf keeps the `do_io_*` + `Continuation`/VIO facade identical to callers
-and is guarded by the Phase-2A autest plus any leaf-specific test.
+and is guarded by the Phase-2A autest plus any leaf-specific test, and is
+verified under ASan + TSan.

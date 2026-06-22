@@ -230,7 +230,8 @@ How the io_uring NetVConnection honors these
 :class:`IOUringNetVConnection` (``src/iocore/net/IOUringNetVConnection.{h,cc}``,
 gated by ``proxy.config.net.io_uring.enabled``) is a :class:`UnixNetVConnection`
 subclass that swaps individual I/O seams to io_uring while inheriting the rest.
-Status of each invariant for the current (read-path) state:
+The read and write paths are converted (recvmsg / sendmsg via the coroutine
+runtime); accept/connect and TLS are not. Status of each invariant:
 
 .. list-table::
    :header-rows: 1
@@ -264,12 +265,15 @@ Status of each invariant for the current (read-path) state:
      - EOS / EAGAIN / ERROR handled per read; relies on the inherited epoll
        re-trigger. Re-verify if the read path stops using the epoll trigger.
    * - INV-W1
-     - inherited
-     - Write still uses the base (epoll) path.
+     - held
+     - ``_write`` is demand-driven: it signals ``WRITE_READY`` to let the user
+       produce more before sending, rather than buffering ahead.
    * - INV-W2
-     - inherited
-     - Write still uses the base path; revisit when the write path moves to
-       io_uring sendmsg.
+     - n/a (plain)
+     - A plain socket VC has no staging buffer between ``SSL_write`` and the
+       socket, so ``WRITE_COMPLETE`` after the sendmsg completion is safe inline
+       (the base does the same). The off-stack rule applies to a layered VC; the
+       io_uring write path must preserve it when TLS layers on top.
    * - INV-B1
      - held
      - Inherited; ``_read`` honors ``write_avail()`` and stops on a full buffer
@@ -284,8 +288,10 @@ Status of each invariant for the current (read-path) state:
        helpers are file-static.
    * - INV-L2
      - held
-     - ``do_io_close`` cancels the in-flight recvmsg and defers the free to the
-       resuming read coroutine.
+     - ``do_io_close`` cancels whichever of the in-flight recvmsg / sendmsg is
+       outstanding and defers the free until neither remains
+       (``_complete_deferred_close``); the signal-unwind free is gated the same
+       way.
    * - INV-L3
      - held
      - One ring per EThread (``thread_local``), so a recvmsg CQE drains and
