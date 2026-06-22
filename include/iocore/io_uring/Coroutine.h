@@ -42,17 +42,105 @@
 #if TS_USE_LINUX_IO_URING
 
 #include "iocore/io_uring/IO_URING.h"
+#include "tscore/ink_queue.h"
 
 #include <cerrno>
 #include <coroutine>
 #include <type_traits>
 #include <utility>
+#include <cstddef>
 
 namespace ts::iouring
 {
 
 namespace detail
 {
+  // A per-thread, bounded cache of coroutine frames keyed by frame size. Each
+  // io_uring drive (_read/_write/_connect) allocates one frame (~1 KB: an iovec
+  // array + msghdr + locals) and frees it at completion; at saturation that
+  // malloc/free stream is the dominant cost of the io_uring net path (measured
+  // ~15-27% throughput vs epoll, recovered by this pool). Frames are allocated and
+  // freed on the same EThread (VCs are thread-confined), so the cache is
+  // thread_local --- no atomics. It is bounded per size class so it cannot grow
+  // with peak connection count, and uses an intrusive free list (the next pointer
+  // lives in the freed frame) so it needs no bookkeeping allocation of its own.
+  // Honors traffic_server -f/-F (ink_freelist_global_disabled) so a debug/ASan run
+  // routes every frame through malloc/free.
+  class FramePool
+  {
+  public:
+    static constexpr std::size_t MAX_CLASSES = 8;    // distinct frame sizes (one per coroutine type)
+    static constexpr std::size_t CAP         = 1024; // frames cached per size class per thread
+
+    void *
+    allocate(std::size_t n)
+    {
+      if (Slot *s = slot(n); s != nullptr && s->head != nullptr) {
+        void *p = s->head;
+        s->head = *static_cast<void **>(p);
+        --s->count;
+        return p;
+      }
+      return ::operator new(n);
+    }
+
+    void
+    deallocate(void *p, std::size_t n) noexcept
+    {
+      if (Slot *s = slot(n); s != nullptr && s->count < CAP) {
+        *static_cast<void **>(p) = s->head;
+        s->head                  = p;
+        ++s->count;
+        return;
+      }
+      ::operator delete(p);
+    }
+
+  private:
+    struct Slot {
+      std::size_t size  = 0;
+      void       *head  = nullptr;
+      std::size_t count = 0;
+    };
+    Slot slots_[MAX_CLASSES];
+
+    // Find (or lazily claim) the slot for size n; nullptr if more than MAX_CLASSES
+    // distinct sizes appear (then the caller falls back to malloc).
+    Slot *
+    slot(std::size_t n)
+    {
+      Slot *vacancy = nullptr;
+      for (Slot &s : slots_) {
+        if (s.size == n) {
+          return &s;
+        }
+        if (s.size == 0 && vacancy == nullptr) {
+          vacancy = &s;
+        }
+      }
+      if (vacancy != nullptr) {
+        vacancy->size = n;
+        return vacancy;
+      }
+      return nullptr;
+    }
+  };
+
+  inline FramePool &
+  frame_pool() noexcept
+  {
+    static thread_local FramePool p;
+    return p;
+  }
+
+  // Resolved once: -f/-F is a startup switch set before any coroutine runs.
+  inline bool
+  frame_pool_enabled() noexcept
+  {
+    static const bool on = !ink_freelist_global_disabled();
+    return on;
+  }
+
   // Promise mixin carrying a coroutine's return channel: a stored value for
   // Task<T>, nothing for Task<void>. Kept as separate (specialized) types so the
   // void path never instantiates a `void _value` member.
@@ -78,6 +166,25 @@ namespace detail
 // not need to hold --- e.g. a connection's read/write drive loop.
 struct DetachedTask {
   struct promise_type {
+    // Frames come from the per-thread bounded pool (see detail::FramePool): one
+    // frame is allocated per drive and freed at completion, so this malloc/free
+    // stream is hot. The pool transparently falls back to ::operator new when a
+    // size class is cold or full, or when freelists are globally disabled (-f/-F).
+    static void *
+    operator new(std::size_t n)
+    {
+      return detail::frame_pool_enabled() ? detail::frame_pool().allocate(n) : ::operator new(n);
+    }
+    static void
+    operator delete(void *p, std::size_t n) noexcept
+    {
+      if (detail::frame_pool_enabled()) {
+        detail::frame_pool().deallocate(p, n);
+      } else {
+        ::operator delete(p);
+      }
+    }
+
     DetachedTask
     get_return_object() noexcept
     {

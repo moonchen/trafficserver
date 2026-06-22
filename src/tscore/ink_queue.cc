@@ -133,6 +133,12 @@ ink_freelist_init_ops(int nofl_class, int nofl_proxy)
   freelist_global_ops = (nofl_class || nofl_proxy) ? ink_freelist_malloc_ops() : ink_freelist_freelist_ops();
 }
 
+bool
+ink_freelist_global_disabled()
+{
+  return freelist_global_ops == ink_freelist_malloc_ops();
+}
+
 void
 ink_freelist_init(InkFreeList **fl, const char *name, uint32_t type_size, uint32_t chunk_size, uint32_t alignment,
                   bool use_hugepages)

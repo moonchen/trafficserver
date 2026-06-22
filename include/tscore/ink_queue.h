@@ -194,6 +194,12 @@ const InkFreeListOps *ink_freelist_malloc_ops();
 const InkFreeListOps *ink_freelist_freelist_ops();
 void                  ink_freelist_init_ops(int nofl_class, int nofl_proxy);
 
+/** True once the freelist allocator has been globally disabled (traffic_server -f
+ * or -F). Lets non-InkFreeList caches (e.g. the io_uring coroutine-frame pool)
+ * honor the same switch, so a debug/ASan run still routes every allocation through
+ * malloc/free. */
+bool ink_freelist_global_disabled();
+
 /*
  * alignment must be a power of 2
  */
