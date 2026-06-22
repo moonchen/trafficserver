@@ -188,11 +188,21 @@ hung 30s under io_uring because the optimistic syscall-connect made the
 timeout). The connect op resolves before `_connect` handles it, so no in-flight
 op at the resulting free.
 
+## Phase 2G — io_uring accept — DONE
+
+`IOUringNetAccept` (NetAccept subclass + IOUringCompletionHandler) accepts with
+`io_uring_prep_accept` per ET_NET thread (single-shot + throttle-gated re-arm),
+so the accepted VC stays thread-local — no cross-thread hand-off. Selected by
+`createNetAccept` when `io_uring.enabled`, forcing the per-thread accept path.
+Single-shot (not multishot) so `check_net_throttle(ACCEPT)` is honored each
+accept. Verified Debug + ASan + TSan incl. the wrk load (64 conns). See D27.
+
+With this, the whole inbound+outbound socket lifecycle — accept, connect, read,
+write, close — runs on io_uring with no epoll for the io_uring VC.
+
 ## Later leaves, in order
 
-(1) **accept** via `io_uring_prep_accept`, *single-shot + re-arm gated by the
-throttle* (`check_net_throttle`/`connections_throttle`/memory), since plain
-multishot would bypass the gate. (2) The **D25 free_thread-choke teardown** redo,
+(1) The **D25 free_thread-choke teardown** redo,
 done properly with a deterministic deferred-path test first (TDD) — the general
 mid-transaction-timeout-with-op-in-flight case (the connect case is now handled).
 (3) **Multishot read** on a provided/ring buffer (deferred — hard to reconcile

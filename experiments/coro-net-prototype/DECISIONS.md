@@ -237,6 +237,29 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   the free_thread-choke properly, but only with a deterministic deferred-path test
   first (TDD)** — the blind refactor was the mistake.
 
+## Accept (Phase 2G, 2026-06-22)
+
+- **D27. io_uring accept = per-thread, single-shot, throttle-gated re-arm.** New
+  `IOUringNetAccept : NetAccept, IOUringCompletionHandler` (in `UnixNetAccept.cc`
+  so it can use the file-static `handle_max_client_connections`), selected by
+  `UnixNetProcessor::createNetAccept` when `io_uring.enabled`. It forces the
+  **per-thread** accept path (not the default dedicated-accept-thread loop): each
+  ET_NET thread keeps one `io_uring_prep_accept` in flight on its own ring and
+  re-arms in `handle_complete` after delivering the VC. The accepted VC stays on
+  the accepting thread — **no cross-thread hand-off** (INV-L3 holds; the listen fd
+  is shared and each thread's ring competes for connections, like EPOLLEXCLUSIVE).
+  **Single-shot, not multishot:** the accept throttle (`check_net_throttle(ACCEPT)`,
+  per-client max) is checked on every accept; multishot would bypass it. Under
+  throttle we accept-then-close + re-arm (matches `acceptFastEvent`); true
+  "stop-accepting-under-throttle" backpressure is a later refinement. The
+  VC-creation mirrors `acceptFastEvent` and is kept separate (the syscall accept
+  path is untouched — zero regression risk; TODO: dedup once settled). One-time
+  NOTE "io_uring accept enabled"; the `io_uring_netvc` autest asserts it. Verified
+  Debug + ASan(0) + TSan(0 races in io_uring code) incl. the wrk load (64 conns).
+  Known gaps: no batching (one accept in flight per thread; could submit several);
+  shutdown cancels the pending accept via listen-socket close (-ECANCELED →
+  handle_complete returns, no re-arm) — best-effort, not a targeted test.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
