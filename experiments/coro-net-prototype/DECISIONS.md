@@ -173,6 +173,45 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
     fire (the common close still rides the read completion: FIN → EOS → close, op
     already drained). That path still needs an external close (Phase 2E).
 
+## Connect (Phase 2F) + a reverted teardown refactor (2026-06-22)
+
+- **D23. Connect needs no conversion; the inherited optimistic connect is correct
+  under io_uring.** Proven (standalone probe): an io_uring `sendmsg`/`recvmsg` on a
+  still-connecting socket **waits via internal poll** (no -EAGAIN returned) until
+  the handshake completes. So the inherited `connectUp` (non-blocking connect →
+  EINPROGRESS → immediate `NET_EVENT_OPEN`) + the io_uring first read/write
+  transparently handles connect-in-progress, even with epoll off. Crucially this
+  also *matches master's semantics*: a refused connect surfaces as an async
+  `VC_EVENT_ERROR` (not `NET_EVENT_OPEN_FAILED`), which HttpSM's retry/error path
+  depends on. An explicit `io_uring_prep_connect` would diverge (refused →
+  `NET_EVENT_OPEN_FAILED`), so we deliberately do NOT convert connect. Verified by
+  `io_uring_connect.test.py` (success + refused, both green, ASan/TSan clean).
+
+- **D24. KNOWN DIVERGENCE: a black-holed origin connect (SYN dropped) returns 000
+  to the client under io_uring vs 502 on master/epoll.** Root cause is NOT the
+  io_uring teardown: `Connection::connect` returns 0 on EINPROGRESS (optimistic),
+  so ATS reports the handshake complete (`CONNECT_EVENT_TXN`) and applies the 30 s
+  post-connect timeout instead of the 2 s connect timeout; with epoll the failure
+  is surfaced differently than with io_uring's internal-poll wait. Deep
+  HttpSM/ConnectingEntry/connect-failure-detection territory; an edge case (origin
+  silently dropping SYNs). Repro: `iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport
+  <p> -j DROP`, remap to that port, short `connect_attempts_timeout`. NOT yet
+  fixed — needs its own investigation (likely explicit connect-failure detection).
+
+- **D25. REVERTED a `free_thread`-as-choke-point teardown refactor — it introduced
+  a UAF under load.** While chasing D24 I hypothesized the timeout path freed the
+  VC via `mainEvent` → base signal → `free_netevent` → `free_thread` with an op in
+  flight (bypassing do_io_close's deferral), and refactored `free_thread` to be the
+  single deferral choke. That hypothesis was wrong for the 000 (it didn't change
+  it), and the refactor introduced a heap-use-after-free in `io_uring_read` (the
+  wrk-load test, ASan) — so it was reverted (commit "Revert net: make free_thread
+  ...the teardown choke point"). The underlying concern is real but unverified: the
+  *current* (Phase-2D) teardown defers only in `do_io_close`, so a timeout/base-
+  signal-driven close could in principle free with an op in flight. It is not
+  observed in any test (the deferred path doesn't fire — D21). **Future work: do
+  the free_thread-choke properly, but only with a deterministic deferred-path test
+  first (TDD)** — the blind refactor was the mistake.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
