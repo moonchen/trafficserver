@@ -212,6 +212,20 @@ sees the VC free) plus a transient free-time assert. Fix: `free_thread` defers l
 unchanged. Verified: `-F`+ASan UAF without the fix, clean with it, no load-test
 regression. See D28.
 
+## Frame allocator (leaf #3) — DONE, io_uring reaches epoll parity
+
+First perf baseline (cache-hit plain HTTP/1.1, ATS pinned to 4 saturated cores) found the io_uring
+net path ran 15-27% below epoll. Root cause (proven by an env-gated prototype, then verified by a
+production allocator): each `_read`/`_write`/`_connect` drive heap-allocates a ~1KB DetachedTask
+coroutine frame and frees it at completion; that malloc/free stream is the deficit. A self-time
+profile under-counts it (malloc ~3%) because the cost is the per-op allocation instruction stream.
+
+`detail::FramePool` (Coroutine.h) is a per-thread, bounded, intrusive free list keyed by frame size,
+on DetachedTask::promise_type. Thread_local (VCs are thread-confined -> no atomics); bounded so it
+cannot grow with peak connections; honors `-f`/`-F` (ink_freelist_global_disabled) so ASan still sees
+frames under -F. Result: within-campaign A/B, io_uring now within ~1.5-2.4% req/s of epoll with BETTER
+p99. Open follow-ups (perf): >=10k-conn memory, cache-MISS/origin + H2/TLS, perf-stat replication.
+
 ## Later leaves, in order
 
 (1) **Multishot read** on a provided/ring buffer (deferred — hard to reconcile
