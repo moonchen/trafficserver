@@ -32,6 +32,9 @@
 #include "iocore/net/NetHandler.h"
 #include "iocore/eventsystem/EThread.h"
 
+#include "tscore/InkErrno.h"
+#include "records/RecCore.h"
+
 #include "tsutil/Metrics.h"
 
 using ts::Metrics;
@@ -46,7 +49,6 @@ namespace
 // value means the UAF-prevention path is being exercised.
 Metrics::Counter::AtomicType *deferred_close_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.vc_deferred_close");
 
-DbgCtl dbg_ctl_io_uring_net{"io_uring_net"};
 } // namespace
 
 namespace
@@ -350,10 +352,10 @@ IOUringNetVConnection::_read()
 void
 IOUringNetVConnection::_complete_deferred_close()
 {
-  // Free only once neither a recvmsg nor a sendmsg is still in flight; otherwise
-  // the other op's completion will resume into a freed `this`. The last coroutine
-  // to clear its op performs the free.
-  if (_read_op == nullptr && _write_op == nullptr) {
+  // Free only once no io_uring op is still in flight; otherwise another op's
+  // completion will resume into a freed `this`. The last coroutine to clear its
+  // op performs the free.
+  if (_read_op == nullptr && _write_op == nullptr && _connect_op == nullptr) {
     super::do_io_close(_close_errno);
   }
 }
@@ -361,7 +363,7 @@ IOUringNetVConnection::_complete_deferred_close()
 void
 IOUringNetVConnection::do_io_close(int alerrno)
 {
-  if (_read_op != nullptr || _write_op != nullptr) {
+  if (_read_op != nullptr || _write_op != nullptr || _connect_op != nullptr) {
     // Cancel-then-unwind: an io_uring op is in flight. Mark closing and cancel it;
     // the resuming coroutine(s) do the actual free once nothing is in flight. Do
     // NOT clear the I/O buffers here --- the kernel may still touch them until the
@@ -376,9 +378,9 @@ IOUringNetVConnection::do_io_close(int alerrno)
     this->closed = (alerrno == -1) ? 1 : -1;
 
     Metrics::Counter::increment(deferred_close_stat);
-    Dbg(dbg_ctl_io_uring_net, "do_io_close deferred: cancelling in-flight ops (read=%p write=%p) vc=%p", _read_op, _write_op, this);
     cancel_in_flight(_read_op);
     cancel_in_flight(_write_op);
+    cancel_in_flight(_connect_op);
     return;
   }
   super::do_io_close(alerrno);
@@ -609,6 +611,136 @@ IOUringNetVConnection::_write()
       // the user to produce more once the buffer runs low).
     }
   }
+}
+
+int
+IOUringNetVConnection::connectUp(EThread *t, int fd)
+{
+  ink_assert(get_NetHandler(t)->mutex->thread_holding == this_ethread());
+  int        res;
+  UnixSocket sock{fd};
+
+  thread = t;
+  if (check_net_throttle(CONNECT)) {
+    check_throttle_warning(CONNECT);
+    res = -ENET_THROTTLING;
+    Metrics::Counter::increment(net_rsb.connections_throttled_out);
+    goto fail;
+  }
+
+  options.ip_family = con.addr.sa.sa_family;
+
+  if (!sock.is_ok()) {
+    // Create + bind the socket and apply options, but do NOT connect(2): _connect
+    // drives the handshake with io_uring instead.
+    res = con.open(options);
+    if (res != 0) {
+      goto fail;
+    }
+  } else {
+    // TS API handed us an already-connected fd. Same as the base: adopt it and
+    // deliver NET_EVENT_OPEN synchronously (no handshake to wait for).
+    int len = sizeof(con.sock_type);
+    safe_getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char *>(&con.sock_type), &len);
+    sock.set_nonblocking();
+    con.sock         = sock;
+    con.is_connected = true;
+    con.is_bound     = true;
+  }
+
+  if ((res = get_NetHandler(t)->startIO(this)) < 0) {
+    goto fail;
+  }
+
+  if (!sock.is_ok()) {
+    // Dynamic options Connection::connect would normally apply, then the io_uring
+    // connect. NET_EVENT_OPEN / NET_EVENT_OPEN_FAILED is delivered from _connect.
+    con.apply_options(options);
+    _connect();
+    return CONNECT_SUCCESS;
+  }
+
+  // Already-connected (TS API) path: complete synchronously like the base.
+  Metrics::Gauge::increment(net_rsb.connections_currently_open);
+  SET_HANDLER(&UnixNetVConnection::mainEvent);
+  nh->startCop(this);
+  set_inactivity_timeout(0);
+  this->set_local_addr();
+  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+  return CONNECT_SUCCESS;
+
+fail:
+  lerrno = -res;
+  action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(res)));
+  if (con.sock.is_ok()) {
+    con.sock = UnixSocket{NO_FD};
+  }
+  if (nullptr != nh) {
+    nh->free_netevent(this);
+  } else {
+    this->free_thread(t);
+  }
+  return CONNECT_FAILURE;
+}
+
+ts::iouring::DetachedTask
+IOUringNetVConnection::_connect()
+{
+  int       fd   = con.sock.get_fd();
+  sockaddr *addr = const_cast<sockaddr *>(&con.addr.sa);
+  socklen_t alen = ats_ip_size(&con.addr.sa);
+
+  // A linked timeout cancels a stuck handshake so a black-holed origin fails
+  // instead of hanging. kts lives in the coroutine frame, pinned across the await.
+  int64_t           secs = RecGetRecordInt("proxy.config.http.connect_attempts_timeout").value_or(30);
+  __kernel_timespec kts  = {.tv_sec = secs, .tv_nsec = 0};
+
+  ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
+    io_uring_prep_connect(sqe, fd, addr, alen);
+    if (io_uring_sqe *tsqe = IOUringContext::local_context()->next_sqe(&noop_completion); tsqe != nullptr) {
+      sqe->flags |= IOSQE_IO_LINK;
+      io_uring_prep_link_timeout(tsqe, &kts, 0);
+    }
+  });
+  _connect_op = &op;
+  int res     = co_await op;
+  _connect_op = nullptr;
+
+  // do_io_close fired during the handshake (e.g. the client aborted): defer the
+  // free until no op is in flight.
+  if (_closing) {
+    _complete_deferred_close();
+    co_return;
+  }
+
+  // The connecting continuation is thread-confined to this EThread, so its mutex
+  // is uncontended here (we resume on the owning thread from service()).
+  MUTEX_TRY_LOCK(lock, action_.continuation->mutex, this_ethread());
+  ink_release_assert(lock.is_locked());
+
+  if (action_.cancelled) {
+    nh->free_netevent(this);
+    co_return;
+  }
+
+  if (res < 0) {
+    // -ECANCELED == the linked timeout fired (treat as a connect timeout); other
+    // negatives are the real connect error (-ECONNREFUSED, ...).
+    int err      = (res == -ECANCELED) ? ETIMEDOUT : -res;
+    this->lerrno = err;
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(-err)));
+    nh->free_netevent(this);
+    co_return;
+  }
+
+  // Handshake complete: NET_EVENT_OPEN now means the connection is really up.
+  con.is_connected = true;
+  Metrics::Gauge::increment(net_rsb.connections_currently_open);
+  SET_HANDLER(&UnixNetVConnection::mainEvent);
+  nh->startCop(this);
+  set_inactivity_timeout(0);
+  this->set_local_addr();
+  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
 }
 
 #endif // TS_USE_LINUX_IO_URING

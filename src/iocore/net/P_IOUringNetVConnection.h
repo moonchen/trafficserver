@@ -76,17 +76,27 @@ public:
   // completion consumes the reader and signals the write VIO.
   void net_write_io(NetHandler *nh) override;
 
-  // If a recvmsg and/or sendmsg is in flight, cancel it and defer teardown until
-  // the (cancelled) completion(s) resume the coroutine(s) --- freeing now would
+  // Connect to the origin with io_uring instead of a connect(2) syscall. connectUp
+  // creates+binds the socket, then _connect submits io_uring_prep_connect (with a
+  // linked timeout) and delivers NET_EVENT_OPEN on the success CQE or
+  // NET_EVENT_OPEN_FAILED on failure/timeout --- so NET_EVENT_OPEN means the
+  // handshake is actually done (the ConnectingEntry write-ready probe is then
+  // accurate). A fd handed in by the TS API is already connected; that path
+  // delivers NET_EVENT_OPEN synchronously, like the base.
+  int connectUp(EThread *t, int fd) override;
+
+  // If an io_uring op is in flight, cancel it and defer teardown until the
+  // (cancelled) completion(s) resume the coroutine(s) --- freeing now would
   // resume into a freed `this` (the net-iouring branch's use-after-free).
   void do_io_close(int lerrno = -1) override;
 
 private:
-  // The asynchronous read/write coroutines: build the iovec from the VIO buffer,
-  // await one io_uring recvmsg/sendmsg, then fill/consume + signal. Fire-and-forget
-  // (DetachedTask); the frame self-cleans at completion.
+  // The asynchronous read/write/connect coroutines: drive one io_uring op, await
+  // it, then signal. Fire-and-forget (DetachedTask); the frame self-cleans at
+  // completion.
   ts::iouring::DetachedTask _read();
   ts::iouring::DetachedTask _write();
+  ts::iouring::DetachedTask _connect();
 
   // Reimplementations of the file-static read_signal_* / write_signal_* helpers in
   // UnixNetVConnection.cc (not visible here). Same recursion/closed/free contract.
@@ -95,14 +105,15 @@ private:
   int _write_signal_and_update(int event);
   int _write_signal_done(int event);
 
-  // Deferred-close completion: free the VC once neither a read nor a write op is
-  // in flight (cancel-then-unwind, see do_io_close).
+  // Deferred-close completion: free the VC once no io_uring op is still in flight
+  // (cancel-then-unwind, see do_io_close).
   void _complete_deferred_close();
 
-  // The in-flight recvmsg / sendmsg ops, reachable for cancellation. Each address
-  // is the SQE user_data; non-null only while that op is actually in flight.
+  // The in-flight recvmsg / sendmsg / connect ops, reachable for cancellation. Each
+  // address is the SQE user_data; non-null only while that op is actually in flight.
   IOUringCompletionHandler *_read_op     = nullptr;
   IOUringCompletionHandler *_write_op    = nullptr;
+  IOUringCompletionHandler *_connect_op  = nullptr;
   bool                      _closing     = false;
   int                       _close_errno = -1;
 };
