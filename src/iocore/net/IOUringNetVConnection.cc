@@ -81,32 +81,10 @@ cancel_in_flight(IOUringCompletionHandler *op)
 void
 IOUringNetVConnection::free_thread(EThread *t)
 {
-  // The single teardown choke point: every close path (do_io_close, an inactivity/
-  // active timeout via mainEvent, the base read/write_signal recursion unwind)
-  // funnels here through NetHandler::free_netevent. If an io_uring op is still in
-  // flight, the coroutine awaiting it will resume and touch `this` (and its
-  // buffers) --- so defer the actual teardown until the op drains. Cancel the ops;
-  // their (-ECANCELED) completions run _do_free once both have drained.
-  if (_read_op != nullptr || _write_op != nullptr) {
-    if (!_want_free) {
-      Metrics::Counter::increment(deferred_close_stat);
-      _want_free = true;
-    }
-    cancel_in_flight(_read_op);
-    cancel_in_flight(_write_op);
-    return;
-  }
-  _do_free(t);
-}
-
-void
-IOUringNetVConnection::_do_free(EThread *t)
-{
-  // The base UnixNetVConnection::free_thread body, differing only in the allocator
-  // the object is returned to (the base hardcodes netVCAllocator, which is
-  // sized/typed for UnixNetVConnection). Runs only once no io_uring op is in flight.
-  ink_release_assert(!_freed);
-  _freed = true;
+  // A faithful copy of UnixNetVConnection::free_thread, differing only in the
+  // allocator the object is returned to. The base hardcodes netVCAllocator, so
+  // it cannot be reused for a differently-typed subclass without corrupting that
+  // freelist.
   ink_release_assert(t == this_ethread());
 
   // close socket fd
@@ -132,6 +110,7 @@ IOUringNetVConnection::_do_free(EThread *t)
   clear();
   SET_CONTINUATION_HANDLER(this, &IOUringNetVConnection::startEvent);
   ink_assert(!con.sock.is_ok());
+  ink_assert(t == this_ethread());
 
   // Return to the global allocator directly. Unlike UnixNetVConnection, this
   // subclass has no per-thread ProxyAllocator member on Thread, so it does not
@@ -166,10 +145,11 @@ IOUringNetVConnection::_read_signal_and_update(int event)
       break;
     }
   }
-  // Same as the base: free on the recursion unwind once closed. free_netevent ->
-  // free_thread defers the actual teardown if an io_uring op is still in flight, so
-  // no extra in-flight guard is needed here.
-  if (!--this->recursion && this->closed) {
+  // Free on the recursion unwind only when nothing is in flight. If an io_uring op
+  // is still outstanding (e.g. a do_io_close fired from inside this read signal
+  // while a sendmsg is pending), defer: that op's completion frees via
+  // _complete_deferred_close once the kernel is done with the VC.
+  if (!--this->recursion && this->closed && _read_op == nullptr && _write_op == nullptr) {
     ink_assert(this->thread == this_ethread());
     this->nh->free_netevent(this);
     return EVENT_DONE;
@@ -308,13 +288,10 @@ IOUringNetVConnection::_read()
     int r    = co_await op;
     _read_op = nullptr;
 
-    // Teardown was requested while this recv was in flight (do_io_close, a timeout,
-    // or free_thread). The VC is being torn down --- do not touch nh / vio / buffers.
-    // Run the deferred teardown once both ops have drained.
-    if (_want_free) {
-      if (_read_op == nullptr && _write_op == nullptr) {
-        _do_free(this_ethread());
-      }
+    // do_io_close deferred teardown to us (it cancelled this recv). Free once no
+    // op is in flight (a sendmsg may still be outstanding), then stop touching `this`.
+    if (_closing) {
+      _complete_deferred_close();
       co_return;
     }
 
@@ -326,7 +303,8 @@ IOUringNetVConnection::_read()
         co_return;
       }
       if (this->closed) {
-        co_return; // a close is in progress; free_thread owns the teardown
+        nh->free_netevent(this);
+        co_return;
       }
 
       if (r <= 0) {
@@ -370,24 +348,35 @@ IOUringNetVConnection::_read()
 }
 
 void
+IOUringNetVConnection::_complete_deferred_close()
+{
+  // Free only once neither a recvmsg nor a sendmsg is still in flight; otherwise
+  // the other op's completion will resume into a freed `this`. The last coroutine
+  // to clear its op performs the free.
+  if (_read_op == nullptr && _write_op == nullptr) {
+    super::do_io_close(_close_errno);
+  }
+}
+
+void
 IOUringNetVConnection::do_io_close(int alerrno)
 {
   if (_read_op != nullptr || _write_op != nullptr) {
-    // Cancel-then-unwind: an io_uring op is in flight. The base do_io_close would
-    // clear the read/write VIO buffers inline --- but a recv's iovec points into
-    // the read buffer blocks, so releasing them while the recv is in the kernel is
-    // a use-after-free. Instead set closed, cancel the ops, and defer the buffer
-    // clear + free to the op completion (or free_thread) once the ops drain.
+    // Cancel-then-unwind: an io_uring op is in flight. Mark closing and cancel it;
+    // the resuming coroutine(s) do the actual free once nothing is in flight. Do
+    // NOT clear the I/O buffers here --- the kernel may still touch them until the
+    // cancels land.
+    _closing            = true;
+    _close_errno        = alerrno;
     this->read.enabled  = 0;
     this->write.enabled = 0;
     if (alerrno && alerrno != -1) {
       this->lerrno = alerrno;
     }
     this->closed = (alerrno == -1) ? 1 : -1;
-    if (!_want_free) {
-      Metrics::Counter::increment(deferred_close_stat);
-      _want_free = true;
-    }
+
+    Metrics::Counter::increment(deferred_close_stat);
+    Dbg(dbg_ctl_io_uring_net, "do_io_close deferred: cancelling in-flight ops (read=%p write=%p) vc=%p", _read_op, _write_op, this);
     cancel_in_flight(_read_op);
     cancel_in_flight(_write_op);
     return;
@@ -435,9 +424,8 @@ IOUringNetVConnection::_write_signal_and_update(int event)
       break;
     }
   }
-  // See _read_signal_and_update: free_netevent -> free_thread defers if an op is in
-  // flight, so just free on the recursion unwind once closed.
-  if (!--this->recursion && this->closed) {
+  // See _read_signal_and_update: defer the free while any io_uring op is in flight.
+  if (!--this->recursion && this->closed && _read_op == nullptr && _write_op == nullptr) {
     ink_assert(this->thread == this_ethread());
     this->nh->free_netevent(this);
     return EVENT_DONE;
@@ -575,11 +563,8 @@ IOUringNetVConnection::_write()
     int wr    = co_await op;
     _write_op = nullptr;
 
-    // Teardown requested while this sendmsg was in flight (see the read path).
-    if (_want_free) {
-      if (_read_op == nullptr && _write_op == nullptr) {
-        _do_free(this_ethread());
-      }
+    if (_closing) {
+      _complete_deferred_close();
       co_return;
     }
 
@@ -591,7 +576,8 @@ IOUringNetVConnection::_write()
         co_return;
       }
       if (this->closed) {
-        co_return; // a close is in progress; free_thread owns the teardown
+        nh->free_netevent(this);
+        co_return;
       }
 
       if (wr <= 0) {
