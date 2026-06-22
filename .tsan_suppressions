@@ -25,3 +25,10 @@
 
 # Ignore data race of freelist
 race:freelist_new
+
+# The free side of the same lock-free freelist: ink_freelist_free reads the
+# approximate `used` accounting counter (an ink_assert) while another thread
+# atomically decrements it. Benign, same class as freelist_new. Surfaces more
+# with the io_uring NetVConnection because it frees to a global ClassAllocator
+# (hit by every ET_NET thread) rather than a per-thread ProxyAllocator.
+race:ink_freelist_free

@@ -120,6 +120,21 @@ commits):
 Load: ~1.75 M requests / 418 GB in 15 s, 0 socket errors, 0 non-2xx — the read
 and close paths are clean under heavy connection churn.
 
+**TSan:** the Phase-1 unit test is clean; under the load test TSan reports only
+pre-existing shared-infra races (lock-free freelist accounting, `ProxyMutex`
+trylock accounting, `CacheVC`, hdrs print, logging) — the exact classes the TLS
+campaign established as benign on master. Triaged by the racing access (frame
+#0/#1): **none are in io_uring code**; `IOUringNetVConnection`/`_read`/
+`handle_complete` appear only as call-stack *context* driving those infra races.
+The thread-confined model (one ring per EThread, completion resumes on the
+submitting thread, no per-VC mutex) holds. Added `race:ink_freelist_free` to
+`.tsan_suppressions` (free-side counterpart of the existing `freelist_new`;
+surfaced more because the io_uring VC frees to a global allocator — see D7).
+Recipe: `sudo sysctl vm.mmap_rnd_bits=28`, build with `-fsanitize=thread`
+(WARNING_AS_ERROR=OFF — a plugin uses `atomic_thread_fence`, unsupported under
+GCC TSan), run autests against the TSan install with
+`TSAN_OPTIONS=suppressions=.tsan_suppressions`.
+
 **Known limits of the first cut (later work):** relies on thread-confinement for
 the post-await mutex (no fallback if contended); SQ-full on the cancel SQE is not
 retried; per-read coroutine-frame heap alloc (no pool); the deferred-close path
