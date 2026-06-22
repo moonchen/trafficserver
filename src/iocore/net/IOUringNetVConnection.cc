@@ -52,6 +52,20 @@ struct NoopCompletion : public IOUringCompletionHandler {
   }
 };
 NoopCompletion noop_completion;
+
+// Submit an async cancel for an in-flight op (keyed on its SQE user_data); the
+// op then completes with -ECANCELED and resumes its coroutine. No-op if null.
+void
+cancel_in_flight(IOUringCompletionHandler *op)
+{
+  if (op == nullptr) {
+    return;
+  }
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&noop_completion);
+  if (sqe != nullptr) {
+    io_uring_prep_cancel(sqe, op, 0);
+  }
+}
 } // namespace
 
 void
@@ -121,7 +135,11 @@ IOUringNetVConnection::_read_signal_and_update(int event)
       break;
     }
   }
-  if (!--this->recursion && this->closed) {
+  // Free on the recursion unwind only when nothing is in flight. If an io_uring op
+  // is still outstanding (e.g. a do_io_close fired from inside this read signal
+  // while a sendmsg is pending), defer: that op's completion frees via
+  // _complete_deferred_close once the kernel is done with the VC.
+  if (!--this->recursion && this->closed && _read_op == nullptr && _write_op == nullptr) {
     ink_assert(this->thread == this_ethread());
     this->nh->free_netevent(this);
     return EVENT_DONE;
@@ -144,9 +162,10 @@ void
 IOUringNetVConnection::net_read_io(NetHandler *nh)
 {
   // A drain is already in flight; its completion continues reading. Don't start a
-  // second one for the same VC.
+  // second one for the same VC. Leave read.triggered alone --- it is the
+  // edge-trigger latch (cleared only when the socket is drained, in _read), and
+  // clearing it here would break the reenable re-drive (INV-R3).
   if (_read_op != nullptr) {
-    this->read.triggered = 0;
     nh->read_ready_list.remove(this);
     return;
   }
@@ -156,7 +175,6 @@ IOUringNetVConnection::net_read_io(NetHandler *nh)
 
   // If a recv is now in flight, keep epoll from re-entering us until it completes.
   if (_read_op != nullptr) {
-    this->read.triggered = 0;
     nh->read_ready_list.remove(this);
   }
 }
@@ -245,10 +263,10 @@ IOUringNetVConnection::_read()
     int r    = co_await op;
     _read_op = nullptr;
 
-    // do_io_close deferred teardown to us (it cancelled this recv). Free now that
-    // no op is in flight, then stop touching `this`.
-    if (_read_closing) {
-      super::do_io_close(_read_close_errno);
+    // do_io_close deferred teardown to us (it cancelled this recv). Free once no
+    // op is in flight (a sendmsg may still be outstanding), then stop touching `this`.
+    if (_closing) {
+      _complete_deferred_close();
       co_return;
     }
 
@@ -266,7 +284,8 @@ IOUringNetVConnection::_read()
 
       if (r <= 0) {
         if (r == -EAGAIN || r == -ENOTCONN) {
-          readReschedule(nh); // socket drained; epoll re-fires on new data
+          this->read.triggered = 0; // socket drained; wait for the next EPOLLIN edge
+          readReschedule(nh);
           co_return;
         }
         if (r == 0 || r == -ECONNRESET) {
@@ -294,7 +313,9 @@ IOUringNetVConnection::_read()
         co_return;
       }
       if (r < static_cast<int>(rattempted)) {
-        // Short read: the socket is drained for now. epoll re-fires on new data.
+        // Short read: the socket is drained for now. Clear the edge-trigger latch
+        // and wait for the next EPOLLIN edge.
+        this->read.triggered = 0;
         readReschedule(nh);
         co_return;
       }
@@ -304,14 +325,26 @@ IOUringNetVConnection::_read()
 }
 
 void
+IOUringNetVConnection::_complete_deferred_close()
+{
+  // Free only once neither a recvmsg nor a sendmsg is still in flight; otherwise
+  // the other op's completion will resume into a freed `this`. The last coroutine
+  // to clear its op performs the free.
+  if (_read_op == nullptr && _write_op == nullptr) {
+    super::do_io_close(_close_errno);
+  }
+}
+
+void
 IOUringNetVConnection::do_io_close(int alerrno)
 {
-  if (_read_op != nullptr) {
-    // Cancel-then-unwind: a recvmsg is in flight. Mark closing and cancel it; the
-    // read coroutine's completion does the actual free. Do NOT clear the read
-    // buffer here --- the kernel may still write into it until the cancel lands.
-    _read_closing       = true;
-    _read_close_errno   = alerrno;
+  if (_read_op != nullptr || _write_op != nullptr) {
+    // Cancel-then-unwind: an io_uring op is in flight. Mark closing and cancel it;
+    // the resuming coroutine(s) do the actual free once nothing is in flight. Do
+    // NOT clear the I/O buffers here --- the kernel may still touch them until the
+    // cancels land.
+    _closing            = true;
+    _close_errno        = alerrno;
     this->read.enabled  = 0;
     this->write.enabled = 0;
     if (alerrno && alerrno != -1) {
@@ -319,13 +352,243 @@ IOUringNetVConnection::do_io_close(int alerrno)
     }
     this->closed = (alerrno == -1) ? 1 : -1;
 
-    io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&noop_completion);
-    if (sqe != nullptr) {
-      io_uring_prep_cancel(sqe, _read_op, 0);
-    }
+    cancel_in_flight(_read_op);
+    cancel_in_flight(_write_op);
     return;
   }
   super::do_io_close(alerrno);
+}
+
+void
+IOUringNetVConnection::net_write_io(NetHandler *nh)
+{
+  // A drain is already in flight; its completion continues writing. Don't start a
+  // second one for the same VC. Leave write.triggered alone: unlike reads (which
+  // are re-driven by a fresh EPOLLIN edge on new socket data), a write is re-driven
+  // by the consumer's reenable, which only re-enqueues when triggered is set. The
+  // latch is cleared only when the socket is full (in _write), per INV-R3.
+  if (_write_op != nullptr) {
+    nh->write_ready_list.remove(this);
+    return;
+  }
+
+  _write();
+
+  if (_write_op != nullptr) {
+    nh->write_ready_list.remove(this);
+  }
+}
+
+int
+IOUringNetVConnection::_write_signal_and_update(int event)
+{
+  this->recursion++;
+  if (this->write.vio.cont && this->write.vio.mutex == this->write.vio.cont->mutex) {
+    this->write.vio.cont->handleEvent(event, &this->write.vio);
+  } else {
+    if (this->write.vio.cont) {
+      Note("_write_signal_and_update: mutexes are different? vc=%p, event=%d", this, event);
+    }
+    switch (event) {
+    case VC_EVENT_EOS:
+    case VC_EVENT_ERROR:
+    case VC_EVENT_ACTIVE_TIMEOUT:
+    case VC_EVENT_INACTIVITY_TIMEOUT:
+      this->closed = 1;
+      break;
+    default:
+      Error("Unexpected event %d for vc %p", event, this);
+      ink_release_assert(0);
+      break;
+    }
+  }
+  // See _read_signal_and_update: defer the free while any io_uring op is in flight.
+  if (!--this->recursion && this->closed && _read_op == nullptr && _write_op == nullptr) {
+    ink_assert(this->thread == this_ethread());
+    this->nh->free_netevent(this);
+    return EVENT_DONE;
+  }
+  return EVENT_CONT;
+}
+
+int
+IOUringNetVConnection::_write_signal_done(int event)
+{
+  this->write.enabled = 0;
+  if (_write_signal_and_update(event) == EVENT_DONE) {
+    return EVENT_DONE;
+  }
+  writeReschedule(this->nh);
+  return EVENT_CONT;
+}
+
+ts::iouring::DetachedTask
+IOUringNetVConnection::_write()
+{
+  NetState   *s  = &this->write;
+  NetHandler *nh = this->nh;
+
+  // Drain the write VIO buffer to the socket per writability edge (edge-triggered
+  // EPOLLOUT, same reasoning as the read path): keep sending until the socket
+  // can't take more (short send), the buffer is empty, or the VIO is satisfied.
+  for (;;) {
+    IOVec         tiovec[NET_MAX_IOV];
+    struct msghdr msg;
+    int           fd           = this->con.sock.get_fd();
+    int64_t       try_to_write = 0;
+
+    // Build the next send under the VIO mutex.
+    {
+      MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+      if (!lock.is_locked() || lock.get_mutex() != s->vio.mutex.get()) {
+        writeReschedule(nh);
+        co_return;
+      }
+      if (this->closed) {
+        nh->free_netevent(this);
+        co_return;
+      }
+      if (this->has_error()) {
+        this->lerrno = this->error;
+        _write_signal_and_update(VC_EVENT_ERROR);
+        co_return;
+      }
+      // Extra setup such as a TLS handshake (a no-op for a plain VC).
+      if (!this->_isReadyToTransferData()) {
+        this->_beReadyToTransferData();
+        co_return;
+      }
+      if (!s->enabled || s->vio.op != VIO::WRITE) {
+        write_disable(nh, this);
+        co_return;
+      }
+      int64_t ntodo = s->vio.ntodo();
+      if (ntodo <= 0) {
+        write_disable(nh, this);
+        co_return;
+      }
+      MIOBufferAccessor &buf     = s->vio.buffer;
+      int64_t            towrite = buf.reader()->read_avail();
+      if (towrite > ntodo) {
+        towrite = ntodo;
+      }
+      // Demand-driven: if the buffer does not yet hold all the requested data and
+      // is not at high water, signal WRITE_READY so the user can produce more
+      // before we send (keeps the write moving without us buffering ahead).
+      if (towrite != ntodo && !buf.writer()->high_water()) {
+        if (_write_signal_and_update(VC_EVENT_WRITE_READY) != EVENT_CONT) {
+          co_return; // EVENT_DONE: the VC was freed during the signal
+        }
+        if (this->closed) {
+          co_return;
+        }
+        ntodo = s->vio.ntodo();
+        if (ntodo <= 0) {
+          write_disable(nh, this);
+          co_return;
+        }
+        towrite = buf.reader()->read_avail();
+        if (towrite > ntodo) {
+          towrite = ntodo;
+        }
+      }
+      if (towrite <= 0) {
+        // Nothing to send right now; reenable re-arms us when the user produces.
+        write_disable(nh, this);
+        co_return;
+      }
+
+      // Build the iovec from a clone of the reader (so the real reader is not
+      // consumed until the send actually completes). tiovec / msg live in this
+      // coroutine frame, pinned across the await.
+      IOBufferReader *tmp  = buf.reader()->clone();
+      unsigned        niov = 0;
+      while (niov < NET_MAX_IOV) {
+        int64_t wavail = towrite - try_to_write;
+        int64_t len    = tmp->block_read_avail();
+        if (len <= 0) {
+          break;
+        }
+        if (len > wavail) {
+          len = wavail;
+        }
+        if (len == 0) {
+          break;
+        }
+        tiovec[niov].iov_len  = len;
+        tiovec[niov].iov_base = tmp->start();
+        niov++;
+        try_to_write += len;
+        tmp->consume(len);
+      }
+      tmp->dealloc();
+      if (niov == 0) {
+        write_disable(nh, this);
+        co_return;
+      }
+      ink_zero(msg);
+      if (!ats_is_unix(this->get_local_addr())) {
+        msg.msg_name    = const_cast<sockaddr *>(this->get_remote_addr());
+        msg.msg_namelen = ats_ip_size(this->get_remote_addr());
+      }
+      msg.msg_iov    = &tiovec[0];
+      msg.msg_iovlen = niov;
+    }
+
+    // Submit one sendmsg and suspend. No lock is held across the await.
+    ts::iouring::UringOp op([&](io_uring_sqe *sqe) { io_uring_prep_sendmsg(sqe, fd, &msg, 0); });
+    _write_op = &op;
+    int wr    = co_await op;
+    _write_op = nullptr;
+
+    if (_closing) {
+      _complete_deferred_close();
+      co_return;
+    }
+
+    // Consume + signal under the VIO mutex.
+    {
+      MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+      if (!lock.is_locked() || lock.get_mutex() != s->vio.mutex.get()) {
+        writeReschedule(nh);
+        co_return;
+      }
+      if (this->closed) {
+        nh->free_netevent(this);
+        co_return;
+      }
+
+      if (wr <= 0) {
+        if (wr == -EAGAIN || wr == -ENOTCONN || wr == -EINPROGRESS) {
+          this->write.triggered = 0; // socket full; wait for the next EPOLLOUT edge
+          writeReschedule(nh);
+          co_return;
+        }
+        this->_writeSignalError(nh, static_cast<int>(-wr));
+        co_return;
+      }
+
+      Metrics::Counter::increment(net_rsb.write_bytes, wr);
+      Metrics::Counter::increment(net_rsb.write_bytes_count);
+      s->vio.buffer.reader()->consume(wr);
+      s->vio.ndone += wr;
+      this->netActivity();
+
+      if (s->vio.ntodo() <= 0) {
+        _write_signal_done(VC_EVENT_WRITE_COMPLETE);
+        co_return;
+      }
+      if (wr < static_cast<int>(try_to_write)) {
+        // Short send: the socket buffer is full. Clear the edge-trigger latch and
+        // wait for the next EPOLLOUT edge.
+        this->write.triggered = 0;
+        writeReschedule(nh);
+        co_return;
+      }
+      // Full send with more to do: loop (the demand WRITE_READY at the top asks
+      // the user to produce more once the buffer runs low).
+    }
+  }
 }
 
 #endif // TS_USE_LINUX_IO_URING
