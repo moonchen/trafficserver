@@ -47,17 +47,29 @@ class IOUringNetVConnection : public UnixNetVConnection
   using super = UnixNetVConnection;
 
 public:
-  IOUringNetVConnection()           = default;
+  // Disable epoll for this VC: both directions are driven by io_uring
+  // completions, which need no readiness signal. ep.syscall == false makes
+  // EventIO::start/modify/stop no-ops, so startIO never registers the fd with
+  // epoll and no epoll edge ever fires for it (the same opt-out QUIC uses).
+  IOUringNetVConnection() { ep.syscall = false; }
   ~IOUringNetVConnection() override = default;
 
   // Return the object to this subclass's own allocator. The base's free_thread
   // hardcodes netVCAllocator, which is sized/typed for UnixNetVConnection.
   void free_thread(EThread *t) override;
 
+  // Re-arm via the io_uring path. With epoll off, nothing sets read/write
+  // .triggered (that was the epoll edge); an io_uring VC is always "armable"
+  // (no readiness to wait for), so mark triggered before delegating. The base
+  // reenable then enqueues us to the ready/enable list, which drives
+  // net_read_io / net_write_io --- with no epoll edge involved.
+  void reenable(VIO *vio) override;
+  void reenable_re(VIO *vio) override;
+
   // The read path is driven by io_uring instead of a synchronous recvmsg on
   // epoll readiness: net_read_io submits an asynchronous recvmsg and returns;
   // the completion (drained by IOUringContext::service() on this EThread) fills
-  // the buffer and signals the VIO. The epoll-readiness trigger is reused as-is.
+  // the buffer and signals the VIO.
   void net_read_io(NetHandler *nh) override;
 
   // Symmetric to net_read_io: submit an asynchronous sendmsg and return; the

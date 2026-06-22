@@ -169,12 +169,27 @@ IOUringNetVConnection::_read_signal_done(int event)
 }
 
 void
+IOUringNetVConnection::reenable(VIO *vio)
+{
+  // io_uring is always armable (no readiness to wait for), so stand in for the
+  // epoll edge that would otherwise set this. The base then enqueues us to the
+  // ready/enable list, driving net_read_io / net_write_io.
+  (vio == &read.vio ? read : write).triggered = 1;
+  super::reenable(vio);
+}
+
+void
+IOUringNetVConnection::reenable_re(VIO *vio)
+{
+  (vio == &read.vio ? read : write).triggered = 1;
+  super::reenable_re(vio);
+}
+
+void
 IOUringNetVConnection::net_read_io(NetHandler *nh)
 {
-  // A drain is already in flight; its completion continues reading. Don't start a
-  // second one for the same VC. Leave read.triggered alone --- it is the
-  // edge-trigger latch (cleared only when the socket is drained, in _read), and
-  // clearing it here would break the reenable re-drive (INV-R3).
+  // A recv is already in flight; its completion continues reading. Don't start a
+  // second one for the same VC.
   if (_read_op != nullptr) {
     nh->read_ready_list.remove(this);
     return;
@@ -195,11 +210,11 @@ IOUringNetVConnection::_read()
   NetState   *s  = &this->read;
   NetHandler *nh = this->nh;
 
-  // Drain the socket per epoll trigger. The net poll set is edge-triggered
-  // (EPOLLIN | EPOLLET): it only re-notifies on NEW data, so a single recvmsg per
-  // trigger would leave readable bytes behind and stall. Keep reading until a
-  // short read (socket drained), a full read buffer (backpressure), or the read
-  // VIO is satisfied/disabled.
+  // Read until a short read (socket has no more data right now), a full read
+  // buffer (backpressure), or the read VIO is satisfied/disabled. A full recvmsg
+  // (filled the iovec) may mean more is buffered, so loop; a short recvmsg means
+  // the socket is drained and we re-arm (the next recv waits in the kernel for
+  // new data --- no epoll, no readiness round-trip).
   for (;;) {
     // tiovec and msg live in this coroutine frame, pinned across the await for the
     // lifetime of the in-flight recvmsg (the structural lifetime guarantee).
@@ -294,8 +309,7 @@ IOUringNetVConnection::_read()
 
       if (r <= 0) {
         if (r == -EAGAIN || r == -ENOTCONN) {
-          this->read.triggered = 0; // socket drained; wait for the next EPOLLIN edge
-          readReschedule(nh);
+          readReschedule(nh); // re-arm; the next recv waits for data
           co_return;
         }
         if (r == 0 || r == -ECONNRESET) {
@@ -323,9 +337,8 @@ IOUringNetVConnection::_read()
         co_return;
       }
       if (r < static_cast<int>(rattempted)) {
-        // Short read: the socket is drained for now. Clear the edge-trigger latch
-        // and wait for the next EPOLLIN edge.
-        this->read.triggered = 0;
+        // Short read: the socket is drained for now. Re-arm; the next recv simply
+        // waits in the kernel until more data arrives (no epoll round-trip).
         readReschedule(nh);
         co_return;
       }
@@ -374,11 +387,8 @@ IOUringNetVConnection::do_io_close(int alerrno)
 void
 IOUringNetVConnection::net_write_io(NetHandler *nh)
 {
-  // A drain is already in flight; its completion continues writing. Don't start a
-  // second one for the same VC. Leave write.triggered alone: unlike reads (which
-  // are re-driven by a fresh EPOLLIN edge on new socket data), a write is re-driven
-  // by the consumer's reenable, which only re-enqueues when triggered is set. The
-  // latch is cleared only when the socket is full (in _write), per INV-R3.
+  // A sendmsg is already in flight; its completion continues writing. Don't start
+  // a second one for the same VC.
   if (_write_op != nullptr) {
     nh->write_ready_list.remove(this);
     return;
@@ -572,8 +582,7 @@ IOUringNetVConnection::_write()
 
       if (wr <= 0) {
         if (wr == -EAGAIN || wr == -ENOTCONN || wr == -EINPROGRESS) {
-          this->write.triggered = 0; // socket full; wait for the next EPOLLOUT edge
-          writeReschedule(nh);
+          writeReschedule(nh); // re-arm; the next sendmsg waits for socket space
           co_return;
         }
         this->_writeSignalError(nh, static_cast<int>(-wr));
@@ -591,9 +600,8 @@ IOUringNetVConnection::_write()
         co_return;
       }
       if (wr < static_cast<int>(try_to_write)) {
-        // Short send: the socket buffer is full. Clear the edge-trigger latch and
-        // wait for the next EPOLLOUT edge.
-        this->write.triggered = 0;
+        // Short send: the socket buffer is full. Re-arm; the next sendmsg waits in
+        // the kernel until there is socket space (no epoll round-trip).
         writeReschedule(nh);
         co_return;
       }
