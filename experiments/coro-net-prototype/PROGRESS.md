@@ -176,17 +176,28 @@ class (INV-R3 no longer applies; see D22). Timeouts unaffected (cop uses its own
 queues). Verified Debug + ASan (0 errors) + TSan (0 races in io_uring code) on
 both autests incl. the wrk load.
 
-## Later leaves (after 2D), in order
+## Phase 2F — io_uring-native connect — DONE (fixes D24)
 
-(1) **Multishot read** on a provided/ring buffer — a recv stays armed across
-completions; makes the deferred-close path the common case + needs a different
-buffer model. (2) **connect** via `io_uring_prep_connect` (outbound, no
-cross-thread; the inherited path already works, so this is an optimization).
-(3) **Phase 2E**: a deterministic deferred-close test (cross-connection teardown
-— origin RST while a client read is armed). (4) **accept** via
-`io_uring_prep_accept`, *single-shot + re-arm gated by the throttle*
-(`check_net_throttle`/`connections_throttle`/memory), since plain multishot would
-bypass the gate. Then the bigger items: TLS (layered SSLNetVConnection),
+`connectUp` overridden to connect with `io_uring_prep_connect` + an
+`IORING_OP_LINK_TIMEOUT` instead of a `connect(2)` syscall; `NET_EVENT_OPEN` on
+the success CQE (so it means the handshake is *actually* done), `NET_EVENT_OPEN_FAILED`
+on failure/timeout. This fixed D24 (a black-holed origin connect returned 000 /
+hung 30s under io_uring because the optimistic syscall-connect made the
+`ConnectingEntry` write-ready probe fire before the handshake; see D24/D26). Now
+502 in ~2s, matching epoll. Verified Debug + ASan + TSan (success / refused /
+timeout). The connect op resolves before `_connect` handles it, so no in-flight
+op at the resulting free.
+
+## Later leaves, in order
+
+(1) **accept** via `io_uring_prep_accept`, *single-shot + re-arm gated by the
+throttle* (`check_net_throttle`/`connections_throttle`/memory), since plain
+multishot would bypass the gate. (2) The **D25 free_thread-choke teardown** redo,
+done properly with a deterministic deferred-path test first (TDD) — the general
+mid-transaction-timeout-with-op-in-flight case (the connect case is now handled).
+(3) **Multishot read** on a provided/ring buffer (deferred — hard to reconcile
+provided-buffer lifetime with MIOBuffer; single-shot stays for now). Then the
+bigger items: TLS (layered SSLNetVConnection),
 timeouts via `IORING_OP_TIMEOUT`, a pooled coroutine-frame allocator, migration.
 
 Each leaf keeps the `do_io_*` + `Continuation`/VIO facade identical to callers

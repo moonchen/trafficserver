@@ -187,16 +187,41 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   `NET_EVENT_OPEN_FAILED`), so we deliberately do NOT convert connect. Verified by
   `io_uring_connect.test.py` (success + refused, both green, ASan/TSan clean).
 
-- **D24. KNOWN DIVERGENCE: a black-holed origin connect (SYN dropped) returns 000
-  to the client under io_uring vs 502 on master/epoll.** Root cause is NOT the
-  io_uring teardown: `Connection::connect` returns 0 on EINPROGRESS (optimistic),
-  so ATS reports the handshake complete (`CONNECT_EVENT_TXN`) and applies the 30 s
-  post-connect timeout instead of the 2 s connect timeout; with epoll the failure
-  is surfaced differently than with io_uring's internal-poll wait. Deep
-  HttpSM/ConnectingEntry/connect-failure-detection territory; an edge case (origin
-  silently dropping SYNs). Repro: `iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport
-  <p> -j DROP`, remap to that port, short `connect_attempts_timeout`. NOT yet
-  fixed — needs its own investigation (likely explicit connect-failure detection).
+- **D24. FIXED (2026-06-22) via io_uring-native connect (Design B).** Symptom: a
+  black-holed origin connect (SYN dropped) returned 000 / hung ~30 s under io_uring
+  vs 502 on epoll. Root cause: the inherited `connectUp` does an *optimistic*
+  non-blocking `connect(2)` and the `ConnectingEntry` probe (`do_io_write(1, empty
+  reader)`) treats the resulting `WRITE_READY` as "socket writable = connected."
+  On epoll, `net_write_io` runs only on `EPOLLOUT`, so that `WRITE_READY` means
+  *actually writable*; the io_uring VC runs `net_write_io` immediately on
+  `reenable` (no writability gate), so it signalled `WRITE_READY` before the
+  handshake → ATS reported the connect complete (`CONNECT_EVENT_TXN`), applied the
+  30 s post-connect timeout, and never honored the connect timeout → 000.
+  **Fix (D26):** override `connectUp` to use `io_uring_prep_connect` + an
+  `IORING_OP_LINK_TIMEOUT` (`proxy.config.http.connect_attempts_timeout`).
+  `NET_EVENT_OPEN` is delivered on the connect *success* CQE (so it means the
+  handshake is truly done → the probe's `WRITE_READY` is accurate), and
+  `NET_EVENT_OPEN_FAILED` on failure/timeout. Empirically confirmed `prep_connect`
+  semantics (standalone probe): blackhole → no CQE until done; refused →
+  `-ECONNREFUSED` immediately; blackhole + linked timeout → `-ETIME` + `-ECANCELED`.
+  Now: black-holed connect → 502 in ~2 s (matching epoll, ASan/TSan-clean). The
+  connect op is already resolved when `_connect` handles it, so there is no
+  in-flight op at the resulting free (sidesteps the D25 teardown coupling for the
+  connect case). Repro for the timeout path (manual, needs root):
+  `iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport <p> -j DROP`. The committed
+  `io_uring_connect` autest covers success + refused (portable); the timeout path
+  is verified manually (Debug/ASan/TSan).
+
+- **D26. io_uring-native connect = the preferred design (maintainer: "I will
+  generally prefer an io_uring-native design").** `io_uring_prep_connect` is the
+  idiomatic primitive — its CQE is posted exactly on handshake completion/failure
+  (it *is* "don't notify me until connect is done"); `POLLOUT` is the lower-level
+  alternative (writable ⇒ resolved, then check `SO_ERROR`). An io_uring socket VC
+  always overrides `connectUp` (the only reason connect "worked" without it was
+  the io_uring read/write internally waiting on a *syscall*-initiated connect —
+  not native). Known limitation: the linked timeout reads the *global*
+  `connect_attempts_timeout`, not the per-transaction `txn_conf` value (connectUp
+  has no SM handle); acceptable for now (the user OK'd not touching the cops).
 
 - **D25. REVERTED a `free_thread`-as-choke-point teardown refactor — it introduced
   a UAF under load.** While chasing D24 I hypothesized the timeout path freed the
