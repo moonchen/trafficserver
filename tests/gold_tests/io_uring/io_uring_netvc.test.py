@@ -46,8 +46,9 @@ ts.Disk.remap_config.AddLine('map http://www.example.com http://127.0.0.1:{0}'.f
 # Prove the gate actually engaged the io_uring VConnection rather than silently
 # falling back to UnixNetVConnection (which would pass this test for the wrong
 # reason). UnixNetProcessor::allocate_vc emits this once when the flag is read.
-ts.Disk.diags_log.Content = Testers.ContainsExpression(
-    "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active")
+ts.Disk.diags_log.Content = Testers.All(
+    Testers.ContainsExpression("io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active"),
+    Testers.ContainsExpression("io_uring accept enabled", "the io_uring accept path must be active"))
 
 # A full proxied transaction exercises the inbound (client-facing) VC read of the
 # request and the outbound (origin-facing) VC read of the response body, both of

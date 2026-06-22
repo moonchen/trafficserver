@@ -25,11 +25,14 @@
 #include "P_Net.h"
 #include "P_UnixNet.h"
 #include "P_UnixNetVConnection.h"
+#include "P_IOUringNetAccept.h"
 #include "iocore/net/ConnectionTracker.h"
 #include "iocore/net/NetHandler.h"
 #include "tscore/TSSystemState.h"
 #include "tscore/ink_inet.h"
 #include "tscore/ink_defs.h"
+
+#include <mutex>
 
 using NetAcceptHandler = int (NetAccept::*)(int, void *);
 
@@ -686,3 +689,149 @@ NetAccept::getNetProcessor() const
 {
   return &netProcessor;
 }
+
+#if TS_USE_LINUX_IO_URING
+//
+// io_uring accept: per-ET_NET-thread, single-shot io_uring_prep_accept with a
+// throttle-gated re-arm. Selected by proxy.config.net.io_uring.enabled. The
+// VC-creation below mirrors acceptFastEvent's; kept separate so the syscall
+// accept path is untouched (TODO: dedup once both paths are settled).
+//
+NetAccept *
+IOUringNetAccept::clone() const
+{
+  return new IOUringNetAccept(*this);
+}
+
+void
+IOUringNetAccept::_submit_accept()
+{
+  _peerlen          = sizeof(_peer);
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(this);
+  if (sqe == nullptr) {
+    // SQ momentarily full; retry on the next loop iteration.
+    SET_HANDLER(&IOUringNetAccept::_retry);
+    this_ethread()->schedule_imm_local(this);
+    return;
+  }
+  io_uring_prep_accept(sqe, server.sock.get_fd(), reinterpret_cast<sockaddr *>(&_peer), &_peerlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+}
+
+int
+IOUringNetAccept::_retry(int /* event */, void * /* e */)
+{
+  _submit_accept();
+  return EVENT_CONT;
+}
+
+int
+IOUringNetAccept::accept_per_thread(int /* event */, void * /* e */)
+{
+  // Per-thread listen socket, if configured (mirrors NetAccept::accept_per_thread).
+  if (RecGetRecordInt("proxy.config.exec_thread.listen").value_or(0) == 1) {
+    if (ats_is_unix(server.accept_addr)) {
+      ats_unix_append_id(&server.accept_addr.sun, this_ethread()->id);
+    }
+    if (do_listen()) {
+      Fatal("[IOUringNetAccept::accept_per_thread]: error listening on ports");
+      return -1;
+    }
+  }
+  // No epoll registration: io_uring delivers each accept via handle_complete.
+  static std::once_flag announced;
+  std::call_once(announced, [] { Note("io_uring accept enabled (proxy.config.net.io_uring.enabled=1)"); });
+  _submit_accept();
+  return 0;
+}
+
+void
+IOUringNetAccept::handle_complete(io_uring_cqe *cqe)
+{
+  int      fd = cqe->res;
+  EThread *t  = this_ethread();
+
+  if (fd < 0) {
+    // The listen socket was closed / accept cancelled on shutdown: stop.
+    if (fd == -ECANCELED || fd == -EBADF || fd == -ENOTSOCK) {
+      return;
+    }
+    // Transient error (-EAGAIN, -ECONNABORTED, ...): just re-arm.
+    _submit_accept();
+    return;
+  }
+
+  NetHandler *h = get_NetHandler(t);
+  Connection  con;
+  con.sock_type = SOCK_STREAM;
+  con.sock      = UnixSocket{fd};
+  ats_ip_copy(&con.addr.sa, reinterpret_cast<sockaddr *>(&_peer));
+
+  std::shared_ptr<ConnectionTracker::Group> conn_track_group;
+
+  // Throttle gate, checked on every accept (the reason for single-shot rather
+  // than a multishot accept that would bypass it). Under throttle we accept then
+  // close, matching acceptFastEvent, and re-arm for the next connection.
+  if (check_net_throttle(ACCEPT)) {
+    con.close();
+    Metrics::Counter::increment(net_rsb.connections_throttled_in);
+    _submit_accept();
+    return;
+  }
+  if (!handle_max_client_connections(con.addr, conn_track_group)) {
+    con.close();
+    _submit_accept();
+    return;
+  }
+
+  Metrics::Counter::increment(net_rsb.tcp_accept);
+
+  int bufsz;
+  if (opt.send_bufsize > 0) {
+    if (unlikely(con.sock.set_sndbuf_size(opt.send_bufsize))) {
+      bufsz = ROUNDUP(opt.send_bufsize, 1024);
+      while (bufsz > 0 && con.sock.set_sndbuf_size(bufsz)) {
+        bufsz -= 1024;
+      }
+    }
+  }
+  if (opt.recv_bufsize > 0) {
+    if (unlikely(con.sock.set_rcvbuf_size(opt.recv_bufsize))) {
+      bufsz = ROUNDUP(opt.recv_bufsize, 1024);
+      while (bufsz > 0 && con.sock.set_rcvbuf_size(bufsz)) {
+        bufsz -= 1024;
+      }
+    }
+  }
+
+  UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(this->getNetProcessor()->allocate_vc(t));
+  ink_release_assert(vc);
+  vc->enable_inbound_connection_tracking(conn_track_group);
+  Metrics::Gauge::increment(net_rsb.connections_currently_open);
+  vc->id = net_next_connection_number();
+  vc->con.move(con);
+  vc->set_remote_addr(con.addr);
+  vc->submit_time = ink_get_hrtime();
+  vc->action_     = *action_;
+  vc->set_is_transparent(opt.f_inbound_transparent);
+  vc->set_is_proxy_protocol(opt.f_proxy_protocol);
+  vc->options.sockopt_flags        = opt.sockopt_flags;
+  vc->options.packet_mark          = opt.packet_mark;
+  vc->options.packet_tos           = opt.packet_tos;
+  vc->options.packet_notsent_lowat = opt.packet_notsent_lowat;
+  vc->options.ip_family            = opt.ip_family;
+  vc->apply_options();
+  vc->set_context(NET_VCONNECTION_IN);
+  if (opt.f_mptcp) {
+    vc->set_mptcp_state();
+  }
+  SET_CONTINUATION_HANDLER(vc, &UnixNetVConnection::acceptEvent);
+  vc->mutex = h->mutex;
+  {
+    SCOPED_MUTEX_LOCK(lock, vc->mutex, t);
+    vc->handleEvent(EVENT_NONE, nullptr);
+  }
+
+  // Re-arm the next accept; the throttle gate is re-checked on its completion.
+  _submit_accept();
+}
+#endif // TS_USE_LINUX_IO_URING

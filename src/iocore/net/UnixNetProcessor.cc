@@ -29,6 +29,15 @@
 #include "P_UnixNetVConnection.h"
 #if TS_USE_LINUX_IO_URING
 #include "P_IOUringNetVConnection.h"
+#include "P_IOUringNetAccept.h"
+
+// proxy.config.net.io_uring.enabled (restart-required), read once.
+static bool
+net_io_uring_enabled()
+{
+  static const bool enabled = RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0;
+  return enabled;
+}
 #endif
 #include "iocore/net/SessionAccept.h"
 #include "tscore/InkErrno.h"
@@ -141,7 +150,14 @@ UnixNetProcessor::accept_internal(Continuation *cont, int fd, AcceptOptions cons
   na->action_->server = &na->server;
 
   if (opt.frequent_accept) { // true
-    if (accept_threads > 0 && listen_per_thread == 0) {
+#if TS_USE_LINUX_IO_URING
+    // io_uring accepts per ET_NET thread on that thread's ring, so the accepted
+    // VC stays thread-local; the dedicated-accept-thread loop does not apply.
+    if (net_io_uring_enabled()) {
+      na->init_accept_per_thread();
+    } else
+#endif
+      if (accept_threads > 0 && listen_per_thread == 0) {
       na->init_accept_loop();
     } else {
       na->init_accept_per_thread();
@@ -302,6 +318,11 @@ UnixNetProcessor::init_socks()
 NetAccept *
 UnixNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 {
+#if TS_USE_LINUX_IO_URING
+  if (net_io_uring_enabled()) {
+    return new IOUringNetAccept(opt);
+  }
+#endif
   return new NetAccept(opt);
 }
 
@@ -311,15 +332,15 @@ UnixNetProcessor::allocate_vc(EThread *t)
 #if TS_USE_LINUX_IO_URING
   // proxy.config.net.io_uring.enabled (restart-required) selects the io_uring
   // VConnection. It is a UnixNetVConnection subclass, so this is a drop-in until
-  // its I/O seams are swapped to io_uring one at a time. Read once and announce.
-  static const bool use_io_uring = []() {
-    bool enabled = RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0;
-    if (enabled) {
+  // its I/O seams are swapped to io_uring one at a time.
+  static const bool announce = []() {
+    if (net_io_uring_enabled()) {
       Note("io_uring NetVConnection enabled (proxy.config.net.io_uring.enabled=1)");
     }
-    return enabled;
+    return true;
   }();
-  if (use_io_uring) {
+  (void)announce;
+  if (net_io_uring_enabled()) {
     IOUringNetVConnection *vc = ioUringNetVCAllocator.alloc();
     if (vc && !t) {
       vc->from_accept_thread = true;
