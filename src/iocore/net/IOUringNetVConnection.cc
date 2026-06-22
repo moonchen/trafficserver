@@ -41,6 +41,16 @@ ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator("ioUringNetVCAllocat
 
 namespace
 {
+// Counts closes that had an io_uring op in flight and so deferred the free until
+// the cancelled op's completion (the cancel-then-unwind path, INV-L2). A nonzero
+// value means the UAF-prevention path is being exercised.
+Metrics::Counter::AtomicType *deferred_close_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.vc_deferred_close");
+
+DbgCtl dbg_ctl_io_uring_net{"io_uring_net"};
+} // namespace
+
+namespace
+{
 // The cancel SQE needs a real completion handler, because IOUringContext::service()
 // dispatches handle_complete() on every CQE's user_data. We do not care about the
 // cancel's own result --- the original recv resumes the read coroutine with
@@ -352,6 +362,8 @@ IOUringNetVConnection::do_io_close(int alerrno)
     }
     this->closed = (alerrno == -1) ? 1 : -1;
 
+    Metrics::Counter::increment(deferred_close_stat);
+    Dbg(dbg_ctl_io_uring_net, "do_io_close deferred: cancelling in-flight ops (read=%p write=%p) vc=%p", _read_op, _write_op, this);
     cancel_in_flight(_read_op);
     cancel_in_flight(_write_op);
     return;
