@@ -309,6 +309,56 @@ each section. Status lives in `PROGRESS.md`; the behavioural contract lives in
   memory behavior, cache-MISS/origin-facing + H2/TLS scenarios, perf-stat
   replication — see [[io-uring-perf-baseline]].
 
+## Deep-dive round (2026-06-23)
+
+Full hypothesis→experiment→result→conclusion log: `PERF-CORO-IOURING.md`.
+
+- **D30. Cross-thread wakeup doorbell — a regression the io_uring branch introduced,
+  now fixed.** `initialize_thread_for_net` (`UnixNet.cc`) chose `IOUringEventIO` vs
+  `AsyncSignalEventIO` at **compile time** (`#if TS_USE_LINUX_IO_URING`), so the
+  io_uring build never registered `thread->evfd` — the fd `NetHandler::signalActivity`
+  writes for cross-thread wakeups. A net thread blocked in `submit_and_wait` (or, on
+  the epoll fallback, in `epoll_wait`) therefore could not be woken by another thread
+  scheduling work onto it; such work stalled to the 60 ms heartbeat. Plain HTTP is
+  unaffected (default `aio.mode=auto` completes disk reads on the net thread's own
+  ring; connection work is thread-local), which is why it went unnoticed. **Repro:**
+  force `aio.mode=thread` + low-concurrency disk cache → p99 62 ms on both the io_uring
+  path and its epoll fallback (true master, USE_IOURING=0, is fine). **Fix, two parts:**
+  (1) on the io_uring path, arm an `io_uring_prep_poll_multishot` on `thread->evfd` in
+  the ring (`NetHandler::IOUringWakeup`), re-armed on `!IORING_CQE_F_MORE`, draining the
+  counter each CQE — the io_uring-native equivalent of `AsyncSignalEventIO`; (2) on the
+  epoll fallback, also register `thread->evfd` via `AsyncSignalEventIO` (inert on the
+  io_uring path, which never waits on epoll). **Result:** p99 62 ms → ~2.1 ms on both
+  paths, perf-neutral on the hot path (the poll only completes when rung). This is the
+  correct way to be "fully io_uring without the eventfd": drop the *completion* eventfd
+  (the io_uring→epoll bridge), keep a doorbell on the *wakeup* eventfd — in the ring.
+
+- **D31. Write is now pure async (batched), reversing EXP-1b.** EXP-1b had kept an
+  opportunistic synchronous `sendmsg` (fall back to io_uring on EAGAIN) because the
+  async round-trip cost ~1.2%. That held only *before* the frame shrink (16 KB → 16
+  iovec) + direct blocking made the CQE/resume nearly free. Re-measured: a pure async
+  `io_uring_prep_send`/`sendmsg` rides the single `submit_and_wait` per loop, so at load
+  many sends batch into one `io_uring_enter` and the per-request `sendmsg` syscall
+  disappears — `sendmsg` 0.98→0/req, net syscalls ~halve, **cycles/req −1.8%** (IPC
+  1.368→1.400), and the 64 KB write tail collapses (p99 ~550 ms → ~16 ms). The read
+  stays async (EXP-1's finding stands: a keep-alive read is a genuine wait). Combined
+  with D30, vs epoll: 4 KB +0.7% (noise), **64 KB −4.3%** (io_uring wins), cache-MISS
+  1 MB +0.1%. Validated: 4 io_uring autests + ASan `-F` load/churn/timeout clean.
+
+- **D32. Findings that did *not* produce a change (recorded so they are not re-litigated).**
+  (a) `IOU_FRAME_IOV=16` is optimal: a sweep {1,4,16,64,256,1024} × {64 KB,1 MB,8 MB}
+  shows iovec sensitivity *peaks at medium sizes* (64 KB U-curve, ±10%) and *vanishes*
+  for large transfers (copy-bound) — both too-few (extra ops) and too-large (frame
+  bloat) lose; 16 sits in the flat optimum. The "larger reads need a larger iovec"
+  intuition is wrong. (b) A contiguous-slab frame arena measured ≈ the scattered LIFO
+  freelist (±1%, noise): the frame is already ~300 B and the working set stays resident,
+  so contiguity buys nothing at this scale. (c) Real-TCP (veth, MTU 1500, offloads off)
+  holds parity (+1.9%/+0.0%), as does origin-facing cache-MISS (+0.1%) — the loopback
+  result was not an artifact. (d) The clean n=3 mechanism **corrects** an earlier
+  cross-session claim: io_uring is +1% instructions / +2% cycles vs master (not fewer),
+  and the residual is *locality* (cache/dTLB/branch) in the `_read`/`_write` `.actor`
+  bodies + `submit_and_wait`, not instruction count.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
