@@ -52,6 +52,7 @@
 #include <syslog.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <list>
 #include <string>
 
@@ -490,7 +491,11 @@ public:
     // ink_get_current_rss() reports current (not peak) RSS in bytes, portably,
     // so the gauge can both rise and fall and the throttle releases correctly.
     uint64_t rss = ink_get_current_rss();
-    ts::Metrics::Gauge::store(memory_rss, static_cast<int64_t>(rss));
+    // The gauge is a signed int64_t, so clamp before the cast: a uint64_t RSS
+    // above INT64_MAX would otherwise wrap to a negative value. This cannot
+    // happen for any real process, but it silences the signed-overflow path
+    // Coverity flags on the cast (CID 1660039).
+    ts::Metrics::Gauge::store(memory_rss, static_cast<int64_t>(std::min(rss, static_cast<uint64_t>(INT64_MAX))));
     Dbg(dbg_ctl_server, "memory usage - current rss: %" PRIu64 " bytes memory limit: %" PRId64 " bytes", rss, _memory_limit);
 
     // net_memory_throttle is read on accept threads, so use relaxed atomics.
