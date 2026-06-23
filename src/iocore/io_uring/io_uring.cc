@@ -209,6 +209,21 @@ IOUringContext::register_eventfd()
   return evfd;
 }
 
+void
+IOUringContext::disable_eventfd()
+{
+  // When the net thread blocks directly in io_uring_enter (submit_and_wait), the
+  // completion eventfd --- registered only to bridge io_uring completions into an
+  // epoll wait --- is dead weight: io_uring still eventfd_signal()s it on every CQE
+  // for a waiter that no longer exists. Unregister and close it so that overhead is
+  // gone. The fd is auto-removed from any epoll set on close (it is never polled).
+  if (evfd != -1) {
+    io_uring_unregister_eventfd(&ring);
+    ::close(evfd);
+    evfd = -1;
+  }
+}
+
 IOUringContext *
 IOUringContext::local_context()
 {

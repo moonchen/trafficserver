@@ -190,6 +190,13 @@ initialize_thread_for_net(EThread *thread)
 #if TS_USE_LINUX_IO_URING
   auto ep = new IOUringEventIO();
   ep->start(pd, IOUringContext::local_context());
+  // When io_uring is disabled at runtime the net thread falls back to epoll, which
+  // would otherwise never watch thread->evfd --- so a cross-thread signalActivity()
+  // could not wake it (the master build registers it here). Register it for the
+  // fallback. On the io_uring path this poll set is never waited on: the thread
+  // blocks in the ring, where its own multishot poll on thread->evfd is the doorbell.
+  auto sig = new AsyncSignalEventIO();
+  sig->start(pd, thread->evfd, EVENTIO_READ);
 #else
   auto ep = new AsyncSignalEventIO();
   ep->start(pd, thread->evfd, EVENTIO_READ);

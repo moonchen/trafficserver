@@ -72,7 +72,8 @@ public:
   void service();
   void submit_and_wait(ink_hrtime ms);
 
-  int register_eventfd();
+  int  register_eventfd();
+  void disable_eventfd();
 
   // assigns the global iouring config
   static void            set_config(const IOUringConfig &);

@@ -42,6 +42,17 @@ using ts::Metrics;
 // Global
 ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator("ioUringNetVCAllocator");
 
+// Inline iovec capacity for the read/write coroutines. Unlike the base
+// UnixNetVConnection --- whose IOVec tiovec[NET_MAX_IOV] (NET_MAX_IOV == UIO_MAXIOV
+// == 1024 -> 16 KB) is a stack local reused at a fixed, cache-warm address every
+// call --- these iovecs live in the heap coroutine frame, pinned across the await.
+// Sizing them at 1024 would make every frame ~16 KB (4 pages), so each pooled
+// frame cycled per op thrashes cache/dTLB. A cache-hit response is 1-2 blocks, so
+// a small inline count covers the hot path; a larger buffer just sends fewer
+// blocks per op and loops (a short "write"/"read" is already handled). 16 entries
+// keep the frame near 300 B.
+static constexpr unsigned IOU_FRAME_IOV = 16;
+
 namespace
 {
 // Counts closes that had an io_uring op in flight and so deferred the free until
@@ -238,7 +249,7 @@ IOUringNetVConnection::_read()
   for (;;) {
     // tiovec and msg live in this coroutine frame, pinned across the await for the
     // lifetime of the in-flight recvmsg (the structural lifetime guarantee).
-    IOVec         tiovec[NET_MAX_IOV];
+    IOVec         tiovec[IOU_FRAME_IOV];
     struct msghdr msg;
     int           fd         = this->con.sock.get_fd();
     int64_t       rattempted = 0;
@@ -274,7 +285,7 @@ IOUringNetVConnection::_read()
       }
       unsigned       niov = 0;
       IOBufferBlock *b    = buf.writer()->first_write_block();
-      while (b && niov < NET_MAX_IOV) {
+      while (b && niov < IOU_FRAME_IOV) {
         int64_t a = b->write_avail();
         if (a > 0) {
           tiovec[niov].iov_base = b->end();
@@ -302,8 +313,21 @@ IOUringNetVConnection::_read()
       msg.msg_iovlen  = niov;
     }
 
-    // Submit one recvmsg and suspend. No lock is held across the await.
-    ts::iouring::UringOp op([&](io_uring_sqe *sqe) { io_uring_prep_recvmsg(sqe, fd, &msg, 0); });
+    // Submit one recvmsg and suspend. No lock is held across the await. (A read is
+    // almost always a genuine wait for the next request --- on keep-alive the next
+    // request is not yet in the socket --- so an opportunistic non-blocking recvmsg
+    // here just wastes a syscall on EAGAIN before falling back to this. Measured
+    // net-negative; the read stays purely io_uring-driven.)
+    // A single-block read (the common case: a request header fits in one block)
+    // needs no msghdr --- recv is lighter in the kernel than recvmsg (no msghdr
+    // copy, no peer-address fill-back on a connected socket).
+    ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
+      if (msg.msg_iovlen == 1) {
+        io_uring_prep_recv(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, 0);
+      } else {
+        io_uring_prep_recvmsg(sqe, fd, &msg, 0);
+      }
+    });
     _read_op = &op;
     int r    = co_await op;
     _read_op = nullptr;
@@ -474,7 +498,7 @@ IOUringNetVConnection::_write()
   // EPOLLOUT, same reasoning as the read path): keep sending until the socket
   // can't take more (short send), the buffer is empty, or the VIO is satisfied.
   for (;;) {
-    IOVec         tiovec[NET_MAX_IOV];
+    IOVec         tiovec[IOU_FRAME_IOV];
     struct msghdr msg;
     int           fd           = this->con.sock.get_fd();
     int64_t       try_to_write = 0;
@@ -545,7 +569,7 @@ IOUringNetVConnection::_write()
       // coroutine frame, pinned across the await.
       IOBufferReader *tmp  = buf.reader()->clone();
       unsigned        niov = 0;
-      while (niov < NET_MAX_IOV) {
+      while (niov < IOU_FRAME_IOV) {
         int64_t wavail = towrite - try_to_write;
         int64_t len    = tmp->block_read_avail();
         if (len <= 0) {
@@ -577,8 +601,18 @@ IOUringNetVConnection::_write()
       msg.msg_iovlen = niov;
     }
 
-    // Submit one sendmsg and suspend. No lock is held across the await.
-    ts::iouring::UringOp op([&](io_uring_sqe *sqe) { io_uring_prep_sendmsg(sqe, fd, &msg, 0); });
+    // Submit one send/sendmsg and suspend. The SQE rides the single submit_and_wait
+    // per event-loop iteration, so at load many sends batch into one io_uring_enter
+    // and the per-request sendmsg syscall disappears --- cheaper than a synchronous
+    // non-blocking send once the coroutine frame is small enough that the CQE/resume
+    // round-trip is nearly free.
+    ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
+      if (msg.msg_iovlen == 1) {
+        io_uring_prep_send(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL);
+      } else {
+        io_uring_prep_sendmsg(sqe, fd, &msg, 0);
+      }
+    });
     _write_op = &op;
     int wr    = co_await op;
     _write_op = nullptr;

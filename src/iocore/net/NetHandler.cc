@@ -27,6 +27,8 @@
 #include "iocore/net/PollCont.h"
 #if TS_USE_LINUX_IO_URING
 #include "iocore/io_uring/IO_URING.h"
+#include <poll.h>
+#include <unistd.h>
 #endif
 
 #include <atomic>
@@ -37,6 +39,49 @@ namespace
 {
 DbgCtl dbg_ctl_net_queue{"net_queue"};
 DbgCtl dbg_ctl_v_net_queue{"v_net_queue"};
+
+#if TS_USE_LINUX_IO_URING
+// Restores the cross-thread wakeup doorbell for net threads that block directly in
+// io_uring_submit_and_wait. NetHandler::signalActivity() writes thread->evfd to wake
+// the net thread; on the epoll path AsyncSignalEventIO makes that fd epoll-wakeable,
+// but io_uring net threads are not registered in epoll. A multishot poll on
+// thread->evfd turns each cross-thread write into a CQE that breaks submit_and_wait
+// promptly, instead of the wakeup waiting out the heartbeat timeout.
+class IOUringWakeup : public IOUringCompletionHandler
+{
+public:
+  void
+  arm(IOUringContext *ur, int fd)
+  {
+    _ur = ur;
+    _fd = fd;
+    _submit();
+  }
+  void
+  handle_complete(io_uring_cqe *cqe) override
+  {
+    // Drain the eventfd counter: POLLIN is level-triggered, so leaving it set would
+    // re-fire the multishot poll into a busy loop.
+    uint64_t v;
+    while (::read(_fd, &v, sizeof(v)) == static_cast<ssize_t>(sizeof(v))) {}
+    // Re-arm if the kernel ended the multishot poll (IORING_CQE_F_MORE clear).
+    if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
+      _submit();
+    }
+  }
+
+private:
+  void
+  _submit()
+  {
+    if (io_uring_sqe *sqe = _ur->next_sqe(this); sqe != nullptr) {
+      io_uring_prep_poll_multishot(sqe, _fd, POLLIN);
+    }
+  }
+  IOUringContext *_ur = nullptr;
+  int             _fd = -1;
+};
+#endif
 
 } // end anonymous namespace
 
@@ -344,7 +389,10 @@ NetHandler::waitForActivity(ink_hrtime timeout)
 {
   EventIO *epd = nullptr;
 #if TS_USE_LINUX_IO_URING
-  IOUringContext *ur = IOUringContext::local_context();
+  // proxy.config.net.io_uring.enabled (restart-required), read once. Mirrors
+  // net_io_uring_enabled() in UnixNetProcessor.cc, which gates the VC type.
+  static const bool io_uring_enabled = RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0;
+  IOUringContext   *ur               = IOUringContext::local_context();
 #endif
 
   Metrics::Counter::increment(net_rsb.handler_run);
@@ -353,6 +401,37 @@ NetHandler::waitForActivity(ink_hrtime timeout)
   process_enabled_list();
 
 #if TS_USE_LINUX_IO_URING
+  if (io_uring_enabled) {
+    // We block directly in the ring, so the completion eventfd is never waited on;
+    // stop io_uring from signaling it on every completion (once per thread).
+    static thread_local IOUringWakeup wakeup;
+    static thread_local bool          io_uring_setup = [&] {
+      ur->disable_eventfd();              // drop the dead completion eventfd
+      wakeup.arm(ur, this->thread->evfd); // restore the cross-thread doorbell in-ring
+      return true;
+    }();
+    (void)io_uring_setup;
+    // io_uring net threads block directly in the ring rather than in epoll. The
+    // submit side (process_ready_list -> net_read_io/net_write_io) queues the
+    // recv/send/accept SQEs; submit_and_wait then flushes them and waits for
+    // completions in a single io_uring_enter --- bypassing the epoll_wait + eventfd
+    // round-trip that otherwise exists only to translate an io_uring completion
+    // into an epoll-wakeable event. Sockets here are never registered in epoll, so
+    // do_poll has nothing to drive. Cross-thread/timer wakeups are bounded by the
+    // caller's timeout (the heartbeat cap), exactly as the epoll path's do_poll was.
+    ink_hrtime pre = ink_get_hrtime();
+    process_ready_list();
+    ink_hrtime mid = ink_get_hrtime();
+    if (timeout > 0) {
+      ur->submit_and_wait(timeout);
+    } else {
+      ur->submit();
+      ur->service();
+    }
+    ink_hrtime post = ink_get_hrtime();
+    this->thread->metrics.current_slice.load(std::memory_order_acquire)->record_io_stats(post - mid, mid - pre);
+    return EVENT_CONT;
+  }
   ur->submit();
 #endif
 
