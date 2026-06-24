@@ -397,6 +397,28 @@ Full H/E/R/C log: `PERF-CORO-IOURING.md` H7–H10. Harness now out-of-tree at
   syscalls, coalescing strips near-free syscalls while adding multi-block `sendmsg` iovec
   build + read-accumulation cost. **Keep the simple per-block `prep_send`.** Instructive: it
   re-confirms H6 captured the real write win and H7's "per-op cost is small" framing.
+- **D36. Real-NIC validation (hawaii, 1 GbE) — the loopback verdict is corrected in both
+  directions (PERF-CORO-IOURING.md NV1–NV4).** All prior findings were loopback-only, where
+  a syscall is cheap and a transmit is free. Re-ran the NIC-sensitive ones with ATS on
+  `enp6s0` (atlantic) to a separate client host (M1 Mac Mini, `wrk`). **(a) Small object
+  (4 KB): io_uring now WINS −6%** (was loopback parity) — its op batching (1.35
+  `io_uring_enter`/req) beats epoll's ~3 syscalls/req where a syscall has real cost.
+  **(b) Large object (1 MB): io_uring loses +5–8% on proc/instr** (loopback was +17% proc
+  with no transmit cost) — its un-coalesced "1 send per recv" (H11) does ~2× epoll's driver
+  `xmit` + TX-completion softirq. **(c)** An epoll-only send-strategy A/B isolated the two
+  costs: `send()` < `sendmsg()` by ~480 instr/send on both media (NIC-independent
+  `import_iovec`); and the **coalescing verdict flips sign** — no-coalesce+`send` was
+  cheapest on loopback, **coalesce is cheapest on the NIC** (per-transmit cost is real).
+  **(d)** The io_uring read-side coalescing (H12) is still rejected on the NIC, now for a
+  *measured* reason: it halves in-flight op concurrency (read-only during accumulation vs
+  per-block's read+write interleave), so completions batch less per `io_uring_enter`
+  (loopback SQE-per-enter 97→53) — more event-loop iterations than the saved sends are
+  worth. **No code change shipped** (all investigation); the recommendation is now: io_uring
+  is a net win on small-object/keep-alive traffic and a bounded loss on large streaming
+  bodies, the latter fixable by a write-side batch (preserving the read↔write interleave) or
+  multishot recv. NIC-INDEPENDENT findings (H1/H2/H4/H8/H10) stand unchanged — pure
+  CPU/cache/frame effects. Harness: `~/work/io-uring-coro-bench/scripts/measure-nic2.sh`,
+  results in `findings/NIC-*.txt`.
 
 ## Open / pending decisions
 

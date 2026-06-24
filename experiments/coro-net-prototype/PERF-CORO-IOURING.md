@@ -5,7 +5,40 @@ network path (branch `io-uring-coroutine-wip`) versus the epoll baseline (master
 Companion to `DECISIONS.md` (which records *what was decided*); this file records
 *what was measured and why*.
 
+## Two environments — and why the contrast is itself the finding
+
+Everything here was measured in two environments. They disagree, and the disagreement
+is the most important result in this document:
+
+- **Loopback** (single host, RAM-cache hit, up to 120k req/s) isolates *CPU / cache /
+  coroutine-frame* effects. There is no driver, no TX descriptor, no doorbell, and a
+  syscall is cheap (no real device behind it). H1–H12 were all first established here.
+- **Real NIC** (ATS on the i9 over a **1 GbE** link — `enp6s0`, Marvell/Aquantia
+  `atlantic` — to a *separate* client host **`hawaii`**, an M1 Mac Mini running `wrk`)
+  adds the genuine driver TX path (descriptor build + doorbell + TX-completion softirq)
+  and a *real* per-syscall cost that loopback hides. Every NIC-sensitive finding was
+  re-validated here.
+
+**Loopback says "parity." The NIC says io_uring *wins small objects and loses large
+ones.*** Loopback under-charges two things that move in opposite directions:
+1. **Per-syscall cost** — cheap on loopback, real on the NIC. io_uring batches many
+   ops into one `io_uring_enter`; epoll pays one syscall per op. → on the NIC io_uring
+   **wins the small-object hot path** (−6% total cpu/1k) where it was at *parity* on
+   loopback.
+2. **Per-transmit cost** — ~free on loopback (`loopback_xmit` is a memory enqueue),
+   real on the NIC (driver `xmit` + TX-completion softirq). io_uring's un-coalesced
+   "one send per recv" pattern does ~2× the transmits of epoll's coalesced writes. → on
+   the NIC io_uring **loses the large-object path** (+5–8% on proc/instr) — a cost
+   loopback hid almost entirely.
+
+So loopback was right about the CPU/frame mechanics (H1, H4–H8, H10) and wrong, in both
+directions, about anything gated by syscalls or transmits (the headline, H6, H9, H11).
+Read the loopback experiments first; the **Real-NIC validation** section then says what
+each one looks like on real hardware.
+
 ## Rig and method (read first)
+
+### Loopback environment
 
 - **Box:** i9-12900K (hybrid: 8 P-cores + 8 E-cores), Ubuntu 24.04 HWE, kernel
   6.17, liburing 2.4. During runs: `performance` governor, turbo **off**
@@ -26,21 +59,43 @@ Companion to `DECISIONS.md` (which records *what was decided*); this file record
 - Binaries are Release `-O3 -fno-omit-frame-pointer` from the current tree
   (`IOU_FRAME_IOV=16`, all five fixes), installed at `/tmp/ts-iou-fp`.
 
+### Real-NIC environment
+
+- **Server:** ATS on the same i9 (same cgroup pinning), reachable on `enp6s0`
+  (`192.168.1.165`, atlantic, **1 GbE** link). **Client:** `hawaii`, an Apple M1 Mac
+  Mini (8 cores) on the same LAN running `wrk 4.2` — a genuine second host, so the
+  response writes traverse the real driver TX path. (Single-host localhost can't test
+  this: the kernel short-circuits local addresses to loopback before any driver; this
+  box has no SR-IOV; veth/netns are software-`xmit` with no doorbell.)
+- **The 1 GbE link caps throughput** (~27k rps at 4 KB, ~115 rps at 1 MB), so the box
+  runs *below* CPU saturation. Per-request metrics (`cpu/1k`, `instr/req`, ops/req) are
+  ratios and remain valid; absolute utilization is low.
+- **Two CPU accountings, because the NIC cost splits across contexts:** `proc cpu/1k` =
+  ATS cgroup CPU (includes the driver `xmit` that runs in the send *syscall* context);
+  `softirq cpu/1k` = `/proc/stat` softirq seconds ÷ req (the NIC TX/RX *completion* the
+  cgroup misses). The softirq number is noisy (constant timer baseline + 20 s windows),
+  so for the large-object total the reliable signals are **proc cpu/1k and `instr/req`**
+  (`perf -p`, which *does* count the in-syscall driver `xmit`); softirq is corroborating.
+- The harness is out-of-tree at `~/work/io-uring-coro-bench` (`measure-nic2.sh`,
+  `setup-box.sh`, the `wrk` lua on hawaii); raw cells in `findings/NIC-*.txt`.
+
 ## Background: the established result this study builds on
 
 The io_uring net path was once **+20.9% cpu/req** vs epoll with a collapsing p99
 tail. Five fixes (documented in `DECISIONS.md` D29 and `io-uring-perf-baseline`)
-brought it to parity. Ranked by impact: (1) shrink the inline `iovec` from
+brought it to loopback parity. Ranked by impact: (1) shrink the inline `iovec` from
 `NET_MAX_IOV`(1024 ⇒ 16 KB) to 16 — the 16 KB array lived in the *heap coroutine
 frame* pinned across the await, where master keeps it as a cache-warm *stack* local;
 (2) block directly in `io_uring_submit_and_wait` instead of bridging completions
-through an eventfd into `epoll_wait`; (3) opportunistic synchronous write; (4)
-single-buffer `recv`/`send` for the 1-block case; (5) unregister the now-dead
-completion eventfd.
+through an eventfd into `epoll_wait`; (3) opportunistic synchronous write (later
+superseded by the async batched write, H6); (4) single-buffer `recv`/`send` for the
+1-block case; (5) unregister the now-dead completion eventfd.
 
-**Anchor (this session, n=5, 4 KB objects, 120k req/s):** master 0.0139 vs io_uring
-0.0140 cpu/1k = **+0.7%**, p99 ~2.1 ms both. The harness/box reproduce the recorded
-parity, so the experiments below stand on a validated baseline.
+**Loopback anchor (n=5, 4 KB, 120k req/s):** master 0.0139 vs io_uring 0.0140 cpu/1k =
+**+0.7%**, p99 ~2.1 ms both. **Real-NIC anchor (4 KB, 1 GbE, hawaii):** io_uring 0.0281
+vs epoll 0.0299 total cpu/1k = **−6% (io_uring wins)**. The harness/box reproduce the
+recorded parity on loopback and surface the NIC win, so the experiments below stand on a
+validated baseline in both environments.
 
 ## Summary of findings
 
@@ -59,9 +114,36 @@ parity, so the experiments below stand on a validated baseline.
 | H11 | Op-count audit (SQE vs syscall) | io_uring **wins on syscalls** (1 MB pass: 18.2 `io_uring_enter` vs 52.6; hot path 1.71 ops vs 2.93 — epoll wastes an EAGAIN-probe recvmsg). But at the **op** level it does ~10% more, all **sends** (28.8 vs 17.5): it emits **one send per recv completion** (`READ_READY` signalled after every recv) where epoll coalesces ~2 reads/send. Each extra send = one extra coroutine resume. |
 | H12 | Write-coalescing | **Tried, rejected — a pessimization.** Accumulating reads before signalling cuts sends 28.8→16.1 (below epoll) and total ops below epoll, **but raises cpu/1k ~2% and instr/req +6%** (clean). H6's async write already amortized the send syscalls, so coalescing removes near-free syscalls while adding multi-block `sendmsg` build + accumulation cost. **Keep per-block sends.** |
 
-**Two actionable code changes came out of this:** (1) the cross-thread doorbell
-(correctness, free) and (2) the async batched write (perf). Both are validated below.
-The arena (H4) is not worth keeping. `IOU_FRAME_IOV=16` (H1) is confirmed optimal.
+The table above is the **loopback** verdict. On the **real NIC** the picture sharpens —
+some findings are confirmed, some are corrected, and the headline changes outright:
+
+| environment / workload | io_uring vs epoll | what it tells us |
+|---|---|---|
+| loopback, 4 KB hot | +0.7% (parity) | syscalls are cheap → batching invisible |
+| **real NIC, 4 KB hot** | **−6% total (io_uring wins)** | io_uring batches ops into 1.35 `io_uring_enter`/req vs epoll's ~3 syscalls; on real hardware that batching is a real win |
+| loopback, 1 MB pass | +17% (proc) | per-op coroutine-resume cost, no transmit cost |
+| **real NIC, 1 MB pass** | **+5–8% (proc/instr); softirq also higher** | io_uring's un-coalesced "1 send per recv" does ~2× epoll's transmits → real driver-`xmit`/softirq cost |
+
+**Which findings are NIC-sensitive vs NIC-independent** (so you know what re-ran on real
+hardware and what didn't need to):
+- **NIC-sensitive (re-validated on hawaii):** the headline parity (H5/H7 → becomes an
+  io_uring *win* on small objects), the large-object gap (H9/H11 → io_uring's send
+  pattern is a real liability), write-coalescing (H12 → still rejected, see below), the
+  async write (H6 → benefit *grows*). These are gated by syscalls or transmits.
+- **NIC-independent (loopback result stands):** H1 (iovec/frame size — a cache effect),
+  H2 (cross-thread doorbell — internal wakeup), H4 (frame contiguity — cache), H8 (huge
+  pages — dTLB), H10 (frame-cost mitigations — cache/allocation). These are pure
+  CPU/cache/coroutine-frame effects the transmit medium does not touch.
+
+**Actionable changes that came out of this:** (1) the cross-thread doorbell (correctness,
+free); (2) the async batched write (perf — and its syscall-batching win is *larger* on
+the NIC). The arena (H4) and frame-in-VC (H10) are not worth keeping; `IOU_FRAME_IOV=16`
+(H1) is confirmed optimal. The open item the NIC surfaces: io_uring's un-coalesced send
+pattern (H11) costs real CPU on large objects — but the obvious fix (H12) is a net loss
+on *both* media, so it needs a different approach (a write-side batch that doesn't
+disturb the read loop, or multishot recv), not the read-side coalescing tried here.
+
+See **Real-NIC validation** (after H12) for the full per-finding NIC data.
 
 ---
 
@@ -333,6 +415,10 @@ and there is no single hot spot left to cut — it is spread across the two `.ac
 bodies. (The `_write.actor` line is the sync-write baseline; H6's async write trims
 its syscall-entry component.)
 
+> **On the real NIC this ~2% loopback "residual = a small loss" inverts into a win:**
+> where a syscall has real cost, io_uring's op batching beats epoll's per-op syscalls and
+> the small-object path goes **−6%** (NV1). The locality residual is below that gain.
+
 ---
 
 ## H6 — Read primitives & cheaper writes
@@ -510,6 +596,11 @@ FramePool on/off (`-f`) cell to separate locality from op-structure.
   already captures — not this gap.** The lever for the large-object case is fewer ops/req
   (multishot recv — deferred), or a coroutine inner drain-loop.
 
+> **On the real NIC the +17% shrinks to +5–8% on proc/instr but gains a real transmit/
+> softirq component (NV1):** loopback charged the per-op resume but nothing for the
+> transmit; the NIC charges both. Same conclusion — fewer ops/req is the lever — now with
+> a hardware reason, not just a coroutine-frame one.
+
 ## H10 — Mitigating the coroutine frame cost (can we make io_uring's efficiency show?)
 
 **Hypothesis.** H7 named the 528/536 B heap coroutine frame the top LLC/dTLB leaf.
@@ -600,6 +691,11 @@ not readv/writev — so the syscall set is captured exactly.
   is a 1:1-with-master-shaped lever (make the io_uring read accumulate before signalling,
   like epoll's drain loop) — see H12.
 
+> **On the real NIC this is the one place io_uring genuinely loses (NV1):** the extra sends
+> are ~free on loopback but each is a real driver `xmit` + TX-completion, so io_uring runs
+> **+5–8%** on the 1 MB path. The read-accumulation lever (H12) loses on both media though
+> (it halves op concurrency, NV3) — the fix is a write-side batch or multishot recv.
+
 ## H12 — Write-coalescing: cuts the op count but *raises* CPU (rejected)
 
 **Hypothesis.** H11 found io_uring issues ~64% more sends than epoll (one send per recv
@@ -640,6 +736,120 @@ import outweighs it — net +6% instr/req, diffuse across the whole `sendmsg` ch
 The simple per-block `prep_send` is genuinely cheap; keep it. (Also re-confirms H7: the per-op
 cost is small, so cutting ops buys little — and here it backfires.)
 
+## Real-NIC validation (hawaii, 1 GbE) — the loopback findings on real hardware
+
+All of H1–H12 above were established on **loopback**, where a syscall is cheap and a
+"transmit" is a memory enqueue. This section re-runs the NIC-sensitive findings against a
+real driver: ATS on the i9 over `enp6s0` (atlantic, 1 GbE) to a separate client host
+`hawaii` (M1 Mac Mini, `wrk`). Same FP binary, `io_uring.enabled` toggled. Medians of 3
+interleaved rounds, 20 s windows.
+
+### NV1 — Headline: io_uring wins small objects, loses large ones
+
+| workload | arm | proc cpu/1k | softirq cpu/1k | total | instr/req | ops/req |
+|---|---|---|---|---|---|---|
+| **4 KB hot** | io_uring | 0.0173 | 0.0108 | **0.0281** | 61,181 | 1.35 `io_uring_enter` |
+| (cache hit) | epoll | 0.0185 | 0.0114 | **0.0299** | 60,426 | ~3 syscalls (2 recvmsg + 1 sendmsg) |
+| **1 MB pass** | io_uring | 0.611 | 1.369 | 1.98 | 1,142 K | 38.7 `io_uring_enter` |
+| (origin) | epoll | 0.582 | 1.270 | 1.85 | 1,036 K | ~57 syscalls (35.7 recvmsg + 21.2 sendmsg) |
+
+- **Small object (4 KB): io_uring −6% total** (0.0281 vs 0.0299). On loopback this was
+  *parity* (+0.7%). The win is io_uring's op batching: **1.35 `io_uring_enter`/req vs
+  epoll's ~3 syscalls** (epoll even wastes an EAGAIN-probe recvmsg, H11). io_uring runs
+  *slightly more instructions* (+1.2%) but far fewer syscalls, and on real hardware the
+  syscall is expensive enough that the trade is a net win. **This is the clean
+  demonstration of io_uring efficiency we were chasing — it just needed a real NIC to
+  show.**
+- **Large object (1 MB): io_uring +5–8% on the reliable metrics** (proc +5%, instr/req
+  +10%; softirq also higher but noisy). On loopback this was +17% proc with *zero*
+  transmit cost. On the NIC the proc gap shrinks but a new **softirq** cost appears,
+  because io_uring's un-coalesced "one send per recv" (H11) does ~2× epoll's transmits
+  (epoll coalesces to ~21 sendmsg/req; io_uring streams per-block). Each extra transmit
+  is a real driver `xmit` + TX-completion. **io_uring's send pattern is a genuine
+  large-object liability on real hardware** — invisible on loopback.
+
+### NV2 — Why: per-syscall and per-transmit cost, isolated (epoll send-strategy A/B)
+
+To separate the two NIC costs from everything else, an epoll-only experiment varied just
+the write strategy (forcing single-block sends to make the choice fire), measured by
+`instr/req` (the clean metric):
+
+| epoll write strategy | sends/req | loopback instr/req | real-NIC instr/req |
+|---|---|---|---|
+| coalesce + `sendmsg` (master default) | ~18–20 multi-block | 1,354 K | **1,028 K** |
+| no-coalesce + `sendmsg` | ~34–39 single-block | 1,351 K | 1,077 K |
+| no-coalesce + `send()` | ~34–39 single-block | **1,334 K (cheapest)** | 1,064 K |
+
+- **`send()` < `sendmsg()`** by ~480 instr/send on *both* media (the kernel skips
+  `copy_msghdr_from_user` + `import_iovec`). This is NIC-independent — it's the syscall's
+  own work. Master always uses `sendmsg`, even for one block, so it leaves this on the
+  table; but in practice master's responses are ≥2 blocks (headers + body), so `niov==1`
+  rarely fires for it — the fast path is only reachably valuable for io_uring's per-block
+  streaming, where `prep_send` already uses it.
+- **The coalescing verdict *flips sign* between media.** On loopback, no-coalesce+`send`
+  was the *cheapest* (coalescing was a wash — fewer syscalls offset by bigger
+  `import_iovec`). On the **real NIC, coalescing is cheapest** (1,028 K vs 1,064–1,077 K):
+  each transmit carries a real driver `xmit` cost, so doing ~2× the sends costs ~2× that
+  work. Loopback's "coalescing ≈ wash, don't bother" was a loopback artifact; on real
+  hardware coalescing is the right strategy — which is exactly why master coalesces.
+
+### NV3 — H12 re-test on the NIC: read-side coalescing still loses
+
+Given NV1/NV2, the natural question: does making **io_uring** coalesce (the H12 read-side
+change — accumulate reads before signalling `READ_READY`, so the write batches) help on
+the NIC, where coalescing pays? **No — still a pessimization** (1 MB pass, NIC):
+
+| io_uring variant | total cpu/1k | `io_uring_enter`/req | CQEs/req |
+|---|---|---|---|
+| per-block (current) | **1.91** | 37.96 | 67.4 |
+| read-coalesced (H12) | 2.14 | **53.2** | 56.3 |
+
+Coalescing *did* cut CQEs (67→56, as intended — fewer sends), yet it **raised
+`io_uring_enter` 38→53**. That looks contradictory until you see that `io_uring_enter` is
+not "submits": `submit_and_wait` makes **one** `io_uring_enter` per event-loop iteration,
+draining *all* currently-ready CQEs and submitting the SQEs they queued. So the count
+tracks **how many completions are ready per wake — i.e. in-flight op concurrency** — not
+op volume. Per-block keeps a read **and** a write in flight per connection (recv→signal→
+send, a 1:1 interleave); coalescing defers the write (the read accumulates alone), roughly
+halving the concurrency, so completions arrive in smaller batches and each request needs
+more iterations. Measured directly on **loopback** (1 MB pass), where it is the same
+effect, not a NIC quirk:
+
+| loopback, 1 MB pass | enter/req | SQE/req | **SQE-per-enter** |
+|---|---|---|---|
+| per-block | 0.69 | 67.3 | **97** |
+| coalesced | 0.99 | 52.6 | **53** |
+
+Fewer total ops (67→53) but **half the batching** (97→53 ops drained per `io_uring_enter`)
+→ more iterations. (The absolute `enter/req` differs wildly between media — ~0.7 on
+saturated loopback, ~38 on the under-loaded 1 GbE box — because batching depth scales with
+load, not because the mechanism differs.) So H12's verdict holds on the NIC, now for a
+*precise* reason: read-side coalescing halves op concurrency, which costs more event-loop
+iterations than the saved sends are worth. The large-object liability (NV1) is real, but
+**read-side coalescing is not its fix**; a write-side batch that leaves the read loop and
+its read↔write interleave alone, or multishot recv, would be the lever.
+
+### NV4 — Per-finding status on the real NIC
+
+| finding | NIC status |
+|---|---|
+| H1 iovec/frame size | **NIC-independent** — frame size is a cache effect; iov16 stays optimal. The op-count side is gated by signalling (H11), not iovec capacity. |
+| H2 cross-thread doorbell | **NIC-independent** — internal thread wakeup; correctness fix unchanged. |
+| H3 real TCP (veth) | **superseded** by this section (a real driver, not just MTU-1500 software TCP). |
+| H4 frame contiguity | **NIC-independent** — cache; null on both. |
+| H5/H7 residual / parity | **corrected**: loopback "parity" → io_uring **−6% win** on the NIC small-object path (syscall batching). |
+| H6 async batched write | **confirmed, benefit grows**: it's *why* io_uring batches to 1.35 enter/req and wins NV1; syscall amortization matters more on the NIC. |
+| H8 huge pages | **NIC-independent** — dTLB; not a lever. |
+| H9 large-object gap | **confirmed + sharpened**: the gap persists (+5–8%) and now has a transmit/softirq component from un-coalesced sends. |
+| H10 frame-cost mitigations | **NIC-independent** — cache/allocation; perf-neutral on both. |
+| H11 op-count (more sends) | **confirmed as a real cost**: the extra sends are ~free on loopback but cost driver `xmit` + softirq on the NIC (NV1 large-object loss). |
+| H12 write-coalescing | **still rejected** (NV3), now for a batching-disruption reason, not a syscall-cost one. |
+
+**Net:** loopback was right about every CPU/cache/frame mechanic and wrong, in both
+directions, about anything gated by syscalls or transmits. The real NIC turns io_uring's
+"parity" into a **small-object win** and exposes a **large-object send-pattern liability**
+that loopback hid.
+
 ## Validation & recommendations
 
 **Validation (combined doorbell + async-write change, current working tree):**
@@ -665,15 +875,27 @@ cost is small, so cutting ops buys little — and here it backfires.)
    guard (the always-in-flight `_write_op` makes that path hotter).
 3. **Keep `IOU_FRAME_IOV=16` (H1).** Confirmed optimal across sizes.
 4. **Do not pursue the frame arena (H4)** — no measurable benefit at this scale.
-5. The residual ~+2% cycles (H5) is locality in the coroutine `.actor` bodies + the
-   ring; with the async write it is ~+0.8%. Beyond this, the only remaining lever is
-   multishot recv + provided buffers (deferred — out of scope here).
-6. **Do not chase the frame footprint (H7/H8/H10).** Three independent attempts on the
-   residual all came up empty: huge pages can't reach the io_uring allocations and help
-   nothing measurable (H8); shrinking the frame is a dead end (H10); embedding the frame
-   in the VC is correct + clean but perf-neutral and costs per-connection memory (H10).
-   The FramePool already neutralizes the frame cost. The small-object hot path is at
-   cpu/1k parity and the **only** path to a clean io_uring *win* is reducing ops/req —
-   i.e. the deferred advanced features (multishot recv, provided buffers), which attack
-   the per-op CQE/resume structure that H9 identified as the real large-object cost.
-   Everything 1:1-with-master that could be done here has been done.
+5. The loopback residual ~+2% cycles (H5; ~+0.8% with the async write) is locality in the
+   coroutine `.actor` bodies + the ring. **On the real NIC this stops being the story
+   (NV1): io_uring *wins* the small-object hot path by −6%** because its op batching beats
+   epoll's per-op syscalls where a syscall is actually expensive. So the small-object case
+   is no longer "reach parity" — it's already a win on real hardware, and the residual
+   locality is below the syscall-batching gain.
+6. **Do not chase the frame footprint (H7/H8/H10).** Huge pages can't reach the io_uring
+   allocations (H8); shrinking the frame is a dead end (H10); frame-in-VC is perf-neutral
+   and costs per-connection memory (H10). The FramePool already neutralizes the frame
+   cost. This holds on both media — the frame is a cache effect the NIC doesn't change.
+7. **The real open lever is io_uring's send pattern on large objects (H9/H11 → NV1).** On
+   loopback it reads as a +17% per-op-resume cost; on the NIC it is a real **transmit**
+   cost — io_uring's un-coalesced "one send per recv" does ~2× epoll's driver `xmit` +
+   TX-completion (NV1, +5–8%). The naive fix (read-side coalescing, H12) loses on *both*
+   media — it halves in-flight op concurrency and so costs more event-loop iterations than
+   the saved sends are worth (NV3). The right lever is a **write-side batch that preserves
+   the read↔write interleave**, or **multishot recv + provided buffers** (deferred). This
+   is the one place io_uring is genuinely behind epoll on real hardware, and it is
+   workload-specific (large streaming bodies, not the small-object hot path).
+8. **Bottom line for shipping:** on a real NIC, io_uring is a **net win on the dominant
+   small-object/keep-alive traffic** and a **bounded loss on large streaming bodies**;
+   loopback's "parity" undersold both halves. Gate behind `net.io_uring.enabled` (done),
+   default off until the large-object send-batching lever lands and TLS + 10k-conn memory
+   are measured.
