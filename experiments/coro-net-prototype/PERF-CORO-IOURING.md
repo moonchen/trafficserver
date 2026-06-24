@@ -809,11 +809,15 @@ Coalescing *did* cut CQEs (67→56, as intended — fewer sends), yet it **raise
 not "submits": `submit_and_wait` makes **one** `io_uring_enter` per event-loop iteration,
 draining *all* currently-ready CQEs and submitting the SQEs they queued. So the count
 tracks **how many completions are ready per wake — i.e. in-flight op concurrency** — not
-op volume. Per-block keeps a read **and** a write in flight per connection (recv→signal→
-send, a 1:1 interleave); coalescing defers the write (the read accumulates alone), roughly
-halving the concurrency, so completions arrive in smaller batches and each request needs
-more iterations. Measured directly on **loopback** (1 MB pass), where it is the same
-effect, not a NIC quirk:
+op volume. The coalescing turns each connection into a **read-burst / write-burst
+ping-pong**: the read fills the buffer with no signal, then at `write_avail()<=0` it
+signals and *stalls* (top of the loop finds no space → `read_disable`) while the write
+drains, then re-arms. At almost every instant only **one direction** is in flight per
+connection. Per-block has no such stall — each recv immediately frees one block into a
+send, so the buffer never fills, the read never waits, and read **and** write are *both*
+continuously in flight (~2 ops/conn). Half the in-flight concurrency → completions arrive
+in smaller batches → more iterations for fewer ops. Measured directly on **loopback**
+(1 MB pass), where it is the same effect, not a NIC quirk:
 
 | loopback, 1 MB pass | enter/req | SQE/req | **SQE-per-enter** |
 |---|---|---|---|
