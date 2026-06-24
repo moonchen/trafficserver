@@ -52,6 +52,10 @@ parity, so the experiments below stand on a validated baseline.
 | H4 | Frame contiguity | Contiguous-slab arena ≈ scattered freelist (±1%, noise). Not a meaningful lever at this scale — the frame is already small. Hypothesis not supported. |
 | H5 | Where the residual lives | Clean n=3: io_uring **+1% instructions / +2% cycles** vs master (corrects the earlier "fewer instructions" claim). Residual = locality (cache +27%, dTLB +28%, branch-miss +17%) in the two `.actor` coroutine bodies + `submit_and_wait`. No single hot spot. |
 | H6 | Cheaper / syscall-free write | **Pure async batched write** removes the per-request `sendmsg` (0.98→0/req), halves net syscalls, and is **−1.8% cycles/req** (IPC 1.368→1.400) — reversing the earlier EXP-1b. Moves io_uring from +2.7% to **+0.8% cycles** vs master. *(actionable optimization)* |
+| H7 | Where the misses land (precise/leaf) | Residual is **memory-footprint, not control-flow**: LLC +79% & dTLB-walks +59% but **L1 ≈0** — cold-line/capacity at `_read.actor` (frame) + `submit_and_wait` (rings). Branch +13% is kernel SQE-issue; the **coroutine resume jump is BTB-predicted, not a miss source** (theory refuted). |
+| H8 | Huge pages | **Not a lever.** THP/glibc-tunable can't reach ATS memory (`AnonHugePages=0`, 6 cells). The working ATS hugetlb knob backs only the shared iobuffer arena (lowers both arms, no cpu/1k benefit), never the frames/rings. dTLB residual is <1% cpu anyway. |
+| H9 | Bigger block / large-object gap | Block size is **not** the lever: CQE/req immovable (67.6→67.0) across 8 KB→256 KB→+2 MB SO_RCVBUF (refutes `ceil(size/block)`; backpressure sets it). io_uring is **+17% on 1 MB passthrough**, and it's **ops-structural** (67 one-op-per-resume CQEs vs epoll's drain loop), not locality — so co-location won't fix it; fewer ops/req (multishot) will. |
+| H10 | Mitigate the frame cost | **No lever found.** Shrinking the frame (iov 16→8) is a dead end (cost is the *allocation*, not the size). Frame-in-VC (embed the frame in the VC, drop the pool) is correct + clean but **perf-neutral** (interleaved A/B: −0.5%, within noise) — the FramePool already keeps the frame hot — and costs 1.28 KB/VC. **Keep the pool.** The frame is not what holds io_uring back. |
 
 **Two actionable code changes came out of this:** (1) the cross-thread doorbell
 (correctness, free) and (2) the async batched write (perf). Both are validated below.
@@ -397,6 +401,164 @@ parity-or-better everywhere measured, with the medium-object regime now a clear 
 
 ---
 
+## H7 — Where the misses physically land (Q4, precise/leaf attribution)
+
+**Hypothesis.** H5 showed the residual is "locality" but attributed it only to whole
+functions via cycle sampling. *Which* misses (L1 / LLC / dTLB / branch) and *which
+leaf instructions*? And is the coroutine resume indirect-jump the branch-miss source,
+as theory predicts?
+
+**Experiment.** Same FP binary toggled `enabled=1`/`=0` under steady 4 KB RAM-hit load
+(4 KB maximises coroutine-ops/sec, so the machinery's misses dominate over body-copy
+misses). `perf record` with **precise (PEBS)** events + fp call graph:
+`br_misp_retired.all_branches`, `dtlb_load_misses.walk_completed`,
+`mem_load_retired.l1_miss`, `mem_load_retired.l3_miss`. Leaf attribution via
+`--no-children`.
+
+**Result.** Window totals (≈ per-req at equal load):
+
+| event | io_uring | epoll | Δ |
+|---|---|---|---|
+| LLC (L3) load-misses | 14.2 M | 7.95 M | **+79%** |
+| dTLB page-walks completed | 28.3 M | 17.8 M | **+59%** |
+| branch mispredicts | 228.8 M | 202.0 M | +13% |
+| L1 load-misses | 1840 M | 2050 M | **≈0 (−10%)** |
+
+Leaf (self%) sites:
+- **L3 + dTLB** concentrate in **`_read.actor`** (the 528 B heap coroutine frame) and
+  **`submit_and_wait`** (the SQ/CQ rings) — io_uring-specific; epoll's counterparts are
+  `net_read_io` + `ReadWriteEventIO::process_event`.
+- **Branch** misses are dominated in *both* arms by `nf_hook_slow` (conntrack — a
+  loopback/veth rig artifact). The io_uring-specific branch leaves are kernel-side
+  `__io_issue_sqe` / `io_sendmsg` (the send now runs inside `io_uring_enter`), replacing
+  epoll's `__x64_sys_sendmsg`. The coroutine **resume indirect-jump does not appear** as
+  a leaf.
+
+**Conclusion.** The residual is a **memory-footprint** cost, not a control-flow cost:
+- **L1 is unchanged** while LLC + page-walks jump — so it is a *cold-line / capacity*
+  effect (the 528 B frame and the ring pages are touched cold, once per op, on pages
+  distinct from the data buffer and the VC), **not** L1 thrash.
+- The **branch-miss theory is refuted**: the resume jump is BTB-predicted (each
+  connection resumes to the same point repeatedly); the small branch excess is kernel
+  SQE-issue, roughly a wash with epoll's syscall entry. This is a *good* surprise — the
+  coroutine dispatch is cheap; the cost is the frame+ring footprint. Refines H5.
+
+## H8 — Huge pages do not reach the io_uring path (Q3)
+
+**Hypothesis.** The dTLB-walk excess (H7) is a page-table cost; 2 MB pages should cut it.
+
+**Experiment.** Three escalating levers, measuring cpu/1k + `dtlb_load_misses/req`, and
+— critically — **verifying the ATS process actually got huge pages** (`AnonHugePages`
+in `smaps_rollup`, `HugePages_Free` drop) before trusting any delta:
+(1) THP `never`/`always`; (2) `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` + aggressive
+khugepaged; (3) ATS's own explicit-hugetlb knob `proxy.config.allocator.hugepages=1`
+with reserved `nr_hugepages`.
+
+**Result.**
+- THP (6 cells) — ATS `AnonHugePages` stayed **0** in every cell. ATS allocates through
+  its own `ink_freelist` (mmap chunks) + small brk allocations; **neither is reachable**
+  by khugepaged, THP, or the glibc malloc-hugetlb tunable. The dTLB numbers just bounce
+  in noise (even rising for epoll-always).
+- ATS hugetlb knob — *did* back **28 MB** of arena (proven: `HugePages_Free` −14 pages),
+  but produced **no cpu/1k benefit** (all cells 0.0139–0.0141). It backs the **shared
+  iobuffer arena**, so it lowers io_uring and epoll equally (not a parity lever), and
+  never touches the FramePool frames or SQ/CQ rings — the actual io_uring dTLB excess.
+- At parity the dTLB residual is **< 1% of cycles** (io_uring/epoll cpu/1k identical).
+
+**Conclusion.** Huge pages are **not a lever** for the io_uring path: the memory that
+would benefit (frames/rings) is unreachable by every stock mechanism, the working knob
+helps only shared infrastructure equally, and the ceiling is sub-1% against THP's
+compaction-jitter risk. Reaching the frames would require a code change to
+hugepage-back the FramePool — for < 1%.
+
+## H9 — Bigger MIOBuffer block does not cut the large-object op count (Q2); the large-object gap is ops-structural (Q1)
+
+**Hypothesis (from the design review).** A 1 MB cache-miss passthrough recvs in 8 KB
+blocks (`HttpSM.cc:1805`, `HTTP_SERVER_RESP_HDR_BUFFER_INDEX`), so a bigger block should
+cut recv ops as `ceil(objsize/blocksize)` — 8 KB→256 KB = ~32× fewer CQEs/coroutine
+resumes.
+
+**Experiment.** 1 MB passthrough, io_uring vs epoll, counting CQEs/req
+(`io_uring:io_uring_complete` tracepoint) and rw-syscalls/req. Then bump the origin read
+buffer 8 KB→256 KB (one line, rebuild), and pair it with a 2 MB `SO_RCVBUF`. Plus a
+FramePool on/off (`-f`) cell to separate locality from op-structure.
+
+**Result.**
+
+| arm | cpu/1k | CQE or syscalls /req |
+|---|---|---|
+| io_uring, 8 KB block | 0.6787 | 67.6 cqe |
+| epoll, 8 KB block | 0.5810 | 53.4 syscalls |
+| io_uring, 256 KB block | 0.6747 | **67.2 cqe** |
+| io_uring, 256 KB + 2 MB SO_RCVBUF | 0.6752 | **67.0 cqe** |
+| io_uring, 8 KB, FramePool **off** (`-f`) | 0.7381 | 67.7 cqe |
+
+**Conclusion.**
+- The CQE count is **immovable** by block or socket-buffer sizing (67.6→67.2→67.0).
+  This **refutes the `ceil(objsize/blocksize)` prediction** — the per-recv size is set
+  by **tunnel backpressure/flow dynamics** (the consumer drains incrementally, so each
+  recv returns ~16 KB regardless of offered space), not the block index. Bigger blocks
+  are not a lever.
+- io_uring is **+17% cpu/1k on 1 MB passthrough** — a real gap (unlike the small-object
+  parity), and it persists with the FramePool **on**. Pool-off adds +8.8%
+  (frames+iobuffers) but leaves CQE/req unchanged, so the gap is **ops-structural**: io_uring
+  does 67 single CQEs, one per coroutine resume; epoll drains the socket in a userspace
+  loop (`UnixNetVConnection.cc:542 do…while(r==rattempted)`), 53 syscalls, fewer
+  event-loop re-entries. **Frame–VC co-location targets only the locality slice the pool
+  already captures — not this gap.** The lever for the large-object case is fewer ops/req
+  (multishot recv — deferred), or a coroutine inner drain-loop.
+
+## H10 — Mitigating the coroutine frame cost (can we make io_uring's efficiency show?)
+
+**Hypothesis.** H7 named the 528/536 B heap coroutine frame the top LLC/dTLB leaf.
+If that footprint is the thing keeping io_uring at parity rather than ahead, then
+either (a) shrinking the frame or (b) co-locating it with the VC should recover cycles
+and turn the small-object parity into a win. Two mitigations, while the code is still
+~1:1 with master (before multishot / provided buffers):
+- **Shrink:** drop `IOU_FRAME_IOV` 16→8 (the `iovec[16]` is 256 B of the 528 B frame).
+- **Frame-in-VC:** make each coroutine's frame a fixed member of the VC
+  (`_read_frame` / `_write_frame`), with a custom `operator new` that returns the
+  embedded buffer and a no-op `operator delete`. There is at most one `_read` and one
+  `_write` live per VC, and the VC already may not be freed with an op in flight, so a
+  per-VC buffer is exactly as long-lived as needed — and it removes the per-op pool
+  allocation *and* puts the frame on the VC's own cache lines. (Patch:
+  `io-uring-coro-bench/prototypes/frame-in-vc-colocation.patch`.)
+
+**Experiment.** 4 KB RAM-hit (1 frame/req) and 1 MB passthrough (frame touched ~67×/req,
+where a per-frame effect is amplified). For frame-in-VC, a **true interleaved A/B** —
+both binaries built, alternated at a fixed sub-saturation rate (4000 rps) to cancel
+drift, n=4 each — because the saturated large-object cpu/1k has a ±5–6% noise floor that
+single samples cannot see through.
+
+**Result.**
+
+| mitigation | workload | cpu/1k | vs baseline |
+|---|---|---|---|
+| `IOU_FRAME_IOV` 16→8 (frame 528→400 B) | 4 KB hot | 0.0144 | +1% (noise / slightly worse) |
+| frame-in-VC | 4 KB hot | 0.0142–0.0146 | flat |
+| frame-in-VC (interleaved, fixed rate) | 1 MB passthrough | 0.4695 med | base 0.4719 med — **−0.5%, within noise** |
+
+The first 1 MB frame-in-VC sample read −4.7%; reps 2–4 read +5–7%. The interleaved A/B
+(base {0.457, 0.464, 0.480, 0.480} vs coloc {0.456, 0.459, 0.480, 0.527}) settles it:
+the distributions overlap; the median gap is 0.5%, inside the noise floor.
+
+**Conclusion.** **Neither mitigation moves cpu/1k** — the frame cost is already paid down:
+- **Shrinking is a dead end.** The cost was never the frame's *size* — H7's top dTLB
+  leaves were `freelist_new`/`thread_alloc` (the *allocation*) and the cold frame line,
+  not the byte count. Below iov=16 you lose op-coverage (H1) for no locality gain.
+- **Frame-in-VC is correct and clean but perf-neutral.** The FramePool (LIFO, thread-local)
+  already keeps the frame hot: the alloc is a cheap inline pop and the reused frame is
+  cache-resident at steady state, so removing the pool and co-locating saves nothing
+  measurable — even at 67 frames/req. And it would **cost 1.28 KB on every VC**
+  (`_read_frame` + `_write_frame`), borne by all connections including idle keep-alives,
+  whereas the pool holds frames only for *active* ops. Worse memory scaling for no perf.
+
+So the frame is **not** what holds io_uring back. The only remaining lever is the one H9
+points to — fewer ops/req (multishot recv / provided buffers, deferred) — which attacks
+the per-op CQE/resume *structure*, not the frame. **Recommendation: keep the FramePool;
+do not adopt either mitigation.** The experiment is the value: it proves the frame cost is
+already neutralized.
+
 ## Validation & recommendations
 
 **Validation (combined doorbell + async-write change, current working tree):**
@@ -425,3 +587,12 @@ parity-or-better everywhere measured, with the medium-object regime now a clear 
 5. The residual ~+2% cycles (H5) is locality in the coroutine `.actor` bodies + the
    ring; with the async write it is ~+0.8%. Beyond this, the only remaining lever is
    multishot recv + provided buffers (deferred — out of scope here).
+6. **Do not chase the frame footprint (H7/H8/H10).** Three independent attempts on the
+   residual all came up empty: huge pages can't reach the io_uring allocations and help
+   nothing measurable (H8); shrinking the frame is a dead end (H10); embedding the frame
+   in the VC is correct + clean but perf-neutral and costs per-connection memory (H10).
+   The FramePool already neutralizes the frame cost. The small-object hot path is at
+   cpu/1k parity and the **only** path to a clean io_uring *win* is reducing ops/req —
+   i.e. the deferred advanced features (multishot recv, provided buffers), which attack
+   the per-op CQE/resume structure that H9 identified as the real large-object cost.
+   Everything 1:1-with-master that could be done here has been done.

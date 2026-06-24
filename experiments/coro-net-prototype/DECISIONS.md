@@ -359,6 +359,33 @@ Full hypothesis→experiment→result→conclusion log: `PERF-CORO-IOURING.md`.
   and the residual is *locality* (cache/dTLB/branch) in the `_read`/`_write` `.actor`
   bodies + `submit_and_wait`, not instruction count.
 
+## Deep-dive round 2 (2026-06-23, follow-up questions)
+
+Full H/E/R/C log: `PERF-CORO-IOURING.md` H7–H10. Harness now out-of-tree at
+`~/work/io-uring-coro-bench` (the narrative stays here; the runnable rig does not).
+
+- **D33. The residual is a memory *footprint* cost, not control-flow — and it is not
+  reachable by huge pages or block sizing.** Precise/leaf profiling (H7): io_uring's
+  excess is LLC misses (+79%) and dTLB page-walks (+59%) at `_read.actor` (the frame) +
+  `submit_and_wait` (the rings), with **L1 unchanged** — cold-line/capacity, not L1
+  thrash. The coroutine resume indirect-jump is **BTB-predicted** (not a branch-miss
+  source, refuting the theory); the small branch excess is kernel SQE-issue. Huge pages
+  (H8) can't reach ATS's `ink_freelist`/brk allocations (`AnonHugePages=0` across THP +
+  glibc-`malloc.hugetlb`), and the working ATS hugetlb knob backs only the shared
+  iobuffer arena (lowers both arms, no cpu/1k change). Bigger MIOBuffer blocks (H9) leave
+  CQE/req immovable (67.6→67.0 across 8 KB→256 KB→+2 MB SO_RCVBUF) — backpressure, not
+  block size, sets the recv count. **No production change from any of these.**
+- **D34. Frame-cost mitigations evaluated and rejected — keep the FramePool.** Two
+  attempts to make io_uring's efficiency show by removing the frame cost (H10): shrinking
+  `IOU_FRAME_IOV` 16→8 (dead end — the cost is the allocation, not the byte count) and
+  embedding the frame in the VC (`_read_frame`/`_write_frame` members, custom `operator
+  new`, no-op delete; patch in `io-uring-coro-bench/prototypes/`). Frame-in-VC is correct
+  and clean, but an interleaved fixed-rate A/B (the saturated large-object cpu/1k has a
+  ±5% floor) shows **−0.5%, within noise** — the pool already keeps the frame hot — and
+  it would add **1.28 KB to every VC** (worse memory scaling than the pool for idle
+  keep-alives). Decision: **keep the pool; do not adopt either.** The frame is not the
+  lever; reducing ops/req (the deferred multishot/provided-buffer features) is.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
