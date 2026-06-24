@@ -385,6 +385,18 @@ Full H/E/R/C log: `PERF-CORO-IOURING.md` H7–H10. Harness now out-of-tree at
   it would add **1.28 KB to every VC** (worse memory scaling than the pool for idle
   keep-alives). Decision: **keep the pool; do not adopt either.** The frame is not the
   lever; reducing ops/req (the deferred multishot/provided-buffer features) is.
+- **D35. Op-count audit + write-coalescing rejected (H11/H12).** Counting SQEs-by-opcode vs
+  epoll syscalls per transaction: io_uring wins decisively on *syscalls* (1 MB passthrough
+  18.2 `io_uring_enter` vs 52.6; 4 KB hot path 1.71 ops vs 2.93 — epoll wastes an EAGAIN
+  drain-probe recvmsg), but does ~10% more *ops*, all **sends** — it emits one send per recv
+  completion (`READ_READY` signalled after every recv at `IOUringNetVConnection.cc:377`)
+  where epoll coalesces ~2 reads per send. Tried coalescing (accumulate reads before
+  signalling, epoll-style): it cut sends 28.8→16.1/req (below epoll) and total ops below
+  epoll, **but raised cpu/1k ~2% and instr/req a clean +6%** (revert restores it — not
+  drift). Rejected: because the async batched write (H6) already amortized the send
+  syscalls, coalescing strips near-free syscalls while adding multi-block `sendmsg` iovec
+  build + read-accumulation cost. **Keep the simple per-block `prep_send`.** Instructive: it
+  re-confirms H6 captured the real write win and H7's "per-op cost is small" framing.
 
 ## Open / pending decisions
 

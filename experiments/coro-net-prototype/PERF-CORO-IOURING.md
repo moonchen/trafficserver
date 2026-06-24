@@ -56,6 +56,8 @@ parity, so the experiments below stand on a validated baseline.
 | H8 | Huge pages | **Not a lever.** THP/glibc-tunable can't reach ATS memory (`AnonHugePages=0`, 6 cells). The working ATS hugetlb knob backs only the shared iobuffer arena (lowers both arms, no cpu/1k benefit), never the frames/rings. dTLB residual is <1% cpu anyway. |
 | H9 | Bigger block / large-object gap | Block size is **not** the lever: CQE/req immovable (67.6→67.0) across 8 KB→256 KB→+2 MB SO_RCVBUF (refutes `ceil(size/block)`; backpressure sets it). io_uring is **+17% on 1 MB passthrough**, and it's **ops-structural** (67 one-op-per-resume CQEs vs epoll's drain loop), not locality — so co-location won't fix it; fewer ops/req (multishot) will. |
 | H10 | Mitigate the frame cost | **No lever found.** Shrinking the frame (iov 16→8) is a dead end (cost is the *allocation*, not the size). Frame-in-VC (embed the frame in the VC, drop the pool) is correct + clean but **perf-neutral** (interleaved A/B: −0.5%, within noise) — the FramePool already keeps the frame hot — and costs 1.28 KB/VC. **Keep the pool.** The frame is not what holds io_uring back. |
+| H11 | Op-count audit (SQE vs syscall) | io_uring **wins on syscalls** (1 MB pass: 18.2 `io_uring_enter` vs 52.6; hot path 1.71 ops vs 2.93 — epoll wastes an EAGAIN-probe recvmsg). But at the **op** level it does ~10% more, all **sends** (28.8 vs 17.5): it emits **one send per recv completion** (`READ_READY` signalled after every recv) where epoll coalesces ~2 reads/send. Each extra send = one extra coroutine resume. |
+| H12 | Write-coalescing | **Tried, rejected — a pessimization.** Accumulating reads before signalling cuts sends 28.8→16.1 (below epoll) and total ops below epoll, **but raises cpu/1k ~2% and instr/req +6%** (clean). H6's async write already amortized the send syscalls, so coalescing removes near-free syscalls while adding multi-block `sendmsg` build + accumulation cost. **Keep per-block sends.** |
 
 **Two actionable code changes came out of this:** (1) the cross-thread doorbell
 (correctness, free) and (2) the async batched write (perf). Both are validated below.
@@ -558,6 +560,80 @@ points to — fewer ops/req (multishot recv / provided buffers, deferred) — wh
 the per-op CQE/resume *structure*, not the frame. **Recommendation: keep the FramePool;
 do not adopt either mitigation.** The experiment is the value: it proves the frame cost is
 already neutralized.
+
+## H11 — Op-count audit: io_uring trades syscalls for ops, and its writes are un-coalesced
+
+**Hypothesis.** The "1:1 with master" port should issue one SQE per recv/send that epoll
+issues as a syscall. Is that true op-for-op — and is the +17% large-object cost partly an
+op-count regression rather than just per-op locality?
+
+**Experiment.** Count io_uring SQEs by opcode (`io_uring:io_uring_submit_req` op_str) and
+`io_uring_enter` syscalls, vs epoll's recvmsg/sendmsg, per transaction, at a fixed
+sub-saturation rate. 4 KB RAM-hit (client I/O only) and 1 MB passthrough (origin read +
+client write). The epoll path uses `recvmsg`/`sendmsg` (`UnixNetVConnection.cc:537,855`),
+not readv/writev — so the syscall set is captured exactly.
+
+**Result.**
+
+| | reads | writes | total ops | actual syscalls |
+|---|---|---|---|---|
+| **4 KB hot** io_uring | 0.86 recv | 0.85 send | **1.71 SQE** | (batched, < 1.71) |
+| 4 KB hot epoll | 1.95 recvmsg | 0.97 sendmsg | **2.93** | 2.93 |
+| **1 MB pass** io_uring | 28.8 recv | **28.8 send** | 57.6 SQE | **18.2 `io_uring_enter`** |
+| 1 MB pass epoll | 35.0 recvmsg | **17.5 sendmsg** | 52.6 | 52.6 |
+
+**Conclusion.** Three distinct facts the loose CQE count had blurred:
+- **At the syscall level io_uring wins decisively** — 1 MB passthrough: 18.2 `io_uring_enter`
+  vs 52.6 syscalls (**2.9× fewer**); its 57.6 SQEs batch ~3.2-to-1. On the hot path it also
+  does *fewer ops* (1.71 vs 2.93): epoll burns an extra recvmsg/req on the EAGAIN
+  drain-probe that io_uring's "submit one recv and wait" avoids.
+- **At the op level io_uring does ~10% more ops on the passthrough, and the increase is
+  *sends*** (28.8 vs 17.5, +64%). The tell: io_uring's send/req (28.80) ≈ recv/req (28.81)
+  — **one send per recv completion**, ~36 KB each; epoll coalesces ~2 reads into one ~60 KB
+  send. Mechanism: each origin recv completion reenables the client write VIO, which fires
+  `net_write_io` with just that one block available (`IOUringNetVConnection.cc:377` signals
+  `READ_READY` after *every* recv); epoll's synchronous read loop pulls several blocks into
+  the buffer before the write side runs, so its write batches them.
+- **Why it costs:** each extra send is one extra CQE = one extra coroutine resume paying the
+  H7 frame+ring footprint — so the ~11 un-coalesced sends/req are a real slice of the +17%
+  large-object gap, *not* via syscalls (those are down) but via per-op coroutine cost. This
+  is a 1:1-with-master-shaped lever (make the io_uring read accumulate before signalling,
+  like epoll's drain loop) — see H12.
+
+## H12 — Write-coalescing: cuts the op count but *raises* CPU (rejected)
+
+**Hypothesis.** H11 found io_uring issues ~64% more sends than epoll (one send per recv
+completion). Coalescing them — so the downstream write batches blocks like epoll's drain
+loop does — should cut coroutine resumes and recover cycles on the large-object path.
+
+**Experiment.** Make `_read` accumulate before signalling: on a *full* recv (more may be
+buffered) loop and read again WITHOUT signalling `READ_READY`; signal only on a short read
+(socket drained), `READ_COMPLETE`, or a full buffer (consumer must drain). This mirrors
+`UnixNetVConnection`'s synchronous recv-until-short-read drain, so the tunnel forwards N
+blocks at once and `_write` coalesces them. Op-count + interleaved fixed-rate cpu A/B on
+the 1 MB passthrough; instr/req as the clean (low-noise) discriminator.
+
+**Result.**
+
+| | sends/req | total ops/req | cpu/1k med | instr/req |
+|---|---|---|---|---|
+| baseline (per-block sends) | 28.8 | 57.6 | 0.450 | ~1.345 M |
+| coalesced | **16.1** | 44.9 | 0.459 | **~1.425 M (+6%)** |
+| epoll (ref) | 17.5 | 52.6 | — | — |
+
+The coalescing *works* — sends fall 28.8→16.1 (below epoll's 17.5), the tally flips from
+single-block `SEND` to multi-block `SENDMSG`, total ops drop below epoll. **But cpu/1k rises
+~2% and instr/req rises a clean, non-overlapping +6%** (reverting restores 1.36 M, proving
+it's the change, not drift).
+
+**Conclusion. Reject — and it's an instructive negative that *validates H6.*** Fewer ops did
+not mean less CPU; the opposite. Because the **async batched write (H6) already amortizes the
+send syscalls** (the 28.8 sends batch ~3:1 into `io_uring_enter`), coalescing removes
+syscalls that were already nearly free while *adding* the cost of building big multi-block
+`sendmsg` iovecs (clone reader, walk/consume N blocks) plus the read-accumulation loop. It
+optimizes a cost H6 had already paid down. The simple per-block `prep_send` path is genuinely
+cheap; keep it. (This also re-confirms H7's framing: the per-op cost is small — so cutting
+ops buys little, and here it backfires.)
 
 ## Validation & recommendations
 
