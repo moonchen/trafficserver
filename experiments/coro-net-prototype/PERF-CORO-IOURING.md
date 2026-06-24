@@ -628,12 +628,17 @@ it's the change, not drift).
 
 **Conclusion. Reject — and it's an instructive negative that *validates H6.*** Fewer ops did
 not mean less CPU; the opposite. Because the **async batched write (H6) already amortizes the
-send syscalls** (the 28.8 sends batch ~3:1 into `io_uring_enter`), coalescing removes
-syscalls that were already nearly free while *adding* the cost of building big multi-block
-`sendmsg` iovecs (clone reader, walk/consume N blocks) plus the read-accumulation loop. It
-optimizes a cost H6 had already paid down. The simple per-block `prep_send` path is genuinely
-cheap; keep it. (This also re-confirms H7's framing: the per-op cost is small — so cutting
-ops buys little, and here it backfires.)
+send syscalls** (the 28.8 sends batch ~3:1 into `io_uring_enter`), coalescing removes syscalls
+that were already nearly free while *adding* a kernel cost. An instruction-level `perf diff`
+localizes it: a single contiguous block goes via `prep_send` → the kernel does `import_ubuf`
+(one pointer, no copy); coalescing N *non-contiguous* `IOBufferBlock`s forces `prep_sendmsg` →
+`copy_msghdr_from_user` + **`copy_iovec_from_user`** + `__check_object_size`/`check_heap_object`
+on the scatter-gather array (all newly present in the coalesced profile, ~absent in baseline),
+plus a smaller buffer-growth tax (`kmem_cache_alloc_node` from holding reads before draining).
+The user side *saves* a little (fewer `_write`/tunnel/signal calls) but the kernel scatter-gather
+import outweighs it — net +6% instr/req, diffuse across the whole `sendmsg` chain (no hot spot).
+The simple per-block `prep_send` is genuinely cheap; keep it. (Also re-confirms H7: the per-op
+cost is small, so cutting ops buys little — and here it backfires.)
 
 ## Validation & recommendations
 
