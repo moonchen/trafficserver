@@ -31,8 +31,11 @@
 
 #include "iocore/net/NetHandler.h"
 #include "iocore/eventsystem/EThread.h"
+#include "iocore/eventsystem/IOBuffer.h"
+#include "../eventsystem/P_IOBuffer.h"
 
 #include "tscore/InkErrno.h"
+#include "tscore/ink_memory.h"
 #include "records/RecCore.h"
 
 #include "tsutil/Metrics.h"
@@ -91,9 +94,206 @@ cancel_in_flight(IOUringCompletionHandler *op)
 }
 } // namespace
 
+// --- Experimental multishot read path (proxy.config.net.io_uring.read_multishot) ---
+namespace
+{
+// One buffer group per thread; every io_uring read coroutine on the thread arms its
+// multishot recv against this group, and the kernel picks a buffer from the shared
+// ring for each completion.
+constexpr int IOU_READ_BGID = 1;
+
+bool
+read_multishot_enabled()
+{
+  static const bool on = RecGetRecordInt("proxy.config.net.io_uring.read_multishot").value_or(0) != 0;
+  return on;
+}
+
+struct ReadBufRing;
+
+// An IOBufferData that wraps one provided-ring buffer rather than owning heap memory.
+// free() (run by Ptr when the read MIOBuffer's last reader releases the block) recycles
+// the buffer back to the ring and returns this descriptor to a freelist, instead of
+// freeing anything --- the ring memory outlives every VC on the thread. Because
+// IOBufferBlock::clone() shares the Ptr<IOBufferData> (it never copies the bytes), a
+// buffer handed to several readers recycles only once, when the last one is done.
+class RingBufferData : public IOBufferData
+{
+public:
+  void            free() override;
+  ReadBufRing    *_ring  = nullptr;
+  RingBufferData *_flink = nullptr; // freelist link while idle
+  int             _bid   = -1;
+};
+
+// The shared per-thread provided-buffer ring. Lazily set up on first use; if setup
+// fails (old kernel / no memory) the read path falls back to single-shot recvmsg.
+struct ReadBufRing {
+  io_uring_buf_ring     *_br      = nullptr;
+  char                  *_pool    = nullptr; // _nbuf contiguous buffers of _bufsize
+  unsigned               _nbuf    = 0;
+  unsigned               _bufsize = 0;
+  int                    _mask    = 0;
+  int64_t                _sizeidx = 0; // IOBufferData size index whose block_size() == _bufsize
+  RingBufferData        *_free    = nullptr;
+  IOUringNetVConnection *_wait    = nullptr; // intrusive stack of VCs parked on -ENOBUFS
+
+  bool
+  ok() const
+  {
+    return _br != nullptr;
+  }
+
+  char *
+  addr(unsigned id) const
+  {
+    return _pool + static_cast<size_t>(id) * _bufsize;
+  }
+
+  // Park a VC whose multishot read stopped on -ENOBUFS; recycle() re-arms it.
+  void
+  add_waiter(IOUringNetVConnection *vc)
+  {
+    if (vc->_rbuf_waiting) {
+      return;
+    }
+    vc->_rbuf_waiting   = true;
+    vc->_rbuf_wait_next = _wait;
+    _wait               = vc;
+  }
+
+  // Remove a VC from the wait list (it is being torn down, or was just woken).
+  void
+  remove_waiter(IOUringNetVConnection *vc)
+  {
+    if (!vc->_rbuf_waiting) {
+      return;
+    }
+    for (IOUringNetVConnection **pp = &_wait; *pp != nullptr; pp = &(*pp)->_rbuf_wait_next) {
+      if (*pp == vc) {
+        *pp = vc->_rbuf_wait_next;
+        break;
+      }
+    }
+    vc->_rbuf_wait_next = nullptr;
+    vc->_rbuf_waiting   = false;
+  }
+
+  // Hand buffer `id` back to the kernel's ring, then re-arm one VC waiting for a buffer.
+  void
+  recycle(int id)
+  {
+    io_uring_buf_ring_add(_br, addr(id), _bufsize, id, _mask, 0);
+    io_uring_buf_ring_advance(_br, 1);
+    if (IOUringNetVConnection *vc = _wait; vc != nullptr) {
+      _wait               = vc->_rbuf_wait_next;
+      vc->_rbuf_wait_next = nullptr;
+      vc->_rbuf_waiting   = false;
+      vc->rearm_read_for_buffers();
+    }
+  }
+
+  RingBufferData *
+  get_data()
+  {
+    if (RingBufferData *d = _free; d != nullptr) {
+      _free     = d->_flink;
+      d->_flink = nullptr;
+      return d;
+    }
+    return new RingBufferData();
+  }
+
+  void
+  put_data(RingBufferData *d)
+  {
+    d->_flink = _free;
+    _free     = d;
+  }
+
+  // Wrap filled buffer `id` (`len` bytes) in a block, zero-copy, for append to a MIOBuffer.
+  IOBufferBlock *
+  wrap(int id, int len)
+  {
+    RingBufferData *d = get_data();
+    d->_ring          = this;
+    d->_bid           = id;
+    d->_data          = addr(id);
+    d->_size_index    = _sizeidx;
+    d->_mem_type      = NO_ALLOC; // dealloc() (never reached --- free() is overridden) would not free it
+    IOBufferBlock *b  = new_IOBufferBlock_internal("io_uring/read_bufring");
+    b->set(d, len, 0); // Ptr-assign d (refcount -> 1); _start/_end/_buf_end from d
+    return b;
+  }
+
+  bool
+  setup()
+  {
+    unsigned nbuf    = static_cast<unsigned>(RecGetRecordInt("proxy.config.net.io_uring.read_buffer_count").value_or(1024));
+    int64_t  bufsize = RecGetRecordInt("proxy.config.net.io_uring.read_buffer_size").value_or(32768);
+    unsigned p       = 1;
+    while (p * 2u <= nbuf) { // round down to a power of two (ring requirement)
+      p *= 2u;
+    }
+    nbuf     = p < 2u ? 2u : p;
+    _sizeidx = iobuffer_size_to_index(bufsize, MAX_BUFFER_SIZE_INDEX);
+    _bufsize = BUFFER_SIZE_FOR_INDEX(_sizeidx); // exact, so block_size() matches the buffer
+
+    int err = 0;
+    _br     = IOUringContext::local_context()->setup_buf_ring(nbuf, IOU_READ_BGID, &err);
+    if (_br == nullptr) {
+      Warning("io_uring read_multishot: buf_ring setup failed (%d); falling back to recvmsg", err);
+      return false;
+    }
+    _nbuf = nbuf;
+    _mask = io_uring_buf_ring_mask(nbuf);
+    _pool = static_cast<char *>(ats_malloc(static_cast<size_t>(nbuf) * _bufsize));
+    for (unsigned i = 0; i < nbuf; ++i) {
+      io_uring_buf_ring_add(_br, addr(i), _bufsize, i, _mask, i);
+    }
+    io_uring_buf_ring_advance(_br, static_cast<int>(nbuf));
+    return true;
+  }
+};
+
+void
+RingBufferData::free()
+{
+  ReadBufRing *r  = _ring;
+  int          id = _bid;
+  _ring           = nullptr;
+  _bid            = -1;
+  _data           = nullptr;
+  _size_index     = BUFFER_SIZE_NOT_ALLOCATED;
+  _mem_type       = NO_ALLOC;
+  r->recycle(id);
+  r->put_data(this);
+}
+
+// The thread's read ring, or nullptr if multishot read is off or setup failed.
+ReadBufRing *
+read_buf_ring()
+{
+  static thread_local ReadBufRing ring;
+  static thread_local bool        tried = false;
+  if (!tried) {
+    tried = true;
+    ring.setup();
+  }
+  return ring.ok() ? &ring : nullptr;
+}
+} // namespace
+
 void
 IOUringNetVConnection::free_thread(EThread *t)
 {
+  // If this VC parked on the read buffer ring's wait list (-ENOBUFS), unlink it before
+  // the free so a later recycle does not wake a freed VC.
+  if (_rbuf_waiting) {
+    if (ReadBufRing *r = read_buf_ring(); r != nullptr) {
+      r->remove_waiter(this);
+    }
+  }
   // Teardown can reach free_thread (via NetHandler::free_netevent) from paths that
   // bypass our do_io_close override --- notably an inactivity/active timeout, which
   // the inherited mainEvent routes through the base file-static read/write_signal
@@ -226,8 +426,14 @@ IOUringNetVConnection::net_read_io(NetHandler *nh)
     return;
   }
 
-  // _read() does its own locking, drains the socket, and re-arms or disables.
-  _read();
+  // The read drive does its own locking, drains the socket, and re-arms or disables.
+  // With read_multishot, one armed multishot recv streams completions from a shared
+  // provided-buffer ring; otherwise the per-edge single-shot recvmsg loop.
+  if (read_multishot_enabled() && read_buf_ring() != nullptr) {
+    _read_multishot();
+  } else {
+    _read();
+  }
 
   // If a recv is now in flight, keep epoll from re-entering us until it completes.
   if (_read_op != nullptr) {
@@ -388,6 +594,164 @@ IOUringNetVConnection::_read()
       }
       // Full read: there may be more in the socket --- loop and read again.
     }
+  }
+}
+
+// Experimental read drive: one armed multishot recv against the shared per-thread
+// provided-buffer ring. Each completion hands us a kernel-filled ring buffer (by id);
+// we attach it to the read MIOBuffer zero-copy (RingBufferData recycles it when the
+// consumer is done) and signal the VIO. When the ring drains the kernel ends the
+// stream with -ENOBUFS --- the backpressure signal --- and a consumer reenable re-arms
+// us once buffers recycle.
+//
+// Unlike single-shot _read, the recv stays armed across completions, so any exit while
+// it is still armed must cancel it and drain to its terminal CQE first; otherwise a
+// later completion would resume into this freed frame (the kernel still holds &stream
+// as user_data). Terminal completions (more()==false: EOS/error/-ENOBUFS/-ECANCELED)
+// are already disarmed and exit directly.
+ts::iouring::DetachedTask
+IOUringNetVConnection::_read_multishot()
+{
+  NetState    *s    = &this->read;
+  NetHandler  *nh   = this->nh;
+  ReadBufRing *ring = read_buf_ring();
+  int          fd   = this->con.sock.get_fd();
+
+  ts::iouring::UringMultishotOp stream([&](io_uring_sqe *sqe) {
+    io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
+    sqe->buf_group  = IOU_READ_BGID;
+    sqe->flags     |= IOSQE_BUFFER_SELECT;
+  });
+  _read_op = &stream;
+
+  for (;;) {
+    int      res  = co_await stream;
+    unsigned flgs = stream.flags();
+
+    // Teardown raced us (do_io_close / free_thread cancelled the recv). Drain to the
+    // terminal CQE so nothing lands in this frame after the free, then complete.
+    if (_closing) {
+      if (stream.more()) {
+        if (res > 0) {
+          ring->recycle(flgs >> IORING_CQE_BUFFER_SHIFT);
+        }
+        continue;
+      }
+      _read_op = nullptr;
+      _complete_deferred_close();
+      co_return;
+    }
+
+    // Terminal completion: the multishot ended on its own (disarmed) --- exit directly.
+    if (!stream.more()) {
+      _read_op = nullptr;
+      MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+      if (!lock.is_locked()) {
+        readReschedule(nh);
+        co_return;
+      }
+      if (this->closed) {
+        nh->free_netevent(this);
+        co_return;
+      }
+      if (res == -ENOBUFS) {
+        // Shared ring exhausted. Park on the ring's wait list and stop --- a recycle
+        // (a consumer releasing a buffer) re-arms us via rearm_read_for_buffers().
+        // Re-arming by spinning instead would starve that very consumer (it shares the
+        // net thread), so the buffers would never come back. read_disable alone is not
+        // enough either: _read_op stayed non-null across the stream, so any consumer
+        // reenable during it was already swallowed by net_read_io.
+        ring->add_waiter(this);
+        read_disable(nh, this);
+        co_return;
+      }
+      if (res == 0 || res == -ECONNRESET) {
+        _read_signal_done(VC_EVENT_EOS);
+        co_return;
+      }
+      if (res == -ECANCELED || res == -EAGAIN || res == -ENOTCONN) {
+        readReschedule(nh);
+        co_return;
+      }
+      this->_readSignalError(nh, static_cast<int>(-res));
+      co_return;
+    }
+
+    // A data completion (res > 0): attach buffer `id` zero-copy and signal READ_READY,
+    // or arrange to stop the stream (VIO satisfied / lock unavailable / closed).
+    int  id       = flgs >> IORING_CQE_BUFFER_SHIFT;
+    bool complete = false; // VIO satisfied: stop, then signal READ_COMPLETE
+    bool reread   = false; // couldn't deliver now: stop, then re-arm via the ready list
+    bool freevc   = false; // closed underneath us: stop, then free
+    {
+      MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+      if (!lock.is_locked()) {
+        ring->recycle(id);
+        reread = true;
+      } else if (this->closed) {
+        ring->recycle(id);
+        freevc = true;
+      } else {
+        s->vio.buffer.writer()->append_block(ring->wrap(id, res));
+        Metrics::Counter::increment(net_rsb.read_bytes, res);
+        Metrics::Counter::increment(net_rsb.read_bytes_count);
+        s->vio.ndone += res;
+        this->netActivity();
+
+        if (s->vio.ntodo() <= 0) {
+          complete = true;
+        } else if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
+          co_return; // freed during the upcall
+        }
+        // If READ_READY closed us, _closing is now set; the loop drains it next.
+      }
+    }
+
+    if (!complete && !reread && !freevc) {
+      continue; // keep streaming
+    }
+
+    // Stop the still-armed stream: cancel and drain to its terminal before leaving.
+    cancel_in_flight(&stream);
+    do {
+      int r2 = co_await stream;
+      if (stream.more() && r2 > 0) {
+        ring->recycle(stream.flags() >> IORING_CQE_BUFFER_SHIFT);
+      }
+    } while (stream.more());
+    _read_op = nullptr;
+
+    if (_closing) {
+      _complete_deferred_close();
+      co_return;
+    }
+    if (freevc) {
+      nh->free_netevent(this);
+      co_return;
+    }
+    if (complete) {
+      MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+      if (!lock.is_locked()) {
+        readReschedule(nh);
+      } else if (this->closed) {
+        nh->free_netevent(this);
+      } else {
+        _read_signal_done(VC_EVENT_READ_COMPLETE);
+      }
+      co_return;
+    }
+    readReschedule(nh); // reread
+    co_return;
+  }
+}
+
+void
+IOUringNetVConnection::rearm_read_for_buffers()
+{
+  // A buffer recycled; the multishot read that parked on -ENOBUFS can run again.
+  // Re-trigger net_read_io via the ready list (it re-arms once the ring has a buffer).
+  if (!this->closed) {
+    readReschedule(this->nh);
   }
 }
 

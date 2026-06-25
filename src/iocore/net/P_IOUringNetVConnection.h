@@ -90,6 +90,13 @@ public:
   // resume into a freed `this` (the net-iouring branch's use-after-free).
   void do_io_close(int lerrno = -1) override;
 
+  // Re-arm a multishot read that parked on -ENOBUFS (shared ring exhausted). Called
+  // by the file-local read buffer ring when a buffer recycles. Public so the ring can
+  // reach it; _rbuf_* are the ring's intrusive wait-list bookkeeping for this VC.
+  void                   rearm_read_for_buffers();
+  IOUringNetVConnection *_rbuf_wait_next = nullptr;
+  bool                   _rbuf_waiting   = false;
+
 private:
   // The asynchronous read/write/connect coroutines: drive one io_uring op, await
   // it, then signal. Fire-and-forget (DetachedTask); the frame self-cleans at
@@ -97,6 +104,12 @@ private:
   ts::iouring::DetachedTask _read();
   ts::iouring::DetachedTask _write();
   ts::iouring::DetachedTask _connect();
+
+  // Experimental read drive (proxy.config.net.io_uring.read_multishot): one armed
+  // multishot recv against a shared per-thread provided-buffer ring, attaching each
+  // kernel-filled buffer to the read MIOBuffer zero-copy (recycled when the consumer
+  // releases it). -ENOBUFS is the backpressure signal. Selected in net_read_io.
+  ts::iouring::DetachedTask _read_multishot();
 
   // Reimplementations of the file-static read_signal_* / write_signal_* helpers in
   // UnixNetVConnection.cc (not visible here). Same recursion/closed/free contract.

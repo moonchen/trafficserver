@@ -420,6 +420,52 @@ Full H/E/R/C log: `PERF-CORO-IOURING.md` H7–H10. Harness now out-of-tree at
   CPU/cache/frame effects. Harness: `~/work/io-uring-coro-bench/scripts/measure-nic2.sh`,
   results in `findings/NIC-*.txt`.
 
+## Multishot recv read path (2026-06-25)
+
+Built `UringMultishotOp` (one SQE → stream of CQEs, `more()`/`flags()`, re-arm on
+re-await) + `IOUringContext::setup_buf_ring`/`free_buf_ring` (committed `3d8900f737`,
+socketpair-tested: poll/recv/recycle/-ENOBUFS-recovery, ASan-clean). Then an
+EXPERIMENTAL flag-gated read path (`proxy.config.net.io_uring.read_multishot`, default
+off): one armed multishot recv per VC against a shared per-thread provided-buffer ring,
+each filled buffer attached to the read MIOBuffer **zero-copy** via a `RingBufferData :
+IOBufferData` whose virtual `free()` recycles the buffer (works because
+`RefCountObj::free()` is virtual and `IOBufferBlock::clone()` shares the
+`Ptr<IOBufferData>`). `-ENOBUFS` parks the VC on a per-ring wait list; a recycle wakes it.
+
+Findings (controlled experiments, `tests/gold_tests/io_uring/io_uring_read_multishot.test.py`):
+
+- **The current single-shot recvmsg read path is already zero-copy** (recvmsg straight
+  into the dest MIOBuffer blocks, per-VC growable buffer). So multishot's only solid win
+  is fewer SQE submits + no per-op iovec (master hands up to `UIO_MAXIOV`=1024 segments;
+  multishot hands 0) — small, and the read residual is footprint, not op-count.
+- **Zero-copy + a fixed shared ring couples buffer lifetime to the SLOWEST consumer.**
+  On a cache miss the cache-write consumer accumulates up to
+  `proxy.config.cache.target_fragment_size` (default 1 MB) before flushing a fragment and
+  releasing. Proven by single-variable flips: ring=32×8K(=object)+1 MB frag → **deadlock**
+  (0 recycles); ring=4096×8K+1 MB frag → **pass**; ring=32×8K+**64 KB** frag → **pass**.
+  So the liveness invariant is: **provided-buffer ring ≥ target_fragment_size ×
+  concurrent cache-misses**, or the read deadlocks (needs a buffer to reach EOS; cache
+  won't free one until EOS). Single-shot has no such floor (per-VC growable buffer).
+- **The cache cannot be threaded zero-copy to disk today.** Cache-write `memcpy`s into a
+  4 MB page-aligned aggregation buffer (`AGG_SIZE`) and io_uring-writes it (same per-thread
+  ring; `aio.mode=auto`). The fd is **O_DIRECT** (`CacheProcessor.cc:231`), which requires
+  every iovec segment block-aligned in base AND length — arbitrary recv buffers + the
+  interleaved Doc header don't qualify, so a `writev` of raw buffers can't replace the agg
+  assembly. The agg `memcpy` is the O_DIRECT alignment shim. ATS registers no io_uring
+  buffers, so the O_DIRECT write re-`get_user_pages` every time.
+- **Readiness is vestigial for io_uring reads.** `read_ready_list`/`write_ready_list` are
+  touched only by `ReadWriteEventIO` (epoll edge — off for the io_uring VC) and
+  `NetHandler`'s dequeue→`net_read_io`/`net_write_io`; nothing outside net reads them, and
+  timeouts run off `netActivity` timestamps. A persistently-armed multishot recv would make
+  the read-readiness path dead code for io_uring.
+
+Direction (not yet built): the compelling framing is not "save SQE submits" but a
+**registered (fixed) provided-buffer pool as a zero-copy substrate** — persistent-armed
+recv into it, drop read-readiness, and a cheap self-contained first win:
+`io_uring_register_buffers` on the existing agg buffers so O_DIRECT cache writes stop
+re-pinning (no format/lifetime change). Full NIC→disk zero-copy is blocked by O_DIRECT
+alignment, not by io_uring. Code committed as WIP, flag off by default.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll
