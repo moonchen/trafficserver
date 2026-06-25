@@ -75,6 +75,14 @@ public:
   int  register_eventfd();
   void disable_eventfd();
 
+  // Provided-buffer ring for a buffer group: the kernel selects a buffer from this
+  // ring for each completion of a BUFFER_SELECT op (e.g. multishot recv), removing
+  // the per-op buffer handoff. Returns the mapped ring (nullptr on failure, with
+  // -errno in *err if non-null); the caller seeds it with io_uring_buf_ring_add /
+  // io_uring_buf_ring_advance and recycles consumed buffers the same way.
+  io_uring_buf_ring *setup_buf_ring(unsigned entries, int bgid, int *err);
+  void               free_buf_ring(io_uring_buf_ring *br, unsigned entries, int bgid);
+
   // assigns the global iouring config
   static void            set_config(const IOUringConfig &);
   static IOUringContext *local_context();

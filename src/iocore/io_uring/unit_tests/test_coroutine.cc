@@ -31,6 +31,7 @@
 #include "tscore/ink_hrtime.h"
 
 #include <cstring>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <liburing.h>
@@ -38,6 +39,7 @@
 using ts::iouring::DetachedTask;
 using ts::iouring::Task;
 using ts::iouring::UringCancel;
+using ts::iouring::UringMultishotOp;
 using ts::iouring::UringOp;
 
 namespace
@@ -124,6 +126,127 @@ do_cancel(IOUringCompletionHandler *target, int *cancel_res)
   *cancel_res = co_await UringCancel(target);
 }
 
+// Arms ONE multishot poll on fd and loops, resuming once per readiness edge: each
+// time the socket becomes readable the kernel posts another CQE for the same SQE
+// (IORING_CQE_F_MORE stays set), so a single co_await object yields a stream of
+// completions. The coroutine drains the socket each edge so the next send is a
+// fresh edge, and bumps *edges. It stops when a terminal CQE arrives (F_MORE
+// cleared --- here, because the op was cancelled), publishing the terminal result.
+// The stream object is a named frame local: its `this` is the SQE user_data and it
+// must outlive every CQE the one SQE generates.
+Task<int>
+poll_edges(int fd, IOUringCompletionHandler **publish, int *edges, int *terminal_res)
+{
+  UringMultishotOp stream([&](io_uring_sqe *s) { io_uring_prep_poll_multishot(s, fd, POLLIN); });
+  *publish = &stream;
+  for (;;) {
+    int res = co_await stream;
+    if (!stream.more()) { // terminal CQE: the multishot ended (cancel / error)
+      *terminal_res = res;
+      break;
+    }
+    char buf[64];
+    while (::recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0) {}
+    ++*edges;
+  }
+  *publish = nullptr;
+  co_return *edges;
+}
+
+// Arms ONE multishot recv against a provided-buffer ring (buffer group bgid): the
+// kernel picks a buffer from the ring for each arriving message and reports its id
+// in the CQE flags. This is the read-path primitive --- recv without a per-op
+// buffer handoff. It deliberately does not recycle consumed buffers, so once the
+// ring drains the next arrival has nowhere to land and the kernel ends the stream
+// with -ENOBUFS: that terminal is the read path's natural backpressure signal.
+Task<int>
+recv_into_ring(int fd, int bgid, int *count, int *lens, int *bufids, int max, int *terminal_res)
+{
+  UringMultishotOp stream([&](io_uring_sqe *s) {
+    io_uring_prep_recv_multishot(s, fd, nullptr, 0, 0);
+    s->buf_group  = bgid;
+    s->flags     |= IOSQE_BUFFER_SELECT;
+  });
+  for (;;) {
+    int res = co_await stream;
+    if (!stream.more()) { // terminal: -ENOBUFS once the ring is exhausted
+      *terminal_res = res;
+      break;
+    }
+    if (*count < max) {
+      lens[*count]   = res;
+      bufids[*count] = stream.flags() >> IORING_CQE_BUFFER_SHIFT; // ring buffer the kernel chose
+    }
+    ++*count;
+  }
+  co_return *count;
+}
+
+// Like recv_into_ring, but recycles each consumed buffer straight back to the ring
+// (the read path's release-on-drain). A two-buffer ring then serves an unbounded
+// stream of messages: this is the steady-state read loop.
+Task<int>
+recv_recycling(int fd, int bgid, io_uring_buf_ring *br, char (*bufs)[64], unsigned nbuf, int *count, int *lens, int max,
+               int *terminal_res)
+{
+  UringMultishotOp stream([&](io_uring_sqe *s) {
+    io_uring_prep_recv_multishot(s, fd, nullptr, 0, 0);
+    s->buf_group  = bgid;
+    s->flags     |= IOSQE_BUFFER_SELECT;
+  });
+  for (;;) {
+    int res = co_await stream;
+    if (!stream.more()) {
+      *terminal_res = res;
+      break;
+    }
+    int id = stream.flags() >> IORING_CQE_BUFFER_SHIFT;
+    if (*count < max) {
+      lens[*count] = res;
+    }
+    ++*count;
+    io_uring_buf_ring_add(br, bufs[id], sizeof bufs[id], id, io_uring_buf_ring_mask(nbuf), 0);
+    io_uring_buf_ring_advance(br, 1);
+  }
+  co_return *count;
+}
+
+// Models read backpressure recovery: it does NOT recycle, so the ring drains and
+// the next arrival ends the stream with -ENOBUFS. On that terminal it hands every
+// buffer back and re-awaits --- which re-arms a fresh multishot recv --- and the
+// data that could not land before is then delivered. This is the read path's
+// "consumer caught up, resume reading" path.
+Task<int>
+recv_recovering(int fd, int bgid, io_uring_buf_ring *br, char (*bufs)[64], unsigned nbuf, int *count, int *lens, int max,
+                bool *recovered, int *terminal_res)
+{
+  UringMultishotOp stream([&](io_uring_sqe *s) {
+    io_uring_prep_recv_multishot(s, fd, nullptr, 0, 0);
+    s->buf_group  = bgid;
+    s->flags     |= IOSQE_BUFFER_SELECT;
+  });
+  for (;;) {
+    int res = co_await stream;
+    if (!stream.more()) {
+      if (res == -ENOBUFS) {
+        for (unsigned i = 0; i < nbuf; ++i) {
+          io_uring_buf_ring_add(br, bufs[i], sizeof bufs[i], i, io_uring_buf_ring_mask(nbuf), i);
+        }
+        io_uring_buf_ring_advance(br, nbuf);
+        *recovered = true;
+        continue; // re-await -> the awaitable re-arms a new recv multishot
+      }
+      *terminal_res = res;
+      break;
+    }
+    if (*count < max) {
+      lens[*count] = res;
+    }
+    ++*count;
+  }
+  co_return *count;
+}
+
 } // namespace
 
 TEST_CASE("coroutine echoes one request over a socketpair", "[io_uring][coroutine]")
@@ -202,6 +325,179 @@ TEST_CASE("a Task<int> hands back its co_returned value", "[io_uring][coroutine]
   REQUIRE(counter.result() == 5);
 
   ::close(sv[0]);
+  ::close(sv[1]);
+}
+
+TEST_CASE("a multishot poll yields one completion per readiness edge, then cancels", "[io_uring][coroutine][multishot]")
+{
+  IOUringConfig cfg = {.queue_entries = 32};
+  IOUringContext::set_config(cfg);
+
+  int sv[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+  IOUringCompletionHandler *in_flight = nullptr;
+  int                       edges = 0, terminal = 0;
+
+  // Eager-start: by return the coroutine has armed its one multishot-poll SQE.
+  Task<int> poller = poll_edges(sv[1], &in_flight, &edges, &terminal);
+  REQUIRE(in_flight != nullptr);             // armed and parked on the stream
+  IOUringContext::local_context()->submit(); // genuinely in flight before we drive it
+
+  // Three readiness edges from one SQE: each send -> drain -> one multishot CQE.
+  for (int edge = 1; edge <= 3; ++edge) {
+    REQUIRE(::send(sv[0], "x", 1, 0) == 1);
+    REQUIRE(pump_until([&] { return edges == edge; }));
+  }
+  REQUIRE(!poller.done()); // F_MORE kept the stream armed across all three edges
+
+  // Cancel the still-armed multishot -> terminal CQE (-ECANCELED, F_MORE clear).
+  int cancel_res = -1;
+  do_cancel(in_flight, &cancel_res);
+  REQUIRE(pump_until([&] { return poller.done(); }));
+
+  REQUIRE(poller.result() == 3);   // exactly three edges consumed before the terminal
+  REQUIRE(terminal == -ECANCELED); // the stream ended because it was cancelled
+  REQUIRE(cancel_res >= 0);        // the cancel op itself was accepted
+
+  ::close(sv[0]);
+  ::close(sv[1]);
+}
+
+TEST_CASE("multishot recv consumes a provided-buffer ring and ends with -ENOBUFS", "[io_uring][coroutine][multishot]")
+{
+  IOUringConfig cfg = {.queue_entries = 32};
+  IOUringContext::set_config(cfg);
+  auto *ur = IOUringContext::local_context();
+
+  int sv[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+  // A tiny provided-buffer ring: two 64-byte buffers in buffer group `bgid`.
+  constexpr int      bgid = 7;
+  constexpr unsigned nbuf = 2; // power of two, required by io_uring_buf_ring_mask
+  char               bufs[nbuf][64];
+  int                err = 0;
+  io_uring_buf_ring *br  = ur->setup_buf_ring(nbuf, bgid, &err);
+  REQUIRE(br != nullptr);
+  for (unsigned i = 0; i < nbuf; ++i) {
+    io_uring_buf_ring_add(br, bufs[i], sizeof bufs[i], i, io_uring_buf_ring_mask(nbuf), i);
+  }
+  io_uring_buf_ring_advance(br, nbuf);
+
+  int       count = 0, lens[4] = {}, bufids[4] = {}, terminal = 0;
+  Task<int> reader = recv_into_ring(sv[1], bgid, &count, lens, bufids, 4, &terminal);
+  ur->submit(); // arm the multishot recv before driving it
+
+  // Two messages, separated in time so each is its own CQE; the coroutine does not
+  // recycle, so both ring buffers are now consumed.
+  REQUIRE(::send(sv[0], "aaa", 3, 0) == 3);
+  REQUIRE(pump_until([&] { return count == 1; }));
+  REQUIRE(::send(sv[0], "bbbb", 4, 0) == 4);
+  REQUIRE(pump_until([&] { return count == 2; }));
+  REQUIRE(!reader.done()); // F_MORE kept the recv armed across both
+
+  REQUIRE(lens[0] == 3);
+  REQUIRE(lens[1] == 4);
+  REQUIRE(bufids[0] != bufids[1]);                      // kernel picked two distinct buffers
+  REQUIRE(std::memcmp(bufs[bufids[0]], "aaa", 3) == 0); // and wrote the data into them
+  REQUIRE(std::memcmp(bufs[bufids[1]], "bbbb", 4) == 0);
+
+  // Ring is empty: the next arrival has nowhere to land -> -ENOBUFS ends the stream.
+  REQUIRE(::send(sv[0], "c", 1, 0) == 1);
+  REQUIRE(pump_until([&] { return reader.done(); }));
+
+  REQUIRE(terminal == -ENOBUFS); // backpressure terminal, the read path's stop signal
+  REQUIRE(reader.result() == 2); // exactly the two buffered messages were delivered
+
+  ur->free_buf_ring(br, nbuf, bgid);
+  ::close(sv[0]);
+  ::close(sv[1]);
+}
+
+TEST_CASE("multishot recv recycles a small ring to serve more messages than it holds", "[io_uring][coroutine][multishot]")
+{
+  IOUringConfig cfg = {.queue_entries = 32};
+  IOUringContext::set_config(cfg);
+  auto *ur = IOUringContext::local_context();
+
+  int sv[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+  constexpr int      bgid = 8;
+  constexpr unsigned nbuf = 2;
+  char               bufs[nbuf][64];
+  io_uring_buf_ring *br = ur->setup_buf_ring(nbuf, bgid, nullptr);
+  REQUIRE(br != nullptr);
+  for (unsigned i = 0; i < nbuf; ++i) {
+    io_uring_buf_ring_add(br, bufs[i], sizeof bufs[i], i, io_uring_buf_ring_mask(nbuf), i);
+  }
+  io_uring_buf_ring_advance(br, nbuf);
+
+  int       count = 0, lens[8] = {}, terminal = 1;
+  Task<int> reader = recv_recycling(sv[1], bgid, br, bufs, nbuf, &count, lens, 8, &terminal);
+  ur->submit();
+
+  // Five messages through a two-buffer ring: recycling is what keeps it armed.
+  const char *msgs[5] = {"a", "bb", "ccc", "dddd", "eeeee"};
+  for (int i = 0; i < 5; ++i) {
+    REQUIRE(::send(sv[0], msgs[i], i + 1, 0) == i + 1);
+    REQUIRE(pump_until([&] { return count == i + 1; }));
+    REQUIRE(lens[i] == i + 1);
+  }
+
+  // Peer close ends the stream with EOF (res 0, F_MORE clear).
+  ::close(sv[0]);
+  REQUIRE(pump_until([&] { return reader.done(); }));
+  REQUIRE(reader.result() == 5);
+  REQUIRE(terminal == 0);
+
+  ur->free_buf_ring(br, nbuf, bgid);
+  ::close(sv[1]);
+}
+
+TEST_CASE("multishot recv re-arms after -ENOBUFS once the ring is refilled", "[io_uring][coroutine][multishot]")
+{
+  IOUringConfig cfg = {.queue_entries = 32};
+  IOUringContext::set_config(cfg);
+  auto *ur = IOUringContext::local_context();
+
+  int sv[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+  constexpr int      bgid = 9;
+  constexpr unsigned nbuf = 2;
+  char               bufs[nbuf][64];
+  io_uring_buf_ring *br = ur->setup_buf_ring(nbuf, bgid, nullptr);
+  REQUIRE(br != nullptr);
+  for (unsigned i = 0; i < nbuf; ++i) {
+    io_uring_buf_ring_add(br, bufs[i], sizeof bufs[i], i, io_uring_buf_ring_mask(nbuf), i);
+  }
+  io_uring_buf_ring_advance(br, nbuf);
+
+  int       count = 0, lens[8] = {}, terminal = 1;
+  bool      recovered = false;
+  Task<int> reader    = recv_recovering(sv[1], bgid, br, bufs, nbuf, &count, lens, 8, &recovered, &terminal);
+  ur->submit();
+
+  // Drain the ring: two messages consume both buffers and are not recycled.
+  REQUIRE(::send(sv[0], "a", 1, 0) == 1);
+  REQUIRE(pump_until([&] { return count == 1; }));
+  REQUIRE(::send(sv[0], "bb", 2, 0) == 2);
+  REQUIRE(pump_until([&] { return count == 2; }));
+
+  // A third arrival has no buffer -> -ENOBUFS terminal -> the coroutine refills the
+  // ring and re-arms, and only then does this message land.
+  REQUIRE(::send(sv[0], "ccc", 3, 0) == 3);
+  REQUIRE(pump_until([&] { return count == 3; }));
+  REQUIRE(recovered);    // the stream came back from -ENOBUFS
+  REQUIRE(lens[2] == 3); // and delivered the message that had triggered it
+
+  ::close(sv[0]);
+  REQUIRE(pump_until([&] { return reader.done(); }));
+  REQUIRE(terminal == 0); // clean EOF after recovery
+
+  ur->free_buf_ring(br, nbuf, bgid);
   ::close(sv[1]);
 }
 

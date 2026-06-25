@@ -370,6 +370,126 @@ private:
 
 template <typename Prep> UringOp(Prep) -> UringOp<Prep>;
 
+// A multishot io_uring operation: one submitted SQE that the kernel completes
+// repeatedly (multishot accept, multishot recv, multishot poll). Awaited in a
+// loop, each co_await yields the next completion; more() reports whether the
+// stream is still armed.
+//
+//   UringMultishotOp stream([&](io_uring_sqe *s){ io_uring_prep_multishot_accept(s, fd, ...); });
+//   for (;;) {
+//     int res = co_await stream;     // resumes once per CQE
+//     if (!stream.more()) break;     // terminal CQE: stream ended (cancel/error)
+//     ... use res (a new fd / byte count / -ENOBUFS) ...
+//   }
+//
+// Every CQE the one SQE generates carries this object's `this` as user_data, so
+// --- unlike UringOp, which is a temporary spanning a single suspension --- a
+// multishot op must be a *named frame local* that outlives the whole stream. The
+// kernel keeps the op armed while it sets IORING_CQE_F_MORE on each CQE; the first
+// CQE without F_MORE is terminal (the op was cancelled, hit an error, or, for
+// recv, exhausted its provided-buffer ring with -ENOBUFS). After a terminal CQE
+// the op is disarmed and the next co_await re-arms a fresh SQE, so the same object
+// is a reusable stream.
+//
+// One completion slot, by contract: the awaiting coroutine must consume each
+// completion and re-await synchronously, without suspending on another awaitable
+// mid-stream. That holds for the net drives (a recv/accept completion is processed
+// straight-line --- hand the buffer/fd off, signal the VIO --- then the loop
+// re-awaits), and it means a CQE never arrives while the coroutine is parked
+// elsewhere, so a single pending result cannot be overwritten. A stream consumed
+// concurrently with another suspending await would need a queue sized to the CQ
+// depth; that is deliberately out of scope here.
+//
+// Non-movable for the same reason as UringOp: `this` is the SQE user_data.
+template <typename Prep> class UringMultishotOp : public IOUringCompletionHandler
+{
+public:
+  explicit UringMultishotOp(Prep prep) : _prep(std::move(prep)) {}
+
+  UringMultishotOp(const UringMultishotOp &)            = delete;
+  UringMultishotOp &operator=(const UringMultishotOp &) = delete;
+  UringMultishotOp(UringMultishotOp &&)                 = delete;
+  UringMultishotOp &operator=(UringMultishotOp &&)      = delete;
+
+  // Resume without suspending if a completion is already pending (the kernel
+  // delivered one before the coroutine came back to await it).
+  bool
+  await_ready() const noexcept
+  {
+    return _ready;
+  }
+
+  bool
+  await_suspend(std::coroutine_handle<> h) noexcept
+  {
+    _waiter = h;
+    if (!_armed) {
+      // First await, or re-arming after a terminal CQE.
+      io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(this); // user_data = this
+      if (sqe == nullptr) {
+        // SQ full and unflushable: surface a terminal error rather than parking
+        // forever, mirroring UringOp. _flags stays 0, so more() is false.
+        _result = -ENOBUFS;
+        _ready  = true;
+        return false;
+      }
+      _prep(sqe);
+      _armed = true;
+    }
+    return true;
+  }
+
+  int
+  await_resume() noexcept
+  {
+    _ready = false;
+    return _result;
+  }
+
+  // Whether the op is still armed (this completion had IORING_CQE_F_MORE). False
+  // marks the terminal completion --- stop the loop (or re-await to re-arm).
+  bool
+  more() const noexcept
+  {
+    return (_flags & IORING_CQE_F_MORE) != 0;
+  }
+
+  // The raw CQE flags of this completion. For a provided-buffer op the selected
+  // buffer id is `flags() >> IORING_CQE_BUFFER_SHIFT`.
+  unsigned
+  flags() const noexcept
+  {
+    return _flags;
+  }
+
+  void
+  handle_complete(io_uring_cqe *cqe) override
+  {
+    _result = cqe->res;
+    _flags  = cqe->flags;
+    if ((_flags & IORING_CQE_F_MORE) == 0) {
+      _armed = false; // kernel ended the multishot; a later co_await re-arms
+    }
+    _ready = true;
+    if (_waiter) {
+      // Resume on the owning EThread. Touch nothing after: a terminal CQE may run
+      // the coroutine to completion and free the frame that holds *this.
+      std::coroutine_handle<> w = std::exchange(_waiter, {});
+      w.resume();
+    }
+  }
+
+private:
+  Prep                    _prep;
+  std::coroutine_handle<> _waiter{};
+  int                     _result{0};
+  unsigned                _flags{0};
+  bool                    _armed{false};
+  bool                    _ready{false};
+};
+
+template <typename Prep> UringMultishotOp(Prep) -> UringMultishotOp<Prep>;
+
 // Cancels an in-flight UringOp by submitting io_uring_prep_cancel keyed on the
 // target op's SQE user_data (which is the target UringOp's `this`). The kernel
 // completes the *original* op with -ECANCELED; the coroutine awaiting it resumes

@@ -23,6 +23,7 @@ Linux io_uring helper library
 
 #include <sys/eventfd.h>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -222,6 +223,51 @@ IOUringContext::disable_eventfd()
     ::close(evfd);
     evfd = -1;
   }
+}
+
+io_uring_buf_ring *
+IOUringContext::setup_buf_ring(unsigned entries, int bgid, int *err)
+{
+  // liburing 2.4 lacks the io_uring_setup_buf_ring/io_uring_free_buf_ring
+  // convenience wrappers (added in 2.5), so allocate the page-aligned ring
+  // ourselves and register it. The ring is entries * sizeof(io_uring_buf), and
+  // entries must be a power of two (io_uring_register_buf_ring requires it).
+  auto fail = [err](int e) -> io_uring_buf_ring * {
+    if (err != nullptr) {
+      *err = e;
+    }
+    return nullptr;
+  };
+
+  std::size_t ring_size = entries * sizeof(io_uring_buf);
+  void       *ring_mem  = nullptr;
+  if (posix_memalign(&ring_mem, sysconf(_SC_PAGESIZE), ring_size) != 0) {
+    return fail(-ENOMEM);
+  }
+
+  io_uring_buf_ring *br = static_cast<io_uring_buf_ring *>(ring_mem);
+  io_uring_buf_ring_init(br);
+
+  io_uring_buf_reg reg = {};
+  reg.ring_addr        = reinterpret_cast<__u64>(br);
+  reg.ring_entries     = entries;
+  reg.bgid             = bgid;
+  if (int ret = io_uring_register_buf_ring(&ring, &reg, 0); ret != 0) {
+    ::free(ring_mem);
+    return fail(ret);
+  }
+
+  if (err != nullptr) {
+    *err = 0;
+  }
+  return br;
+}
+
+void
+IOUringContext::free_buf_ring(io_uring_buf_ring *br, unsigned /* entries */, int bgid)
+{
+  io_uring_unregister_buf_ring(&ring, bgid);
+  ::free(br);
 }
 
 IOUringContext *
