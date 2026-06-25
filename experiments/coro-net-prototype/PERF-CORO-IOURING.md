@@ -1,905 +1,519 @@
 # io_uring + coroutine net path — performance study
 
-A hypothesis → experiment → result → conclusion log for the io_uring/coroutine
-network path (branch `io-uring-coroutine-wip`) versus the epoll baseline (master).
-Companion to `DECISIONS.md` (which records *what was decided*); this file records
-*what was measured and why*.
+The single performance document for the io_uring/coroutine network path (branch
+`io-uring-coroutine-wip`) versus the epoll baseline (master). All perf data and analysis
+live here; `DECISIONS.md` is the companion that records *what was decided* (and points back
+here for the *why*).
 
-## Two environments — and why the contrast is itself the finding
+## How to read this
 
-Everything here was measured in two environments. They disagree, and the disagreement
-is the most important result in this document:
+Organized around the **cost transitions** you actually want to reason about, with an explicit
+**known / unknown** split, so you can see what is measured before choosing where to optimize.
 
-- **Loopback** (single host, RAM-cache hit, up to 120k req/s) isolates *CPU / cache /
-  coroutine-frame* effects. There is no driver, no TX descriptor, no doorbell, and a
-  syscall is cheap (no real device behind it). H1–H12 were all first established here.
-- **Real NIC** (ATS on the i9 over a **1 GbE** link — `enp6s0`, Marvell/Aquantia
-  `atlantic` — to a *separate* client host **`hawaii`**, an M1 Mac Mini running `wrk`)
-  adds the genuine driver TX path (descriptor build + doorbell + TX-completion softirq)
-  and a *real* per-syscall cost that loopback hides. Every NIC-sensitive finding was
-  re-validated here.
+- **§1 Cost model** — the one equation everything decomposes into.
+- **§2 Transition A: syscall → io_uring** — how the submission/completion model moves cost.
+- **§3 Transition B: stack → coroutine frame** — how moving per-op state off the stack moves cost.
+- **§4 Other axes we have data for** — object size, environment, direction, cache, allocation, concurrency.
+- **§5 Per-op cost catalog** — the concrete per-op numbers (real NIC).
+- **§6 Known / unknown ledger** — every claim with evidence + confidence.
+- **§7 Known unknowns** — the gaps that matter, named from where we stand.
+- **§8 Optimization directions** — what the gaps point to.
+- **Rig & method**, **Background**, then the **Experiment log** (the live evidence), and an
+  **Appendix of ruled-out options** (tested-and-dominated, kept as one-liners so we don't re-try them).
 
-**Loopback says "parity." The NIC says io_uring *wins small objects and loses large
-ones.*** Loopback under-charges two things that move in opposite directions:
-1. **Per-syscall cost** — cheap on loopback, real on the NIC. io_uring batches many
-   ops into one `io_uring_enter`; epoll pays one syscall per op. → on the NIC io_uring
-   **wins the small-object hot path** (−6% total cpu/1k) where it was at *parity* on
-   loopback.
-2. **Per-transmit cost** — ~free on loopback (`loopback_xmit` is a memory enqueue),
-   real on the NIC (driver `xmit` + TX-completion softirq). io_uring's un-coalesced
-   "one send per recv" pattern does ~2× the transmits of epoll's coalesced writes. → on
-   the NIC io_uring **loses the large-object path** (+5–8% on proc/instr) — a cost
-   loopback hid almost entirely.
+**Confidence tags:** **[Known]** = measured, reproduced (≥3 reps or n≥1.8M-req windows),
+mechanism understood; **[Thin]** = measured but under-powered (single environment / noisy
+metric / n=1); **[Open]** = not measured.
 
-So loopback was right about the CPU/frame mechanics (H1, H4–H8, H10) and wrong, in both
-directions, about anything gated by syscalls or transmits (the headline, H6, H9, H11).
-Read the loopback experiments first; the **Real-NIC validation** section then says what
-each one looks like on real hardware.
+**Two environments** (detail in *Rig & method*). **Loopback** charges ~0 for syscall-entry and
+~0 for transmit → isolates userspace + copy. The **real NIC** (1 GbE to a separate host)
+charges both. *Loopback was right about every CPU/cache/frame mechanic and wrong, in both
+directions, about anything gated by syscalls or transmits* — so NIC-sensitive claims are
+tagged with their NIC result, and loopback-only ones are flagged.
 
-## Rig and method (read first)
+---
+
+## §1 Cost model
+
+Everything reduces to one equation:
+
+    CPU/request ≈ (ops per request) × (mean cost per op)
+
+**ops per request = bytes ÷ bytes-per-op**, and bytes-per-op is set by **coalescing**, which is
+asymmetric:
+
+- **Writes coalesce.** The whole response sits in the buffer; the sender picks the op size (and
+  TSO coalesces further in the NIC). A 1 MiB cache hit goes out in ~2 sends of ~520 KB.
+- **Reads cannot.** Inbound data arrives at line rate, so each read drains only what landed
+  since the last one — and on a real 1500-MTU NIC that is ~1 MTU. **A 1 MiB upload becomes
+  ~750 reads of ~1.4 KB.** (Loopback's 65536 MTU hides this — there the same read is ~29 ops;
+  the real-NIC fragmentation is the truth, and it is the single biggest fact about bulk-transfer
+  cost: **reads cost ~20× more CPU/byte than writes**.)
+
+**cost per op splits three ways**, and the two transitions move *different* terms:
+
+| term | what it is | moved by |
+|---|---|---|
+| **userspace** | coroutine-frame touch + resume/suspend + protocol / op-building | **both** (A adds the resume; B changes frame locality) |
+| **kernel / syscall** | per-op copy (recvmsg/sendmsg) + syscall entry | **Transition A** — io_uring batches the *entry*; the per-byte copy is unchanged |
+| **softirq** | NIC RX/TX completion (per byte / per packet) | neither — engine-independent, per-byte; **absent on loopback** |
+
+The whole game is reading that split: **io_uring's wins and losses live in the *userspace*
+term and in *instruction count*; the *kernel transfer* (system + softirq) is essentially
+engine-flat for the same bytes** [§5]. A userspace event-model change can only move the
+userspace slice — large when ops are many and small, negligible when ops are few and big.
+
+---
+
+## §2 Transition A: syscall → io_uring
+
+**Mechanically:** epoll = readiness (`epoll_wait`) + one syscall per op (recvmsg/sendmsg), with
+a userspace drain loop pulling several blocks per wakeup. io_uring = queue SQEs; one
+`io_uring_enter` (`submit_and_wait`) per event-loop iteration drains *all* ready CQEs and
+submits *all* queued SQEs; each completion **resumes a coroutine**. Single-block transfers use
+`recv`/`send`, multi-block use `recvmsg`/`sendmsg`.
+
+**Known:**
+- **Syscall batching wins where syscalls cost.** Small-object hot path: 1.35 `io_uring_enter`/req
+  vs epoll's ~3 syscalls → **−6% total CPU on the NIC** (it was *parity* on loopback, where a
+  syscall is free). [Known — A6, §5]
+- **io_uring wins the read path: −16% user CPU, stable across 6 reps.** epoll fires ~1431
+  recvmsg/req but only ~747 return data (~684 wasted EAGAIN edge-retriggers); io_uring issues
+  only the productive recvs, and uses the lighter `recv` (no msghdr) where epoll always pays
+  recvmsg. [Known — §5, A5]
+- **`send()` < `sendmsg()` by ~480 instr** (the kernel skips `copy_msghdr` + `import_iovec`),
+  NIC-independent. io_uring's per-block path already uses `send`. [Known — A6]
+- **The async batched write removes the per-request sendmsg** (it rides `submit_and_wait`):
+  `sendmsg` 0.98→0/req, net syscalls ~halve, −1.8% cycles, IPC 1.368→1.400, and the 64 KB write
+  tail collapses (~550 ms → ~16 ms). The benefit *grows* on the NIC. [Known — A4]
+- **Op count dominates total cost, and coalescing helps io_uring more than epoll.** Small-block
+  write: coalescing cuts instr/req epoll −11%, **io_uring −45%** — each un-coalesced io_uring
+  send is a coroutine resume + enter; epoll loops several sends inside one wakeup. At big block
+  sizes (cache hit) coalescing is moot (≤8%, copy-dominated). [Known — §5]
+- **Large-object liability: io_uring's un-coalesced "one send per recv" does ~2× epoll's
+  transmits** → +5–8% on the NIC (real driver `xmit` + TX-softirq), +17% on loopback (per-op
+  resume). The one place io_uring is genuinely behind on real hardware. [Known — A5, A6]
+- **Cross-thread doorbell regression + fix.** The branch dropped `thread->evfd` registration
+  (compile-time gated), stalling cross-thread work to the 60 ms heartbeat; a multishot poll on
+  `thread->evfd` restores it (p99 62 ms → 2.2 ms, perf-neutral). [Known — A2]
+
+**Open / thin:**
+- **A write-side send batch that preserves the read↔write interleave** — the actual fix for the
+  large-object liability (read-side coalescing is *ruled out*, see appendix; this would batch
+  *sends* without serializing the connection). Not built. [Open]
+- **Multishot recv + provided buffers** — the only structural lever on the read side
+  (the ~750 reads/MiB and the ring footprint). Open question gating it: does line-rate arrival
+  still cap each completion at ~1 MTU, or can a provided-buffer ring carry more? [Open]
+- **Syscall-batching win at CPU saturation** — the 1 GbE link caps load below CPU saturation;
+  the magnitude of the win at a CPU-bound point is unmeasured. [Thin]
+
+---
+
+## §3 Transition B: stack → coroutine frame
+
+**Mechanically:** master keeps the iovec array + msghdr as **stack locals** in
+`net_read_io`/`load_buffer_and_write` — reused at a fixed, cache-warm address every call.
+io_uring keeps them in the **coroutine frame**: a heap block, pooled (thread-local LIFO
+`FramePool`), pinned across the await. `IOU_FRAME_IOV=16` sizes it at ~528 B.
+
+**Known:**
+- **The frame pool is load-bearing.** With it off, io_uring's frames hit the general allocator →
+  **+8–17% CPU vs master** and the tail collapses; that is the per-op cost of 2 unpooled
+  frames/req. The recovered win is primarily an *allocation-instruction* effect (fewer
+  malloc/free/madvise), not chiefly a TLB effect. [Known — Background, 12-cell matrix]
+- **Frame *size* is the dominant frame risk, not op-count coverage.** The original +21% was
+  largely the 16 KB frame (`IOU_FRAME_IOV=1024`); shrinking to 16 fixed it. iov=16 is the flat
+  optimum across object sizes; "larger transfers need a larger iovec" is **wrong** (large
+  transfers are copy-bound; op-count cost vanishes). [Known — A1]
+- **The post-fix residual is locality, not control flow.** io_uring +1% instr / +2% cycles on
+  loopback; the gap is +27% cache / +28% dTLB / +17% branch-miss, in the two `.actor` bodies +
+  `submit_and_wait`. Precise leaf attribution: **memory-footprint** — LLC +79%, dTLB-walk +59%,
+  **L1 ≈ 0** (cold-line/capacity at the frame + rings); the coroutine resume jump is
+  **BTB-predicted, not a branch-miss source** (the intuitive culprit is refuted). [Known — A3]
+
+**Bottom line:** the frame cost is **already neutralized** (FramePool + iov=16). It is a ~2%
+loopback locality residual that the NIC's syscall-batching win more than covers. **The frame is
+not a lever** — every attempt to squeeze it further was null (see appendix: arena, shrink,
+frame-in-VC, huge pages).
+
+**Open / thin:**
+- **Memory + locality at 10k+ connections.** The frame is pooled per *active* op, but the
+  per-VC + ring footprint at high conn counts is unmeasured, and the prototype pool never frees
+  (cap 8192/size/thread) — a bounded/watermarked production allocator could re-introduce
+  malloc/free under fluctuating conns. The locality residual is explicitly a *scaling* risk. [Open]
+- **Locality under a busier i-cache** (TLS, plugins) — measured only on a lean plaintext path. [Thin]
+
+---
+
+## §4 Other axes we have data for
+
+Beyond the two transitions, these axes were exercised; each is "what we know + where the gap is."
+
+| axis | what the data says | evidence | gap |
+|---|---|---|---|
+| **Object size** | op-overhead matters at small/medium (4–64 KB), vanishes when copy-bound (≥1 MB). iov sensitivity peaks at 64 KB (U-curve), flat by 1 MB. | A1, A6, §5 | nothing swept between 64 KB–1 MB on the NIC |
+| **Environment** (loopback vs NIC) | loopback under-charges syscalls *and* transmits; flips io_uring's verdict from "parity" to "small-object win / large-object loss". Also under-counts read ops (big MTU). | A6, all NV | only 1 GbE; **10G+ and CPU-saturated NIC unmeasured** |
+| **Direction** (read vs write) | reads can't coalesce → ~750 ops/MiB on the NIC, ~20× the CPU/byte of writes. | §5 | full-duplex / simultaneous bidirectional load unmeasured |
+| **Cache hit vs passthrough** | hit = write-only, ~2 sends, parity-class; passthrough = origin read + client write, where the large-object op-structure gap lives. | A5, A6 | **real disk-cache I/O** unmeasured (only RAM hit + passthrough) |
+| **Sync vs async write** | async batched send wins post-fix (A4). | A4 | — (live) |
+| **Coalesce vs not** | coalescing helps io_uring ≫ epoll on writes; read-side coalescing loses (appendix). | §5, A6 | — (live) |
+| **Allocation strategy** | pool = load-bearing; off = +8–17%; arena / frame-in-VC / huge-page all null. | Background, B-appendix | bounded allocator at 10k+ conns unmeasured |
+| **malloc (glibc vs jemalloc)** | jemalloc helps *master* more than io_uring (io_uring already bypasses malloc for frames + ATS freelists). | 12-cell matrix | — |
+| **Connection count / cross-thread** | conns ≤ 600 measured; cross-thread doorbell fixed (A2). | A2, Background | **10k+ conns** (memory + locality), high churn |
+
+---
+
+## §5 Per-op cost catalog (real NIC, 1 GbE → hawaii)
+
+The most direct decomposition: each op split into **userspace / kernel / softirq**, from the
+6-op isolation (experiment A7; generator-plugin workloads, no origin/disk, cgroup
+`user_usec`/`system_usec` split, 6 reps; instr/req stable ±1%, softirq noisy ±40%).
+
+| op (serving 1 MiB) | ops/req | KB/op | user µs | sys µs | softirq µs | **instr/req** |
+|---|---|---|---|---|---|---|
+| READ epoll `recvmsg` | 747 | 1.4 | 1566 | 2979 | 1779 | 13.74 M |
+| READ io_uring `recv` | 747 | 1.4 | **1320** | 2818 | 2353\* | 13.52 M |
+| WRITE-small epoll `sendmsg` (coalesce) | 33 | 31 | 219 | 326 | 378 | 0.649 M |
+| WRITE-small io_uring `sendmsg` (coalesce) | 33 | 31 | 205 | 331 | 419 | 0.677 M |
+| WRITE-small io_uring `send` (no-coalesce) | 93 | 11 | 275 | 392 | 356 | 1.241 M |
+| WRITE-big, cache hit (~520 KB blocks) — any engine | ~2 | ~520 | ~70 | ~260 | ~310 | 0.204–0.221 M |
+
+\* read softirq is within the ±40% noise band (epoll 1397–2695, io_uring 1080–3201); it does
+**not** separate the engines. (The dominated epoll `send`-no-coalesce row is folded into the
+appendix.) NV anchors (per request, mixed): 4 KB hot — io_uring 0.0281 vs epoll 0.0299 cpu/1k
+(**−6%**); 1 MB passthrough — io_uring 1.98 vs epoll 1.85 cpu/1k (**+5–8%**).
+
+**What the catalog shows (the cost model, concretely):**
+1. **Op count = total cost.** The *same* 1 MiB is 0.20 M / 0.65 M / 13.7 M instr depending only
+   on how many ops it's chopped into (2 big sends → 33 small sends → 747 MTU reads). Per-op cost
+   is ~constant; **bytes-per-op is the lever.**
+2. **Reads cost ~20× more CPU/byte than writes** — the read can't coalesce (line-rate arrival).
+3. **Coalescing helps io_uring far more than epoll** (small-block write instr: io_uring −45%,
+   epoll −11%); at big-block (cache hit) it's moot.
+4. **The split localizes everything:** io_uring's deltas are in **user CPU + instructions**;
+   **system + softirq are per-byte and engine-flat**.
+
+---
+
+## §6 Known / unknown ledger
+
+| claim | transition / axis | evidence | confidence |
+|---|---|---|---|
+| Syscall batching wins small objects on the NIC (−6%) | A | A6, §5 | **Known** |
+| io_uring wins reads (−16% user; avoids epoll EAGAIN waste) | A | §5, A5 | **Known** |
+| `send()` < `sendmsg()` (~480 instr) | A | A6 | **Known** |
+| Async batched write removes per-req sendmsg (−1.8% cyc) | A | A4 | **Known** |
+| Coalescing helps io_uring ≫ epoll; op count is the lever | A | §5 | **Known** |
+| Large-object un-coalesced sends: +5–8% NIC liability | A | A5, A6 | **Known** |
+| Cross-thread doorbell regression + multishot-poll fix | A | A2 | **Known** |
+| Frame pool is load-bearing (off = +8–17%) | B | Background | **Known** |
+| iov=16 optimal; frame *size* is the only frame risk | B | A1 | **Known** |
+| Residual = memory-footprint locality, not control flow | B | A3 | **Known** |
+| Reads can't coalesce → ~750 ops/MiB on a real NIC | A / direction | §5 | **Known** |
+| Write-side batch preserving read↔write interleave | A | — | **Open** |
+| Multishot recv + provided buffers (read op count, copy) | A/B | — | **Open** |
+| TLS path (per-record blocks → coalescing relevant) | A | — | **Open** |
+| 10k-conn memory + bounded allocator at scale | B | VERDICT scope caveat | **Open** |
+| Syscall-batching win at CPU saturation | A | — | **Thin** |
+| HTTP/2, disk-cache I/O, NUMA, 10G+, error/churn paths | mixed | — | **Open** |
+
+---
+
+## §7 Known unknowns — the gaps that matter
+
+Named from where we stand. Ordered by how much they could change the verdict.
+
+1. **TLS.** Everything is plaintext. TLS produces many small per-record write blocks, which puts
+   us squarely in the regime where write-coalescing and Transition A's op-count term dominate —
+   and where io_uring's "coalescing helps it more" likely shows up as a *win*, not parity. Also
+   the async-SSL engine interaction is untested. **The single biggest unknown for a real verdict.**
+2. **Scale: 10k+ connections.** Per-VC + ring + pooled-frame memory, and the H7 locality residual
+   that is explicitly a scaling risk. The prototype pool never frees (cap 8192/size/thread,
+   ~100 MB/thread at 100k conns); a bounded/watermarked production allocator is the most likely
+   way the frame-pool win under-delivers under fluctuating conns (a VERDICT scope caveat we never
+   closed).
+3. **CPU-saturated NIC operating point.** We ran *below* saturation (1 GbE caps offered load). The
+   syscall-batching win (−6% small) is measured at low utilization; its magnitude when the box is
+   CPU-bound — the operating point that matters for capacity — is unmeasured.
+4. **Multishot recv + provided buffers.** The deferred io_uring features. They are the *only*
+   structural attack on the read side's ~750 ops/MiB and the only path to a different copy story
+   (zero-copy / kernel-chosen buffers). Open question: does line-rate arrival still force
+   ~1-MTU completions even with a provided-buffer ring?
+5. **The write-side send-batch lever's actual cost.** The proposed fix for the large-object
+   liability (batch sends without serializing the read loop). Unbuilt, so its win is hypothetical.
+6. **HTTP/2.** Multiplexing many streams over one connection changes the op pattern (interleaved
+   small frames) and the buffering — a different op-count regime than HTTP/1.1 keep-alive.
+7. **Real disk-cache I/O.** Only RAM-hit and origin-passthrough are measured. The disk path uses
+   thread-mode AIO and cross-thread completions (where the A2 doorbell matters) — unmeasured cost.
+8. **Larger MTU / 10G+ NIC.** Read fragmentation (§1) is MTU-gated; jumbo frames or 10G change
+   bytes-per-read and per-transmit cost, possibly shrinking the read-side gap.
+9. **NUMA / multi-socket.** Single-socket 12900K only; ring/frame/buffer locality across NUMA
+   nodes is untested.
+10. **Error, teardown, and churn paths.** Only the happy path's *CPU* is measured. RST / timeout /
+    half-close correctness is tested (and accept/connect are on io_uring), but per-connection
+    setup/teardown CPU at high churn, and behavior under packet loss / retransmit, are not.
+
+---
+
+## §8 Optimization directions
+
+The known results close off several tempting directions and point at two real ones.
+
+**Pursue — the open levers (both on Transition A's op-count term):**
+1. **Write-side send batching that preserves the read↔write interleave.** The large-object
+   liability is io_uring's one-send-per-recv (A5). Read-side coalescing fixes the symptom but
+   halves op concurrency (appendix). A batch on the *write* side — accumulate ready blocks into
+   one send without stalling the read loop — is the untried lever. [Open]
+2. **Multishot recv + provided buffers.** The only structural attack on the read side's
+   ~750 ops/MiB (and the ring/frame footprint). Whether line-rate arrival still caps a completion
+   at ~1 MTU is the open question that gates it. [Open]
+
+**Do not pursue — closed by the evidence (see appendix for each):** the coroutine frame
+(neutralized; arena / shrink / huge-pages / frame-in-VC all null), read-side write-coalescing
+(net loss on both media), and bigger MIOBuffer blocks (CQE/req is set by backpressure, not block
+size).
+
+**Measure before shipping — the §7 unknowns that gate the default:** TLS, 10k-conn memory, and
+NIC behavior at CPU saturation. Until these land, gate behind `net.io_uring.enabled` (done),
+default off.
+
+**Net for shipping:** on a real NIC, io_uring is a **net win on the dominant small-object /
+keep-alive traffic** (−6%, + a 2–3× p99 tail improvement) and a **bounded loss on large
+streaming bodies** (+5–8%); loopback's "parity" undersold both halves.
+
+---
+
+## Rig & method
 
 ### Loopback environment
-
-- **Box:** i9-12900K (hybrid: 8 P-cores + 8 E-cores), Ubuntu 24.04 HWE, kernel
-  6.17, liburing 2.4. During runs: `performance` governor, turbo **off**
-  (`no_turbo=1`), `perf_event_paranoid=-1`.
-- **Pinning:** ATS confined to a cgroup-v2 cpuset `atsbench` = P-cores `0,2,4,6`
-  (taskset is insufficient — hwloc rebinds ET_NET threads); the `wrk2` client to
-  `clibench` = `8-23`. 4 ET_NET threads, 1 accept thread.
-- **Gold metric:** `cpu/1k-req` = cgroup `cpu.stat` `usage_usec` delta ÷ requests.
-  This counts only ATS user+sys CPU (softirq and the client are excluded), so it is
-  a clean per-request efficiency signal independent of who the bottleneck is.
-- **Workload:** `wrk2` open-loop constant rate, HTTP/1.1 keep-alive, reverse-proxy
-  + remap, served from a 100% RAM-cache HIT (origin nginx out of path). Validated
-  every run by `RAM% = 100·cache_hit_mem_fresh/cache_hit_fresh == 100`.
-- **A/B isolation:** unless noted, master vs io_uring is the **same Release+fp
-  binary** with `proxy.config.net.io_uring.enabled` toggled 0/1 — so the only
-  variable is the net path (+ the accept-thread topology the flag selects). This
-  removes the cross-campaign drift that weakened the earlier frame-pool numbers.
-- Binaries are Release `-O3 -fno-omit-frame-pointer` from the current tree
-  (`IOU_FRAME_IOV=16`, all five fixes), installed at `/tmp/ts-iou-fp`.
+- **Box:** i9-12900K (8 P-cores + 8 E-cores), Ubuntu 24.04 HWE, kernel 6.17, liburing 2.4.
+  During runs: `performance` governor, turbo **off**, `perf_event_paranoid=-1`.
+- **Pinning:** ATS in a cgroup-v2 cpuset (P-cores; taskset is insufficient — hwloc rebinds
+  ET_NET threads); client (`wrk2`) on the remaining cores. 4 ET_NET threads, 1 accept thread.
+- **Gold metric:** `cpu/1k-req` = cgroup `cpu.stat` `usage_usec` ÷ requests (ATS user+sys only;
+  softirq and client excluded) — a clean per-request efficiency signal independent of the
+  bottleneck.
+- **Workload:** `wrk2` open-loop constant rate, HTTP/1.1 keep-alive, reverse-proxy + remap,
+  100% RAM-cache HIT (validated `RAM% = 100`). Same Release `-O3 -fno-omit-frame-pointer` binary
+  with `net.io_uring.enabled` toggled 0/1 — the only variable is the net path.
 
 ### Real-NIC environment
+- **Server:** ATS on the i9 over `enp6s0` (atlantic, **1 GbE**). **Client:** `hawaii`, an M1 Mac
+  Mini, `wrk` — a genuine second host, so writes traverse the real driver TX path. (Localhost
+  can't test this — the kernel short-circuits local addresses to loopback before any driver.)
+- **The 1 GbE link caps throughput** (~27k rps at 4 KB, ~115 rps at 1 MB), so the box runs
+  *below* CPU saturation. Per-request ratios (`cpu/1k`, `instr/req`, ops/req) stay valid.
+- **Two CPU accountings:** `proc cpu/1k` = ATS cgroup CPU (incl. the driver `xmit` in send-syscall
+  context); `softirq cpu/1k` = `/proc/stat` softirq ÷ req (the NIC TX/RX completion the cgroup
+  misses; noisy → corroborating, not load-bearing). The 6-op rig (A7) additionally splits the
+  cgroup into `user_usec` / `system_usec`.
+- Harness is out-of-tree at `~/work/io-uring-coro-bench` (`measure-nic2.sh`, `measure-6op.sh`,
+  `setup-box.sh`); raw cells in `findings/*.txt` + `SIXOP.csv`.
 
-- **Server:** ATS on the same i9 (same cgroup pinning), reachable on `enp6s0`
-  (`192.168.1.165`, atlantic, **1 GbE** link). **Client:** `hawaii`, an Apple M1 Mac
-  Mini (8 cores) on the same LAN running `wrk 4.2` — a genuine second host, so the
-  response writes traverse the real driver TX path. (Single-host localhost can't test
-  this: the kernel short-circuits local addresses to loopback before any driver; this
-  box has no SR-IOV; veth/netns are software-`xmit` with no doorbell.)
-- **The 1 GbE link caps throughput** (~27k rps at 4 KB, ~115 rps at 1 MB), so the box
-  runs *below* CPU saturation. Per-request metrics (`cpu/1k`, `instr/req`, ops/req) are
-  ratios and remain valid; absolute utilization is low.
-- **Two CPU accountings, because the NIC cost splits across contexts:** `proc cpu/1k` =
-  ATS cgroup CPU (includes the driver `xmit` that runs in the send *syscall* context);
-  `softirq cpu/1k` = `/proc/stat` softirq seconds ÷ req (the NIC TX/RX *completion* the
-  cgroup misses). The softirq number is noisy (constant timer baseline + 20 s windows),
-  so for the large-object total the reliable signals are **proc cpu/1k and `instr/req`**
-  (`perf -p`, which *does* count the in-syscall driver `xmit`); softirq is corroborating.
-- The harness is out-of-tree at `~/work/io-uring-coro-bench` (`measure-nic2.sh`,
-  `setup-box.sh`, the `wrk` lua on hawaii); raw cells in `findings/NIC-*.txt`.
+## Background: +21% → parity (the five fixes)
 
-## Background: the established result this study builds on
+The io_uring net path was once **+20.9% cpu/req** vs epoll with a collapsing p99 tail. Five
+fixes brought it to loopback parity, ranked by impact:
+1. **Shrink the inline iovec `NET_MAX_IOV`(1024 ⇒ 16 KB) → 16** — the 16 KB array lived in the
+   *heap coroutine frame* pinned across the await, where master keeps it as a cache-warm *stack*
+   local (~12 of the ~20 points; instr/req 71k→59k, dTLB 14.3→8.7).
+2. **Block directly in `io_uring_submit_and_wait`** instead of bridging completions through an
+   eventfd into `epoll_wait` (~3 points; drops `epoll_wait` + eventfd read per req).
+3. **Async batched write** (superseded the original sync write — see A4) (~3 points).
+4. **Single-buffer `recv`/`send`** for the 1-block case (lighter kernel than recvmsg/sendmsg).
+5. **Unregister the dead completion eventfd** (~1 point).
 
-The io_uring net path was once **+20.9% cpu/req** vs epoll with a collapsing p99
-tail. Five fixes (documented in `DECISIONS.md` D29 and `io-uring-perf-baseline`)
-brought it to loopback parity. Ranked by impact: (1) shrink the inline `iovec` from
-`NET_MAX_IOV`(1024 ⇒ 16 KB) to 16 — the 16 KB array lived in the *heap coroutine
-frame* pinned across the await, where master keeps it as a cache-warm *stack* local;
-(2) block directly in `io_uring_submit_and_wait` instead of bridging completions
-through an eventfd into `epoll_wait`; (3) opportunistic synchronous write (later
-superseded by the async batched write, H6); (4) single-buffer `recv`/`send` for the
-1-block case; (5) unregister the now-dead completion eventfd.
-
-**Loopback anchor (n=5, 4 KB, 120k req/s):** master 0.0139 vs io_uring 0.0140 cpu/1k =
-**+0.7%**, p99 ~2.1 ms both. **Real-NIC anchor (4 KB, 1 GbE, hawaii):** io_uring 0.0281
-vs epoll 0.0299 total cpu/1k = **−6% (io_uring wins)**. The harness/box reproduce the
-recorded parity on loopback and surface the NIC win, so the experiments below stand on a
-validated baseline in both environments.
-
-## Summary of findings
-
-| # | Question | Answer |
-|---|---|---|
-| H1 | iovec size vs transfer size | Sensitivity peaks at *medium* sizes (64 KB: ±10%, U-curve), **vanishes** for large (copy-bound). `IOU_FRAME_IOV=16` is in the flat optimum; the real risk is the *large* frame, not the small one. The "larger reads need larger iovec" intuition is wrong. |
-| H2 | Run without the eventfd? | **Yes for plain HTTP** (and default on-thread io_uring AIO). But the branch silently dropped the **cross-thread wakeup doorbell**, stalling cross-thread work up to the 60 ms heartbeat. A multishot poll on `thread->evfd` restores it: **p99 62 ms → 2.2 ms, perf-neutral.** *(actionable fix)* |
-| H3 | Real TCP, not loopback | **Parity holds** (+1.9% at 4 KB, +0.0% at 64 KB on veth MTU 1500). The loopback result was not an artifact. |
-| H4 | Frame contiguity | Contiguous-slab arena ≈ scattered freelist (±1%, noise). Not a meaningful lever at this scale — the frame is already small. Hypothesis not supported. |
-| H5 | Where the residual lives | Clean n=3: io_uring **+1% instructions / +2% cycles** vs master (corrects the earlier "fewer instructions" claim). Residual = locality (cache +27%, dTLB +28%, branch-miss +17%) in the two `.actor` coroutine bodies + `submit_and_wait`. No single hot spot. |
-| H6 | Cheaper / syscall-free write | **Pure async batched write** removes the per-request `sendmsg` (0.98→0/req), halves net syscalls, and is **−1.8% cycles/req** (IPC 1.368→1.400) — reversing the earlier EXP-1b. Moves io_uring from +2.7% to **+0.8% cycles** vs master. *(actionable optimization)* |
-| H7 | Where the misses land (precise/leaf) | Residual is **memory-footprint, not control-flow**: LLC +79% & dTLB-walks +59% but **L1 ≈0** — cold-line/capacity at `_read.actor` (frame) + `submit_and_wait` (rings). Branch +13% is kernel SQE-issue; the **coroutine resume jump is BTB-predicted, not a miss source** (theory refuted). |
-| H8 | Huge pages | **Not a lever.** THP/glibc-tunable can't reach ATS memory (`AnonHugePages=0`, 6 cells). The working ATS hugetlb knob backs only the shared iobuffer arena (lowers both arms, no cpu/1k benefit), never the frames/rings. dTLB residual is <1% cpu anyway. |
-| H9 | Bigger block / large-object gap | Block size is **not** the lever: CQE/req immovable (67.6→67.0) across 8 KB→256 KB→+2 MB SO_RCVBUF (refutes `ceil(size/block)`; backpressure sets it). io_uring is **+17% on 1 MB passthrough**, and it's **ops-structural** (67 one-op-per-resume CQEs vs epoll's drain loop), not locality — so co-location won't fix it; fewer ops/req (multishot) will. |
-| H10 | Mitigate the frame cost | **No lever found.** Shrinking the frame (iov 16→8) is a dead end (cost is the *allocation*, not the size). Frame-in-VC (embed the frame in the VC, drop the pool) is correct + clean but **perf-neutral** (interleaved A/B: −0.5%, within noise) — the FramePool already keeps the frame hot — and costs 1.28 KB/VC. **Keep the pool.** The frame is not what holds io_uring back. |
-| H11 | Op-count audit (SQE vs syscall) | io_uring **wins on syscalls** (1 MB pass: 18.2 `io_uring_enter` vs 52.6; hot path 1.71 ops vs 2.93 — epoll wastes an EAGAIN-probe recvmsg). But at the **op** level it does ~10% more, all **sends** (28.8 vs 17.5): it emits **one send per recv completion** (`READ_READY` signalled after every recv) where epoll coalesces ~2 reads/send. Each extra send = one extra coroutine resume. |
-| H12 | Write-coalescing | **Tried, rejected — a pessimization.** Accumulating reads before signalling cuts sends 28.8→16.1 (below epoll) and total ops below epoll, **but raises cpu/1k ~2% and instr/req +6%** (clean). H6's async write already amortized the send syscalls, so coalescing removes near-free syscalls while adding multi-block `sendmsg` build + accumulation cost. **Keep per-block sends.** |
-
-The table above is the **loopback** verdict. On the **real NIC** the picture sharpens —
-some findings are confirmed, some are corrected, and the headline changes outright:
-
-| environment / workload | io_uring vs epoll | what it tells us |
-|---|---|---|
-| loopback, 4 KB hot | +0.7% (parity) | syscalls are cheap → batching invisible |
-| **real NIC, 4 KB hot** | **−6% total (io_uring wins)** | io_uring batches ops into 1.35 `io_uring_enter`/req vs epoll's ~3 syscalls; on real hardware that batching is a real win |
-| loopback, 1 MB pass | +17% (proc) | per-op coroutine-resume cost, no transmit cost |
-| **real NIC, 1 MB pass** | **+5–8% (proc/instr); softirq also higher** | io_uring's un-coalesced "1 send per recv" does ~2× epoll's transmits → real driver-`xmit`/softirq cost |
-
-**Which findings are NIC-sensitive vs NIC-independent** (so you know what re-ran on real
-hardware and what didn't need to):
-- **NIC-sensitive (re-validated on hawaii):** the headline parity (H5/H7 → becomes an
-  io_uring *win* on small objects), the large-object gap (H9/H11 → io_uring's send
-  pattern is a real liability), write-coalescing (H12 → still rejected, see below), the
-  async write (H6 → benefit *grows*). These are gated by syscalls or transmits.
-- **NIC-independent (loopback result stands):** H1 (iovec/frame size — a cache effect),
-  H2 (cross-thread doorbell — internal wakeup), H4 (frame contiguity — cache), H8 (huge
-  pages — dTLB), H10 (frame-cost mitigations — cache/allocation). These are pure
-  CPU/cache/coroutine-frame effects the transmit medium does not touch.
-
-**Actionable changes that came out of this:** (1) the cross-thread doorbell (correctness,
-free); (2) the async batched write (perf — and its syscall-batching win is *larger* on
-the NIC). The arena (H4) and frame-in-VC (H10) are not worth keeping; `IOU_FRAME_IOV=16`
-(H1) is confirmed optimal. The open item the NIC surfaces: io_uring's un-coalesced send
-pattern (H11) costs real CPU on large objects — but the obvious fix (H12) is a net loss
-on *both* media, so it needs a different approach (a write-side batch that doesn't
-disturb the read loop, or multishot recv), not the read-side coalescing tried here.
-
-See **Real-NIC validation** (after H12) for the full per-finding NIC data.
+**Anchors.** Loopback (n=5, 4 KB, 120k rps): master 0.0139 vs io_uring 0.0140–0.0141 = **+0.7–1.4%**,
+p99 ~2.1 ms (and ~2–3× *better* tail than epoll across freelist modes). Real NIC (4 KB, 1 GbE):
+io_uring 0.0281 vs epoll 0.0299 = **−6%**. The harness reproduces both, so the experiments stand
+on a validated baseline.
 
 ---
 
-## H1 — IOVEC size vs transfer size (Q2)
+## Experiment log (the live evidence)
 
-**Hypothesis.** `IOU_FRAME_IOV` trades two costs: a *small* value shrinks the
-coroutine frame (cache/dTLB friendly) but caps how many buffer blocks one recv/send
-op can carry, forcing more ops + loop iterations on large transfers; a *large* value
-cuts ops but re-bloats the frame. There should be a knee, and it may move with the
-object size — larger objects should favor a larger iovec.
+Each entry: hypothesis → key data → conclusion. Tagged by transition. Dead-end experiments are
+in the appendix, not here. *Label map for legacy references (`DECISIONS.md`, prior notes):
+A1=H1, A2=H2, A3=H5+H7, A4=H6, A5=H9+H11, A6=NV1–4, A7=the 6-op isolation.*
 
-**Experiment.** Build one binary per `IOU_FRAME_IOV ∈ {1,4,16,64,256,1024}`
-(only `IOUringNetVConnection.cc.o` differs). For object sizes 64 KB / 1 MB / 8 MB
-(multi-block regime), measure cpu/1k at a saturating rate, with an epoll reference
-(iovec-independent) per size. 3 rounds each.
+### A1 — iovec size vs transfer size [Transition B] [Known]
+Sweep `IOU_FRAME_IOV ∈ {1,4,16,64,256,1024}` × {64 KB, 1 MB, 8 MB}, Δ vs the (iovec-independent)
+epoll reference:
 
-**Result.**
-
-cpu/1k (median of 3 rounds), Δ vs the epoll reference at each size:
-
-| IOU_FRAME_IOV | 64 KB (CPU-bound, ~190k rps) | 1 MB (bw-bound, ~20 GB/s) | 8 MB (client-bound, ~52 rps) |
+| iov | 64 KB | 1 MB | 8 MB |
 |---|---|---|---|
-| epoll (1024 stack) | 0.0209 | 0.1992 | 3.034 |
-| 1 | 0.0231 (**+10.5%**) | 0.2014 (+1.1%) | 2.990 (−1.5%) |
-| 4 | 0.0203 (−2.9%) | 0.2004 (+0.6%) | 2.962 (−2.4%) |
-| 16 | 0.0203 (−2.9%) | 0.2022 (+1.5%) | 3.019 (−0.5%) |
-| 64 | 0.0203 (−2.9%) | 0.2002 (+0.5%) | 2.991 (−1.4%) |
-| 256 | 0.0205 (−1.9%) | 0.2026 (+1.7%) | 2.948 (−2.9%) |
-| 1024 | 0.0217 (**+3.8%**) | 0.2032 (**+2.0%**) | 3.003 (−1.0%) |
-| spread (min→max) | **±10%** | ±1% | ±2% (noise) |
+| 1 | **+10.5%** | +1.1% | −1.5% |
+| 4–64 | **−2.9%** (optimum) | ±1% | ±2% |
+| 1024 | **+3.8%** | +2.0% | −1.0% |
 
-**Conclusion.** The intuition that *larger* transfers favor a *larger* iovec is **not
-supported** — it is the opposite. Sensitivity to `IOU_FRAME_IOV` peaks at *medium*
-object sizes and vanishes for large ones:
+A clean U-curve at 64 KB (too few iovecs → extra ops; too large → 16 KB frame bloat); flat by
+1 MB (copy-bound — even iov=1 is within noise). **iov=16 sits in the flat optimum** and is far
+from both costly extremes. The "larger transfers need a larger iovec" intuition is wrong; the
+real risk is the *large* frame.
 
-- **64 KB (CPU-bound):** a clean U-curve. iov=1 costs **+10.5%** (a 64 KB object is
-  ~2 blocks, so a 1-iovec op needs 2 recv/send ops + 2 loop iterations); the 16 KB
-  frame at iov=1024 costs **+3.8%** (cache/dTLB). The flat optimum is iov 4–64, where
-  io_uring *beats* epoll by ~3%. This is the regime where per-op overhead is a
-  meaningful fraction of the per-request cost.
-- **1 MB / 8 MB:** all values collapse to within ±1–2% (noise). Once the per-request
-  data **copy** dominates (20 GB/s loopback at 1 MB; client-bound at 8 MB), the
-  op-count cost is negligible — even iov=1 (forcing the most ops) is within noise.
-  The only signal that survives is the *negative* one: iov=1024 is the worst at every
-  size (+2.0% even at 1 MB), i.e. the large frame's cache cost persists while its
-  op-count benefit does not.
+### A2 — cross-thread wakeup doorbell [Transition A] [Known] — *actionable correctness fix*
+`initialize_thread_for_net` chose `IOUringEventIO` vs `AsyncSignalEventIO` at **compile time**
+(`#if TS_USE_LINUX_IO_URING`), so the io_uring build never registered `thread->evfd` (the
+cross-thread wakeup fd). A thread blocked in `submit_and_wait`/`epoll_wait` could not be woken by
+another thread → such work stalled to the 60 ms heartbeat. Plain HTTP is unaffected (default
+`aio.mode=auto` keeps connection work thread-local), which hid it.
 
-So `IOU_FRAME_IOV=16` is well-chosen and robust: optimal in the medium regime,
-indistinguishable from optimal at large sizes, and far from the costly extremes. The
-real risk a designer should avoid is the *large* inline iovec (frame bloat), not the
-small one — the small inline iovec does not hurt large transfers on this path. (The
-read path is structurally identical, same constant; H6 and the cache-miss large-read
-run below confirm the read side behaves the same.)
-
----
-
-## H2 — Cross-thread wakeup correctness without the eventfd (Q1)
-
-**Hypothesis.** Two eventfds exist: (A) the io_uring *completion* eventfd that
-bridges CQEs into `epoll_wait`, and (B) the per-EThread *wakeup* eventfd that
-`NetHandler::signalActivity()` writes for cross-thread wakeups. The direct-blocking
-io_uring path unregisters (A) — correct, it is pure epoll-bridge overhead. But once
-a net thread blocks in `io_uring_submit_and_wait`, a cross-thread `write(thread->evfd)`
-(B) wakes nothing (B is in neither epoll nor the ring), so cross-thread reenables and
-timers injected after the thread blocked are only serviced on the next CQE or the
-≤60 ms heartbeat. This is invisible on a single-thread RAM-hit benchmark but is a
-real latency regression for disk-cache / multi-thread / plugin work. The fix: arm a
-**multishot poll on `thread->evfd` inside the ring** (the io_uring-native equivalent
-of `AsyncSignalEventIO`), so the cross-thread write produces a CQE that breaks
-`submit_and_wait`.
-
-**Experiment.** (a) Confirm plain HTTP runs correctly with the completion eventfd
-gone (it already does — `disable_eventfd` at runtime). (b) Add the multishot-poll
-doorbell and confirm it is perf-neutral on the RAM-hit path. (c) Try to reproduce
-the cross-thread stall by forcing `proxy.config.aio.mode=thread` (so disk-cache reads
-complete on an ET_AIO thread and reenable the net VC cross-thread), low concurrency,
-and compare latency: epoll vs io_uring-no-doorbell vs io_uring-doorbell.
-
-**Result.**
-
-- **Perf-neutral (variants A/B):** doorbell vs baseline io_uring = 0.0138 vs 0.0139
-  cpu/1k at 4 KB, 0.0201 vs 0.0204 at 64 KB — within noise. The multishot poll arms
-  one SQE per net thread and only completes when another thread rings the doorbell,
-  which plain HTTP never does, so steady-state cost is zero.
-- **Why plain HTTP is already safe without the eventfd:** with the default
-  `aio.mode=auto`, disk-cache reads use **io_uring on the net thread's own ring**, so
-  their completions are CQEs on that same ring — they wake `submit_and_wait` directly,
-  no cross-thread doorbell needed. A plain-HTTP connection's work (accept, read,
-  cache, write) all stays on its own ET_NET thread. So the cross-thread doorbell gap
-  does **not** bite the target workload.
-- **Cross-thread stall reproduction (forced `aio.mode=thread`, conns=4, disk-cache):**
-
-  | net path | p50 | p99 | p99.9 |
-  |---|---|---|---|
-  | epoll (io_uring build, enabled=0) | 1.13 ms | **62.1 ms** | 62.3 ms |
-  | io_uring, no doorbell | 1.11 ms | **61.6 ms** | 61.7 ms |
-  | io_uring, **doorbell** | 1.07 ms | **2.21 ms** | 11.7 ms |
-
-  The doorbell cuts p99 from ~62 ms (≈ the 60 ms heartbeat cap) to 2.2 ms — a **28×**
-  tail improvement when work arrives cross-thread. Same at conns=32 (p99 61.3/61.6 ms
-  without → 2.08 ms with), so it is not a low-concurrency artifact.
-
-- **Scope of the underlying bug (verified in code, `UnixNet.cc:189-201`):** the choice
-  between `IOUringEventIO` (registers the io_uring completion fd) and
-  `AsyncSignalEventIO` (registers `thread->evfd`, the cross-thread doorbell) is made at
-  **compile time** (`#if TS_USE_LINUX_IO_URING`), not by the runtime flag. So *any*
-  io_uring-enabled build never registers `thread->evfd` — the cross-thread doorbell is
-  missing on **both** the io_uring net path and its epoll fallback (that is why the
-  "epoll" arm above also stalls at 62 ms). True master (USE_IOURING=0) installs
-  `AsyncSignalEventIO` and does not have this gap. So this is a **latent regression
-  introduced by the io_uring branch**, not a property of io_uring itself.
-
-**Conclusion.** Three things. (1) **Yes — plain HTTP runs correctly without the
-completion eventfd**, and the default `aio.mode=auto` keeps even disk-cache work on
-the connection's own ET_NET ring, so the cross-thread gap does not bite the target
-workload. (2) The completion eventfd (A) is correctly gone; it was pure
-epoll-bridge overhead. (3) But the branch *did* silently drop the cross-thread
-doorbell (`thread->evfd`) for the whole io_uring build, which stalls genuinely
-cross-thread work (thread-mode AIO, cross-thread continuations, future H2) up to the
-heartbeat. The **multishot poll on `thread->evfd`** restores it — a one-SQE-per-thread
-doorbell that is provably perf-neutral on the hot path (it only completes when rung)
-and fixes the 62 ms tail. This is the correct way to be "fully io_uring without the
-eventfd": drop the *completion* eventfd, but keep a doorbell on the *wakeup* eventfd —
-in the ring, not in epoll. (Caveat: the doorbell is armed only on the io_uring-enabled
-path; the io_uring build's epoll *fallback* still lacks it and should restore
-`AsyncSignalEventIO` when `enabled=0`.)
-
----
-
-## H3 — Real TCP vs loopback (Q3)
-
-**Hypothesis.** The parity result was measured on loopback (MTU 65536, no real
-segmentation/softirq). On a real TCP path (MTU 1500, real segmentation) the net-path
-CPU difference is the coroutine state machine, which is independent of segmentation,
-so parity should hold; absolute cpu/req rises for both.
-
-**Experiment.** veth pair to a client netns, MTU 1500, GRO/GSO/TSO off (real
-segmentation, like a NIC without offload). Re-run the master-vs-io_uring A/B at
-4 KB and 64 KB. ATS cgroup-pinned (host); wrk in the netns.
-
-**Result.**
-
-| object | epoll cpu/1k | io_uring cpu/1k | Δ | vs loopback |
-|---|---|---|---|---|
-| 4 KB | 0.0156 | 0.0159 | +1.9% | (loopback +0.7–1.5%) |
-| 64 KB | 0.0493 | 0.0493 | +0.0% | (loopback −2.4%) |
-
-**Conclusion.** **Parity holds on a real-TCP path.** Absolute cpu/req rises (4 KB
-0.0156 vs loopback 0.0137; 64 KB 0.0493 vs 0.0209 — real 1500-byte segmentation costs
-more socket-layer work per request, counted in ATS's sys time), but the
-io_uring-vs-epoll *relationship* is unchanged: +1.9% at 4 KB, exact parity at 64 KB,
-both within the loopback band. The earlier loopback-only result was not a loopback
-artifact — the coroutine/ring cost is independent of segmentation, as hypothesized.
-This closes the prior "proven only on loopback" scope caveat for the
-client-facing cache-hit path.
-
-_Origin-facing cache-MISS large read (passthrough, no cache, 1 MB from origin →
-client; the origin-facing `_read` over io_uring recv):_ at a clean sub-saturation
-rate (4000 req/s), cpu/1k = epoll 0.4399 vs io_uring 0.4403 = **+0.1%, parity.** (A
-naive saturating run earlier showed a ~16% throughput gap, but that was a closed-loop
-ceiling artifact, not a CPU-efficiency difference — at a controlled rate the per-
-request CPU is equal.) This extends parity to the origin-facing read path and the
-cache-MISS scenario, two more of the previously-unmeasured scopes.
-
----
-
-## H4 — Coroutine frame contiguity (Q4)
-
-**Hypothesis.** Frames are individual `::operator new` blocks recycled by an
-intrusive LIFO freelist — scattered across the heap. A contiguous-slab arena (CAP
-frames of one size packed into one region) should cut dTLB/cache misses. BUT the
-prior adversarial review found the pool win was primarily an *instruction-count*
-(malloc-removal) effect, dTLB only ~26–42% of saved cycles; and at conns≤200 the
-LIFO working set is tiny and likely already resident. So the expected effect is
-small at this scale, larger only at high connection counts.
-
-**Experiment.** Drop-in arena allocator (`FramePool` internals replaced: CAP frames
-of one size class packed into one contiguous slab, bump-allocated, intrusive LIFO
-freelist within the slab; same public API, same `-f`/`-F` bypass). A/B vs the
-scattered freelist at 4 KB and 64 KB.
-
-**Result.**
-
-| | 4 KB cpu/1k | 64 KB cpu/1k |
+| net path (forced `aio.mode=thread`, disk cache, conns=4) | p50 | p99 |
 |---|---|---|
-| scattered freelist (baseline) | 0.0139 | 0.0204 |
-| contiguous slab (arena) | 0.0137 | 0.0201 |
-| Δ | −1.4% | −1.5% |
+| epoll (io_uring build, enabled=0) | 1.13 ms | **62.1 ms** |
+| io_uring, no doorbell | 1.11 ms | **61.6 ms** |
+| io_uring, **doorbell** | 1.07 ms | **2.21 ms** |
 
-**Conclusion.** The arena is **at most a ~1% improvement, inside run-to-run noise** —
-not a clear win. This matches the prediction and the prior adversarial review: the
-frame pool's real win was eliminating the per-op malloc/free *instruction* stream,
-which *both* allocators already do; contiguity only addresses locality, and the
-locality headroom is tiny here. Two reasons it can't be large: (1) the frame is
-already small (16 inline iovec ⇒ ~300 B), so even scattered frames touch few pages;
-(2) LIFO reuse at conns ≤ 600 keeps the hot working set to a handful of frames that
-stay cache/TLB-resident regardless of where `malloc` placed them. The whole io_uring
-dTLB *excess* over epoll is ~2 misses/req (H5: 9.5 vs 7.4); at ~20–40 cycles/walk
-that caps any contiguity win at ≈0.1% of the 42k cycles/req — so a high-connection
-campaign was not worth running. **The user's hypothesis (non-contiguity hurts) is not
-supported at this scale.** It is directionally real but immaterial; the lever that
-*would* matter (frame size) was already pulled by `IOU_FRAME_IOV=16`.
+**Fix:** arm `io_uring_prep_poll_multishot` on `thread->evfd` in the ring (re-armed on
+`!IORING_CQE_F_MORE`) — the io_uring-native `AsyncSignalEventIO`. **p99 62 → 2.2 ms,
+perf-neutral** (the poll only completes when rung). Restore `AsyncSignalEventIO` on the epoll
+fallback too.
 
----
+### A3 — the residual: locality / footprint [Transition B] [Known]
+Clean within-session n=3 A/B (same binary toggled, ~1.8M req/window):
 
-## H5 — Where the residual lives: cache + branch profile
-
-**Hypothesis.** Post-fix, io_uring does fewer instructions/req than master but
-~equal cycles; the residual is the SQ/CQ ring's cache cost. A branch-miss profile
-should show the coroutine state machine's branches; a cache profile should localize
-the misses to the ring/CQE handling.
-
-**Experiment.** `evidence2.sh` — 3 windows, request-normalized, instructions /
-cycles / branches / branch-misses / cache-misses / dTLB; plus `perf record` symbol
-diff io_uring vs master.
-
-**Result.** Per request, median of 3 windows (~1.8M reqs each, RAM%=100, same binary
-toggled):
-
-| metric / req | master (epoll) | io_uring (opt) | Δ |
+| /req | epoll | io_uring | Δ |
 |---|---|---|---|
-| instructions | 58,055 | 58,637 | **+1.0%** |
-| cycles | 41,551 | 42,386 | **+2.0%** |
-| branches | 10,568 | 10,709 | +1.3% |
-| branch-misses | 76.4 | 89.1 | **+16.6%** |
-| cache-misses | 76.1 | 96.7 | **+27%** |
-| dTLB-load-misses | 7.42 | 9.48 | **+28%** |
-| IPC | 1.396 | 1.381 | −1.1% |
-| CQE/req | 0 | 1.01 | the recv completion |
+| instructions | 58,055 | 58,637 | +1.0% |
+| cycles | 41,551 | 42,386 | +2.0% |
+| cache-misses | 76.1 | 96.7 | +27% |
+| dTLB-misses | 7.42 | 9.48 | +28% |
+| branch-misses | 76.4 | 89.1 | +17% |
 
-**Conclusion.** This **corrects** an earlier claim (recorded as "io_uring now does
-*fewer* instructions/req than master"). That comparison was across *separate*
-measurement sessions; the clean within-session n=3 A/B shows io_uring at **+1.0%
-instructions / +2.0% cycles** — still parity-class, but it does *not* do less work.
-The residual ~+2% cycles is roughly half a small instruction overhead and half a
-~1% IPC penalty, and the IPC penalty is explained by markedly worse locality:
-**+27% cache-misses, +28% dTLB, +17% branch-misses per request.** The extra cache/TLB
-footprint is the SQ/CQ rings + the CQE completion records + the heap coroutine frame
-(even at 16 entries it is touched memory master keeps on the warm stack); the extra
-branch-misses are the coroutine state machine's resume/suspend dispatch that master's
-straight-line `net_read_io`/`load_buffer_and_write` does not have. Exactly one CQE
-per request (the read recv) — the write is the sync `sendmsg`, so it generates none.
-This is the honest floor of the current design: ~2% cycles, locality-bound, not
-instruction-bound. <!-- perf record symbol diff appended below -->
+Precise/leaf (PEBS): **LLC +79%, dTLB-walk +59%, L1 ≈ 0** — a cold-line/capacity cost at
+`_read.actor` (the 528 B frame) + `submit_and_wait` (the rings), **not** L1 thrash and **not**
+control-flow (the resume jump is BTB-predicted, so it is not a branch-miss source — the intuitive
+culprit is refuted). Symbol diff: io_uring adds `_read.actor` +1.55%, `_write.actor` +1.07%,
+`submit_and_wait` +0.77%; removes epoll poll-callback + syscall-entry machinery. The honest floor
+of the current design: ~2% cycles, locality-bound, no single hot spot. **On the NIC this ~2% loss
+inverts into the −6% small-object win** (A6).
 
-_Symbol-level perf diff (io_uring − master), post-fix:_
+### A4 — async batched write [Transition A] [Known] — *actionable optimization*
+Sync `sendmsg` vs a pure async io_uring send riding the batched `submit_and_wait`:
 
-```
-io_uring ADDS (user, coroutine machinery):
-  +1.55%  IOUringNetVConnection::_read [clone .actor]
-  +1.07%  IOUringNetVConnection::_write [clone .actor]
-  +0.77%  IOUringContext::submit_and_wait
-  +0.47%  IOUringNetVConnection::_read_signal_and_update
-io_uring ADDS (kernel, ring dispatch):
-  +0.42 llist_reverse_order  +0.37 task_work_run  +0.26 fget  +0.22 io_free_batch_list
-  +0.59 asm_sysvec_reschedule_ipi  (io_uring task_work reschedule IPIs)
-io_uring REMOVES (kernel, epoll + syscall entry):
-  -0.70 entry_SYSCALL_64  -0.57 sock_poll  -0.40 fdget  -0.34 NetHandler::waitForActivity
-  -0.56 pthread_{en,dis}able_asynccancel  -0.24 copy_iovec_from_user  -0.24 _copy_from_user
-```
-
-This is the *small* post-fix version of the pre-fix diff (which had `_read.actor`
-+7.0% and `_write.actor` +4.1% — the 16 KB frame). With the frame shrunk, the residual
-is just the coroutine state machines' dispatch (resume/suspend + frame touch) and
-`submit_and_wait`, partly offset by the epoll poll-callback + syscall-entry machinery
-io_uring removes. The +0.77% in `submit_and_wait` and the reschedule-IPI lines are the
-ring's own cost. Net: the residual is genuinely the coroutine + ring machinery, ~2%,
-and there is no single hot spot left to cut — it is spread across the two `.actor`
-bodies. (The `_write.actor` line is the sync-write baseline; H6's async write trims
-its syscall-entry component.)
-
-> **On the real NIC this ~2% loopback "residual = a small loss" inverts into a win:**
-> where a syscall has real cost, io_uring's op batching beats epoll's per-op syscalls and
-> the small-object path goes **−6%** (NV1). The locality residual is below that gain.
-
----
-
-## H6 — Read primitives & cheaper writes
-
-**Hypothesis.** Without a provided-buffer ring (deferred), the only realistic read
-primitives are `recv` (1 block) and `recvmsg` (multi) — already chosen. For writes,
-the steady-state path is a sync `sendmsg` (1 syscall, no `io_uring_enter`); a pure
-async io_uring send riding the batched `submit_and_wait` would cost ~0 extra syscalls
-(amortized) but add a CQE + coroutine resume per write. Whether sync or batched-async
-wins is the question.
-
-**Experiment.** A/B the current opportunistic sync `sendmsg` vs a pure async io_uring
-send that rides the batched `submit_and_wait` (`ts-wasync`); cpu/1k at 4 KB / 64 KB
-and a syscall-level profile.
-
-**Result.**
-
-| write strategy | 4 KB cpu/1k | 64 KB cpu/1k | 64 KB p99 |
-|---|---|---|---|
-| sync sendmsg (baseline) | 0.0139 | 0.0204 | 240–600 ms |
-| pure async, batched (wasync) | **0.0136** | **0.0198** | **3–32 ms** |
-| Δ | −2.2% | −2.9% | tail collapses |
-
-_Syscall-level confirmation (per request):_
-
-| per req | sync `sendmsg` (baseline) | pure async, batched |
+| /req | sync `sendmsg` | pure async |
 |---|---|---|
-| `sendmsg` | 0.98 | **0** |
-| `io_uring_enter` | 0.345 | 0.519 |
+| `sendmsg` syscall | 0.98 | **0** |
 | total net syscalls | ~1.33 | **~0.52** |
-| CQEs | 1.01 (recv only) | 2.01 (recv + send) |
 | cycles/req | 42,671 | **41,897 (−1.8%)** |
 | IPC | 1.368 | **1.400** |
+| 64 KB write p99 | 240–600 ms | **3–32 ms** |
 
-The mechanism is exactly as hypothesized: the send SQE rides the one
-`submit_and_wait` per loop iteration, so at 120k req/s many sends batch into a single
-`io_uring_enter`; the per-request `sendmsg` syscall (0.98/req) disappears and total
-net syscalls roughly halve. Instructions tick up +0.5% (the suspend/resume) but cycles
-drop −1.8% because IPC improves (fewer syscall-entry stalls). Relative to the H5
-master baseline (41,551 cyc/req), this moves io_uring from +2.7% (sync) to **+0.8%
-(async) cycles/req**.
+The send SQE rides the one `submit_and_wait` per loop, so at load many sends batch into one
+`io_uring_enter` and the per-request `sendmsg` disappears. cpu/1k −2.2% (4 KB) / −2.9% (64 KB).
+Combined with A2 vs epoll: 4 KB +0.7% (noise), **64 KB −4.3%**, cache-MISS 1 MB +0.1%. (This
+*reversed* the earlier "sync is cheaper" finding — that held only before the frame was small
+enough to make the resume nearly free; see appendix.)
 
-**Honesty note on the metrics.** The 4 KB *cpu/1k* numbers (0.0136 wasync vs 0.0139
-baseline vs 0.0137 epoll vs 0.0138 combined) sit inside the harness's ~±1.5% cpu/1k
-noise floor and cannot, on their own, resolve a 1–2% effect — the wasync win rests on
-the *cleaner* signals: cycles/req (−1.8%, n≈1.8M-req windows, tight), syscalls/req
-(`sendmsg` 0.98→0), the 64 KB cpu/1k (−2.9%, clearer because the per-request cost is
-larger), and the 64 KB tail collapse. Treat the cycles/syscall evidence as
-load-bearing, not the 4 KB cpu/1k.
+### A5 — large-object op structure [Transition A] [Known] — *the open liability*
+Op counts per transaction (fixed sub-saturation rate):
 
-**Conclusion.** This **reverses the earlier EXP-1b finding** that sync write was ~1.2%
-cheaper. EXP-1b was measured *before* the frame
-shrink + direct-blocking fixes; on the current path the async write's CQE/resume is
-cheap (small pooled frame) and, crucially, the send SQE rides the one
-`submit_and_wait` per loop iteration — so at 120k req/s many sends batch into a single
-`io_uring_enter`, costing ~0 marginal syscalls, versus one `sendmsg` syscall per
-request on the sync path. The result is a small but consistent CPU win *and* a large
-64 KB tail-latency improvement. This is the answer to "avoid the write syscall with
-better performance": on the optimized path, batched async send is both
-syscall-light and faster. (SQPOLL — no `io_uring_enter` at all — was characterized but
-not adopted: it dedicates a kernel poller core, the wrong trade for CPU/req.)
+| | reads | writes | total ops | syscalls |
+|---|---|---|---|---|
+| 4 KB hot, io_uring | 0.86 recv | 0.85 send | 1.71 SQE | batched (<1.71) |
+| 4 KB hot, epoll | 1.95 recvmsg | 0.97 sendmsg | 2.93 | 2.93 |
+| 1 MB pass, io_uring | 28.8 recv | **28.8 send** | 57.6 SQE | **18.2 `io_uring_enter`** |
+| 1 MB pass, epoll | 35.0 recvmsg | **17.5 sendmsg** | 52.6 | 52.6 |
 
-_Combined with the doorbell (the ship candidate), vs epoll:_ 4 KB +0.7% (noise),
-**64 KB −4.3%** (io_uring wins; baseline was −2.4%, so the async write adds ~2 more
-points at medium size and collapses the 64 KB write tail: p99 16–154 ms vs epoll
-516–571 ms), cache-MISS 1 MB +0.1% (parity). So the net effect of the two changes is
-parity-or-better everywhere measured, with the medium-object regime now a clear win.
+Three facts: (1) **io_uring wins syscalls decisively** (18.2 enter vs 52.6 = 2.9× fewer; and on
+the hot path fewer ops — epoll burns an EAGAIN drain-probe recvmsg io_uring avoids). (2) **At the
+op level io_uring does ~10% more, all sends** — send/req ≈ recv/req means *one send per recv
+completion* (`READ_READY` signalled after every recv), where epoll's drain loop coalesces ~2
+reads/send. (3) **Each extra send is one extra coroutine resume** — on loopback a per-op cost
+(+17%); on the NIC a real driver `xmit` + TX-softirq (A6). A bigger MIOBuffer block does *not*
+help: CQE/req is immovable (67.6→67.0 across 8 KB→256 KB→+2 MB SO_RCVBUF) — backpressure, not
+block size, sets the recv count (appendix).
+
+### A6 — real-NIC validation [Transition A] [Known]
+Same FP binary toggled, ATS over `enp6s0` (1 GbE) → hawaii. Medians of 3 interleaved rounds.
+
+**NV1 — headline:**
+
+| workload | arm | proc cpu/1k | softirq | total | instr/req |
+|---|---|---|---|---|---|
+| 4 KB hot | io_uring | 0.0173 | 0.0108 | **0.0281** | 61,181 |
+| | epoll | 0.0185 | 0.0114 | **0.0299** | 60,426 |
+| 1 MB pass | io_uring | 0.611 | 1.369 | 1.98 | 1,142 K |
+| | epoll | 0.582 | 1.270 | 1.85 | 1,036 K |
+
+Small object **−6% (io_uring wins)** — was *parity* on loopback; the win is op batching
+(1.35 enter/req vs ~3 syscalls) where a syscall has real cost. Large object **+5–8%** — was
++17% proc on loopback with *zero* transmit cost; on the NIC the proc gap shrinks but a real
+**softirq/`xmit`** cost appears because io_uring's un-coalesced sends (A5) do ~2× epoll's
+transmits.
+
+**NV2 — send strategy isolated (epoll-only A/B, `instr/req`):**
+
+| epoll write strategy | loopback | real NIC |
+|---|---|---|
+| coalesce + `sendmsg` (master default) | 1,354 K | **1,028 K (cheapest)** |
+| no-coalesce + `send()` | **1,334 K (cheapest)** | 1,064 K |
+
+`send()` < `sendmsg()` by ~480 instr on *both* media (NIC-independent — the kernel skips
+`copy_msghdr`/`import_iovec`). But **the coalescing verdict flips sign**: a wash on loopback (no
+transmit cost), genuinely cheapest on the NIC (each transmit carries a real driver `xmit`). This
+is exactly why master coalesces — and why io_uring's per-block streaming is a NIC liability.
+
+### A7 — per-op cost isolation [both transitions] [Known]
+The 6-op matrix that produced §5. Origin-free + disk-free via the `generator` plugin: cache-hit
+GET = pure send from RAM; `/nocache/` GET = regenerated through an in-memory PluginVC (32 KiB
+blocks, makes coalescing engage); `POST 1 MiB` = generator drains the body so the only 1 MiB
+socket op is the inbound recv. cgroup `user_usec`/`system_usec` split + softirq + perf opcode
+mix; ATS on an exclusive cpuset partition, NIC IRQs isolated, 6 reps. The catalog and its four
+conclusions are in §5; the headline is the read/write asymmetry (reads ~750 ops/MiB) and that
+io_uring's deltas live in **user CPU + instructions**, not the kernel transfer.
 
 ---
 
-## H7 — Where the misses physically land (Q4, precise/leaf attribution)
+## Validation
 
-**Hypothesis.** H5 showed the residual is "locality" but attributed it only to whole
-functions via cycle sampling. *Which* misses (L1 / LLC / dTLB / branch) and *which
-leaf instructions*? And is the coroutine resume indirect-jump the branch-miss source,
-as theory predicts?
+Combined doorbell (A2) + async-write (A4) change, current working tree:
+- 4/4 io_uring autests pass (Debug): `io_uring_connect`, `io_uring_netvc`, `io_uring_read`
+  (256 KB body, multi-block — exercises the async path), `io_uring_origin_timeout` (teardown with
+  an op in flight; the async write always sets `_write_op`, so close-while-write-in-flight is
+  exercised every write).
+- ASan `-F` (freelist off → every VC/frame free visible) load + connection churn + 1 s keep-alive
+  timeout: **clean** over 1.22 M requests (no UAF / overflow / double-free).
 
-**Experiment.** Same FP binary toggled `enabled=1`/`=0` under steady 4 KB RAM-hit load
-(4 KB maximises coroutine-ops/sec, so the machinery's misses dominate over body-copy
-misses). `perf record` with **precise (PEBS)** events + fp call graph:
-`br_misp_retired.all_branches`, `dtlb_load_misses.walk_completed`,
-`mem_load_retired.l1_miss`, `mem_load_retired.l3_miss`. Leaf attribution via
-`--no-children`.
+---
 
-**Result.** Window totals (≈ per-req at equal load):
+## Appendix: ruled out — tested and dominated
 
-| event | io_uring | epoll | Δ |
-|---|---|---|---|
-| LLC (L3) load-misses | 14.2 M | 7.95 M | **+79%** |
-| dTLB page-walks completed | 28.3 M | 17.8 M | **+59%** |
-| branch mispredicts | 228.8 M | 202.0 M | +13% |
-| L1 load-misses | 1840 M | 2050 M | **≈0 (−10%)** |
+Kept as one-liners so we don't re-investigate them. Each was measured; each is dominated by a
+better option already in the design (or is null). Raw data in `~/work/io-uring-coro-bench/findings/`.
 
-Leaf (self%) sites:
-- **L3 + dTLB** concentrate in **`_read.actor`** (the 528 B heap coroutine frame) and
-  **`submit_and_wait`** (the SQ/CQ rings) — io_uring-specific; epoll's counterparts are
-  `net_read_io` + `ReadWriteEventIO::process_event`.
-- **Branch** misses are dominated in *both* arms by `nf_hook_slow` (conntrack — a
-  loopback/veth rig artifact). The io_uring-specific branch leaves are kernel-side
-  `__io_issue_sqe` / `io_sendmsg` (the send now runs inside `io_uring_enter`), replacing
-  epoll's `__x64_sys_sendmsg`. The coroutine **resume indirect-jump does not appear** as
-  a leaf.
+**Transition A (op / syscall):**
+- **Read-side write-coalescing** (accumulate reads before signalling, epoll-style). Cuts sends
+  28.8→16.1/req (below epoll) but **+6% instr/req loopback, +12% cpu on the NIC** — the async
+  write (A4) already amortized the send syscalls, so coalescing strips near-free syscalls while
+  adding a multi-block `sendmsg` scatter-gather import; and it serializes each connection into a
+  read-burst/write-burst ping-pong that **halves in-flight op concurrency** (SQE-per-enter 97→53)
+  → more event-loop iterations than the saved sends are worth. *Dominated by per-block sends; the
+  real fix is a write-side batch that preserves the interleave (§8).*
+- **Opportunistic sync recv** (MSG_DONTWAIT recvmsg, fall back to io_uring on EAGAIN). 0.0170
+  (worse) — a keep-alive read is a genuine wait, so the probe is a wasted EAGAIN syscall. *Read
+  stays pure io_uring.*
+- **Sync write** (the original opportunistic `sendmsg`). −1.2% only *before* the frame shrink;
+  once the resume was cheap, async (A4) won and collapsed the write tail. *Superseded by A4.*
+- **`sendmsg` without coalescing.** Pareto-dominated: 1,077 K instr on the NIC vs coalesce+sendmsg
+  1,028 K and no-coalesce+send 1,064 K — you pay the msghdr import *and* skip coalescing.
+- **Bigger MIOBuffer block** (8 KB→256 KB, +2 MB SO_RCVBUF). CQE/req immovable (67.6→67.0) —
+  backpressure, not block size, sets the recv count. *Not a lever.*
+- **SQPOLL.** Removes `io_uring_enter` entirely but dedicates a kernel poller core — the wrong
+  trade for cpu/req. *Characterized, not adopted.*
+- **Completion eventfd → `epoll_wait` bridge.** Pure indirection (io_uring layered on epoll);
+  removed in the baseline fixes.
 
-**Conclusion.** The residual is a **memory-footprint** cost, not a control-flow cost:
-- **L1 is unchanged** while LLC + page-walks jump — so it is a *cold-line / capacity*
-  effect (the 528 B frame and the ring pages are touched cold, once per op, on pages
-  distinct from the data buffer and the VC), **not** L1 thrash.
-- The **branch-miss theory is refuted**: the resume jump is BTB-predicted (each
-  connection resumes to the same point repeatedly); the small branch excess is kernel
-  SQE-issue, roughly a wash with epoll's syscall entry. This is a *good* surprise — the
-  coroutine dispatch is cheap; the cost is the frame+ring footprint. Refines H5.
-
-## H8 — Huge pages do not reach the io_uring path (Q3)
-
-**Hypothesis.** The dTLB-walk excess (H7) is a page-table cost; 2 MB pages should cut it.
-
-**Experiment.** Three escalating levers, measuring cpu/1k + `dtlb_load_misses/req`, and
-— critically — **verifying the ATS process actually got huge pages** (`AnonHugePages`
-in `smaps_rollup`, `HugePages_Free` drop) before trusting any delta:
-(1) THP `never`/`always`; (2) `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` + aggressive
-khugepaged; (3) ATS's own explicit-hugetlb knob `proxy.config.allocator.hugepages=1`
-with reserved `nr_hugepages`.
-
-**Result.**
-- THP (6 cells) — ATS `AnonHugePages` stayed **0** in every cell. ATS allocates through
-  its own `ink_freelist` (mmap chunks) + small brk allocations; **neither is reachable**
-  by khugepaged, THP, or the glibc malloc-hugetlb tunable. The dTLB numbers just bounce
-  in noise (even rising for epoll-always).
-- ATS hugetlb knob — *did* back **28 MB** of arena (proven: `HugePages_Free` −14 pages),
-  but produced **no cpu/1k benefit** (all cells 0.0139–0.0141). It backs the **shared
-  iobuffer arena**, so it lowers io_uring and epoll equally (not a parity lever), and
-  never touches the FramePool frames or SQ/CQ rings — the actual io_uring dTLB excess.
-- At parity the dTLB residual is **< 1% of cycles** (io_uring/epoll cpu/1k identical).
-
-**Conclusion.** Huge pages are **not a lever** for the io_uring path: the memory that
-would benefit (frames/rings) is unreachable by every stock mechanism, the working knob
-helps only shared infrastructure equally, and the ceiling is sub-1% against THP's
-compaction-jitter risk. Reaching the frames would require a code change to
-hugepage-back the FramePool — for < 1%.
-
-## H9 — Bigger MIOBuffer block does not cut the large-object op count (Q2); the large-object gap is ops-structural (Q1)
-
-**Hypothesis (from the design review).** A 1 MB cache-miss passthrough recvs in 8 KB
-blocks (`HttpSM.cc:1805`, `HTTP_SERVER_RESP_HDR_BUFFER_INDEX`), so a bigger block should
-cut recv ops as `ceil(objsize/blocksize)` — 8 KB→256 KB = ~32× fewer CQEs/coroutine
-resumes.
-
-**Experiment.** 1 MB passthrough, io_uring vs epoll, counting CQEs/req
-(`io_uring:io_uring_complete` tracepoint) and rw-syscalls/req. Then bump the origin read
-buffer 8 KB→256 KB (one line, rebuild), and pair it with a 2 MB `SO_RCVBUF`. Plus a
-FramePool on/off (`-f`) cell to separate locality from op-structure.
-
-**Result.**
-
-| arm | cpu/1k | CQE or syscalls /req |
-|---|---|---|
-| io_uring, 8 KB block | 0.6787 | 67.6 cqe |
-| epoll, 8 KB block | 0.5810 | 53.4 syscalls |
-| io_uring, 256 KB block | 0.6747 | **67.2 cqe** |
-| io_uring, 256 KB + 2 MB SO_RCVBUF | 0.6752 | **67.0 cqe** |
-| io_uring, 8 KB, FramePool **off** (`-f`) | 0.7381 | 67.7 cqe |
-
-**Conclusion.**
-- The CQE count is **immovable** by block or socket-buffer sizing (67.6→67.2→67.0).
-  This **refutes the `ceil(objsize/blocksize)` prediction** — the per-recv size is set
-  by **tunnel backpressure/flow dynamics** (the consumer drains incrementally, so each
-  recv returns ~16 KB regardless of offered space), not the block index. Bigger blocks
-  are not a lever.
-- io_uring is **+17% cpu/1k on 1 MB passthrough** — a real gap (unlike the small-object
-  parity), and it persists with the FramePool **on**. Pool-off adds +8.8%
-  (frames+iobuffers) but leaves CQE/req unchanged, so the gap is **ops-structural**: io_uring
-  does 67 single CQEs, one per coroutine resume; epoll drains the socket in a userspace
-  loop (`UnixNetVConnection.cc:542 do…while(r==rattempted)`), 53 syscalls, fewer
-  event-loop re-entries. **Frame–VC co-location targets only the locality slice the pool
-  already captures — not this gap.** The lever for the large-object case is fewer ops/req
-  (multishot recv — deferred), or a coroutine inner drain-loop.
-
-> **On the real NIC the +17% shrinks to +5–8% on proc/instr but gains a real transmit/
-> softirq component (NV1):** loopback charged the per-op resume but nothing for the
-> transmit; the NIC charges both. Same conclusion — fewer ops/req is the lever — now with
-> a hardware reason, not just a coroutine-frame one.
-
-## H10 — Mitigating the coroutine frame cost (can we make io_uring's efficiency show?)
-
-**Hypothesis.** H7 named the 528/536 B heap coroutine frame the top LLC/dTLB leaf.
-If that footprint is the thing keeping io_uring at parity rather than ahead, then
-either (a) shrinking the frame or (b) co-locating it with the VC should recover cycles
-and turn the small-object parity into a win. Two mitigations, while the code is still
-~1:1 with master (before multishot / provided buffers):
-- **Shrink:** drop `IOU_FRAME_IOV` 16→8 (the `iovec[16]` is 256 B of the 528 B frame).
-- **Frame-in-VC:** make each coroutine's frame a fixed member of the VC
-  (`_read_frame` / `_write_frame`), with a custom `operator new` that returns the
-  embedded buffer and a no-op `operator delete`. There is at most one `_read` and one
-  `_write` live per VC, and the VC already may not be freed with an op in flight, so a
-  per-VC buffer is exactly as long-lived as needed — and it removes the per-op pool
-  allocation *and* puts the frame on the VC's own cache lines. (Patch:
-  `io-uring-coro-bench/prototypes/frame-in-vc-colocation.patch`.)
-
-**Experiment.** 4 KB RAM-hit (1 frame/req) and 1 MB passthrough (frame touched ~67×/req,
-where a per-frame effect is amplified). For frame-in-VC, a **true interleaved A/B** —
-both binaries built, alternated at a fixed sub-saturation rate (4000 rps) to cancel
-drift, n=4 each — because the saturated large-object cpu/1k has a ±5–6% noise floor that
-single samples cannot see through.
-
-**Result.**
-
-| mitigation | workload | cpu/1k | vs baseline |
-|---|---|---|---|
-| `IOU_FRAME_IOV` 16→8 (frame 528→400 B) | 4 KB hot | 0.0144 | +1% (noise / slightly worse) |
-| frame-in-VC | 4 KB hot | 0.0142–0.0146 | flat |
-| frame-in-VC (interleaved, fixed rate) | 1 MB passthrough | 0.4695 med | base 0.4719 med — **−0.5%, within noise** |
-
-The first 1 MB frame-in-VC sample read −4.7%; reps 2–4 read +5–7%. The interleaved A/B
-(base {0.457, 0.464, 0.480, 0.480} vs coloc {0.456, 0.459, 0.480, 0.527}) settles it:
-the distributions overlap; the median gap is 0.5%, inside the noise floor.
-
-**Conclusion.** **Neither mitigation moves cpu/1k** — the frame cost is already paid down:
-- **Shrinking is a dead end.** The cost was never the frame's *size* — H7's top dTLB
-  leaves were `freelist_new`/`thread_alloc` (the *allocation*) and the cold frame line,
-  not the byte count. Below iov=16 you lose op-coverage (H1) for no locality gain.
-- **Frame-in-VC is correct and clean but perf-neutral.** The FramePool (LIFO, thread-local)
-  already keeps the frame hot: the alloc is a cheap inline pop and the reused frame is
-  cache-resident at steady state, so removing the pool and co-locating saves nothing
-  measurable — even at 67 frames/req. And it would **cost 1.28 KB on every VC**
-  (`_read_frame` + `_write_frame`), borne by all connections including idle keep-alives,
-  whereas the pool holds frames only for *active* ops. Worse memory scaling for no perf.
-
-So the frame is **not** what holds io_uring back. The only remaining lever is the one H9
-points to — fewer ops/req (multishot recv / provided buffers, deferred) — which attacks
-the per-op CQE/resume *structure*, not the frame. **Recommendation: keep the FramePool;
-do not adopt either mitigation.** The experiment is the value: it proves the frame cost is
-already neutralized.
-
-## H11 — Op-count audit: io_uring trades syscalls for ops, and its writes are un-coalesced
-
-**Hypothesis.** The "1:1 with master" port should issue one SQE per recv/send that epoll
-issues as a syscall. Is that true op-for-op — and is the +17% large-object cost partly an
-op-count regression rather than just per-op locality?
-
-**Experiment.** Count io_uring SQEs by opcode (`io_uring:io_uring_submit_req` op_str) and
-`io_uring_enter` syscalls, vs epoll's recvmsg/sendmsg, per transaction, at a fixed
-sub-saturation rate. 4 KB RAM-hit (client I/O only) and 1 MB passthrough (origin read +
-client write). The epoll path uses `recvmsg`/`sendmsg` (`UnixNetVConnection.cc:537,855`),
-not readv/writev — so the syscall set is captured exactly.
-
-**Result.**
-
-| | reads | writes | total ops | actual syscalls |
-|---|---|---|---|---|
-| **4 KB hot** io_uring | 0.86 recv | 0.85 send | **1.71 SQE** | (batched, < 1.71) |
-| 4 KB hot epoll | 1.95 recvmsg | 0.97 sendmsg | **2.93** | 2.93 |
-| **1 MB pass** io_uring | 28.8 recv | **28.8 send** | 57.6 SQE | **18.2 `io_uring_enter`** |
-| 1 MB pass epoll | 35.0 recvmsg | **17.5 sendmsg** | 52.6 | 52.6 |
-
-**Conclusion.** Three distinct facts the loose CQE count had blurred:
-- **At the syscall level io_uring wins decisively** — 1 MB passthrough: 18.2 `io_uring_enter`
-  vs 52.6 syscalls (**2.9× fewer**); its 57.6 SQEs batch ~3.2-to-1. On the hot path it also
-  does *fewer ops* (1.71 vs 2.93): epoll burns an extra recvmsg/req on the EAGAIN
-  drain-probe that io_uring's "submit one recv and wait" avoids.
-- **At the op level io_uring does ~10% more ops on the passthrough, and the increase is
-  *sends*** (28.8 vs 17.5, +64%). The tell: io_uring's send/req (28.80) ≈ recv/req (28.81)
-  — **one send per recv completion**, ~36 KB each; epoll coalesces ~2 reads into one ~60 KB
-  send. Mechanism: each origin recv completion reenables the client write VIO, which fires
-  `net_write_io` with just that one block available (`IOUringNetVConnection.cc:377` signals
-  `READ_READY` after *every* recv); epoll's synchronous read loop pulls several blocks into
-  the buffer before the write side runs, so its write batches them.
-- **Why it costs:** each extra send is one extra CQE = one extra coroutine resume paying the
-  H7 frame+ring footprint — so the ~11 un-coalesced sends/req are a real slice of the +17%
-  large-object gap, *not* via syscalls (those are down) but via per-op coroutine cost. This
-  is a 1:1-with-master-shaped lever (make the io_uring read accumulate before signalling,
-  like epoll's drain loop) — see H12.
-
-> **On the real NIC this is the one place io_uring genuinely loses (NV1):** the extra sends
-> are ~free on loopback but each is a real driver `xmit` + TX-completion, so io_uring runs
-> **+5–8%** on the 1 MB path. The read-accumulation lever (H12) loses on both media though
-> (it halves op concurrency, NV3) — the fix is a write-side batch or multishot recv.
-
-## H12 — Write-coalescing: cuts the op count but *raises* CPU (rejected)
-
-**Hypothesis.** H11 found io_uring issues ~64% more sends than epoll (one send per recv
-completion). Coalescing them — so the downstream write batches blocks like epoll's drain
-loop does — should cut coroutine resumes and recover cycles on the large-object path.
-
-**Experiment.** Make `_read` accumulate before signalling: on a *full* recv (more may be
-buffered) loop and read again WITHOUT signalling `READ_READY`; signal only on a short read
-(socket drained), `READ_COMPLETE`, or a full buffer (consumer must drain). This mirrors
-`UnixNetVConnection`'s synchronous recv-until-short-read drain, so the tunnel forwards N
-blocks at once and `_write` coalesces them. Op-count + interleaved fixed-rate cpu A/B on
-the 1 MB passthrough; instr/req as the clean (low-noise) discriminator.
-
-**Result.**
-
-| | sends/req | total ops/req | cpu/1k med | instr/req |
-|---|---|---|---|---|
-| baseline (per-block sends) | 28.8 | 57.6 | 0.450 | ~1.345 M |
-| coalesced | **16.1** | 44.9 | 0.459 | **~1.425 M (+6%)** |
-| epoll (ref) | 17.5 | 52.6 | — | — |
-
-The coalescing *works* — sends fall 28.8→16.1 (below epoll's 17.5), the tally flips from
-single-block `SEND` to multi-block `SENDMSG`, total ops drop below epoll. **But cpu/1k rises
-~2% and instr/req rises a clean, non-overlapping +6%** (reverting restores 1.36 M, proving
-it's the change, not drift).
-
-**Conclusion. Reject — and it's an instructive negative that *validates H6.*** Fewer ops did
-not mean less CPU; the opposite. Because the **async batched write (H6) already amortizes the
-send syscalls** (the 28.8 sends batch ~3:1 into `io_uring_enter`), coalescing removes syscalls
-that were already nearly free while *adding* a kernel cost. An instruction-level `perf diff`
-localizes it: a single contiguous block goes via `prep_send` → the kernel does `import_ubuf`
-(one pointer, no copy); coalescing N *non-contiguous* `IOBufferBlock`s forces `prep_sendmsg` →
-`copy_msghdr_from_user` + **`copy_iovec_from_user`** + `__check_object_size`/`check_heap_object`
-on the scatter-gather array (all newly present in the coalesced profile, ~absent in baseline),
-plus a smaller buffer-growth tax (`kmem_cache_alloc_node` from holding reads before draining).
-The user side *saves* a little (fewer `_write`/tunnel/signal calls) but the kernel scatter-gather
-import outweighs it — net +6% instr/req, diffuse across the whole `sendmsg` chain (no hot spot).
-The simple per-block `prep_send` is genuinely cheap; keep it. (Also re-confirms H7: the per-op
-cost is small, so cutting ops buys little — and here it backfires.)
-
-## Real-NIC validation (hawaii, 1 GbE) — the loopback findings on real hardware
-
-All of H1–H12 above were established on **loopback**, where a syscall is cheap and a
-"transmit" is a memory enqueue. This section re-runs the NIC-sensitive findings against a
-real driver: ATS on the i9 over `enp6s0` (atlantic, 1 GbE) to a separate client host
-`hawaii` (M1 Mac Mini, `wrk`). Same FP binary, `io_uring.enabled` toggled. Medians of 3
-interleaved rounds, 20 s windows.
-
-### NV1 — Headline: io_uring wins small objects, loses large ones
-
-| workload | arm | proc cpu/1k | softirq cpu/1k | total | instr/req | ops/req |
-|---|---|---|---|---|---|---|
-| **4 KB hot** | io_uring | 0.0173 | 0.0108 | **0.0281** | 61,181 | 1.35 `io_uring_enter` |
-| (cache hit) | epoll | 0.0185 | 0.0114 | **0.0299** | 60,426 | ~3 syscalls (2 recvmsg + 1 sendmsg) |
-| **1 MB pass** | io_uring | 0.611 | 1.369 | 1.98 | 1,142 K | 38.7 `io_uring_enter` |
-| (origin) | epoll | 0.582 | 1.270 | 1.85 | 1,036 K | ~57 syscalls (35.7 recvmsg + 21.2 sendmsg) |
-
-- **Small object (4 KB): io_uring −6% total** (0.0281 vs 0.0299). On loopback this was
-  *parity* (+0.7%). The win is io_uring's op batching: **1.35 `io_uring_enter`/req vs
-  epoll's ~3 syscalls** (epoll even wastes an EAGAIN-probe recvmsg, H11). io_uring runs
-  *slightly more instructions* (+1.2%) but far fewer syscalls, and on real hardware the
-  syscall is expensive enough that the trade is a net win. **This is the clean
-  demonstration of io_uring efficiency we were chasing — it just needed a real NIC to
-  show.**
-- **Large object (1 MB): io_uring +5–8% on the reliable metrics** (proc +5%, instr/req
-  +10%; softirq also higher but noisy). On loopback this was +17% proc with *zero*
-  transmit cost. On the NIC the proc gap shrinks but a new **softirq** cost appears,
-  because io_uring's un-coalesced "one send per recv" (H11) does ~2× epoll's transmits
-  (epoll coalesces to ~21 sendmsg/req; io_uring streams per-block). Each extra transmit
-  is a real driver `xmit` + TX-completion. **io_uring's send pattern is a genuine
-  large-object liability on real hardware** — invisible on loopback.
-
-### NV2 — Why: per-syscall and per-transmit cost, isolated (epoll send-strategy A/B)
-
-To separate the two NIC costs from everything else, an epoll-only experiment varied just
-the write strategy (forcing single-block sends to make the choice fire), measured by
-`instr/req` (the clean metric):
-
-| epoll write strategy | sends/req | loopback instr/req | real-NIC instr/req |
-|---|---|---|---|
-| coalesce + `sendmsg` (master default) | ~18–20 multi-block | 1,354 K | **1,028 K** |
-| no-coalesce + `sendmsg` | ~34–39 single-block | 1,351 K | 1,077 K |
-| no-coalesce + `send()` | ~34–39 single-block | **1,334 K (cheapest)** | 1,064 K |
-
-- **`send()` < `sendmsg()`** by ~480 instr/send on *both* media (the kernel skips
-  `copy_msghdr_from_user` + `import_iovec`). This is NIC-independent — it's the syscall's
-  own work. Master always uses `sendmsg`, even for one block, so it leaves this on the
-  table; but in practice master's responses are ≥2 blocks (headers + body), so `niov==1`
-  rarely fires for it — the fast path is only reachably valuable for io_uring's per-block
-  streaming, where `prep_send` already uses it.
-- **The coalescing verdict *flips sign* between media.** On loopback, no-coalesce+`send`
-  was the *cheapest* (coalescing was a wash — fewer syscalls offset by bigger
-  `import_iovec`). On the **real NIC, coalescing is cheapest** (1,028 K vs 1,064–1,077 K):
-  each transmit carries a real driver `xmit` cost, so doing ~2× the sends costs ~2× that
-  work. Loopback's "coalescing ≈ wash, don't bother" was a loopback artifact; on real
-  hardware coalescing is the right strategy — which is exactly why master coalesces.
-
-### NV3 — H12 re-test on the NIC: read-side coalescing still loses
-
-Given NV1/NV2, the natural question: does making **io_uring** coalesce (the H12 read-side
-change — accumulate reads before signalling `READ_READY`, so the write batches) help on
-the NIC, where coalescing pays? **No — still a pessimization** (1 MB pass, NIC):
-
-| io_uring variant | total cpu/1k | `io_uring_enter`/req | CQEs/req |
-|---|---|---|---|
-| per-block (current) | **1.91** | 37.96 | 67.4 |
-| read-coalesced (H12) | 2.14 | **53.2** | 56.3 |
-
-Coalescing *did* cut CQEs (67→56, as intended — fewer sends), yet it **raised
-`io_uring_enter` 38→53**. That looks contradictory until you see that `io_uring_enter` is
-not "submits": `submit_and_wait` makes **one** `io_uring_enter` per event-loop iteration,
-draining *all* currently-ready CQEs and submitting the SQEs they queued. So the count
-tracks **how many completions are ready per wake — i.e. in-flight op concurrency** — not
-op volume. The coalescing turns each connection into a **read-burst / write-burst
-ping-pong**: the read fills the buffer with no signal, then at `write_avail()<=0` it
-signals and *stalls* (top of the loop finds no space → `read_disable`) while the write
-drains, then re-arms. At almost every instant only **one direction** is in flight per
-connection. Per-block has no such stall — each recv immediately frees one block into a
-send, so the buffer never fills, the read never waits, and read **and** write are *both*
-continuously in flight (~2 ops/conn). Half the in-flight concurrency → completions arrive
-in smaller batches → more iterations for fewer ops. Measured directly on **loopback**
-(1 MB pass), where it is the same effect, not a NIC quirk:
-
-| loopback, 1 MB pass | enter/req | SQE/req | **SQE-per-enter** |
-|---|---|---|---|
-| per-block | 0.69 | 67.3 | **97** |
-| coalesced | 0.99 | 52.6 | **53** |
-
-Fewer total ops (67→53) but **half the batching** (97→53 ops drained per `io_uring_enter`)
-→ more iterations. (The absolute `enter/req` differs wildly between media — ~0.7 on
-saturated loopback, ~38 on the under-loaded 1 GbE box — because batching depth scales with
-load, not because the mechanism differs.) So H12's verdict holds on the NIC, now for a
-*precise* reason: read-side coalescing halves op concurrency, which costs more event-loop
-iterations than the saved sends are worth. The large-object liability (NV1) is real, but
-**read-side coalescing is not its fix**; a write-side batch that leaves the read loop and
-its read↔write interleave alone, or multishot recv, would be the lever.
-
-### NV4 — Per-finding status on the real NIC
-
-| finding | NIC status |
-|---|---|
-| H1 iovec/frame size | **NIC-independent** — frame size is a cache effect; iov16 stays optimal. The op-count side is gated by signalling (H11), not iovec capacity. |
-| H2 cross-thread doorbell | **NIC-independent** — internal thread wakeup; correctness fix unchanged. |
-| H3 real TCP (veth) | **superseded** by this section (a real driver, not just MTU-1500 software TCP). |
-| H4 frame contiguity | **NIC-independent** — cache; null on both. |
-| H5/H7 residual / parity | **corrected**: loopback "parity" → io_uring **−6% win** on the NIC small-object path (syscall batching). |
-| H6 async batched write | **confirmed, benefit grows**: it's *why* io_uring batches to 1.35 enter/req and wins NV1; syscall amortization matters more on the NIC. |
-| H8 huge pages | **NIC-independent** — dTLB; not a lever. |
-| H9 large-object gap | **confirmed + sharpened**: the gap persists (+5–8%) and now has a transmit/softirq component from un-coalesced sends. |
-| H10 frame-cost mitigations | **NIC-independent** — cache/allocation; perf-neutral on both. |
-| H11 op-count (more sends) | **confirmed as a real cost**: the extra sends are ~free on loopback but cost driver `xmit` + softirq on the NIC (NV1 large-object loss). |
-| H12 write-coalescing | **still rejected** (NV3), now for a batching-disruption reason, not a syscall-cost one. |
-
-**Net:** loopback was right about every CPU/cache/frame mechanic and wrong, in both
-directions, about anything gated by syscalls or transmits. The real NIC turns io_uring's
-"parity" into a **small-object win** and exposes a **large-object send-pattern liability**
-that loopback hid.
-
-## Validation & recommendations
-
-**Validation (combined doorbell + async-write change, current working tree):**
-- 4/4 io_uring autests pass (Debug): `io_uring_connect`, `io_uring_netvc`,
-  `io_uring_read` (256 KB body, multi-block write — exercises the async path),
-  `io_uring_origin_timeout` (teardown with an op in flight — and the async write now
-  *always* sets `_write_op`, so the close-while-write-in-flight path is exercised on
-  every write, not just on EAGAIN).
-- ASan `-F` (freelist off, so ASan sees every VC/frame free) load + connection churn +
-  1 s keep-alive timeout: **clean** — no use-after-free / overflow / double-free over
-  1.22 M requests.
-
-**Recommendations.**
-1. **Keep the cross-thread doorbell (H2).** It is a correctness fix for a real
-   regression the io_uring branch introduced (cross-thread work stalls to the 60 ms
-   heartbeat), it is provably perf-neutral, and it is the right way to be "fully
-   io_uring without the eventfd". Follow-up: the io_uring build's *epoll fallback*
-   (`enabled=0`) still lacks `thread->evfd` registration — restore `AsyncSignalEventIO`
-   there for symmetry.
-2. **Adopt the async batched write (H6)** — but knowingly, since it reverses EXP-1b.
-   It removes the per-request `sendmsg`, is −1.8% cycles/req, and collapses the medium-
-   object write tail; validated above. Keep the existing `-F`/ASan teardown test as the
-   guard (the always-in-flight `_write_op` makes that path hotter).
-3. **Keep `IOU_FRAME_IOV=16` (H1).** Confirmed optimal across sizes.
-4. **Do not pursue the frame arena (H4)** — no measurable benefit at this scale.
-5. The loopback residual ~+2% cycles (H5; ~+0.8% with the async write) is locality in the
-   coroutine `.actor` bodies + the ring. **On the real NIC this stops being the story
-   (NV1): io_uring *wins* the small-object hot path by −6%** because its op batching beats
-   epoll's per-op syscalls where a syscall is actually expensive. So the small-object case
-   is no longer "reach parity" — it's already a win on real hardware, and the residual
-   locality is below the syscall-batching gain.
-6. **Do not chase the frame footprint (H7/H8/H10).** Huge pages can't reach the io_uring
-   allocations (H8); shrinking the frame is a dead end (H10); frame-in-VC is perf-neutral
-   and costs per-connection memory (H10). The FramePool already neutralizes the frame
-   cost. This holds on both media — the frame is a cache effect the NIC doesn't change.
-7. **The real open lever is io_uring's send pattern on large objects (H9/H11 → NV1).** On
-   loopback it reads as a +17% per-op-resume cost; on the NIC it is a real **transmit**
-   cost — io_uring's un-coalesced "one send per recv" does ~2× epoll's driver `xmit` +
-   TX-completion (NV1, +5–8%). The naive fix (read-side coalescing, H12) loses on *both*
-   media — it halves in-flight op concurrency and so costs more event-loop iterations than
-   the saved sends are worth (NV3). The right lever is a **write-side batch that preserves
-   the read↔write interleave**, or **multishot recv + provided buffers** (deferred). This
-   is the one place io_uring is genuinely behind epoll on real hardware, and it is
-   workload-specific (large streaming bodies, not the small-object hot path).
-8. **Bottom line for shipping:** on a real NIC, io_uring is a **net win on the dominant
-   small-object/keep-alive traffic** and a **bounded loss on large streaming bodies**;
-   loopback's "parity" undersold both halves. Gate behind `net.io_uring.enabled` (done),
-   default off until the large-object send-batching lever lands and TLS + 10k-conn memory
-   are measured.
+**Transition B (frame / memory):**
+- **iovec extremes.** iov=1 (+10.5% at 64 KB, extra ops) and iov=1024 (+3.8% at 64 KB / +2% at
+  1 MB, 16 KB frame bloat). *Dominated by iov=16 (A1).*
+- **Frame contiguity (slab arena).** ≈ scattered LIFO freelist (±1%, noise) — the frame is small
+  (~300–528 B) and LIFO reuse keeps it resident. *Null.*
+- **Shrink `IOU_FRAME_IOV` 16→8.** Dead end — the cost is the *allocation*, not the byte count;
+  below 16 you lose op-coverage (A1) for no locality gain. *Null.*
+- **Frame-in-VC** (embed `_read_frame`/`_write_frame` in the VC, drop the pool). Correct + clean
+  but **−0.5% (within noise)** — the pool already keeps the frame hot — and costs **1.28 KB on
+  every VC** (worse memory scaling for idle keep-alives). *Keep the pool.*
+- **Huge pages.** THP / glibc-`malloc.hugetlb` can't reach ATS's `ink_freelist`/brk allocations
+  (`AnonHugePages=0`); the working ATS hugetlb knob backs only the shared iobuffer arena (lowers
+  both arms). dTLB residual is <1% cpu anyway. *Not a lever.*
