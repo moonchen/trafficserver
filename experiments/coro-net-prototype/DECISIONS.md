@@ -550,3 +550,33 @@ removal of the stale-VIO crash class. Caveat: at 1500 MTU reads are MTU-paced (~
 so 8 KB provided buffers run ~18% full --- the late-binding memory win is for idle
 connections (not measured here, saturated-CPU test). Harness: io-uring-coro-bench/scripts/
 measure-read-ab.sh + setup-box.sh.
+
+### Idle-connection memory: provided vs recvmsg vs epoll (2026-06-26)
+
+The provided-buffer memory question (CPU is parity, the value is memory): with many IDLE
+keep-alive connections, io_uring keeps a recv armed per connection. Does the provided
+shared ring avoid the per-connection read buffer that the recvmsg drive pins? Measured by
+holding N idle keep-alive conns (loopback holder) and reading ATS per-allocator in-use
+(ink_freelists_dump) + RSS, for all three read drives on one fp binary. N=10000:
+
+| per-conn allocator           | epoll      | io_uring recvmsg | io_uring provided |
+|------------------------------|------------|------------------|-------------------|
+| read buffer ioBufAllocator[5]| 4.0 KB     | 4.0 KB           | 0                 |
+| VC (netVC / ioUringNetVC)    | 1.51 KB    | 1.56 KB          | 1.56 KB           |
+| session (http1ClientSession) | 1.02 KB    | 1.02 KB          | 1.02 KB           |
+| fixed per-thread ring        | --         | --               | ~33 MB (4096x8K)  |
+
+Finding: epoll AND recvmsg each pin one 4 KB session read buffer per idle connection
+(10000 in-use 4 KB blocks for 10000 conns); the recvmsg armed recv REUSES the session
+block (no second buffer). provided holds ZERO --- its data lands in the shared ring,
+released after each request, so an idle connection's read buffer is empty. So provided
+saves ~4 KB/idle-conn vs BOTH (not io_uring-specific: epoll holds it too; provided's shared
+ring is what removes it). VC + session memory identical across modes. The 4 KB is traded
+for a FIXED ~33 MB/thread ring (faults into RSS during the test, which is why raw dRSS/conn
+looked flat ~10 KB at 10k): it amortizes --- ~3.3 KB/conn at 10k (~cancels the 4 KB saved),
+~0.3 KB/conn at 100k (4 KB/conn saving dominates, ~370 MB saved); below ~4k conns the ring
+costs more than it saves. Net: provided wins memory in the many-idle-connections regime
+(conns >> ring buffers), wash/loss at low counts. Bounded here by the small 4 KB header
+buffer; larger held read buffers would widen the saving. Caveat: both io_uring modes carry
+a per-conn suspended coroutine frame epoll lacks (does not amortize). Harness:
+io-uring-coro-bench/scripts/measure-idle-mem.sh + idle_holder.py.
