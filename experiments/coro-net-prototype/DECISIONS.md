@@ -525,3 +525,28 @@ recorded above — a dead end for the shared-ring read path.
 - Targeted close-with-recv-in-flight test (e.g. inactivity timeout while a
   keep-alive read is armed) — the deferred path is currently exercised only
   incidentally by load churn.
+
+### Real-NIC perf: single-shot provided-buffer read path (2026-06-26)
+
+A/B/C on the real NIC (enp6s0/atlantic 1GbE, ATS pinned to P-cores 0,2,4,6 via cgroup;
+wrk on hawaii), POST 1 MiB -> generator so the client-facing read path is the dominant
+work. Three read drives as runtime flags on one fp Release binary, 5 reps, medians:
+
+| read drive            | cpu/1k | vs epoll | instr/req | cyc/req | read syscalls/req |
+|-----------------------|--------|----------|-----------|---------|-------------------|
+| epoll (recvmsg)       | 4.610  | --       | 13.89M    | 11.20M  | 1456 recvmsg      |
+| io_uring recvmsg      | 4.131  | -10.4%   | 13.01M    | 9.67M   | 0 (744 enter)     |
+| io_uring provided-buf | 4.188  | -9.2%    | 13.16M    | 9.82M   | 0 (713 enter)     |
+
+All NIC-bound at 114 req/s (~93% of line rate); throughput and p99 (~536 ms, pure NIC
+queueing at c64x1MB) identical across modes, so CPU/req is the differentiator. Both
+io_uring drives beat epoll ~9-10% cpu/req (-13% cyc/req) by turning ~1456 recvmsg
+syscalls/req into SQEs. The provided-buffer drive is at parity with the recvmsg drive
+(+1.4% cpu/1k, consistent across all 5 reps) --- the cost is userspace bookkeeping
+(RingBufferData alloc/recycle + buf_ring add/advance), NOT syscalls (provided issues
+slightly fewer io_uring_enter, 713 vs 744). The +1.4% buys idle-connection late binding
+(no read buffer held while idle), fair shared-pool use, per-connection backpressure, and
+removal of the stale-VIO crash class. Caveat: at 1500 MTU reads are MTU-paced (~1.45 KB),
+so 8 KB provided buffers run ~18% full --- the late-binding memory win is for idle
+connections (not measured here, saturated-CPU test). Harness: io-uring-coro-bench/scripts/
+measure-read-ab.sh + setup-box.sh.
