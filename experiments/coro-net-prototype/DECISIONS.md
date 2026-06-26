@@ -466,6 +466,55 @@ recv into it, drop read-readiness, and a cheap self-contained first win:
 re-pinning (no format/lifetime change). Full NIC→disk zero-copy is blocked by O_DIRECT
 alignment, not by io_uring. Code committed as WIP, flag off by default.
 
+### Verdict (2026-06-26): abandon multishot read; use single-shot + provided buffers
+
+A keep-alive POST workload crashed multishot read at `ink_assert(0)` (Http1ClientSession
+`state_keep_alive` got a bogus `VC_EVENT_READ_COMPLETE`). Root cause: multishot must
+cancel + drain to stop the armed stream, which inserts a `co_await` suspension between
+*deciding* the read is complete (`ntodo<=0`) and *signaling* `READ_COMPLETE`. During that
+suspension the connection's response WRITE completes, the tunnel injects its own
+`READ_COMPLETE` (`HttpTunnel.cc:1539`) and `Http1ClientSession::release` issues
+`do_io_read(INT64_MAX)` for keep-alive — reassigning `read.vio` — so the deferred
+`READ_COMPLETE` lands on the keep-alive VIO. Epoll/single-shot never hit this: they
+compute-and-signal in one non-suspending pass, re-checking `ntodo()/enabled` after each
+callback (`UnixNetVConnection.cc:591/601/608`).
+
+The violated contract is real, not incidental: "no read events after the read is
+stopped/disabled/completed" is documented (`do_io_shutdown`/`do_io_close` "MUST NOT send
+any further events"; `reenable`; INV-R5), assumed by consumers (survey: 17 fatal
+`ink_assert(0)`/`ink_release_assert(0)` handlers on an unexpected read event vs 3
+defensive), and structurally provided by the epoll path.
+
+The stale signal is suppressible (signal before the drain; re-validate the VIO), but the
+deeper problem is structural and unavoidable: with a SHARED provided-buffer ring (`bgid`
+is 16-bit; prod has >>64k conns, so per-connection rings are impossible) the only way to
+apply *per-connection* backpressure to a multishot — stop one slow connection without
+`-ENOBUFS`-starving the shared pool for the others — is to CANCEL its op. Verified against
+kernel 6.17: no throttle/pause/partial-consumption feature does it (`IOU_PBUF_RING_INC`
+6.12, `REGISTER_PBUF_STATUS` 6.8, `RECVSEND_BUNDLE` 6.10 all checked and rejected), and no
+prior-art server does no-cancel per-connection backpressure on a shared multishot ring
+(the runtimes that get free backpressure use owned-buffer single-shot). And
+cancel-for-backpressure must STAGE the in-flight bytes the drain would otherwise drop —
+the current drain `recycle()`s them (`IOUringNetVConnection.cc:719`), a latent data-loss
+bug masked today only because cancel fires solely at end-of-read, where the recv is armed
+waiting and nothing is in flight.
+
+So multishot read needs the full apparatus — proactive cancel per throttle, a bounded
+staging buffer, deferred re-arm, the in-flight-after-cancel race — to buy one thing: SQE
+collapse on large streaming reads (~1 arm vs ~750 single-shot recvs/MiB). That win
+concentrates entirely in large reads, while proxy traffic is dominated by small keep-alive
+reads where the economics invert (arm + throttle-cancel = 2-3 ops vs single-shot's 1).
+
+**DECISION:** drive reads with SINGLE-SHOT recv + provided buffers (the existing
+`ReadBufRing` infra, demand-driven). Per-connection backpressure is free — don't submit the
+next recv; nothing is armed, so nothing to cancel, no window, no stale-VIO crash, no
+interleave, no stage. It keeps the provided-buffer late binding (the kernel picks a ring
+buffer only when data is ready, so idle keep-alive connections hold no read buffer), caps
+each connection to ~1 in-flight buffer (fair shared-pool use vs multishot's `F_MORE`
+bursts), and caps each recv to `min(ntodo, bufsize)`. Cost: +1 SQE per read vs multishot,
+but an SQE build is not a syscall (batched submit amortizes it). Multishot stays only as
+recorded above — a dead end for the shared-ring read path.
+
 ## Open / pending decisions
 
 - Whether/when to go fully completion-driven for reads/writes (drop epoll

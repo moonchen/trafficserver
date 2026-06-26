@@ -105,11 +105,12 @@ private:
   ts::iouring::DetachedTask _write();
   ts::iouring::DetachedTask _connect();
 
-  // Experimental read drive (proxy.config.net.io_uring.read_multishot): one armed
-  // multishot recv against a shared per-thread provided-buffer ring, attaching each
-  // kernel-filled buffer to the read MIOBuffer zero-copy (recycled when the consumer
-  // releases it). -ENOBUFS is the backpressure signal. Selected in net_read_io.
-  ts::iouring::DetachedTask _read_multishot();
+  // Read drive (proxy.config.net.io_uring.read_provided_buffers): demand-driven
+  // single-shot recv that selects a buffer from a shared per-thread provided-buffer
+  // ring (late binding), attaching each kernel-filled buffer to the read MIOBuffer
+  // zero-copy (recycled when the consumer releases it). Capped to ntodo; -ENOBUFS is
+  // the backpressure signal. Selected in net_read_io.
+  ts::iouring::DetachedTask _read_provided();
 
   // Reimplementations of the file-static read_signal_* / write_signal_* helpers in
   // UnixNetVConnection.cc (not visible here). Same recursion/closed/free contract.

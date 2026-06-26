@@ -352,10 +352,20 @@ public:
     return _result;
   }
 
+  // CQE flags from the last completion. For a provided-buffer (IOSQE_BUFFER_SELECT)
+  // op, the selected buffer id is `flags() >> IORING_CQE_BUFFER_SHIFT`. Valid after
+  // the co_await returns (the awaitable outlives the resume).
+  unsigned
+  flags() const noexcept
+  {
+    return _flags;
+  }
+
   void
   handle_complete(io_uring_cqe *cqe) override
   {
     _result = cqe->res; // bytes / accepted-fd on success, -errno (or -ECANCELED) on failure
+    _flags  = cqe->flags;
     // Resume on the owning EThread (this CQE drained on the same thread that
     // submitted it). Touch nothing after this: resuming may run the coroutine
     // past the co_await and destroy *this (the awaitable temporary).
@@ -366,6 +376,7 @@ private:
   Prep                    _prep;
   std::coroutine_handle<> _waiter{};
   int                     _result{0};
+  unsigned                _flags{0};
 };
 
 template <typename Prep> UringOp(Prep) -> UringOp<Prep>;
