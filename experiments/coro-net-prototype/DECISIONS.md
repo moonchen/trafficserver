@@ -660,3 +660,35 @@ send rejected (no multishot send exists; BUNDLE == the coalesced sendmsg we alre
 
 Kept flag-gated + OFF by default: correct, validated, and a ready fast-NIC lever. Harness:
 io-uring-coro-bench/scripts/measure-write-zc-ab.sh.
+
+#### Correction (2026-06-26): the SEND_ZC loss is the IOMMU, not memory bandwidth / NIC speed
+
+The "1GbE is not memory-bandwidth-bound" reasoning above is WRONG. System-wide perf profiling
+(measure-write-zc-ab + profile-write-zc-sys, atlantic NIC -> hawaii) traced the +171% to the
+IOMMU. Cost by mechanism (system-wide self%, summed across cores):
+
+| mechanism                         | noz (copy) | zc (send_zc) |
+|-----------------------------------|-----------:|-------------:|
+| IOMMU / DMA-map (__domain_mapping,clflush) | 4.37 | **8.80** |
+| payload copy (_copy_from_iter)    | 1.57       | 0.04         |
+| skb page alloc/zero (clear_page)  | 2.80       | 0.03         |
+| io_uring enter/CQE                | 0.43       | 0.71         |
+| pin/unpin pages                   | 0.00       | 0.30         |
+| ZC notification                   | 0.01       | 0.12         |
+
+Root cause: this box runs Intel VT-d in TRANSLATE mode (default domain type DMA-FQ on all 19
+groups incl. the NIC). So the NIC cannot DMA from the app's cache pages without a per-send
+IOMMU mapping (__domain_mapping + clflush of the PTEs) on submit + an unmap on ACK. The copy
+path avoids this because its skb pages come from a RECYCLED kernel pool whose IOMMU mappings
+are reused; send_zc's source is the per-request cache blocks --- different physical pages each
+send --> a FRESH mapping every time, uncacheable. The IOMMU-map share DOUBLED (4.4 -> 8.8%) and
+exceeded the copy+page-zero it removed (~4.3%). NIC speed is NOT the driver (the per-send cost
+is fixed); the IOMMU per-send translation is.
+
+Prod relevance: DMA-FQ is the distro DEFAULT (device isolation), NOT what a throughput-tuned
+prod host runs. CDN/NFV/hyperscaler hosts boot iommu=pt (passthrough) or IOMMU off precisely
+to avoid per-DMA translation. So this result is PESSIMISTIC vs prod. Untested hypothesis: under
+iommu=pt (or send_zc_fixed with the cache region registered = mapped once), the __domain_mapping
+cost vanishes and send_zc should flip to a win (removes the copy for ~free). This box's NIC is
+alone in IOMMU group 18, so a runtime switch to an identity domain (no reboot) is feasible to
+test. Field survey prompt: research/zerocopy-write-landscape-prompt.md.
