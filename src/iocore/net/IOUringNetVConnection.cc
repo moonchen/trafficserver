@@ -42,6 +42,15 @@
 
 using ts::Metrics;
 
+// Zero-copy-send constants, in case the kernel uapi header pulled in by liburing predates
+// them (the io_uring_prep_send_zc helper is older than these report flags).
+#ifndef IORING_SEND_ZC_REPORT_USAGE
+#define IORING_SEND_ZC_REPORT_USAGE (1U << 3)
+#endif
+#ifndef IORING_NOTIF_USAGE_ZC_COPIED
+#define IORING_NOTIF_USAGE_ZC_COPIED (1U << 31)
+#endif
+
 // Global
 ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator("ioUringNetVCAllocator");
 
@@ -108,6 +117,31 @@ read_provided_enabled()
   static const bool on = RecGetRecordInt("proxy.config.net.io_uring.read_provided_buffers").value_or(0) != 0;
   return on;
 }
+
+// Zero-copy send (IORING_OP_SEND_ZC) for writes at/above the threshold. The kernel DMAs
+// from the source pages instead of copying into skbs; a second IORING_CQE_F_NOTIF CQE
+// reports when the pages are free. Gated on size because below ~a page the copy is
+// cheaper than the extra notification. No HDS / special NIC needed (only NETIF_F_SG).
+bool
+write_zc_enabled()
+{
+  static const bool on = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy").value_or(0) != 0;
+  return on;
+}
+
+int64_t
+write_zc_threshold()
+{
+  static const int64_t t = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy_threshold").value_or(4096);
+  return t;
+}
+
+// write_zerocopy: sends issued on the zero-copy path. write_zerocopy_copied: of those, the
+// ones the kernel fell back to copying (IORING_NOTIF_USAGE_ZC_COPIED in the notification) ---
+// a nonzero ratio means the fast path is not actually engaging.
+Metrics::Counter::AtomicType *write_zc_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy");
+Metrics::Counter::AtomicType *write_zc_copied_stat =
+  Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_copied");
 
 struct ReadBufRing;
 
@@ -867,10 +901,12 @@ IOUringNetVConnection::_write()
   // EPOLLOUT, same reasoning as the read path): keep sending until the socket
   // can't take more (short send), the buffer is empty, or the VIO is satisfied.
   for (;;) {
-    IOVec         tiovec[IOU_FRAME_IOV];
-    struct msghdr msg;
-    int           fd           = this->con.sock.get_fd();
-    int64_t       try_to_write = 0;
+    IOVec              tiovec[IOU_FRAME_IOV];
+    struct msghdr      msg;
+    Ptr<IOBufferBlock> anchor[IOU_FRAME_IOV]; // zero-copy: hold the source pages until the NOTIF
+    bool               use_zc       = false;
+    int                fd           = this->con.sock.get_fd();
+    int64_t            try_to_write = 0;
 
     // Build the next send under the VIO mutex.
     {
@@ -933,9 +969,14 @@ IOUringNetVConnection::_write()
         co_return;
       }
 
-      // Build the iovec from a clone of the reader (so the real reader is not
-      // consumed until the send actually completes). tiovec / msg live in this
-      // coroutine frame, pinned across the await.
+      // Zero-copy send is gated on size: below the threshold the per-byte copy is cheaper
+      // than the extra notification CQE (and the page pinning).
+      use_zc = write_zc_enabled() && towrite >= write_zc_threshold();
+
+      // Build the iovec from a clone of the reader (so the real reader is not consumed
+      // until the send actually completes). For zero-copy the kernel DMAs from these source
+      // pages until the notification, so also hold a Ptr to each block until then. tiovec /
+      // msg / anchor live in this coroutine frame, pinned across the await.
       IOBufferReader *tmp  = buf.reader()->clone();
       unsigned        niov = 0;
       while (niov < IOU_FRAME_IOV) {
@@ -952,6 +993,9 @@ IOUringNetVConnection::_write()
         }
         tiovec[niov].iov_len  = len;
         tiovec[niov].iov_base = tmp->start();
+        if (use_zc) {
+          anchor[niov] = tmp->block;
+        }
         niov++;
         try_to_write += len;
         tmp->consume(len);
@@ -970,21 +1014,52 @@ IOUringNetVConnection::_write()
       msg.msg_iovlen = niov;
     }
 
-    // Submit one send/sendmsg and suspend. The SQE rides the single submit_and_wait
-    // per event-loop iteration, so at load many sends batch into one io_uring_enter
-    // and the per-request sendmsg syscall disappears --- cheaper than a synchronous
-    // non-blocking send once the coroutine frame is small enough that the CQE/resume
-    // round-trip is nearly free.
-    ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
-      if (msg.msg_iovlen == 1) {
-        io_uring_prep_send(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL);
-      } else {
-        io_uring_prep_sendmsg(sqe, fd, &msg, 0);
+    // Submit one send/sendmsg and suspend. The SQE rides the single submit_and_wait per
+    // event-loop iteration, so at load many sends batch into one io_uring_enter and the
+    // per-request sendmsg syscall disappears.
+    int wr = 0;
+    if (use_zc) {
+      // Zero-copy: the kernel DMAs from the source pages (no copy into skbs) and posts a
+      // second IORING_CQE_F_NOTIF CQE once the pages are free (typically after the peer
+      // ACKs). The send-result CQE (IORING_CQE_F_MORE set) does NOT mean the pages are free,
+      // so the anchors are held and the consume is deferred until the notification drains.
+      Metrics::Counter::increment(write_zc_stat);
+      ts::iouring::UringMultishotOp op([&](io_uring_sqe *sqe) {
+        if (msg.msg_iovlen == 1) {
+          io_uring_prep_send_zc(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL,
+                                IORING_SEND_ZC_REPORT_USAGE);
+        } else {
+          io_uring_prep_sendmsg_zc(sqe, fd, &msg, MSG_NOSIGNAL);
+          sqe->ioprio |= IORING_SEND_ZC_REPORT_USAGE;
+        }
+      });
+      _write_op = &op;
+      wr        = co_await op; // send-result CQE (bytes sent)
+      // Drain the notification (and any cancel terminal): F_MORE means another CQE follows.
+      // The notification's res carries IORING_NOTIF_USAGE_ZC_COPIED if the kernel fell back
+      // to copying (the fast path did not engage).
+      while (op.more()) {
+        int n = co_await op;
+        if ((op.flags() & IORING_CQE_F_NOTIF) && (static_cast<unsigned>(n) & IORING_NOTIF_USAGE_ZC_COPIED)) {
+          Metrics::Counter::increment(write_zc_copied_stat);
+        }
       }
-    });
-    _write_op = &op;
-    int wr    = co_await op;
-    _write_op = nullptr;
+      _write_op = nullptr;
+      for (auto &a : anchor) {
+        a = nullptr; // kernel is done with the source pages
+      }
+    } else {
+      ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
+        if (msg.msg_iovlen == 1) {
+          io_uring_prep_send(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL);
+        } else {
+          io_uring_prep_sendmsg(sqe, fd, &msg, 0);
+        }
+      });
+      _write_op = &op;
+      wr        = co_await op;
+      _write_op = nullptr;
+    }
 
     if (_closing) {
       _complete_deferred_close();

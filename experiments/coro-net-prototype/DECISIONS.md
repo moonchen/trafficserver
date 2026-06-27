@@ -621,3 +621,42 @@ queue -> per-consumer pin budget). A parallel HDS-gated fast path, not a rewrite
 provided off) = 4.131, cheapest + the default; provided buffers (`_read_provided`) = 4.188
 (+1.4%) for the 4KB/idle-conn memory saving (opt-in, off); zcrx pinned. NEXT: zero-copy +
 multishot for the WRITE path (SEND_ZC needs no HDS -> testable on this box).
+
+### Write-path zero-copy send (SEND_ZC): implemented, gated off, a CPU LOSS on 1GbE (2026-06-26)
+
+Unlike zero-copy RECEIVE (HDS-gated, untestable here), zero-copy SEND needs no special NIC
+(only NETIF_F_SG; the kernel silently copy-falls-back otherwise) and is TLS-compatible in
+principle (the ciphertext is the wire data), so it was buildable + measurable on the atlantic
+1GbE here.
+
+Implemented `proxy.config.net.io_uring.write_zerocopy` (+ `write_zerocopy_threshold`, default
+4096; both restart, off by default). In `_write`, when the coalesced send is >= the threshold:
+submit io_uring_prep_send_zc / sendmsg_zc (with IORING_SEND_ZC_REPORT_USAGE) via the multishot
+awaitable, hold a Ptr<IOBufferBlock> anchor per source block, await the send-result CQE then
+DRAIN the IORING_CQE_F_NOTIF CQE (the send CQE's F_MORE flags that a notification follows; the
+source pages are NOT free until it lands --- typically after the peer ACK), then drop the
+anchors + consume. The existing clone-for-iovec discipline ports directly. Teardown holds
+_write_op set across both CQEs so the deferred free waits until the notification drains.
+
+VALIDATION: functional (20/20 1MiB cache hits returned intact, no crash); ASan-clean under
+teardown churn + mid-write client aborts (the pinned-pages-vs-free hazard); and zc_copied=0 on
+the real NIC --- the fast path is genuinely live (loopback ALWAYS copy-falls-back for
+MSG_ZEROCOPY, so it must be NIC-tested, not loopback).
+
+REAL-NIC A/B (atlantic 1GbE -> hawaii, 1 MiB cache-hit GET, 3 reps, medians):
+| mode          | cpu/1k | instr/req | io_uring_enter/req | zc_copied |
+|---------------|--------|-----------|--------------------|-----------|
+| sendmsg (off) | 0.432  | 654 K     | 31.2               | --        |
+| send_zc (on)  | 1.171  | 1787 K    | 62.2               | 0         |
+
+=> send_zc is **+171% cpu/1k on 1GbE --- a clear LOSS.** Mechanism: the per-send F_NOTIF
+doubles the CQEs / io_uring_enter and adds page-pinning, while at 1GbE the LINK (not memory
+bandwidth) is the bottleneck, so the copy it eliminates is trivially cheap (~1 MiB x 113/s =
+~113 MB/s of memcpy). The published send_zc wins (+22% @ 4 KB etc.) are on FAST NICs where the
+copy bandwidth dominates; on a slow link the fixed notification overhead exceeds the cheap
+copy. So SEND_ZC needs a 10/25/100 GbE NIC to pay off --- pinned on hardware like the read side,
+but for a different reason (read: HDS; write: a memory-bandwidth-bound link). Bundle/multishot-
+send rejected (no multishot send exists; BUNDLE == the coalesced sendmsg we already do).
+
+Kept flag-gated + OFF by default: correct, validated, and a ready fast-NIC lever. Harness:
+io-uring-coro-bench/scripts/measure-write-zc-ab.sh.
