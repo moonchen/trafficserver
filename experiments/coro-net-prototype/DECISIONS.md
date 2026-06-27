@@ -723,3 +723,40 @@ kill the IOMMU mapping) AND (b) a NIC fast enough that the eliminated copy is ac
 the notification roundtrip, so they alone won't close the +74% on a slow NIC. This box (1GbE)
 cannot exhibit a win; a 10/25/100 GbE host with iommu=pt is the regime to test next. Box restored
 to DMA-FQ after the test.
+
+#### Microbench decomposition (2026-06-27): corrects "pinning is 65% of the residual" -> it is the NOTIFICATION
+
+An isolated io_uring send_zc microbench (scripts/sender_zc.c, atlantic -> hawaii sink, copied=0
+true ZC at window=2) decomposes the residual by comparing three modes at the SAME send size:
+send (plain copy, 1 CQE), zc (send_zc, per-send pin + 2 CQEs), fixed (send_zc_fixed, registered
+buffer = pinned once, 2 CQEs). At passthrough (no IOMMU), instr/MB:
+
+| send size | copy | zc  | fixed | residual(zc-copy) | pinning(zc-fixed) | pin % of residual |
+|-----------|-----:|----:|------:|------------------:|------------------:|------------------:|
+| 32 KB     | 204K | 813K| 738K  | 609K              | 75K               | **12%**           |
+| 64 KB     | 156K | 413K| 325K  | 257K              | 88K               | 34%               |
+| 256 KB    | 124K | 209K| 128K  | 85K               | 81K               | 95%               |
+| 512 KB    | 118K | 159K| 79K   | 41K               | 80K               | 195%              |
+
+The earlier "pinning ~65% of the residual" (from a noisy ATS perf-diff bucketing) was WRONG. At
+our 32 KB send size the residual is 88% the NOTIFICATION ROUNDTRIP (the 2nd F_NOTIF CQE: extra
+io_uring submit/reap + ZC skb build) and only 12% pinning. Two facts make this precise:
+ - Pinning is ~CONSTANT 80K instr/MB across all send sizes (256 page-pins/MB regardless of
+   coalescing) -- it is a per-BYTE cost. Registered buffers remove it.
+ - The notification roundtrip is per-SEND, so it shrinks as sends coalesce: 530K/MB at 32 KB
+   (32 sends) -> ~0 at 512 KB (2 sends). Only coalescing removes it.
+
+So the two levers are COMPLEMENTARY and size-dependent: coalescing kills the (dominant-at-small-
+sends) notification; registered buffers kill the (dominant-at-large-sends) pinning. TOGETHER they
+flip the verdict: at 512 KB sends with registered buffers, fixed = 79K instr/MB BEATS the copy
+path's 118K by 33% -- send_zc wins on this 1GbE box once both levers are applied. Plain send_zc
+(anonymous, 159K) still loses to copy at 512 KB because the 80K/MB pinning keeps it above.
+
+Size lever, standalone (zc, instr/MB vs send size): 32K=1060K, 128K=490K, 512K=205K -- 5.2x from
+coalescing alone, since ~85% of the 32 KB send-path instructions are per-operation, not per-byte.
+
+Implication for the ATS path: its writes are buffer-capped at 32 KB (4x 8K blocks; IOU_FRAME_IOV
+allows 16 but the response buffer water-mark gates occupancy), i.e. the worst case -- max
+notifications, ZC a clear loss. Making ATS send_zc win needs BOTH (a) large coalesced sends
+(raise the write water-mark / coalesce target) AND (b) registered cache buffers. Neither alone
+suffices. Harness: scripts/sender_zc.c + the persistent hawaii python sink.
