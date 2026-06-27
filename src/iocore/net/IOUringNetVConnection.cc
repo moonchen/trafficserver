@@ -1035,6 +1035,11 @@ IOUringNetVConnection::_write()
       msg.msg_iovlen = niov;
     }
 
+    // Re-gate zero-copy on the ACTUAL bytes in this iovec, not the total available: after the
+    // header/body split, the leading HTTP-header send is tiny and below the threshold, so it
+    // drops to a plain copy send rather than paying a notification + pin for a few hundred bytes.
+    use_zc = use_zc && try_to_write >= write_zc_threshold();
+
     // Submit one send/sendmsg and suspend. The SQE rides the single submit_and_wait per
     // event-loop iteration, so at load many sends batch into one io_uring_enter and the
     // per-request sendmsg syscall disappears.

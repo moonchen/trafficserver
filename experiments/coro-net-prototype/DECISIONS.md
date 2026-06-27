@@ -824,3 +824,32 @@ PROTOTYPE simplifications (production TODO): single region + global mutex free-s
 drainable magazines); per-ring independent registration (-> IORING_REGISTER_CLONE_BUFFERS, 1x pin);
 the header send is anonymous send_zc not copy. NEXT: real-NIC A/B (send_zc_fixed body vs
 anonymous send_zc vs copy) under iommu=pt + ASan on the recycle/teardown lifetime. Off by default.
+
+### Registered-arena A/B on the real NIC under passthrough (2026-06-27): send_zc_fixed is -42% vs copy
+
+NIC flipped to an identity (passthrough) IOMMU domain = iommu=pt. Disk-served 1 MiB object
+(round-robin over 50 objects, tiny RAM cache -> the cache Doc-read path -> arena), atlantic 1GbE
+-> hawaii, 3 reps interleaved. cpu/1k (cgroup) medians:
+
+| mode               | cpu/1k | vs copy | instr/req | zc_copied |
+|--------------------|-------:|--------:|----------:|----------:|
+| copy (sendmsg)     | 0.358  | --      | 639K      | --        |
+| anon send_zc       | 0.222  | -38%    | 689K      | 0         |
+| send_zc_fixed      | 0.206  | -42%    | 612K      | 0         |
+
+zc_copied=0 (true zero-copy on the NIC); zc_FIXED = 98% of body sends. So on the real NIC under
+passthrough, serving disk-cached large objects:
+ - ZERO-COPY (even anonymous) beats copy by -38% cpu/1k. The win is the response-body memcpy:
+   the disk-read Doc buffer is cache-COLD and CONTIGUOUS, so (a) the copy path's 1 MiB memcpy is
+   memory-bound (~40% of the per-req CPU) and (b) the contiguous buffer coalesces into ~600 KB
+   sends, amortizing the notification. Removing the copy removes that ~40%.
+ - send_zc_FIXED beats anonymous send_zc by a further -7% by deleting the per-send pin (the
+   instr/req ordering shows it: anon 689K > copy 639K > fixed 612K -- anon adds pinning
+   instructions, copy's fewer instructions are memory-bound/slow, fixed is lowest on both).
+
+This REVERSES the earlier "send_zc loses on 1GbE" result, which was the WRONG regime: that test
+was a RAM-hit served in 32 KB buffer-capped sends under DMA-FQ -- small sends (notification-heavy)
++ the IOMMU map. Here all the levers line up (passthrough, big contiguous disk Doc buffer ->
+big sends, registered = no pin, cold source = expensive copy) and the arena pays off. The arena's
+specific contribution is the -7% over anonymous; the -38% is zero-copy + big-contiguous-sends,
+which the disk-read path provides whether the buffer is arena or heap. Box left at NIC=identity.
