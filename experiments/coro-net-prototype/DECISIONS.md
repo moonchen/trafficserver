@@ -580,3 +580,44 @@ costs more than it saves. Net: provided wins memory in the many-idle-connections
 buffer; larger held read buffers would widen the saving. Caveat: both io_uring modes carry
 a per-conn suspended coroutine frame epoll lacks (does not amortize). Harness:
 io-uring-coro-bench/scripts/measure-idle-mem.sh + idle_holder.py.
+
+### Zero-copy receive exploration (2026-06-26): pinned pending HDS hardware
+
+Explored eliminating the skb->userspace copy (`_copy_to_iter`, the dominant per-byte read
+cost --- ~25% of CPU on the loopback profile). Two mechanisms, both gated on hardware
+header/data split (HDS) for a server taking arbitrary inbound traffic:
+
+- **TCP_ZEROCOPY_RECEIVE** (getsockopt, ~4.18): remaps received skb pages into userspace via
+  vm_insert_page instead of copying. API is NIC-independent, but only zero-copies the
+  page-aligned portion and pays a per-call vm_insert + madvise(DONTNEED) TLB cost. Verified
+  with a socketpair test (/tmp/tcpzc_test.c): **0% mapped on a default loopback send**
+  (page_frag packing leaves payload unaligned), **87.7% only after forcing the SENDER to hand
+  page-aligned pages via MSG_ZEROCOPY** --- a loopback artifact (controlled sender + loopback
+  forwarding frags intact). On a real NIC the wire erases alignment (MSS segmentation +
+  receiver re-DMA -> payload at offset ~54), so inbound-from-arbitrary-clients maps ~0%
+  without HDS. NOT a generic server win.
+- **zcrx** (io_uring zero-copy rx, kernel 6.15): NIC DMAs payload directly into a registered
+  "area" via HDS; IORING_OP_RECV_ZC reaps {area-offset,len} aux CQEs; app returns buffers via
+  a refill ring. True from-the-wire zero-copy, HDS-gated.
+
+Verdict: zero-copy RECEIVE for arbitrary inbound REQUIRES HDS at the receiving NIC (the wire
+carries no page boundaries). The atlantic/aqc107 1GbE here lacks HDS -> neither exercisable.
+Pinned pending an mlx5/bnxt-class card. Also wants a cleartext/bulk path (TLS delivers
+ciphertext; decrypt re-copies --- but the IO/crypto-decoupling TLS refactor makes ciphertext
+consumable, so it's one-fewer-copy not zero-benefit; pays off only above ~4KB).
+
+**zcrx adoption sketch** (if HDS arrives): data-path seam is clean --- `RingBufferData` (wrap
+area+offset, `free()` posts to the refill ring) + the kept `UringMultishotOp` port ~80%.
+zcrx is **multishot-ONLY** (`io_recvzc_prep` rejects non-multishot), so it resurrects a
+persistent multishot recv --- BUT buffer-SAFE: the recv owns no buffer (NIC fills the area
+independently via the refill ring), so cancel drops no data (reaped data pinned by user_refs;
+unreaped stays in the socket queue). Only the control-flow stale-VIO hazard remains (guard aux
+CQEs vs a torn-down VIO; F_MORE-clear = only terminator). Real work = the SETUP layer:
+ifq/area/refill registration + ET_NET-thread<->NIC-rx-queue affinity (one ifq/queue, RSS
+steering) + queue-global backpressure (a slow consumer pinning area blocks stalls the whole rx
+queue -> per-consumer pin budget). A parallel HDS-gated fast path, not a rewrite of _read_provided.
+
+**Read-drive standing** (no zero-copy, real NIC, cpu/1k medians): recv->MIOBuffer (`_read`,
+provided off) = 4.131, cheapest + the default; provided buffers (`_read_provided`) = 4.188
+(+1.4%) for the 4KB/idle-conn memory saving (opt-in, off); zcrx pinned. NEXT: zero-copy +
+multishot for the WRITE path (SEND_ZC needs no HDS -> testable on this box).
