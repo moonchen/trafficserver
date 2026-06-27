@@ -83,6 +83,11 @@ public:
   io_uring_buf_ring *setup_buf_ring(unsigned entries, int bgid, int *err);
   void               free_buf_ring(io_uring_buf_ring *br, unsigned entries, int bgid);
 
+  // Register a fixed ("registered") buffer region on this ring so send_zc_fixed can DMA
+  // from it without a per-send pin/IOMMU-map. Returns 0 on success or -errno. The region
+  // becomes registered buffer index 0 on this ring (prototype: one region per ring).
+  int register_fixed_buffers(void *base, size_t len);
+
   // assigns the global iouring config
   static void            set_config(const IOUringConfig &);
   static IOUringContext *local_context();

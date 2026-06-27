@@ -761,6 +761,10 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.net.io_uring.write_zerocopy_threshold", RECD_INT, "4096", RECU_RESTART_TS, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
+  {RECT_CONFIG, "proxy.config.net.io_uring.fixed_arena_size", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.net.io_uring.fixed_arena_block_size", RECD_INT, "1048576", RECU_RESTART_TS, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
+  ,
   {RECT_CONFIG, "proxy.config.net.connections_throttle", RECD_INT, "30000", RECU_RESTART_TS, RR_REQUIRED, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.net.listen_backlog", RECD_INT, "-1", RECU_NULL, RR_NULL, RECC_NULL, nullptr, RECA_NULL}

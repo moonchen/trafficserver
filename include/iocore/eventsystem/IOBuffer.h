@@ -210,6 +210,18 @@ public:
   */
   void free() override;
 
+  /**
+    io_uring registered-buffer index for this memory, or -1 if it is not part of a
+    registered ("fixed") buffer arena. Lets the write path choose send_zc_fixed (no
+    per-send pin/IOMMU-map) when the source is arena-backed. Overridden by
+    RegisteredBufferData; ordinary heap/provided buffers return -1.
+  */
+  virtual int
+  registered_index() const
+  {
+    return -1;
+  }
+
   int64_t _size_index;
 
   /**

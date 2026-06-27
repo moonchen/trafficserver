@@ -795,3 +795,32 @@ sweet spot -- and the lever is io_uring's core batched submission, NOT the zero-
 provided-buffer / multishot features (all prototyped, measured, defaulted off). Not a universal
 win: high fan-out and large objects are parity-to-loss on this hardware. Harness:
 io-uring-coro-bench/scripts/measure-nic2.sh (hot4k), same-binary io_uring on/off.
+
+### Registered-buffer arena prototype (2026-06-27): send_zc_fixed from the cache, end-to-end
+
+Built the registered ("fixed") buffer arena so cache-served bodies can use send_zc_fixed (no
+per-send get_user_pages / IOMMU map -- removes the ~80K instr/MB pinning half of the send_zc
+residual). Shape (per the design discussion): the MEMORY is global+registered (forced -- cache
+blocks are cross-thread: per-stripe RAM cache, served by any net thread), the ALLOCATION is
+per-thread-cacheable. Components:
+ - UringFixedBufArena (include/iocore/io_uring/UringFixedBufArena.{h,cc}): one pinned mmap region
+   carved into fixed blocks; RegisteredBufferData : IOBufferData recycles on free() (refcount-
+   gated -- the write anchor holds a ref until the F_NOTIF, so an in-flight block can't be reused).
+   IOBufferData gains a virtual registered_index() (-1 default).
+ - IOUringContext::register_fixed_buffers() registers the region on a ring.
+ - CacheVC::handleRead Doc buffer (>=64K reads) draws from the arena -> the RAM cache promotes it
+   by reference, so RAM + disk hits both inherit the registration.
+ - _write detects a contiguous run of one registered buffer (the body) and stops the iovec at the
+   header/body boundary, sending the body as send_zc_fixed and the (tiny) header separately.
+ - Config: proxy.config.net.io_uring.fixed_arena_size (0=off), fixed_arena_block_size (1M).
+
+VALIDATED end-to-end on loopback (force disk reads: tiny RAM cache + agg-buffer flush via 14x 1MB
+nginx objects): arena inits (128x2MB=256MB), 1MB cache hits served intact, NO crash, and
+write_zerocopy_fixed = +11 over 12 GETs (one fixed body-send + one header-send each). So the whole
+chain -- cache disk read -> arena block -> RAM-promote-by-ref -> serve -> _write fixed branch --
+works. (Loopback send_zc copy-falls-back, so this proves the PATH, not the CPU win.)
+
+PROTOTYPE simplifications (production TODO): single region + global mutex free-stack (-> per-thread
+drainable magazines); per-ring independent registration (-> IORING_REGISTER_CLONE_BUFFERS, 1x pin);
+the header send is anonymous send_zc not copy. NEXT: real-NIC A/B (send_zc_fixed body vs
+anonymous send_zc vs copy) under iommu=pt + ASan on the recycle/teardown lifetime. Off by default.

@@ -30,6 +30,7 @@
 #include "P_UnixNet.h"
 
 #include "iocore/net/NetHandler.h"
+#include "iocore/io_uring/UringFixedBufArena.h"
 #include "iocore/eventsystem/EThread.h"
 #include "iocore/eventsystem/IOBuffer.h"
 #include "../eventsystem/P_IOBuffer.h"
@@ -140,6 +141,9 @@ write_zc_threshold()
 // ones the kernel fell back to copying (IORING_NOTIF_USAGE_ZC_COPIED in the notification) ---
 // a nonzero ratio means the fast path is not actually engaging.
 Metrics::Counter::AtomicType *write_zc_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy");
+// of the zero-copy sends, the ones issued as send_zc_fixed from the registered arena (no
+// per-send pin / IOMMU map) --- the rest are anonymous send_zc (pinned per send).
+Metrics::Counter::AtomicType *write_zc_fixed_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_fixed");
 Metrics::Counter::AtomicType *write_zc_copied_stat =
   Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_copied");
 
@@ -905,6 +909,9 @@ IOUringNetVConnection::_write()
     struct msghdr      msg;
     Ptr<IOBufferBlock> anchor[IOU_FRAME_IOV]; // zero-copy: hold the source pages until the NOTIF
     bool               use_zc       = false;
+    int                reg_idx      = -1;      // registered buf_index of the source run (send_zc_fixed)
+    bool               fixed_ok     = false;   // all iovec blocks are one registered buffer + contiguous
+    char              *fixed_end    = nullptr; // running end pointer for the contiguity check
     int                fd           = this->con.sock.get_fd();
     int64_t            try_to_write = 0;
 
@@ -995,6 +1002,20 @@ IOUringNetVConnection::_write()
         tiovec[niov].iov_base = tmp->start();
         if (use_zc) {
           anchor[niov] = tmp->block;
+          // send_zc_fixed needs one registered buffer over a contiguous range. Track whether
+          // every iovec block so far is the same registered buf_index and abuts the previous
+          // (e.g. the body windows of one cache fragment); the leading HTTP-header block, a
+          // non-arena buffer, fails this and keeps that send on the copy/anonymous path.
+          int   reg  = (tmp->block && tmp->block->data) ? tmp->block->data->registered_index() : -1;
+          char *base = static_cast<char *>(tiovec[niov].iov_base);
+          if (niov == 0) {
+            reg_idx  = reg;
+            fixed_ok = (reg >= 0);
+          } else if (reg != reg_idx || base != fixed_end) {
+            break; // stop the iovec at a registered-ness / contiguity boundary, so the leading
+                   // HTTP-header block and the registered body run go out as separate sends
+          }
+          fixed_end = base + len;
         }
         niov++;
         try_to_write += len;
@@ -1024,8 +1045,18 @@ IOUringNetVConnection::_write()
       // ACKs). The send-result CQE (IORING_CQE_F_MORE set) does NOT mean the pages are free,
       // so the anchors are held and the consume is deferred until the notification drains.
       Metrics::Counter::increment(write_zc_stat);
+      if (fixed_ok) {
+        UringFixedBufArena::instance().ensure_registered(); // idempotent: register the arena on this ring
+        Metrics::Counter::increment(write_zc_fixed_stat);
+      }
       ts::iouring::UringMultishotOp op([&](io_uring_sqe *sqe) {
-        if (msg.msg_iovlen == 1) {
+        if (fixed_ok) {
+          // Arena-backed contiguous run: DMA from the pre-registered, pre-pinned region (no
+          // per-send get_user_pages / IOMMU map). reg_idx selects the registered region;
+          // try_to_write is the merged length of the contiguous blocks.
+          io_uring_prep_send_zc_fixed(sqe, fd, tiovec[0].iov_base, try_to_write, MSG_NOSIGNAL, IORING_SEND_ZC_REPORT_USAGE,
+                                      reg_idx);
+        } else if (msg.msg_iovlen == 1) {
           io_uring_prep_send_zc(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL,
                                 IORING_SEND_ZC_REPORT_USAGE);
         } else {

@@ -15,7 +15,7 @@
 #
 #######################
 
-add_library(inkuring STATIC io_uring.cc IOUringEventIO.cc)
+add_library(inkuring STATIC io_uring.cc IOUringEventIO.cc UringFixedBufArena.cc)
 add_library(ts::inkuring ALIAS inkuring)
 
 target_link_libraries(

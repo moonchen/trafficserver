@@ -29,6 +29,11 @@
 #include "P_CacheInternal.h"
 #include "Stripe.h"
 
+#include "tscore/ink_config.h"
+#if TS_USE_LINUX_IO_URING
+#include "iocore/io_uring/UringFixedBufArena.h"
+#endif
+
 // must be included after the others
 #include "CacheVC.h"
 
@@ -469,7 +474,19 @@ CacheVC::handleRead(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
   if (static_cast<off_t>(io.aiocb.aio_offset + io.aiocb.aio_nbytes) > static_cast<off_t>(stripe->skip + stripe->len)) {
     io.aiocb.aio_nbytes = stripe->skip + stripe->len - io.aiocb.aio_offset;
   }
-  buf              = new_IOBufferData(iobuffer_size_to_index(io.aiocb.aio_nbytes, MAX_BUFFER_SIZE_INDEX), MEMALIGNED);
+  buf = nullptr;
+#if TS_USE_LINUX_IO_URING
+  // Large reads: draw the Doc buffer from the io_uring registered arena so the body served
+  // from it can use send_zc_fixed (no per-send pin). The RAM cache promotes it by reference,
+  // so RAM hits inherit the registration. Falls back to a heap buffer if the arena is off,
+  // exhausted, or the read is too big for a block.
+  if (io.aiocb.aio_nbytes >= 65536) {
+    buf = UringFixedBufArena::instance().alloc(io.aiocb.aio_nbytes);
+  }
+#endif
+  if (!buf) {
+    buf = new_IOBufferData(iobuffer_size_to_index(io.aiocb.aio_nbytes, MAX_BUFFER_SIZE_INDEX), MEMALIGNED);
+  }
   io.aiocb.aio_buf = buf->data();
   io.action        = this;
   io.thread        = mutex->thread_holding->tt == DEDICATED ? AIO_CALLBACK_THREAD_ANY : mutex->thread_holding;

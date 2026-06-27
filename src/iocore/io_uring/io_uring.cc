@@ -270,6 +270,15 @@ IOUringContext::free_buf_ring(io_uring_buf_ring *br, unsigned /* entries */, int
   ::free(br);
 }
 
+int
+IOUringContext::register_fixed_buffers(void *base, size_t len)
+{
+  struct iovec iov {
+    base, len
+  };
+  return io_uring_register_buffers(&ring, &iov, 1);
+}
+
 IOUringContext *
 IOUringContext::local_context()
 {
