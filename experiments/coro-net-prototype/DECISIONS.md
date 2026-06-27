@@ -853,3 +853,13 @@ was a RAM-hit served in 32 KB buffer-capped sends under DMA-FQ -- small sends (n
 big sends, registered = no pin, cold source = expensive copy) and the arena pays off. The arena's
 specific contribution is the -7% over anonymous; the -38% is zero-copy + big-contiguous-sends,
 which the disk-read path provides whether the buffer is arena or heap. Box left at NIC=identity.
+
+### Tier 2 (2026-06-27): the "512-conn reversal" is NOT real -- io_uring wins at high fan-out too
+
+Re-ran the small-object (hot4k) io_uring-vs-epoll A/B at 512 conns with clean interleaved reps:
+per-pair total-cpu deltas -12.4 / -11.1 / -0.8 / +0.7 -> median -5.9% (io_uring WINS, like 256's
+-4.9%). The earlier checkpoint's "+3.7% at 512" was box-drift noise (that run's deltas spanned
+-2.4..+10.4); the central tendency is a win. So there is NO concurrency regression to fix --
+io_uring's batched submission is a consistent small-object win across 128-512 conns, strongest at
+moderate concurrency. (Caveat: high run-to-run variance; trust the interleaved median.) Remaining
+Tier-2: full autest suite + the master-TSan differential (task #13).
