@@ -760,3 +760,38 @@ allows 16 but the response buffer water-mark gates occupancy), i.e. the worst ca
 notifications, ZC a clear loss. Making ATS send_zc win needs BOTH (a) large coalesced sends
 (raise the write water-mark / coalesce target) AND (b) registered cache buffers. Neither alone
 suffices. Harness: scripts/sender_zc.c + the persistent hawaii python sink.
+
+### Checkpoint (2026-06-27): well-tuned io_uring vs the epoll path -- small-object win via batched submission
+
+Sensible defaults for the prototype on this box: io_uring.enabled=1, read_provided_buffers=0,
+write_zerocopy=0 -- lean on io_uring's CORE feature (batched submission), exotic features OFF,
+because none pay at ATS's operating point here: write_zerocopy loses at the 32 KB buffer-capped
+sends (notification-dominated; needs big coalesced sends + registered buffers + iommu=pt to win),
+read_provided_buffers is +1.4%, multishot read was rejected (keep-alive crash + cancel data-loss).
+The path already carries the validated parity work (inline iovec=16, async batched write,
+multishot-poll doorbell, eventfd removed).
+
+DEMONSTRATION (same WIP fp binary, io_uring ON vs OFF = the epoll/master net path; hot4k = 4 KB
+cache hits, atlantic 1GbE -> hawaii; interleaved per-pair total-CPU [proc cgroup + system softirq]
+deltas, drift-controlled):
+
+| conns | median delta (io_uring vs epoll) | n | notes                              |
+|-------|----------------------------------|---|------------------------------------|
+| 128   | -2.6%                            | 3 | all negative                       |
+| 256   | **-7.3%**                        | 7 | 6/7 negative (-6..-13%); 1 +23% outlier |
+| 512   | +3.7%                            | 4 | io_uring LOSES                     |
+
+Mechanism: batched submission -- ~1.35 io_uring_enter + 2 CQEs/req vs epoll's 3 syscalls/req
+(recvmsg x2 + sendmsg x1) -- cutting NIC-completion SOFTIRQ -12..-14%. Process cpu/1k is ~parity
+(the HTTP state machine dominates ~60K instr/req, so the net-path saving surfaces in softirq). Win
+peaks at moderate concurrency (256), narrows at 128, REVERSES at 512 (per-connection coroutine
+frame + CQE overhead outweighs the syscall savings at high fan-out). Large objects: parity/loss
+(un-coalesced sends). Caveats: absolutes drifted (box heating) -- trust the interleaved per-pair
+deltas; n small + softirq metric system-wide/noisy (the +23% outlier).
+
+BOTTOM LINE: a well-tuned io_uring ATS is meaningfully more CPU-efficient than the epoll path in
+the small-object / moderate-concurrency regime (CDN small-asset workload) -- ~-7% total CPU at the
+sweet spot -- and the lever is io_uring's core batched submission, NOT the zero-copy /
+provided-buffer / multishot features (all prototyped, measured, defaulted off). Not a universal
+win: high fan-out and large objects are parity-to-loss on this hardware. Harness:
+io-uring-coro-bench/scripts/measure-nic2.sh (hot4k), same-binary io_uring on/off.
