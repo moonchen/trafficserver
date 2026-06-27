@@ -692,3 +692,34 @@ iommu=pt (or send_zc_fixed with the cache region registered = mapped once), the 
 cost vanishes and send_zc should flip to a win (removes the copy for ~free). This box's NIC is
 alone in IOMMU group 18, so a runtime switch to an identity domain (no reboot) is feasible to
 test. Field survey prompt: research/zerocopy-write-landscape-prompt.md.
+
+#### iommu=pt empirical test (2026-06-26): IOMMU is ~half the loss; a notification-roundtrip residual remains
+
+Switched the atlantic NIC's IOMMU group to an identity (passthrough) domain at runtime (no
+reboot: unbind atlantic -> echo identity > /sys/kernel/iommu_groups/18/type -> rebind -> DHCP),
+i.e. the prod-typical iommu=pt config for that device, and re-ran the A/B (1 MiB cache-hit GET,
+atlantic 1GbE -> hawaii, 3 reps, cpu/1k medians):
+
+| mode | DMA-FQ (translate) | identity (passthrough) |
+|------|-------------------:|-----------------------:|
+| noz (sendmsg) | 0.432 | 0.339 |
+| zc (send_zc)  | 1.171 | **0.589** |
+| zc vs noz     | +171% | **+74%** |
+
+Passthrough HALVED zc's cpu/1k (1.171 -> 0.589) and the confirming profile shows IOMMU/DMA-map
+8.80% -> 0.09% --- the per-send __domain_mapping is gone, proving it was real. But zc is STILL
++74% vs noz under passthrough. The residual is the NOTIFICATION ROUNDTRIP: every send_zc posts a
+second F_NOTIF CQE that lands ~an RTT later in its own event-loop iteration, so enter/req stays
+2x (62 vs 31) --- an extra io_uring_enter + coroutine resume per send. That is intrinsic to
+send_zc (you must reap the NOTIF to free the pages) and to the demand-driven write (each block's
+completion gates the next). At 1GbE the copy it buys back is tiny (_copy_from_iter ~1.6% +
+page-zero ~2.8%), so there is almost nothing to offset the notification cost.
+
+Decomposition of the original +171%: ~+97pts IOMMU translate-mode per-send mapping (config-
+dependent; prod likely runs iommu=pt) + ~+74pts notification roundtrip (intrinsic) against a
+near-zero copy saving (1GbE). So send_zc needs BOTH (a) passthrough / registered buffers (to
+kill the IOMMU mapping) AND (b) a NIC fast enough that the eliminated copy is actually expensive
+(bandwidth-bound), to win. Registered buffers (send_zc_fixed) would remove the pinning but NOT
+the notification roundtrip, so they alone won't close the +74% on a slow NIC. This box (1GbE)
+cannot exhibit a win; a 10/25/100 GbE host with iommu=pt is the regime to test next. Box restored
+to DMA-FQ after the test.
