@@ -70,14 +70,22 @@ T2.1 **Large-object zero-copy autest** (Tier-1 tail). DONE -- `tests/gold_tests/
   env-var prefix like `VAR=x cmd` fails -- pass config another way.
 
 T2.2 **Full autest suite + ASan** with `io_uring.enabled=1` (and a cell with `write_zerocopy=1`).
-  PARTIAL: all 6 `io_uring_*` gold tests (which set `enabled=1` themselves, and now a `write_zerocopy=1`
-  + arena cell via io_uring_write_zerocopy) pass under build-dev-asan, ASan-clean -- 6/6.
+  io_uring_* suite: all 6 gold tests (which set `enabled=1` themselves, + a `write_zerocopy=1`/arena cell
+  via io_uring_write_zerocopy) pass under build-dev-asan, ASan-clean -- 6/6.
   Recipe: `cd tests && ./autest.sh --ats-bin=/tmp/ats-dev-asan/bin --sandbox=/tmp/sb --filters='io_uring_*'`.
-  REMAINING: force io_uring on for the WHOLE suite to catch general-proxying regressions -- the per-test
-  records_config can't be overridden globally, so this needs either a default flip in RecordsConfig.cc
-  (`net.io_uring.enabled` 0->1) rebuilt into a throwaway binary, then a full-suite run diffed against an
-  enabled=0 run; or a representative subset (basic/cache/h2/post/redirect/tunnel) re-run with the flip.
-  Distinct `AUTEST_PORT_OFFSET` only if running concurrent autest.sh (see [[autest-concurrent-port-offset]]).
+  FORCE-ON DIFFERENTIAL DONE (flip RecordsConfig.cc `net.io_uring.enabled` 0->1 in a throwaway binary, run
+  plain-HTTP gold tests, diff vs off). It FOUND A REAL BUG: a recv-destination-buffer write-after-free in
+  `_read` (origin early-return drops the request-body buffer mid-recv -> kernel writes freed memory ->
+  `ink_freelist_new "bad list"`). FIXED `bfb14a84ea` (pin destination blocks across the await); see
+  [[io-uring-recv-buffer-uaf-freelist]]. post-early-return: crashed 3/3 on / clean off; plain-HTTP cases
+  pass after the fix; io_uring_* suite still 6/6 ASan-clean.
+  CAVEAT (cost me time): force-on globally ALSO breaks TLS ACCEPT -- the SSL acceptor builds plain io_uring
+  VCs, TLS handshakes hang (curl "SSL connection timeout"). So the differential must skip ANY `enable_tls=True`
+  test, not just tls//h2/ (post-early-return enables TLS yet its plain-HTTP cases are what matter). See
+  [[io-uring-tls-depends-on-tls-refactor]].
+  REMAINING: widen the force-on differential past the pilot set (basic/post/chunked/redirect done) to
+  cache/timeout/headers/tunnel/pipeline -- ASan + autest parallelism makes fixed-port tests (config family)
+  collide and is slow; run sequential (`--jobs=1`) or curate. Diff against an enabled=0 run of the same set.
 
 T2.3 **Master-TSan differential** (long-open task #13). Goal: confirm the io_uring net path adds no new
   data races. Recipe: TSan build (needs `sudo sysctl vm.mmap_rnd_bits=28`, jemalloc OFF), run the suite
