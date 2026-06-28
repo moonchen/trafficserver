@@ -81,6 +81,49 @@ private:
   IOUringContext *_ur = nullptr;
   int             _fd = -1;
 };
+
+// Bridges the thread's epoll poll set into the ring for net threads that block directly
+// in io_uring_submit_and_wait. The net path is hybrid: io_uring VConnection fds get their
+// readiness from the ring, but some fds are still epoll-only --- notably the DNS UDP
+// sockets (a DNSConnection is a raw socket + EventIO, not an io_uring VConnection) which
+// run on a net thread (ET_DNS == ET_CALL when proxy.config.dns.dedicated_thread is 0).
+// An epoll fd is itself readable whenever any fd it watches has an event, so a multishot
+// poll on it turns "some epoll-only fd is ready" into a CQE that breaks submit_and_wait;
+// waitForActivity then harvests those fds with a non-blocking do_poll. Without this, a DNS
+// reply never wakes the ring and async resolution stalls until the heartbeat timeout (and
+// would never be processed, since nothing calls do_poll on the io_uring path). Unlike
+// IOUringWakeup there is nothing to drain --- the do_poll + process_event clears the
+// underlying fds' readiness; this only keeps the poll armed.
+class IOUringPollBridge : public IOUringCompletionHandler
+{
+public:
+  void
+  arm(IOUringContext *ur, int fd)
+  {
+    _ur = ur;
+    _fd = fd;
+    _submit();
+  }
+  void
+  handle_complete(io_uring_cqe *cqe) override
+  {
+    // Re-arm if the kernel ended the multishot poll (IORING_CQE_F_MORE clear).
+    if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
+      _submit();
+    }
+  }
+
+private:
+  void
+  _submit()
+  {
+    if (io_uring_sqe *sqe = _ur->next_sqe(this); sqe != nullptr) {
+      io_uring_prep_poll_multishot(sqe, _fd, POLLIN);
+    }
+  }
+  IOUringContext *_ur = nullptr;
+  int             _fd = -1;
+};
 #endif
 
 } // end anonymous namespace
@@ -402,23 +445,28 @@ NetHandler::waitForActivity(ink_hrtime timeout)
 
 #if TS_USE_LINUX_IO_URING
   if (io_uring_enabled) {
+    PollDescriptor *pd = get_PollDescriptor(this->thread);
     // We block directly in the ring, so the completion eventfd is never waited on;
-    // stop io_uring from signaling it on every completion (once per thread).
-    static thread_local IOUringWakeup wakeup;
-    static thread_local bool          io_uring_setup = [&] {
+    // stop io_uring from signaling it on every completion (once per thread). The ring
+    // does not wait in epoll, but the net path is still hybrid: some fds live only in
+    // epoll (the DNS UDP sockets, which are not io_uring VConnections; the cross-thread
+    // signal fd). Arm two in-ring multishot polls so the ring still wakes for them ---
+    // thread->evfd (cross-thread doorbell) and the thread's own epoll fd, which goes
+    // readable whenever any epoll-registered fd has an event. Without the epoll-fd bridge
+    // a DNS reply never wakes the ring and async resolution stalls (see IOUringPollBridge).
+    static thread_local IOUringWakeup     wakeup;
+    static thread_local IOUringPollBridge poll_bridge;
+    static thread_local bool              io_uring_setup = [&] {
       ur->disable_eventfd();              // drop the dead completion eventfd
       wakeup.arm(ur, this->thread->evfd); // restore the cross-thread doorbell in-ring
+      poll_bridge.arm(ur, pd->epoll_fd);  // wake the ring on epoll-only fd readiness (e.g. DNS)
       return true;
     }();
     (void)io_uring_setup;
-    // io_uring net threads block directly in the ring rather than in epoll. The
-    // submit side (process_ready_list -> net_read_io/net_write_io) queues the
-    // recv/send/accept SQEs; submit_and_wait then flushes them and waits for
-    // completions in a single io_uring_enter --- bypassing the epoll_wait + eventfd
-    // round-trip that otherwise exists only to translate an io_uring completion
-    // into an epoll-wakeable event. Sockets here are never registered in epoll, so
-    // do_poll has nothing to drive. Cross-thread/timer wakeups are bounded by the
-    // caller's timeout (the heartbeat cap), exactly as the epoll path's do_poll was.
+    // The submit side (process_ready_list -> net_read_io/net_write_io) queues the
+    // recv/send/accept SQEs; submit_and_wait then flushes them and waits for completions
+    // in a single io_uring_enter. io_uring VConnection fds get their readiness from the
+    // ring; only the epoll-only fds above need the bridge.
     ink_hrtime pre = ink_get_hrtime();
     process_ready_list();
     ink_hrtime mid = ink_get_hrtime();
@@ -428,6 +476,17 @@ NetHandler::waitForActivity(ink_hrtime timeout)
       ur->submit();
       ur->service();
     }
+    // Harvest any epoll-only fds (DNS, etc.) that became ready while we waited in the
+    // ring. Non-blocking --- the wait already happened above; mirrors the epoll path's
+    // harvest loop below so e.g. a DNS reply drives its HostDB continuation.
+    get_PollCont(this->thread)->do_poll(0);
+    for (int x = 0; x < pd->result; x++) {
+      epd                                  = static_cast<EventIO *> get_ev_data(pd, x);
+      int                          e_flags = get_ev_events(pd, x);
+      epd->process_event(e_flags);
+      ev_next_event(pd, x);
+    }
+    pd->result      = 0;
     ink_hrtime post = ink_get_hrtime();
     this->thread->metrics.current_slice.load(std::memory_order_acquire)->record_io_stats(post - mid, mid - pre);
     return EVENT_CONT;
