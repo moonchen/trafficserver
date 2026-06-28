@@ -28,6 +28,7 @@
 #if TS_USE_LINUX_IO_URING
 
 #include "iocore/eventsystem/IOBuffer.h"
+#include "tsutil/Metrics.h"
 #include <mutex>
 #include <vector>
 #include <cstdint>
@@ -39,10 +40,16 @@
 // nothing" -- the memory is necessarily global (registered everywhere) but the alloc/free
 // path is per-thread-cacheable.
 //
-// PROTOTYPE scope (to measure the win before the full build-out): one region == registered
-// buffer index 0, one fixed block size, a single mutex-guarded free-block stack, and
-// independent per-ring registration (N x memlock). Production refinements, noted inline:
-//   - per-thread DRAINABLE magazines over a global pool (ClassAllocator semantics),
+// The single registered region is partitioned into power-of-two SIZE CLASSES following the
+// ATS IOBuffer size-index scheme (64K..2M): a read takes the smallest class that fits, which
+// mirrors how the normal allocator (iobuffer_size_to_index) rounds a Doc up to a power-of-two
+// class. This matters because the arena is the only allocator that can be "too small": a Doc
+// larger than the one block size used to make alloc() decline silently (no send_zc_fixed). The
+// classes share ONE registered region (== buffer index 0), so registered_index() is 0 for every
+// block and the send path is unchanged -- the classes are purely an allocator-internal split.
+//
+// PROTOTYPE scope still open (production refinements, noted inline):
+//   - per-thread DRAINABLE magazines over a global pool (drop the single mutex; ClassAllocator),
 //   - IORING_REGISTER_CLONE_BUFFERS (register once, clone into the other rings -> 1x pin).
 class RegisteredBufferData;
 
@@ -51,40 +58,102 @@ class UringFixedBufArena
 public:
   static UringFixedBufArena &instance();
 
+  // Test-only: build the size-class table + backing region from explicit parameters, skipping
+  // records, io_uring registration, and metrics. Production uses instance() (records-driven).
+  UringFixedBufArena(int64_t total_bytes, int64_t max_block_size);
+
   bool
   enabled() const
   {
     return _region != nullptr;
-  }
-  unsigned
-  block_size() const
-  {
-    return _block_size;
   }
 
   // Register the arena on the current thread's ring (idempotent per thread). Must run on a
   // net thread before it issues send_zc_fixed from an arena block.
   void ensure_registered();
 
-  // A free block wrapped as a RegisteredBufferData sized to req_bytes (<= block_size), or
-  // nullptr if disabled / exhausted (caller falls back to new_IOBufferData -> copy send).
+  // A free block wrapped as a RegisteredBufferData drawn from the smallest size class that fits
+  // req_bytes, or nullptr if disabled / the request exceeds the top class (over-size) / the
+  // fitting class is exhausted (caller falls back to new_IOBufferData -> copy send). The decline
+  // reasons are visible in the oversize / class-exhausted metrics.
   RegisteredBufferData *alloc(int64_t req_bytes);
 
   // Recycle a block + its descriptor (called from RegisteredBufferData::free()).
-  void release(uint32_t block_idx, RegisteredBufferData *desc);
+  void release(unsigned class_id, uint32_t block_idx, RegisteredBufferData *desc);
+
+  // Introspection for tests and ops. The counters are written under the arena mutex; these
+  // unlocked reads are a racy-but-monotonic snapshot (tests are single-threaded).
+  size_t
+  num_classes() const
+  {
+    return _classes.size();
+  }
+  unsigned
+  class_block_size(size_t i) const
+  {
+    return _classes[i].block_size;
+  }
+  int64_t
+  class_alloc(size_t i) const
+  {
+    return _classes[i].n_alloc;
+  }
+  int64_t
+  class_in_use(size_t i) const
+  {
+    return _classes[i].n_alloc - _classes[i].n_free;
+  }
+  int64_t
+  exhausted_count() const
+  {
+    return _exhausted;
+  }
+  int64_t
+  oversize_count() const
+  {
+    return _oversize;
+  }
+  const char *
+  region_base() const
+  {
+    return _region;
+  }
+  size_t
+  region_len() const
+  {
+    return _region_len;
+  }
 
 private:
   UringFixedBufArena();
-  void init();
+  void build(int64_t total_bytes, int64_t max_block_size, bool with_metrics);
 
-  char    *_region     = nullptr;
-  size_t   _region_len = 0;
-  unsigned _block_size = 0;
-  unsigned _nblocks    = 0;
+  // One power-of-two block size carved from a contiguous span of the single region.
+  struct SizeClass {
+    unsigned              block_size = 0; // bytes per block (power of two, 64K..2M)
+    int                   size_index = 0; // ATS IOBuffer size index for block_size (== class id)
+    size_t                base_off   = 0; // byte offset of this class's span within _region
+    unsigned              nblocks    = 0;
+    std::vector<uint32_t> free;        // free block ordinals [0,nblocks), guarded by _m
+    int64_t               n_alloc = 0; // guarded by _m
+    int64_t               n_free  = 0; // guarded by _m
 
-  std::mutex            _m;
-  std::vector<uint32_t> _free_blocks;         // guarded by _m (prototype: global stack)
-  RegisteredBufferData *_free_desc = nullptr; // descriptor freelist, guarded by _m
+    ts::Metrics::Counter::AtomicType *alloc_stat  = nullptr;
+    ts::Metrics::Counter::AtomicType *free_stat   = nullptr;
+    ts::Metrics::Gauge::AtomicType   *inuse_gauge = nullptr;
+  };
+
+  char  *_region     = nullptr;
+  size_t _region_len = 0;
+
+  std::mutex             _m;
+  std::vector<SizeClass> _classes;             // ascending block_size, guarded by _m
+  RegisteredBufferData  *_free_desc = nullptr; // descriptor freelist, guarded by _m
+  int64_t                _exhausted = 0;       // requests that hit an empty fitting class (guarded by _m)
+  int64_t                _oversize  = 0;       // requests larger than the top class (guarded by _m)
+
+  ts::Metrics::Counter::AtomicType *_exhausted_stat = nullptr;
+  ts::Metrics::Counter::AtomicType *_oversize_stat  = nullptr;
 };
 
 // IOBufferData backed by one arena block. free() recycles the block + descriptor instead of
@@ -102,8 +171,10 @@ public:
     return _buf_index;
   }
 
-  uint32_t              _block_idx = 0;
-  int                   _buf_index = -1;
+  UringFixedBufArena   *_arena     = nullptr; // owning arena, so free() returns to the right pool
+  uint32_t              _block_idx = 0;       // ordinal within its size class
+  unsigned              _class_id  = 0;       // index into _arena->_classes
+  int                   _buf_index = -1;      // registered region index (0 when arena-backed)
   RegisteredBufferData *_flink     = nullptr; // descriptor freelist link while idle
 };
 

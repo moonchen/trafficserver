@@ -28,8 +28,38 @@
 #include "iocore/io_uring/IO_URING.h"
 #include "records/RecCore.h"
 #include "tscore/Diags.h"
+#include "tscore/ink_assert.h"
 
+#include <cinttypes>
+#include <string>
 #include <sys/mman.h>
+
+using ts::Metrics;
+
+namespace
+{
+// The smallest size class the arena offers. The cache only draws from the arena for reads >=
+// 64 KiB (CacheVC::handleRead), so a 64 KiB floor wastes nothing on tiny reads. Classes run
+// from here up to a configurable top (<= 2 MiB = MAX_BUFFER_SIZE_INDEX), following the ATS
+// IOBuffer power-of-two size-index scheme so a class id is the IOBuffer size index.
+constexpr int MIN_ARENA_INDEX = BUFFER_SIZE_INDEX_64K;
+
+int64_t
+index_block_size(int idx)
+{
+  return int64_t{DEFAULT_BUFFER_BASE_SIZE} << idx; // 128 << idx
+}
+
+// "64k", "128k", "1m", "2m" -- the per-class metric name component.
+std::string
+class_label(unsigned block_size)
+{
+  if (block_size >= (1u << 20)) {
+    return std::to_string(block_size >> 20) + "m";
+  }
+  return std::to_string(block_size >> 10) + "k";
+}
+} // namespace
 
 UringFixedBufArena &
 UringFixedBufArena::instance()
@@ -40,40 +70,109 @@ UringFixedBufArena::instance()
 
 UringFixedBufArena::UringFixedBufArena()
 {
-  init();
+  int64_t total = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_size").value_or(0);
+  // fixed_arena_block_size is the largest size class (rounded down to a power-of-two IOBuffer
+  // index, capped at 2 MiB). It used to be the ONE block size, which silently declined any Doc
+  // bigger than it -- a nominal 1 MiB object (1 MiB body + Doc header) needs the 2 MiB class.
+  int64_t bsz = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_block_size").value_or(2097152);
+  build(total, bsz, /* with_metrics */ true);
+}
+
+UringFixedBufArena::UringFixedBufArena(int64_t total_bytes, int64_t max_block_size)
+{
+  build(total_bytes, max_block_size, /* with_metrics */ false);
 }
 
 void
-UringFixedBufArena::init()
+UringFixedBufArena::build(int64_t total_bytes, int64_t max_block_size, bool with_metrics)
 {
-  int64_t total = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_size").value_or(0);
-  if (total <= 0) {
-    return; // disabled (default)
+  if (total_bytes <= 0 || max_block_size <= 0) {
+    return; // disabled (default: fixed_arena_size == 0)
   }
-  int64_t bsz = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_block_size").value_or(1048576);
-  if (bsz <= 0) {
+
+  // Top class: the largest IOBuffer index whose block size is <= the configured max (and <= the
+  // 2 MiB allocator ceiling). Mirrors iobuffer_size_to_index's power-of-two classes.
+  int top = -1;
+  for (int i = MIN_ARENA_INDEX; i <= MAX_BUFFER_SIZE_INDEX; ++i) {
+    if (index_block_size(i) <= max_block_size) {
+      top = i;
+    } else {
+      break;
+    }
+  }
+  if (top < MIN_ARENA_INDEX) {
+    if (diags() != nullptr) {
+      Warning("io_uring fixed arena: fixed_arena_block_size=%" PRId64 " is below the %" PRId64 " B floor; disabled", max_block_size,
+              index_block_size(MIN_ARENA_INDEX));
+    }
     return;
   }
-  _block_size = static_cast<unsigned>(bsz);
-  _nblocks    = static_cast<unsigned>(total / _block_size);
-  if (_nblocks == 0) {
+
+  // Even-bytes split: each class gets total/nclasses bytes, floored to a whole number of blocks. So
+  // full coverage (>=1 block in every class, including the top one) needs total >= nclasses * top
+  // block size (~12 MiB at the default 2 MiB top, 6 classes); below that the loop below warns.
+  int           nclasses  = top - MIN_ARENA_INDEX + 1;
+  const int64_t per_class = total_bytes / nclasses;
+  size_t        off       = 0;
+  for (int i = MIN_ARENA_INDEX; i <= top; ++i) {
+    SizeClass c;
+    c.block_size  = static_cast<unsigned>(index_block_size(i));
+    c.size_index  = i;
+    c.nblocks     = static_cast<unsigned>(per_class / c.block_size);
+    c.base_off    = off;
+    off          += static_cast<size_t>(c.nblocks) * c.block_size;
+    _classes.push_back(std::move(c));
+  }
+  _region_len = off;
+  if (_region_len == 0) {
+    if (diags() != nullptr) {
+      Warning("io_uring fixed arena: fixed_arena_size=%" PRId64 " too small for any block; disabled", total_bytes);
+    }
+    _classes.clear();
     return;
   }
-  _region_len = static_cast<size_t>(_nblocks) * _block_size;
+
   // Page-aligned, pre-faulted region; the io_uring registration pins it.
   void *p = mmap(nullptr, _region_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
   if (p == MAP_FAILED) {
-    _region     = nullptr;
+    if (diags() != nullptr) {
+      Warning("io_uring fixed arena: mmap(%zu) failed; disabled", _region_len);
+    }
     _region_len = 0;
-    Warning("io_uring fixed arena: mmap(%zu) failed; disabled", _region_len);
+    _classes.clear();
     return;
   }
   _region = static_cast<char *>(p);
-  _free_blocks.reserve(_nblocks);
-  for (uint32_t i = _nblocks; i-- > 0;) {
-    _free_blocks.push_back(i);
+
+  std::string summary;
+  for (SizeClass &c : _classes) {
+    c.free.reserve(c.nblocks);
+    for (uint32_t b = c.nblocks; b-- > 0;) {
+      c.free.push_back(b);
+    }
+    // The even-bytes split gives each class total/nclasses bytes; if that is below a class's block
+    // size the class gets zero blocks and silently declines every request for that size (-> heap, no
+    // send_zc_fixed). Warn so an operator who under-sized the arena sees it instead of an arena that
+    // is "enabled" but does nothing for large objects. Full coverage needs nclasses * top_block_size.
+    if (c.nblocks == 0 && diags() != nullptr) {
+      Warning("io_uring fixed arena: class %s got 0 blocks; raise fixed_arena_size to >= %" PRId64 " for full coverage",
+              class_label(c.block_size).c_str(), static_cast<int64_t>(nclasses) * index_block_size(top));
+    }
+    if (with_metrics) {
+      const std::string base = "proxy.process.net.io_uring.fixed_arena." + class_label(c.block_size) + ".";
+      c.alloc_stat           = Metrics::Counter::createPtr(base + "alloc");
+      c.free_stat            = Metrics::Counter::createPtr(base + "free");
+      c.inuse_gauge          = Metrics::Gauge::createPtr(base + "in_use");
+    }
+    summary += " " + class_label(c.block_size) + ":" + std::to_string(c.nblocks);
   }
-  Note("io_uring fixed arena: %u blocks x %u B = %zu MB", _nblocks, _block_size, _region_len >> 20);
+  if (with_metrics) {
+    _exhausted_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.fixed_arena.class_exhausted");
+    _oversize_stat  = Metrics::Counter::createPtr("proxy.process.net.io_uring.fixed_arena.oversize_fallback");
+  }
+  if (diags() != nullptr) {
+    Note("io_uring fixed arena: %zu MB pinned, blocks/class:%s", _region_len >> 20, summary.c_str());
+  }
 }
 
 void
@@ -82,7 +181,8 @@ UringFixedBufArena::ensure_registered()
   if (_region == nullptr) {
     return;
   }
-  // Prototype: register the single region (== buffer index 0) independently on each ring.
+  // Prototype: register the single region (== buffer index 0) independently on each ring. All
+  // size classes live within this one region, so send_zc_fixed addresses any block by index 0.
   // Production: register once, then IORING_REGISTER_CLONE_BUFFERS into the other rings.
   static thread_local bool registered = false;
   if (registered) {
@@ -98,15 +198,40 @@ UringFixedBufArena::ensure_registered()
 RegisteredBufferData *
 UringFixedBufArena::alloc(int64_t req_bytes)
 {
-  if (_region == nullptr || req_bytes <= 0 || req_bytes > _block_size) {
+  if (_region == nullptr || req_bytes <= 0) {
     return nullptr;
   }
   std::lock_guard<std::mutex> g(_m);
-  if (_free_blocks.empty()) {
-    return nullptr; // exhausted -> caller falls back to a non-registered buffer
+
+  // Smallest class that fits. _classes is ascending, so the first fit is the smallest. No upward
+  // promotion on exhaustion: lending a bigger block to a small read would starve the large reads
+  // the arena exists to serve.
+  size_t ci = _classes.size();
+  for (size_t i = 0; i < _classes.size(); ++i) {
+    if (static_cast<int64_t>(_classes[i].block_size) >= req_bytes) {
+      ci = i;
+      break;
+    }
   }
-  uint32_t idx = _free_blocks.back();
-  _free_blocks.pop_back();
+  if (ci == _classes.size()) {
+    ++_oversize; // larger than the top class -> caller heap-allocates (and loses send_zc_fixed)
+    if (_oversize_stat != nullptr) {
+      Metrics::Counter::increment(_oversize_stat);
+    }
+    return nullptr;
+  }
+
+  SizeClass &c = _classes[ci];
+  if (c.free.empty()) {
+    ++_exhausted;
+    if (_exhausted_stat != nullptr) {
+      Metrics::Counter::increment(_exhausted_stat);
+    }
+    return nullptr;
+  }
+  uint32_t b = c.free.back();
+  c.free.pop_back();
+
   RegisteredBufferData *d = _free_desc;
   if (d != nullptr) {
     _free_desc = d->_flink;
@@ -114,19 +239,34 @@ UringFixedBufArena::alloc(int64_t req_bytes)
   } else {
     d = new RegisteredBufferData();
   }
-  d->_block_idx  = idx;
-  d->_buf_index  = 0;
-  d->_data       = _region + static_cast<size_t>(idx) * _block_size;
-  d->_size_index = iobuffer_size_to_index(_block_size, MAX_BUFFER_SIZE_INDEX);
+  d->_arena      = this;
+  d->_class_id   = static_cast<unsigned>(ci);
+  d->_block_idx  = b;
+  d->_buf_index  = 0; // the single registered region
+  d->_data       = _region + c.base_off + static_cast<size_t>(b) * c.block_size;
+  d->_size_index = c.size_index;
   d->_mem_type   = NO_ALLOC; // dealloc() (never reached, free() is overridden) must not free it
+
+  ++c.n_alloc;
+  if (c.alloc_stat != nullptr) {
+    Metrics::Counter::increment(c.alloc_stat);
+    Metrics::Gauge::increment(c.inuse_gauge);
+  }
   return d;
 }
 
 void
-UringFixedBufArena::release(uint32_t block_idx, RegisteredBufferData *desc)
+UringFixedBufArena::release(unsigned class_id, uint32_t block_idx, RegisteredBufferData *desc)
 {
   std::lock_guard<std::mutex> g(_m);
-  _free_blocks.push_back(block_idx);
+  ink_assert(class_id < _classes.size()); // only reached via free() on a successfully alloc'd block
+  SizeClass &c = _classes[class_id];
+  c.free.push_back(block_idx);
+  ++c.n_free;
+  if (c.free_stat != nullptr) {
+    Metrics::Counter::increment(c.free_stat);
+    Metrics::Gauge::decrement(c.inuse_gauge);
+  }
   desc->_flink = _free_desc;
   _free_desc   = desc;
 }
@@ -134,12 +274,18 @@ UringFixedBufArena::release(uint32_t block_idx, RegisteredBufferData *desc)
 void
 RegisteredBufferData::free()
 {
-  uint32_t idx = _block_idx;
-  _data        = nullptr;
-  _size_index  = BUFFER_SIZE_NOT_ALLOCATED;
-  _mem_type    = NO_ALLOC;
-  _buf_index   = -1;
-  UringFixedBufArena::instance().release(idx, this);
+  UringFixedBufArena *arena    = _arena;
+  unsigned            class_id = _class_id;
+  uint32_t            idx      = _block_idx;
+  // Clear every field so a freelisted descriptor carries no stale state; alloc() repopulates it.
+  _data       = nullptr;
+  _size_index = BUFFER_SIZE_NOT_ALLOCATED;
+  _mem_type   = NO_ALLOC;
+  _buf_index  = -1;
+  _arena      = nullptr;
+  _class_id   = 0;
+  _block_idx  = 0;
+  arena->release(class_id, idx, this);
 }
 
 #endif // TS_USE_LINUX_IO_URING
