@@ -181,15 +181,34 @@ T3.5 **Arena ASan**. DONE -- folded into T2.1's io_uring_write_zerocopy autest r
 
 ## Suggested order
 
-DONE: T2.1 (zero-copy autest) + T3.5 (arena ASan, folded in) + T2.2 io_uring-suite cell (6/6 ASan-clean)
-+ T2.2 force-on differential pilot (found+fixed the _read recv UAF, bfb14a84ea) + T3.3 (size classes;
-default block_size 1M->2M so 1 MiB objects engage send_zc_fixed) + T3.1 (lock-free InkAtomicList pool,
-dropped the global mutex; atomic-pool-only, no magazine -- cold allocator).
-NEXT: T3.2 (clone buffers) -> T3.4 (origin-recv) -> widen the T2.2 force-on differential (sequential)
--> T2.3 (TSan). Then representative perf data (the milestone). Ship sequence stays: batching first,
-then large-object zero-copy (anon), then the arena.
-NOT ON THE ROADMAP YET (raised 2026-06-28): **ZC disk read** -- io_uring_prep_read_fixed for the cache
-disk read into the (already-registered) arena block, the read-side mirror of send_zc_fixed (removes the
-per-IO get_user_pages pin on the read target). Today the disk read lands directly in the arena block but
-via ink_aio_read -> io_uring_prep_read (AIO.cc:558), a plain read. Would be a T3.6; pairs with T3.2.
-Cross-subsystem (AIO backend must detect an arena-backed aio_buf and emit read_fixed w/ buf_index).
+DONE: T2.1 + T3.5 + T2.2 io_uring-suite cell + T2.2 force-on pilot (recv UAF, bfb14a84ea) + T3.3 (size
+classes) + T3.1 (lock-free InkAtomicList pool) + T3.4 (recv coalescing for pass-through send-ZC -- built,
+measured, NO-GO for general prod: needs a high lowat unsafe for TLS/H2, moot for H2 by the framing copy;
+renamed recv_zerocopy->recv_coalesce, off by default) + **PERF MILESTONE** (disk-cache serving step
+ladder, master epoll+thread-AIO 0.341 -> io_uring+arena+send_zc_fixed 0.132 = -61% cpu/1k, true NIC ZC;
+recorded in experiments/coro-net-prototype/PERF-RESULTS-2026-06-28.md = canonical store, see
+[[io-uring-perf-results]]) + widened T2.2 force-on differential under ASan (0 UAF in 9 plain-HTTP tests,
+but FOUND a ship-blocker, below).
+
+NEXT (Track B = bank the proven win toward shipping):
+1. **FIX the io_uring pipelining stall** (SHIP-BLOCKER found by the force-on differential 2026-06-28:
+   HTTP/1.1 pipelined requests stall under io_uring, pass epoll; `_read` never re-signals already-
+   buffered data on consumer re-arm). Full hypothesis + the ready `pipeline` regression test in
+   [[io-uring-pipelining-stall-bug]]. Do this first.
+2. Widen the force-on differential further (more plain-HTTP autests, skip TLS); T2.3 master-TSan
+   differential for the net path (the lock-free arena was already TSan-clean modulo the benign
+   InkAtomicList race); T3.2 clone buffers (1x memlock); then scope the upstream PR (TLS-independent
+   net path + arena -- TLS/H2 over io_uring is blocked on the TLS refactor, see
+   [[io-uring-tls-depends-on-tls-refactor]]).
+
+T3.6 **ZC disk read (read_fixed)** -- ON THE ROADMAP, LOW PRIORITY / LOW RISK (user, 2026-06-28). Use
+io_uring_prep_read_fixed for the cache disk read into the already-registered arena block (read-side
+mirror of send_zc_fixed) -> fully-registered round trip. Investigated+profiled 2026-06-28: gain is SMALL
+(~0.07%) because the cache opens O_DIRECT so the read already DMAs disk->buffer with NO copy, and the
+only thing read_fixed removes is the per-IO pin -- cheap because the arena is MAP_POPULATE pre-faulted
+(get_user_pages = refcount bumps, not faults). BUT it's nearly-free + low-risk to wire (the buffer is
+already registered for the send): plumb registered_index through the AIO op (AIOCallback), call the
+arena's ensure_registered() before the read (the io_uring AIO read uses IOUringContext::local_context(),
+AIO.cc:607 = the same per-thread ring the arena registers on, so buf_index 0 works), emit
+io_uring_prep_read_fixed with a fallback to prep_read if unregistered. Take it when convenient for the
+complete picture; an upstream reviewer would question AIO-subsystem complexity for 0.07%.
