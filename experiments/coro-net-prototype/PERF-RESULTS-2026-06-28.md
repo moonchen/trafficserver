@@ -62,6 +62,22 @@ the send skips BOTH the copy AND the per-send pin -> instr/req collapses to 361K
 Disk-cache serving is the arena's best case: the whole object is one big contiguous registered block,
 read once and DMA'd to the NIC with zero copies and zero per-send setup.
 
+### ZC disk read (read_fixed) -- INVESTIGATED, NO-GO (profile)
+
+Idea: io_uring_prep_read_fixed for the cache disk read into the already-registered arena block (the
+read-side mirror of send_zc_fixed) -> fully-registered round trip. FEASIBLE: the io_uring AIO read uses
+IOUringContext::local_context() (AIO.cc:607), the same per-thread ring the arena registers on, so
+read_fixed could address it by buf_index 0. But profiling the fixed step's read path (perf -C 0,2,4,6 -g
+under load) shows it is NOT worth it: the cache opens O_DIRECT (DIO path confirmed: __iomap_dio_rw /
+btrfs_dio_iomap_begin / __submit_bio), so the read already DMAs disk->buffer with NO copy. The only thing
+read_fixed removes is the per-IO buffer PINNING (`__iov_iter_get_pages_alloc`), which is ~0.07% of samples
+-- on par with cache bookkeeping (CacheVC::handleReadDone), i.e. negligible. (Contrast: the send-side
+anon->fixed -37% step was the whole send_zc machinery -- pinning + notification + skb-zerocopy setup --
+far more than a bare get_user_pages.) So O_DIRECT already captured the read win; read_fixed adds ~nothing.
+NOTE the workload is NIC-bound at 1 GbE (cores mostly idle), so CPU isn't even the bottleneck here.
+VERDICT: do not build ZC disk read; the disk-serve win is maximized by send_zc_fixed. (Would only matter
+on BUFFERED storage -- a non-O_DIRECT fs/tmpfs -- where the read copies; not the prod case.)
+
 ## Pass-through send-ZC via recv coalescing (T3.4)
 
 NOTE the name: the recv is NOT zero-copy (it still copies kernel->buffer). This COALESCES the origin
