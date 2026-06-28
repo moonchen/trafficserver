@@ -24,39 +24,43 @@ NEW code change.
 objects forces disk reads -> the arena Doc path). `epoll` = `io_uring.enabled=0` (the stock
 UnixNetVConnection path master uses); `fixed` = io_uring + size-class arena + `send_zc_fixed`.
 
-| mode                         | cpu/1k     | instr/req | zc_fixed | zc_copied |
-| ---------------------------- | ---------- | --------- | -------- | --------- |
-| **master** (epoll net path)  | **0.3218** | 654K      | 0        | 0         |
-| **best** (io_uring+arena+ZC) | **0.1789** | 583K      | ~1300    | **0**     |
+| mode                             | cpu/1k    | instr/req | zc_fixed | zc_copied |
+| -------------------------------- | --------- | --------- | -------- | --------- |
+| **master** (epoll + thread-AIO)  | **0.341** | 680K      | 0        | 0         |
+| **best** (io_uring + arena + ZC) | **0.132** | 361K      | ~1.4/req | **0**     |
 
-**-44% cpu/1k (1.8x requests per CPU-second), true zero-copy on the NIC.** From the single-matrix step
-ladder below (epoll 0.3292/0.3218/0.3160, fixed 0.1788/0.1789/0.1777 -- very low variance). A separate
-2-mode run on a hotter box read epoll 0.3548 -> fixed 0.1927 (-46%); same story, absolutes drift.
+**-61% cpu/1k (~2.6x requests per CPU-second), true zero-copy on the NIC.** From the disk-cache step
+ladder below, verified 100% disk reads (ram_cache.hits=0). (Supersedes an earlier -44% number that used
+auto-AIO -- not a true thread-AIO master -- and a 256 MB arena whose 2M class exhausted at 48 conns,
+diluting the fixed step. Same scenario, measured properly.)
 
-## Step ladder: epoll -> io_uring -> zero-copy -> arena (one matrix, disk-served 1 MiB)
+## Disk-cache serving step ladder (1 MiB objects, 100% disk reads)
 
-`measure-fixed-ab.sh epoll|copy|anon|fixed` x3 interleaved -- all four steps in ONE run so the
-absolutes are directly comparable. Each row adds one optimization.
+`measure-fixed-ab.sh epoll|copy|anon|fixed` x3 interleaved -- disk-served 1 MiB cache hits (small RAM
+cache + round-robin over 50 objects forces disk reads). VERIFIED disk-heavy: ram_cache.hits=0,
+bytes_used=0 (a 1 MiB object does not fit the 512 KB RAM cache), cache.read.success=every request,
+read_busy=0 (no read sharing). `aio.mode` is `thread` for the master and `io_uring` for the rest; the
+arena is 1 GiB so its 2M class (~85 blocks) does not exhaust at 48 conns (a 256 MB arena did, diluting
+the fixed step to ~0.78 fixed sends/req). Each row adds one layer.
 
-| step                       | what it adds                              | cpu/1k     | step Δ   | vs master | instr/req |
-| -------------------------- | ----------------------------------------- | ---------- | -------- | --------- | --------- |
-| 1. epoll (master)          | stock UnixNetVConnection, copy every byte | **0.3218** | —        | —         | 654K      |
-| 2. + io_uring (copy)       | batched SQE submission, still copy sends  | **0.3106** | -3.5%    | -3.5%     | 637K      |
-| 3. + zero-copy (anon)      | no send memcpy (pages pinned per send)    | **0.2025** | -34.8%   | -37%      | 674K      |
-| 4. + arena (send_zc_fixed) | registered buffers, no per-send pin       | **0.1789** | -11.7%   | **-44%**  | 583K      |
+| step                              | what it adds                                   | cpu/1k    | step Δ | vs master | instr/req |
+| --------------------------------- | ---------------------------------------------- | --------- | ------ | --------- | --------- |
+| 1. epoll + thread-AIO (master)    | epoll net, AIO-thread disk read, copy send     | **0.341** | —      | —         | 680K      |
+| 2. + io_uring (net + AIO)         | io_uring net AND io_uring disk read, copy send | **0.315** | -7.7%  | -7.7%     | 641K      |
+| 3. + zero-copy send (anon)        | no send memcpy (pages pinned per send)         | **0.211** | -33%   | -38%      | 679K      |
+| 4. + fixed buffer (send_zc_fixed) | disk read into the registered arena, no pin    | **0.132** | -37%   | **-61%**  | 361K      |
 
-reps: epoll 0.3292/0.3218/0.3160, copy 0.3197/0.3106/0.3093, anon 0.2025/0.2010/0.2083, fixed
-0.1788/0.1789/0.1777 (very low variance). zc_copied=0 throughout the ZC steps (true NIC zero-copy).
+reps: epoll 0.3409/0.3458/0.3375, copy 0.3162/0.3147/0.3033, anon 0.188/0.211/0.218, fixed
+0.1322/0.1381/0.1304 (very low variance). zc_copied=0 throughout the ZC steps; fixed zc_FIXED ~= zc_total
+(full arena engagement, ~1.4 fixed sends/req).
 
-Shape: step 2 (batched submission) is modest on LARGE objects (-3.5%; its big win is small-object /
-moderate concurrency). Step 3 (zero-copy send) is the giant leap -- removing the 1 MiB memcpy's
-memory-bandwidth cost is -35% EVEN THOUGH it spends more instructions (per-send page pinning, instr/req
-637K->674K). Step 4 (arena) pays off that pinning debt: send_zc_fixed drops instr/req to 583K (below
-epoll) and shaves another -12%. Confirms T3.1 (lock-free pool) + T3.3 (size classes) did not regress the
-arena win.
-
-(An earlier separate copy/anon/fixed-only matrix, different box thermal state, read copy 0.3147 / anon
-0.2079 / fixed 0.1666 -- same shape; trust the single-matrix ladder above for the step deltas.)
+Shape: io_uring (net + AIO) is a modest -7.7% on large objects. Zero-copy send is the big leap (-38%
+cumulative): removing the 1 MiB memcpy -- note instr/req barely moves (641K->679K), the win is pure
+memory bandwidth (pinning costs instructions but saves the copy's cache traffic). Fixed buffer is the
+cleanest step here (-61% cumulative): the disk Doc is read STRAIGHT into the registered arena block, so
+the send skips BOTH the copy AND the per-send pin -> instr/req collapses to 361K (-44% vs copy).
+Disk-cache serving is the arena's best case: the whole object is one big contiguous registered block,
+read once and DMA'd to the NIC with zero copies and zero per-send setup.
 
 ## Pass-through send-ZC via recv coalescing (T3.4)
 
