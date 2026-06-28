@@ -25,8 +25,10 @@
 
 #include "iocore/io_uring/UringFixedBufArena.h"
 
+#include <atomic>
 #include <cstdint>
 #include <set>
+#include <thread>
 #include <vector>
 
 // These tests drive the allocator core through the test-only constructor, which builds the
@@ -184,4 +186,74 @@ TEST_CASE("in-use accounting follows alloc and free within a class", "[arena]")
   d2->free();
   CHECK(a.class_in_use(cls) == 0);
   CHECK(a.class_alloc(cls) == 2); // alloc count is monotonic; free does not decrement it
+}
+
+TEST_CASE("concurrent alloc/free is race-free and conserves the block pool", "[arena][concurrency]")
+{
+  UringFixedBufArena a(64 * MiB, 2 * MiB);
+
+  // Hammer three distinct classes at once -- each thread rotates through the sizes, so all three
+  // lock-free lists see concurrent pop/push (the single shared _flink offset is exercised on each).
+  const int64_t sizes[] = {64 * KiB, 256 * KiB, 1 * MiB};
+  constexpr int NSIZE   = 3;
+  for (int64_t sz : sizes) {
+    REQUIRE(class_of(a, sz) < a.num_classes());
+    REQUIRE(a.class_nblocks(class_of(a, sz)) > NSIZE); // room for contention without constant exhaustion
+  }
+
+  constexpr int     NTHREAD = 8;
+  constexpr int     ITERS   = 20000;
+  std::atomic<bool> corrupt{false};
+  std::atomic<int>  stamp{1};
+
+  auto worker = [&](int tid) {
+    for (int i = 0; i < ITERS; ++i) {
+      RegisteredBufferData *d = a.alloc(sizes[(tid + i) % NSIZE]);
+      if (d == nullptr) {
+        continue; // transient exhaustion under contention is expected
+      }
+      // Stamp the block (sized by its actual class capacity) with a value no other thread uses; a
+      // second concurrent holder of the same block would clobber a stamp and trip the re-read.
+      const int     s     = stamp.fetch_add(1, std::memory_order_relaxed);
+      volatile int *p     = reinterpret_cast<volatile int *>(d->data());
+      const size_t  words = (size_t{128} << d->_size_index) / sizeof(int);
+      p[0]                = s;
+      p[words - 1]        = s;
+      for (int k = 0; k < 64; ++k) {
+        if (p[0] != s || p[words - 1] != s) {
+          corrupt.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+      d->free();
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(NTHREAD);
+  for (int t = 0; t < NTHREAD; ++t) {
+    threads.emplace_back(worker, t);
+  }
+  for (std::thread &th : threads) {
+    th.join();
+  }
+
+  CHECK_FALSE(corrupt.load()); // no two threads ever held the same block
+
+  // Each hammered class is fully intact: in_use back to 0 and exactly nblocks distinct blocks are
+  // reclaimable -- none lost into limbo, none duplicated.
+  for (int64_t sz : sizes) {
+    const size_t cls = class_of(a, sz);
+    CHECK(a.class_in_use(cls) == 0);
+    std::set<char *>                    seen;
+    std::vector<RegisteredBufferData *> drained;
+    for (RegisteredBufferData *d = a.alloc(sz); d != nullptr; d = a.alloc(sz)) {
+      CHECK(seen.insert(d->data()).second);
+      drained.push_back(d);
+    }
+    CHECK(drained.size() == a.class_nblocks(cls));
+    for (RegisteredBufferData *d : drained) {
+      d->free();
+    }
+  }
 }

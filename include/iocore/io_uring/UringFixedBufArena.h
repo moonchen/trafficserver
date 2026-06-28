@@ -28,17 +28,16 @@
 #if TS_USE_LINUX_IO_URING
 
 #include "iocore/eventsystem/IOBuffer.h"
+#include "tscore/ink_queue.h"
 #include "tsutil/Metrics.h"
-#include <mutex>
-#include <vector>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 
 // Process-global, io_uring-registered ("fixed") buffer arena. The region is pinned and
 // registered on every ET_NET thread's ring, so send_zc_fixed can DMA from any block no
 // matter which thread filled it (the cache is shared across threads). Blocks recycle on
-// free; the memory outlives every VC / cache entry. Allocation is what stays "share
-// nothing" -- the memory is necessarily global (registered everywhere) but the alloc/free
-// path is per-thread-cacheable.
+// free; the memory outlives every VC / cache entry.
 //
 // The single registered region is partitioned into power-of-two SIZE CLASSES following the
 // ATS IOBuffer size-index scheme (64K..2M): a read takes the smallest class that fits, which
@@ -48,9 +47,14 @@
 // classes share ONE registered region (== buffer index 0), so registered_index() is 0 for every
 // block and the send path is unchanged -- the classes are purely an allocator-internal split.
 //
-// PROTOTYPE scope still open (production refinements, noted inline):
-//   - per-thread DRAINABLE magazines over a global pool (drop the single mutex; ClassAllocator),
-//   - IORING_REGISTER_CLONE_BUFFERS (register once, clone into the other rings -> 1x pin).
+// Each class is a LOCK-FREE pool: an InkAtomicList (ATS's ABA-safe Treiber stack) of descriptors
+// pre-bound to blocks. alloc() pops, free() pushes -- one CAS each, no mutex. This is the same
+// global-pool layer ATS's ClassAllocator uses (an atomic InkFreeList). ATS adds a per-thread
+// ProxyAllocator magazine in front of that ONLY for hot allocators (~20 of ~95); this arena is a
+// cold allocator (one alloc per >=64 KiB disk fragment), so it uses the atomic pool directly.
+// TODO(perf): if the arena ever goes hot, add a ProxyAllocator-style thread-local magazine
+//   (thread_freelist_high/low_watermark) over these per-class pools.
+// Still open: IORING_REGISTER_CLONE_BUFFERS (register once, clone into the other rings -> 1x pin).
 class RegisteredBufferData;
 
 class UringFixedBufArena
@@ -79,39 +83,46 @@ public:
   RegisteredBufferData *alloc(int64_t req_bytes);
 
   // Recycle a block + its descriptor (called from RegisteredBufferData::free()).
-  void release(unsigned class_id, uint32_t block_idx, RegisteredBufferData *desc);
+  void release(unsigned class_id, RegisteredBufferData *desc);
 
-  // Introspection for tests and ops. The counters are written under the arena mutex; these
-  // unlocked reads are a racy-but-monotonic snapshot (tests are single-threaded).
+  // Introspection for tests and ops. Counters are atomic; the per-class block tables are
+  // immutable after build().
   size_t
   num_classes() const
   {
-    return _classes.size();
+    return _nclasses;
   }
   unsigned
   class_block_size(size_t i) const
   {
     return _classes[i].block_size;
   }
+  unsigned
+  class_nblocks(size_t i) const
+  {
+    return _classes[i].nblocks;
+  }
   int64_t
   class_alloc(size_t i) const
   {
-    return _classes[i].n_alloc;
+    return _classes[i].n_alloc.load(std::memory_order_relaxed);
   }
+  // Approximate under concurrency (two relaxed loads, not a consistent snapshot); exact once the
+  // allocating threads have quiesced, which is how tests and ops snapshots read it.
   int64_t
   class_in_use(size_t i) const
   {
-    return _classes[i].n_alloc - _classes[i].n_free;
+    return _classes[i].n_alloc.load(std::memory_order_relaxed) - _classes[i].n_free.load(std::memory_order_relaxed);
   }
   int64_t
   exhausted_count() const
   {
-    return _exhausted;
+    return _exhausted.load(std::memory_order_relaxed);
   }
   int64_t
   oversize_count() const
   {
-    return _oversize;
+    return _oversize.load(std::memory_order_relaxed);
   }
   const char *
   region_base() const
@@ -128,39 +139,45 @@ private:
   UringFixedBufArena();
   void build(int64_t total_bytes, int64_t max_block_size, bool with_metrics);
 
-  // One power-of-two block size carved from a contiguous span of the single region.
+  // One power-of-two block size carved from a contiguous span of the single region. Its free
+  // blocks live as pre-bound descriptors on a lock-free InkAtomicList (linked via _flink).
   struct SizeClass {
-    unsigned              block_size = 0; // bytes per block (power of two, 64K..2M)
-    int                   size_index = 0; // ATS IOBuffer size index for block_size (== class id)
-    size_t                base_off   = 0; // byte offset of this class's span within _region
-    unsigned              nblocks    = 0;
-    std::vector<uint32_t> free;        // free block ordinals [0,nblocks), guarded by _m
-    int64_t               n_alloc = 0; // guarded by _m
-    int64_t               n_free  = 0; // guarded by _m
+    unsigned      block_size = 0; // bytes per block (power of two, 64K..2M)
+    int           size_index = 0; // ATS IOBuffer size index for block_size (== class id)
+    unsigned      nblocks    = 0;
+    InkAtomicList free_list; // lock-free stack of free RegisteredBufferData (linked by _flink)
+
+    std::atomic<int64_t> n_alloc{0};
+    std::atomic<int64_t> n_free{0};
 
     ts::Metrics::Counter::AtomicType *alloc_stat  = nullptr;
     ts::Metrics::Counter::AtomicType *free_stat   = nullptr;
     ts::Metrics::Gauge::AtomicType   *inuse_gauge = nullptr;
   };
+  // InkAtomicList::head is a 128-bit value (cmpxchg16b on x86-64) and must be 16-byte aligned;
+  // head_p drives SizeClass's alignment, and new SizeClass[] honors it. Fail loud if a future
+  // field reshuffle ever breaks that contract.
+  static_assert(alignof(SizeClass) % 16 == 0, "InkAtomicList head needs 16-byte alignment for cmpxchg16b");
 
   char  *_region     = nullptr;
   size_t _region_len = 0;
 
-  std::mutex             _m;
-  std::vector<SizeClass> _classes;             // ascending block_size, guarded by _m
-  RegisteredBufferData  *_free_desc = nullptr; // descriptor freelist, guarded by _m
-  int64_t                _exhausted = 0;       // requests that hit an empty fitting class (guarded by _m)
-  int64_t                _oversize  = 0;       // requests larger than the top class (guarded by _m)
+  std::unique_ptr<SizeClass[]> _classes; // _nclasses entries, ascending block_size, immutable after build
+  size_t                       _nclasses = 0;
+
+  std::atomic<int64_t> _exhausted{0}; // requests that hit an empty fitting class
+  std::atomic<int64_t> _oversize{0};  // requests larger than the top class
 
   ts::Metrics::Counter::AtomicType *_exhausted_stat = nullptr;
   ts::Metrics::Counter::AtomicType *_oversize_stat  = nullptr;
 };
 
 // IOBufferData backed by one arena block. free() recycles the block + descriptor instead of
-// releasing memory (the arena owns the pinned memory for the process lifetime). Because
-// IOBufferBlock::clone() shares the Ptr<IOBufferData>, a block handed to several readers
-// recycles only once, when the last ref drops -- and the write anchor holds a ref until the
-// F_NOTIF, so an in-flight block is never recycled while the NIC is still DMA-ing it.
+// releasing memory (the arena owns the pinned memory for the process lifetime). Each descriptor
+// is permanently bound to one block at build() time. Because IOBufferBlock::clone() shares the
+// Ptr<IOBufferData>, a block handed to several readers recycles only once, when the last ref
+// drops -- and the write anchor holds a ref until the F_NOTIF, so an in-flight block is never
+// recycled while the NIC is still DMA-ing it.
 class RegisteredBufferData : public IOBufferData
 {
 public:
@@ -172,10 +189,10 @@ public:
   }
 
   UringFixedBufArena   *_arena     = nullptr; // owning arena, so free() returns to the right pool
-  uint32_t              _block_idx = 0;       // ordinal within its size class
+  uint32_t              _block_idx = 0;       // ordinal within its size class (diagnostics)
   unsigned              _class_id  = 0;       // index into _arena->_classes
   int                   _buf_index = -1;      // registered region index (0 when arena-backed)
-  RegisteredBufferData *_flink     = nullptr; // descriptor freelist link while idle
+  RegisteredBufferData *_flink     = nullptr; // intrusive next while on a class's free list
 };
 
 #endif // TS_USE_LINUX_IO_URING
