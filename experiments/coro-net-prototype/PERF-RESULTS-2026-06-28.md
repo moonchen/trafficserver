@@ -23,26 +23,37 @@ UnixNetVConnection path master uses); `fixed` = io_uring + size-class arena + `s
 
 | mode                         | cpu/1k     | instr/req | zc_fixed | zc_copied |
 | ---------------------------- | ---------- | --------- | -------- | --------- |
-| **master** (epoll net path)  | **0.3548** | 659K      | 0        | 0         |
-| **best** (io_uring+arena+ZC) | **0.1927** | 574K      | ~1285    | **0**     |
+| **master** (epoll net path)  | **0.3218** | 654K      | 0        | 0         |
+| **best** (io_uring+arena+ZC) | **0.1789** | 583K      | ~1300    | **0**     |
 
-**-46% cpu/1k (1.84x requests per CPU-second), true zero-copy on the NIC.** reps: epoll
-0.3548/0.4286/0.3381, fixed 0.1927/0.1854/0.2015.
+**-44% cpu/1k (1.8x requests per CPU-second), true zero-copy on the NIC.** From the single-matrix step
+ladder below (epoll 0.3292/0.3218/0.3160, fixed 0.1788/0.1789/0.1777 -- very low variance). A separate
+2-mode run on a hotter box read epoll 0.3548 -> fixed 0.1927 (-46%); same story, absolutes drift.
 
-## Decomposition: copy vs anon-send_zc vs fixed-arena (disk-served 1 MiB)
+## Step ladder: epoll -> io_uring -> zero-copy -> arena (one matrix, disk-served 1 MiB)
 
-`measure-fixed-ab.sh copy|anon|fixed` — all io_uring on; isolates the send mechanism.
+`measure-fixed-ab.sh epoll|copy|anon|fixed` x3 interleaved -- all four steps in ONE run so the
+absolutes are directly comparable. Each row adds one optimization.
 
-| mode                       | cpu/1k     | vs copy  | instr/req | zc_copied |
-| -------------------------- | ---------- | -------- | --------- | --------- |
-| copy (io_uring, ZC off)    | 0.3147     | —        | 639K      | 0         |
-| anon `send_zc`             | 0.2079     | **-34%** | 680K      | 0         |
-| fixed (arena `send_zc`)    | 0.1666     | **-47%** | 525K      | **0**     |
+| step                       | what it adds                              | cpu/1k     | step Δ   | vs master | instr/req |
+| -------------------------- | ----------------------------------------- | ---------- | -------- | --------- | --------- |
+| 1. epoll (master)          | stock UnixNetVConnection, copy every byte | **0.3218** | —        | —         | 654K      |
+| 2. + io_uring (copy)       | batched SQE submission, still copy sends  | **0.3106** | -3.5%    | -3.5%     | 637K      |
+| 3. + zero-copy (anon)      | no send memcpy (pages pinned per send)    | **0.2025** | -34.8%   | -37%      | 674K      |
+| 4. + arena (send_zc_fixed) | registered buffers, no per-send pin       | **0.1789** | -11.7%   | **-44%**  | 583K      |
 
-The ladder: epoll 0.355 -> io_uring-copy 0.315 (batched submission) -> anon-ZC 0.208 -> fixed-arena-ZC
-~0.17-0.19. anon spends MORE instructions (per-send page pinning) yet wins on cpu by removing the 1 MiB
-memcpy's memory-bandwidth cost; fixed removes the pinning too. Confirms T3.1 (lock-free pool) + T3.3
-(size classes) did not regress the arena win (fixed -47% vs the pre-refactor -42%).
+reps: epoll 0.3292/0.3218/0.3160, copy 0.3197/0.3106/0.3093, anon 0.2025/0.2010/0.2083, fixed
+0.1788/0.1789/0.1777 (very low variance). zc_copied=0 throughout the ZC steps (true NIC zero-copy).
+
+Shape: step 2 (batched submission) is modest on LARGE objects (-3.5%; its big win is small-object /
+moderate concurrency). Step 3 (zero-copy send) is the giant leap -- removing the 1 MiB memcpy's
+memory-bandwidth cost is -35% EVEN THOUGH it spends more instructions (per-send page pinning, instr/req
+637K->674K). Step 4 (arena) pays off that pinning debt: send_zc_fixed drops instr/req to 583K (below
+epoll) and shaves another -12%. Confirms T3.1 (lock-free pool) + T3.3 (size classes) did not regress the
+arena win.
+
+(An earlier separate copy/anon/fixed-only matrix, different box thermal state, read copy 0.3147 / anon
+0.2079 / fixed 0.1666 -- same shape; trust the single-matrix ladder above for the step deltas.)
 
 ## Recv zero-copy: cache-miss pass-through (T3.4)
 
