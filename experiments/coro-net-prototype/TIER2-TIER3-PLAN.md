@@ -108,13 +108,27 @@ T3.2 **IORING_REGISTER_CLONE_BUFFERS** (1x pinning). Goal: register the arena ON
   Needs startup ordering (one ring registers first; others clone). Accept: 1x RLIMIT_MEMLOCK accounting;
   `send_zc_fixed` still works cross-thread (buf_index identical on all rings).
 
-T3.3 **Size classes**. Goal: the arena currently has one fixed block size (wastes a block on medium
-  objects, exhausts faster). Add per-size slabs (e.g. powers of two up to the fragment size). Accept:
-  mixed-object workload doesn't exhaust the arena prematurely; small reads don't take big blocks.
-  EXTRA MOTIVATION (found in T2.1): the single block_size is also a hard CEILING -- any Doc bigger than
-  block_size (body + Doc struct + marshalled header) gets `alloc()==nullptr` and falls back to heap (no
-  ZC), silently. So with the default 1 MiB block, a 1 MiB object never uses send_zc_fixed. Size classes
-  (or just a bigger top class) must cover the largest fragment's full Doc, not just the body.
+T3.3 **Size classes** -- AGREED NEXT STEP (2026-06-28). Goal: the arena currently has one fixed block
+  size (wastes a block on medium objects, exhausts faster). Add per-size slabs (powers of two up to the
+  fragment size) so a read takes the smallest class that fits.
+  PRIMARY DRIVER (found in T2.1): the single block_size is a hard CEILING -- any Doc bigger than
+  block_size (body + `Doc` struct + marshalled header) makes `alloc()==nullptr`, silently falling back to
+  a heap buffer (read still works; just no send_zc_fixed). With the default 1 MiB block a nominal 1 MiB
+  object gets body+overhead > 1 MiB -> ZERO send_zc_fixed. So the arena's headline win is off by default
+  config today.
+  FRAMING (important, do not re-mis-state): this "whole Doc in one contiguous buffer" need is NOT new and
+  is NOT an io_uring change -- the cache disk read has always done one `ink_aio_read` into one
+  IOBufferData (CacheVC::handleRead), on epoll too. The normal allocator NEVER fails to size it:
+  `iobuffer_size_to_index` rounds up to a power-of-two class (<= 2 MiB = MAX_BUFFER_SIZE_INDEX) and uses
+  an exact xmalloc above that. The arena is the ONLY allocator that can be "too small", because it lacks
+  size classes AND lacks that xmalloc escape. So mirror the normal allocator: per-size classes covering
+  the fragment range, plus a path for Docs > the top class (either a top class >= the max fragment Doc,
+  or fall through to heap by design -- but then count it).
+  METRICS: add per-class alloc/free/in-use counters (and a class-exhausted + over-size-fallback counter).
+  These subsume the "silent over-size decline" visibility, so no separate decline metric is needed before
+  this lands (decided 2026-06-28).
+  Accept: mixed-object workload doesn't exhaust the arena prematurely; small reads don't take big blocks;
+  send_zc_fixed engages on 1 MiB objects with default config; per-class metrics move as expected.
 
 T3.4 **Origin-recv coverage**. Goal: extend the fixed path past disk-served. Wire the origin/client recv
   MIOBuffer to allocate from the arena so pass-through (and RAM-hits of origin-fetched objects) become
@@ -132,7 +146,10 @@ T3.5 **Arena ASan**. DONE -- folded into T2.1's io_uring_write_zerocopy autest r
 
 ## Suggested order
 
-DONE: T2.1 (zero-copy autest) + T3.5 (arena ASan, folded in) + T2.2 io_uring-suite cell (6/6 ASan-clean).
-REMAINING: T3.1 (magazines) -> T3.3/T3.2/T3.4 (arena breadth; T3.3 now has a concrete bug-shaped driver)
--> T2.2 full-suite global-on differential -> T2.3 (TSan). Ship sequence stays: batching first, then
+DONE: T2.1 (zero-copy autest) + T3.5 (arena ASan, folded in) + T2.2 io_uring-suite cell (6/6 ASan-clean)
++ T2.2 force-on differential pilot (found+fixed the _read recv UAF, bfb14a84ea).
+NEXT (agreed 2026-06-28): **T3.3 size classes** -- without it the arena gives zero send_zc_fixed on 1 MiB
+objects by default; it carries the per-class metrics, so do it before any decline-metric.
+THEN: T3.1 (magazines) -> T3.2 (clone buffers) -> T3.4 (origin-recv) -> widen the T2.2 force-on
+differential (sequential) -> T2.3 (TSan). Ship sequence stays: batching first, then
 large-object zero-copy (anon), then the arena.
