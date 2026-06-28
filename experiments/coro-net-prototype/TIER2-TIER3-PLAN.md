@@ -94,13 +94,28 @@ T2.3 **Master-TSan differential** (long-open task #13). Goal: confirm the io_uri
 
 ## TIER 3 -- the arena's production form (the +7%, currently a prototype)
 
-T3.1 **Per-thread drainable magazines** (drop the global mutex). Goal: replace `UringFixedBufArena`'s
-  `std::mutex` + `std::vector` free-stack with `InkFreeList`/`ClassAllocator`-style per-thread magazines
-  over a global pool (ATS already has this: `thread_freelist_size`=512 cap + `_low_watermark`=32 refill).
-  The catch: the arena MEMORY is a fixed registered mmap region, so give the freelist a custom chunk
-  source (the region) instead of `ats_memalign`. Accept: same cpu/1k on the large-obj A/B (it's a low
-  alloc-rate path so this is correctness/scale, not the number); validates under churn. Gotcha:
-  refcount-gated recycle must be preserved (block not reused until F_NOTIF; the `_write` anchor holds it).
+T3.1 **Drop the global mutex** -- DONE (2026-06-28). Replaced `UringFixedBufArena`'s `std::mutex` +
+  `std::vector` free-stack with a LOCK-FREE per-class `InkAtomicList` (ATS's ABA-safe Treiber stack, the
+  same primitive `InkFreeList` is built on). At build() each class pre-creates one `RegisteredBufferData`
+  per block, permanently bound to its block address, and pushes it onto the class list (linked via the
+  `_flink` field at a runtime-computed offset). alloc()=pop, free()=push -- one CAS each, no lock.
+  Counters are `std::atomic` relaxed; `_classes` is `std::unique_ptr<SizeClass[]>` (NOT vector --
+  InkAtomicList + atomics are non-movable, and `new[]` gives the 16-byte alignment cmpxchg16b needs;
+  a `static_assert(alignof(SizeClass)%16==0)` guards it). The refcount-gated recycle is preserved (the
+  `_write` Ptr anchor holds the block until F_NOTIF, so free()/push can't fire mid-DMA).
+  DECISION (asked, agreed 2026-06-28): atomic POOL only, NO per-thread magazine. ATS's thread-local
+  magazine is `ProxyAllocator` (Thread.h members + THREAD_ALLOC), reserved for HOT allocators (~20 of
+  ~95 ClassAllocators); cold allocators use the global atomic pool directly. The arena is cold (one
+  alloc per >=64 KiB disk fragment), so it matches the cold-allocator convention -- the InkAtomicList
+  IS the ClassAllocator global-pool layer done right. TODO(perf) left in the header for the magazine if
+  it ever goes hot. Accept met: low alloc-rate path, this is correctness/scale not the number.
+  VALIDATED: unit test test_iouring_arena 8 cases/302 assertions incl. an 8-thread×20k multi-class
+  stamp/verify/free stress + pool-conservation drain -- green on dev + ASan + **TSan** (the only TSan
+  race is the primitive's benign `_flink` link access in ink_atomiclist_pop/push, ABA-version-protected;
+  added `race:ink_atomiclist_pop|push` to `.tsan_suppressions` next to the existing freelist entries --
+  the arena is the first DIRECT InkAtomicList user, others go through ink_freelist). io_uring_* autests
+  6/6 under ASan (write_zerocopy drives the arena under live net-thread concurrency). 9-agent adversarial
+  review: lock-free correct, alignment concern refuted, no material findings.
 
 T3.2 **IORING_REGISTER_CLONE_BUFFERS** (1x pinning). Goal: register the arena ONCE then clone into every
   ET_NET ring instead of independent per-ring registration (N x memlock). Kernel 6.12+ (box is 6.17);
@@ -168,7 +183,13 @@ T3.5 **Arena ASan**. DONE -- folded into T2.1's io_uring_write_zerocopy autest r
 
 DONE: T2.1 (zero-copy autest) + T3.5 (arena ASan, folded in) + T2.2 io_uring-suite cell (6/6 ASan-clean)
 + T2.2 force-on differential pilot (found+fixed the _read recv UAF, bfb14a84ea) + T3.3 (size classes;
-unit test test_iouring_arena + default block_size 1M->2M so 1 MiB objects engage send_zc_fixed).
-NEXT: T3.1 (magazines) -> T3.2 (clone buffers) -> T3.4 (origin-recv) -> widen the T2.2 force-on
-differential (sequential) -> T2.3 (TSan). Ship sequence stays: batching first, then
-large-object zero-copy (anon), then the arena.
+default block_size 1M->2M so 1 MiB objects engage send_zc_fixed) + T3.1 (lock-free InkAtomicList pool,
+dropped the global mutex; atomic-pool-only, no magazine -- cold allocator).
+NEXT: T3.2 (clone buffers) -> T3.4 (origin-recv) -> widen the T2.2 force-on differential (sequential)
+-> T2.3 (TSan). Then representative perf data (the milestone). Ship sequence stays: batching first,
+then large-object zero-copy (anon), then the arena.
+NOT ON THE ROADMAP YET (raised 2026-06-28): **ZC disk read** -- io_uring_prep_read_fixed for the cache
+disk read into the (already-registered) arena block, the read-side mirror of send_zc_fixed (removes the
+per-IO get_user_pages pin on the read target). Today the disk read lands directly in the arena block but
+via ink_aio_read -> io_uring_prep_read (AIO.cc:558), a plain read. Would be a T3.6; pairs with T3.2.
+Cross-subsystem (AIO backend must detect an arena-backed aio_buf and emit read_fixed w/ buf_index).
