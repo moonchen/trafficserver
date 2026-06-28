@@ -1,7 +1,10 @@
 # io_uring perf results — session 2026-06-28
 
-Consolidated A/B measurements for the io_uring net-path + registered-arena work, so the numbers are
-easy to look back at (the `findings/*.txt` in the bench repo get overwritten each run).
+CANONICAL store for the io_uring net-path + registered-arena A/B measurements, so the numbers survive
+and any agent can show the progression WITHOUT re-running (the bench repo `findings/*.txt` get
+overwritten each run; re-running needs the pinned box + the `hawaii` second host). Future sessions:
+append new dated sections / files here. To SHOW the step ladder, read this file; only re-measure for a
+NEW code change.
 
 ## Environment
 
