@@ -26,6 +26,8 @@
 #include "tscore/ink_hrtime.h"
 #include "tsutil/Metrics.h"
 #include "tsutil/ts_bw_format.h"
+#include "iocore/io_uring/UringFixedBufArena.h" // recv zero-copy: back the origin-recv body with the arena
+#include "records/RecCore.h"
 #include "proxy/ProxyTransaction.h"
 #include "proxy/http/HttpSM.h"
 #include "proxy/http/ConnectingEntry.h"
@@ -7231,12 +7233,43 @@ HttpSM::setup_server_transfer()
   int64_t nbytes;
 
   alloc_index = find_server_buffer_size();
-#ifndef USE_NEW_EMPTY_MIOBUFFER
-  MIOBuffer *buf = new_MIOBuffer(alloc_index);
-#else
-  MIOBuffer *buf = new_empty_MIOBuffer(alloc_index);
-  buf->append_block(HTTP_HEADER_BUFFER_SIZE_INDEX);
+
+  // Recv zero-copy (T3.4): for a known, large origin response, back the body buffer with the io_uring
+  // registered arena and ask the origin VC to coalesce reads (SO_RCVLOWAT) so a >= recv_coalesce_size
+  // contiguous chunk lands in one arena block -> the tunnel send to the client is send_zc_fixed. The
+  // header block stays a normal heap block; only the body blocks (appended as the tunnel fills) are
+  // arena-backed. Falls back to plain copy whenever the chunk is short (FIN tail, rmem cap): _write
+  // re-gates zero-copy on the actual send size.
+  int64_t recv_coalesce = 0;
+#if TS_USE_LINUX_IO_URING
+  if (RecGetRecordInt("proxy.config.net.io_uring.recv_zerocopy").value_or(0) != 0 && UringFixedBufArena::instance().enabled()) {
+    int64_t       target = RecGetRecordInt("proxy.config.net.io_uring.recv_coalesce_size").value_or(262144);
+    int64_t const cl     = t_state.hdr_info.response_content_length;
+    if (cl != HTTP_UNDEFINED_CL && cl >= target) { // known-large only; skip chunked/unknown + small
+      recv_coalesce = target;
+      alloc_index   = buffer_size_to_index(target, MAX_BUFFER_SIZE_INDEX); // body blocks >= the chunk
+    }
+  }
 #endif
+
+  MIOBuffer *buf;
+  if (recv_coalesce > 0) {
+    buf = new_empty_MIOBuffer(alloc_index);
+    buf->append_block(HTTP_HEADER_BUFFER_SIZE_INDEX); // small heap block for the response header
+#if TS_USE_LINUX_IO_URING
+    buf->_block_alloc = &UringFixedBufArena::block_alloc_hook; // body blocks come from the arena
+    if (NetVConnection *svc = (server_txn != nullptr) ? server_txn->get_netvc() : nullptr; svc != nullptr) {
+      svc->set_recv_coalesce(recv_coalesce);
+    }
+#endif
+  } else {
+#ifndef USE_NEW_EMPTY_MIOBUFFER
+    buf = new_MIOBuffer(alloc_index);
+#else
+    buf = new_empty_MIOBuffer(alloc_index);
+    buf->append_block(HTTP_HEADER_BUFFER_SIZE_INDEX);
+#endif
+  }
   buf->water_mark           = static_cast<int>(t_state.txn_conf->default_buffer_water_mark);
   IOBufferReader *buf_start = buf->alloc_reader();
 

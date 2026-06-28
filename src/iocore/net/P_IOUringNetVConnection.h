@@ -97,6 +97,12 @@ public:
   IOUringNetVConnection *_rbuf_wait_next = nullptr;
   bool                   _rbuf_waiting   = false;
 
+  // Recv-coalescing (T3.4 recv zero-copy): set SO_RCVLOWAT so reads return only once a large
+  // contiguous chunk is buffered, and mark reads to use IORING_RECVSEND_POLL_FIRST (without which
+  // io_uring's inline non-blocking recv ignores SO_RCVLOWAT). Paired with an arena-backed read
+  // buffer, the coalesced chunk then sends as send_zc_fixed.
+  void set_recv_coalesce(int64_t min_bytes) override;
+
 private:
   // The asynchronous read/write/connect coroutines: drive one io_uring op, await
   // it, then signal. Fire-and-forget (DetachedTask); the frame self-cleans at
@@ -125,11 +131,14 @@ private:
 
   // The in-flight recvmsg / sendmsg / connect ops, reachable for cancellation. Each
   // address is the SQE user_data; non-null only while that op is actually in flight.
-  IOUringCompletionHandler *_read_op     = nullptr;
-  IOUringCompletionHandler *_write_op    = nullptr;
-  IOUringCompletionHandler *_connect_op  = nullptr;
-  bool                      _closing     = false;
-  int                       _close_errno = -1;
+  IOUringCompletionHandler *_read_op            = nullptr;
+  IOUringCompletionHandler *_write_op           = nullptr;
+  IOUringCompletionHandler *_connect_op         = nullptr;
+  bool                      _closing            = false;
+  int                       _close_errno        = -1;
+  bool                      _recv_poll_first    = false; // arm reads with IORING_RECVSEND_POLL_FIRST
+  int64_t                   _recv_coalesce_size = 0;     // SO_RCVLOWAT target for coalesced reads
+  int                       _recv_lowat_cur     = 0;     // last SO_RCVLOWAT we set (redundant-call guard)
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;

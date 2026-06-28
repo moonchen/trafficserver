@@ -328,6 +328,15 @@ public:
   /** Attempt to push any changed options down */
   virtual void apply_options() = 0;
 
+  /** Hint that reads on this connection should coalesce into chunks of at least @a min_bytes before
+      completing, so the data lands in large contiguous buffers (e.g. for io_uring send_zc_fixed).
+      Default is a no-op; the io_uring VC sets SO_RCVLOWAT and reads with IORING_RECVSEND_POLL_FIRST. */
+  virtual void
+  set_recv_coalesce(int64_t min_bytes)
+  {
+    (void)min_bytes;
+  }
+
   //
   // Private
   //

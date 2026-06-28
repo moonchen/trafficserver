@@ -575,11 +575,29 @@ IOUringNetVConnection::_read()
     // A single-block read (the common case: a request header fits in one block)
     // needs no msghdr --- recv is lighter in the kernel than recvmsg (no msghdr
     // copy, no peer-address fill-back on a connected socket).
+    // Recv-coalescing (T3.4): cap SO_RCVLOWAT at the bytes we will actually read (rattempted) so the
+    // recv never blocks waiting for more than the body has left -- the origin may keep-alive with no
+    // FIN to flush a short tail. POLL_FIRST (skip io_uring's inline non-blocking recv, which ignores
+    // SO_RCVLOWAT) is used only for a full coalesce chunk; for the partial tail the inline recv grabs
+    // what is there immediately, and a sub-threshold chunk just ships as a copy (see _write re-gate).
+    bool poll_first = false;
+    if (_recv_poll_first && rattempted > 0) {
+      int want = static_cast<int>(rattempted < _recv_coalesce_size ? rattempted : _recv_coalesce_size);
+      if (want != _recv_lowat_cur) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &want, sizeof(want));
+        _recv_lowat_cur = want;
+      }
+      poll_first = rattempted >= _recv_coalesce_size;
+    }
+
     ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
       if (msg.msg_iovlen == 1) {
         io_uring_prep_recv(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, 0);
       } else {
         io_uring_prep_recvmsg(sqe, fd, &msg, 0);
+      }
+      if (poll_first) {
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
       }
     });
     _read_op = &op;
@@ -804,6 +822,34 @@ IOUringNetVConnection::rearm_read_for_buffers()
   // Re-trigger net_read_io via the ready list (it re-arms once the ring has a buffer).
   if (!this->closed) {
     readReschedule(this->nh);
+  }
+}
+
+void
+IOUringNetVConnection::set_recv_coalesce(int64_t min_bytes)
+{
+  _recv_poll_first    = true;
+  _recv_coalesce_size = min_bytes;
+  _recv_lowat_cur     = static_cast<int>(min_bytes);
+  int fd              = con.sock.get_fd();
+  if (fd < 0 || min_bytes <= 0) {
+    return;
+  }
+  // SO_RCVLOWAT is capped near SO_RCVBUF/2 (and SO_RCVBUF at net.core.rmem_max), so widen the receive
+  // buffer first. Disabling autotuning is acceptable here: a coalescing read wants a large fixed window.
+  int want_rcvbuf = static_cast<int>(min_bytes * 2);
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want_rcvbuf, sizeof(want_rcvbuf));
+  int lowat = static_cast<int>(min_bytes);
+  setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &lowat, sizeof(lowat));
+  // Warn (once) if the kernel capped the low-water below the target: reads then coalesce to less than
+  // min_bytes, so the chunks fall under the send_zc threshold and ship as copies. Raising
+  // net.core.rmem_max lets the coalescing reach the target.
+  int       got = 0;
+  socklen_t gl  = sizeof(got);
+  if (getsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &got, &gl) == 0 && got < min_bytes) {
+    SiteThrottledWarning("io_uring recv coalesce: SO_RCVLOWAT capped at %d B (< %" PRId64
+                         " target); raise net.core.rmem_max for full coalescing",
+                         got, min_bytes);
   }
 }
 
