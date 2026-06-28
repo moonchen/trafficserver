@@ -51,6 +51,10 @@ Http2ClientSession::destroy()
 {
   if (!in_destroy) {
     in_destroy = true;
+    // write_vio points into _vc's write-VIO sub-object. Drop it before closing _vc so the
+    // liveness-blind write_reenable() guard short-circuits and never touches the freed VC.
+    // Mirrors Http2ServerSession::destroy().
+    write_vio = nullptr;
     REMEMBER(NO_EVENT, this->recursion)
     Http2SsnDebug("session destroy");
     if (_vc) {
@@ -160,6 +164,7 @@ Http2ClientSession::do_io_close(int /* alerrno ATS_UNUSED */)
 
     // Clean up the write VIO in case of inactivity timeout
     this->do_io_write(this, 0, nullptr);
+    write_vio = nullptr;
   }
 }
 
