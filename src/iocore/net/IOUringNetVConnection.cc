@@ -493,11 +493,19 @@ IOUringNetVConnection::_read()
   // new data --- no epoll, no readiness round-trip).
   for (;;) {
     // tiovec and msg live in this coroutine frame, pinned across the await for the
-    // lifetime of the in-flight recvmsg (the structural lifetime guarantee).
-    IOVec         tiovec[IOU_FRAME_IOV];
-    struct msghdr msg;
-    int           fd         = this->con.sock.get_fd();
-    int64_t       rattempted = 0;
+    // lifetime of the in-flight recvmsg (the structural lifetime guarantee). The kernel
+    // writes the received bytes into the destination blocks asynchronously, so those
+    // blocks must outlive the recv too: hold a Ptr to each across the await. Unlike epoll
+    // (whose recv is synchronous and touches the buffer only during the call) the consumer
+    // can release the read VIO's MIOBuffer (e.g. a request-body tunnel abandoned when the
+    // origin responds early) while this recv is still in flight; without these anchors the
+    // kernel would write into freed memory --- invisible to ASan, surfacing later as
+    // freelist corruption.
+    IOVec              tiovec[IOU_FRAME_IOV];
+    Ptr<IOBufferBlock> anchor[IOU_FRAME_IOV];
+    struct msghdr      msg;
+    int                fd         = this->con.sock.get_fd();
+    int64_t            rattempted = 0;
 
     // Build the next read request under the VIO mutex.
     {
@@ -534,6 +542,7 @@ IOUringNetVConnection::_read()
         int64_t a = b->write_avail();
         if (a > 0) {
           tiovec[niov].iov_base = b->end();
+          anchor[niov]          = b; // keep this destination block alive until the recv completes
           int64_t togo          = toread - rattempted;
           if (a > togo) {
             a = togo;
