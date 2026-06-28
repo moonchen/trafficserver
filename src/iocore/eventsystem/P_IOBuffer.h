@@ -816,7 +816,12 @@ MIOBuffer::append_block(int64_t asize_index)
 {
   ink_assert(BUFFER_SIZE_ALLOCATED(asize_index));
   IOBufferBlock *b = new_IOBufferBlock_internal(_location);
-  b->alloc(asize_index);
+  IOBufferData  *d = _block_alloc ? _block_alloc(asize_index, _location) : nullptr;
+  if (d != nullptr) {
+    b->set(d, 0, 0); // hook supplied the backing (e.g. an io_uring registered arena block)
+  } else {
+    b->alloc(asize_index); // normal path / hook declined
+  }
   append_block_internal(b);
   return;
 }
@@ -958,8 +963,13 @@ MIOBuffer::append_fast_allocated(void *b, int64_t len, int64_t fast_size_index)
 TS_INLINE void
 MIOBuffer::alloc(int64_t i)
 {
-  _writer = new_IOBufferBlock_internal(_location);
-  _writer->alloc(i);
+  _writer         = new_IOBufferBlock_internal(_location);
+  IOBufferData *d = _block_alloc ? _block_alloc(i, _location) : nullptr;
+  if (d != nullptr) {
+    _writer->set(d, 0, 0);
+  } else {
+    _writer->alloc(i);
+  }
   size_index = i;
   init_readers();
 }

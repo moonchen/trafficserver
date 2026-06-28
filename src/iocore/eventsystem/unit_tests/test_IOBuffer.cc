@@ -33,7 +33,70 @@
 
 #include "iocore/utils/diags.i"
 
+#include <atomic>
+
 #define TEST_THREADS 1
+
+namespace
+{
+std::atomic<int> g_hook_calls{0};
+int64_t          g_hook_last_index{-1};
+
+// Records that it was consulted, then delegates to the normal allocator so the block is usable.
+IOBufferData *
+recording_hook(int64_t size_index, const char * /* loc */)
+{
+  g_hook_calls.fetch_add(1, std::memory_order_relaxed);
+  g_hook_last_index = size_index;
+  return new_IOBufferData(size_index, DEFAULT_ALLOC);
+}
+
+// Consulted but declines (e.g. arena off/exhausted) -> MIOBuffer must fall back to the normal path.
+IOBufferData *
+declining_hook(int64_t /* size_index */, const char * /* loc */)
+{
+  g_hook_calls.fetch_add(1, std::memory_order_relaxed);
+  return nullptr;
+}
+} // namespace
+
+TEST_CASE("MIOBuffer block_alloc hook", "[iocore]")
+{
+  SECTION("a set hook supplies every appended block")
+  {
+    g_hook_calls    = 0;
+    MIOBuffer *b    = new_empty_MIOBuffer(BUFFER_SIZE_INDEX_64K);
+    b->_block_alloc = recording_hook;
+    b->append_block(BUFFER_SIZE_INDEX_64K);
+    b->append_block(BUFFER_SIZE_INDEX_64K);
+    b->append_block(BUFFER_SIZE_INDEX_64K);
+    CHECK(g_hook_calls.load() == 3);
+    CHECK(g_hook_last_index == BUFFER_SIZE_INDEX_64K);
+    CHECK(b->current_write_avail() > 0); // blocks really got allocated
+    free_MIOBuffer(b);
+  }
+
+  SECTION("a null hook (default) uses the normal allocator")
+  {
+    g_hook_calls = 0;
+    MIOBuffer *b = new_empty_MIOBuffer(BUFFER_SIZE_INDEX_64K);
+    b->append_block(BUFFER_SIZE_INDEX_64K);
+    CHECK(g_hook_calls.load() == 0);     // hook never consulted
+    CHECK(b->current_write_avail() > 0); // block still allocated
+    free_MIOBuffer(b);
+  }
+
+  SECTION("a declining hook falls back to the normal allocator")
+  {
+    g_hook_calls    = 0;
+    MIOBuffer *b    = new_empty_MIOBuffer(BUFFER_SIZE_INDEX_64K);
+    b->_block_alloc = declining_hook;
+    b->append_block(BUFFER_SIZE_INDEX_64K);
+    CHECK(g_hook_calls.load() == 1);     // consulted...
+    CHECK(b->current_write_avail() > 0); // ...but the block was still allocated via fallback
+    free_MIOBuffer(b);
+  }
+}
 
 TEST_CASE("MIOBuffer", "[iocore]")
 {

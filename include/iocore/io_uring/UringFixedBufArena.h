@@ -85,6 +85,12 @@ public:
   // Recycle a block + its descriptor (called from RegisteredBufferData::free()).
   void release(unsigned class_id, RegisteredBufferData *desc);
 
+  // MIOBuffer::_block_alloc hook: hand a buffer's blocks out of the arena so the data it collects
+  // (e.g. a coalesced origin-recv body) is registered and can send_zc_fixed. Gated to >= 64K
+  // (smaller blocks gain nothing); returns nullptr when too small / arena off / exhausted, so the
+  // MIOBuffer falls back to the normal allocator. Signature matches MIOBuffer::_block_alloc.
+  static IOBufferData *block_alloc_hook(int64_t size_index, const char *loc);
+
   // Introspection for tests and ops. Counters are atomic; the per-class block tables are
   // immutable after build().
   size_t

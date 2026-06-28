@@ -1246,6 +1246,15 @@ public:
 
   const char *_location = nullptr;
 
+  /**
+    Optional block-data source. When set, the buffer's block allocation (alloc/append_block) asks
+    this hook for the IOBufferData backing each new block, falling back to the normal allocator if
+    it returns nullptr. The default (nullptr) is the normal path. This is a dependency-inversion
+    hook so a higher layer (e.g. the io_uring registered-buffer arena) can back a specific buffer's
+    blocks with its own memory without the event system depending on that layer.
+  */
+  IOBufferData *(*_block_alloc)(int64_t size_index, const char *loc) = nullptr;
+
   explicit MIOBuffer(int64_t default_size_index);
   MIOBuffer();
   ~MIOBuffer();
