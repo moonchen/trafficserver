@@ -52,16 +52,32 @@ Code map:
 
 ## TIER 2 -- harden the net path for shipping
 
-T2.1 **Large-object zero-copy autest** (Tier-1 tail). Goal: gold test for a disk-served large-object
-  zero-copy serve + teardown-with-send-in-flight. Files: new `tests/gold_tests/.../*.test.py` + a
-  client that aborts mid-1 MiB-read (close while a send_zc + NOTIF are in flight). Accept: body intact
-  + no crash with `write_zerocopy=1`; runs under OpenSSL+ASAN. Gotcha: needs a disk cache + the
-  round-robin trick to actually hit the ZC path; verify the `write_zerocopy` metric increments in-test.
+T2.1 **Large-object zero-copy autest** (Tier-1 tail). DONE -- `tests/gold_tests/io_uring/
+  io_uring_write_zerocopy.test.py` (+ `io_uring_write_zerocopy_rr.lua`). Five phases: warm (miss->disk
+  write), cache-hit body integrity, wrk round-robin load (disk reads -> arena + churn), abort mid-read
+  (curl | head -c 4096 closes while a send_zc + NOTIF are in flight), and a metric gate. Validated under
+  ASan (build-dev-asan) AND non-ASan Debug: 5/5 phases pass, body intact, no crash, `write_zerocopy`
+  and `write_zerocopy_fixed` both engage (measured zerocopy=5121 / fixed=4581 -- ~89% through the
+  registered arena). Combined with T3.5 (the abort phase IS the arena-lifetime ASan workload).
+  KEY FINDING: a block must hold the whole on-disk **Doc** (Doc struct + marshalled header + body), not
+  just the body -- a nominal "1 MiB" object is ~1 MiB body + overhead > a 1 MiB block, so `alloc()`
+  returns nullptr (`req_bytes > block_size`) and silently falls back to a heap buffer (no send_zc_fixed,
+  fixed stays 0). The test uses 2 MiB blocks. So the shipped default `fixed_arena_block_size=1048576`
+  is effectively too small for 1 MiB objects -- motivates T3.3 (size classes) and is a config-doc note.
+  Run: `cd tests && ./autest.sh --ats-bin=/tmp/ats-dev-asan/bin --sandbox=/tmp/sb --filter=io_uring_write_zerocopy`
+  (filter flag is `-f/--filters`, glob-capable; the old note's `-R` is actually `--reporters`). autest
+  exec's a command with no shell operator directly (no `sh -c`), so bash `$` must be escaped `$$` and an
+  env-var prefix like `VAR=x cmd` fails -- pass config another way.
 
 T2.2 **Full autest suite + ASan** with `io_uring.enabled=1` (and a cell with `write_zerocopy=1`).
-  Accept: no NEW failures vs master (pre-existing fails are catalogued in [[tls-refactor-fullsuite-regressions]]
-  style -- compare against an `enabled=0` run). Recipe: `autest.sh -R iouring ...` + distinct
-  `AUTEST_PORT_OFFSET` if concurrent (see [[autest-concurrent-port-offset]]).
+  PARTIAL: all 6 `io_uring_*` gold tests (which set `enabled=1` themselves, and now a `write_zerocopy=1`
+  + arena cell via io_uring_write_zerocopy) pass under build-dev-asan, ASan-clean -- 6/6.
+  Recipe: `cd tests && ./autest.sh --ats-bin=/tmp/ats-dev-asan/bin --sandbox=/tmp/sb --filters='io_uring_*'`.
+  REMAINING: force io_uring on for the WHOLE suite to catch general-proxying regressions -- the per-test
+  records_config can't be overridden globally, so this needs either a default flip in RecordsConfig.cc
+  (`net.io_uring.enabled` 0->1) rebuilt into a throwaway binary, then a full-suite run diffed against an
+  enabled=0 run; or a representative subset (basic/cache/h2/post/redirect/tunnel) re-run with the flip.
+  Distinct `AUTEST_PORT_OFFSET` only if running concurrent autest.sh (see [[autest-concurrent-port-offset]]).
 
 T2.3 **Master-TSan differential** (long-open task #13). Goal: confirm the io_uring net path adds no new
   data races. Recipe: TSan build (needs `sudo sysctl vm.mmap_rnd_bits=28`, jemalloc OFF), run the suite
@@ -87,18 +103,28 @@ T3.2 **IORING_REGISTER_CLONE_BUFFERS** (1x pinning). Goal: register the arena ON
 T3.3 **Size classes**. Goal: the arena currently has one fixed block size (wastes a block on medium
   objects, exhausts faster). Add per-size slabs (e.g. powers of two up to the fragment size). Accept:
   mixed-object workload doesn't exhaust the arena prematurely; small reads don't take big blocks.
+  EXTRA MOTIVATION (found in T2.1): the single block_size is also a hard CEILING -- any Doc bigger than
+  block_size (body + Doc struct + marshalled header) gets `alloc()==nullptr` and falls back to heap (no
+  ZC), silently. So with the default 1 MiB block, a 1 MiB object never uses send_zc_fixed. Size classes
+  (or just a bigger top class) must cover the largest fragment's full Doc, not just the body.
 
 T3.4 **Origin-recv coverage**. Goal: extend the fixed path past disk-served. Wire the origin/client recv
   MIOBuffer to allocate from the arena so pass-through (and RAM-hits of origin-fetched objects) become
   arena-backed too -- today only the disk-read Doc buffer is. Accept: `write_zerocopy_fixed` engages on
   a cache-miss pass-through large object, not just disk hits.
 
-T3.5 **Arena ASan**. Goal: validate the arena recycle/teardown lifetime (the NEW, riskiest code) under
-  ASan -- a disk-read arena workload (round-robin) + connection churn + mid-write aborts, with
-  `fixed_arena_size>0`. Accept: ASan-clean (no UAF on a recycled block reused before its NOTIF). This is
-  the gate before the arena is trustworthy under load; do it EARLY in Tier 3.
+T3.5 **Arena ASan**. DONE -- folded into T2.1's io_uring_write_zerocopy autest run under build-dev-asan.
+  The wrk round-robin load drove ~4.5k send_zc_fixed (4581) through the arena -- thousands of block
+  alloc/recycle cycles -- and the abort-mid-read phase closed connections while a send_zc + NOTIF were
+  in flight (the cancel/teardown -> _complete_deferred_close path), all ASan-clean (detect_leaks=0,
+  halt_on_error=1): no UAF on a recycled block reused before its NOTIF. The arena memory is mmap'd and
+  intentionally never freed (NO_ALLOC), so leak detection is off; the gate here is use-after-free, which
+  the recycle path could trip and did not. NOTE if re-running with leaks on: the arena region + idle
+  descriptors will show as "leaks" by design.
 
 ## Suggested order
 
-T3.5 (arena ASan -- safety first) -> T3.1 (magazines) -> T2.1+T2.2 (autests) -> T3.2/T3.3/T3.4 (breadth)
--> T2.3 (TSan). Ship sequence stays: batching first, then large-object zero-copy (anon), then the arena.
+DONE: T2.1 (zero-copy autest) + T3.5 (arena ASan, folded in) + T2.2 io_uring-suite cell (6/6 ASan-clean).
+REMAINING: T3.1 (magazines) -> T3.3/T3.2/T3.4 (arena breadth; T3.3 now has a concrete bug-shaped driver)
+-> T2.2 full-suite global-on differential -> T2.3 (TSan). Ship sequence stays: batching first, then
+large-object zero-copy (anon), then the arena.
