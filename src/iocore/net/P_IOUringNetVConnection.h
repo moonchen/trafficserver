@@ -97,10 +97,10 @@ public:
   IOUringNetVConnection *_rbuf_wait_next = nullptr;
   bool                   _rbuf_waiting   = false;
 
-  // Recv-coalescing (T3.4 recv zero-copy): set SO_RCVLOWAT so reads return only once a large
+  // Recv coalescing (T3.4, "pass-through send-ZC"): set SO_RCVLOWAT so reads return only once a large
   // contiguous chunk is buffered, and mark reads to use IORING_RECVSEND_POLL_FIRST (without which
-  // io_uring's inline non-blocking recv ignores SO_RCVLOWAT). Paired with an arena-backed read
-  // buffer, the coalesced chunk then sends as send_zc_fixed.
+  // io_uring's inline non-blocking recv ignores SO_RCVLOWAT). The recv is NOT zero-copy; paired with an
+  // arena-backed read buffer, the coalesced chunk just becomes large enough to SEND as send_zc_fixed.
   void set_recv_coalesce(int64_t min_bytes) override;
 
 private:

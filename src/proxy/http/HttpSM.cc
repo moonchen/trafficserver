@@ -26,7 +26,7 @@
 #include "tscore/ink_hrtime.h"
 #include "tsutil/Metrics.h"
 #include "tsutil/ts_bw_format.h"
-#include "iocore/io_uring/UringFixedBufArena.h" // recv zero-copy: back the origin-recv body with the arena
+#include "iocore/io_uring/UringFixedBufArena.h" // recv coalescing: back the origin-recv body with the arena
 #include "records/RecCore.h"
 #include "proxy/ProxyTransaction.h"
 #include "proxy/http/HttpSM.h"
@@ -7234,15 +7234,16 @@ HttpSM::setup_server_transfer()
 
   alloc_index = find_server_buffer_size();
 
-  // Recv zero-copy (T3.4): for a known, large origin response, back the body buffer with the io_uring
-  // registered arena and ask the origin VC to coalesce reads (SO_RCVLOWAT) so a >= recv_coalesce_size
-  // contiguous chunk lands in one arena block -> the tunnel send to the client is send_zc_fixed. The
-  // header block stays a normal heap block; only the body blocks (appended as the tunnel fills) are
-  // arena-backed. Falls back to plain copy whenever the chunk is short (FIN tail, rmem cap): _write
-  // re-gates zero-copy on the actual send size.
+  // Pass-through send zero-copy via recv coalescing (T3.4): the recv itself is NOT zero-copy -- this
+  // coalesces the origin recv into a large registered buffer so the tunnel SEND to the client clears
+  // the threshold and can use send_zc_fixed. For a known, large origin response, back the body buffer
+  // with the io_uring registered arena and ask the origin VC to coalesce reads (SO_RCVLOWAT) so a
+  // >= recv_coalesce_size contiguous chunk lands in one arena block. The header block stays a normal
+  // heap block; only the body blocks (appended as the tunnel fills) are arena-backed. Falls back to a
+  // plain copy whenever the chunk is short (FIN tail, rmem cap): _write re-gates on the actual send size.
   int64_t recv_coalesce = 0;
 #if TS_USE_LINUX_IO_URING
-  if (RecGetRecordInt("proxy.config.net.io_uring.recv_zerocopy").value_or(0) != 0 && UringFixedBufArena::instance().enabled()) {
+  if (RecGetRecordInt("proxy.config.net.io_uring.recv_coalesce").value_or(0) != 0 && UringFixedBufArena::instance().enabled()) {
     int64_t       target = RecGetRecordInt("proxy.config.net.io_uring.recv_coalesce_size").value_or(262144);
     int64_t const cl     = t_state.hdr_info.response_content_length;
     if (cl != HTTP_UNDEFINED_CL && cl >= target) { // known-large only; skip chunked/unknown + small

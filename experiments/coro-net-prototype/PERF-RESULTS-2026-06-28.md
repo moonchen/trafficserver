@@ -58,7 +58,11 @@ arena win.
 (An earlier separate copy/anon/fixed-only matrix, different box thermal state, read copy 0.3147 / anon
 0.2079 / fixed 0.1666 -- same shape; trust the single-matrix ladder above for the step deltas.)
 
-## Recv zero-copy: cache-miss pass-through (T3.4)
+## Pass-through send-ZC via recv coalescing (T3.4)
+
+NOTE the name: the recv is NOT zero-copy (it still copies kernel->buffer). This COALESCES the origin
+recv into a large registered buffer so the pass-through SEND to the client clears the threshold and can
+use `send_zc_fixed`. Config: `net.io_uring.recv_coalesce` (+ `recv_coalesce_size`).
 
 `measure-recvzc-ab.sh copy|recvzc` — cache OFF, every request is an origin->client tunnel. wrk over the
 NIC -> ATS -> nginx (loopback). `recvzc` coalesces the origin recv (SO_RCVLOWAT=256K + POLL_FIRST) into
@@ -75,14 +79,33 @@ the POLL_FIRST/coalesce overhead. (Pass-through copy is pricier than disk copy b
 the 1 MiB recv AND send; recv-ZC strips the send copy.) reps (clean): recvzc 0.368/0.370, one outlier
 0.579 with 66 wrk timeouts.
 
-CAVEATS:
-- recvzc shows MORE wrk timeouts (16/42/66 vs copy 13) = coalesce LATENCY (waiting 256K) -> occasional
-  tail/HoL stalls under load. Real latency-vs-throughput tradeoff.
-- 256K lowat is a best-case. PROD CONSTRAINT: a high SO_RCVLOWAT is unsafe in general -- it only works
-  when you KNOW >= lowat more bytes are coming (known-large plain-HTTP Content-Length). TLS (record-
-  based) + H2 (multiplexed frames) make the next-step byte count unpredictable -> high lowat can stall.
-  Shippable target = the MINIMAL lowat above the ZC crossover (~128K per the cold sender_zc microbench),
-  not 256K. Re-measure at the minimal lowat before committing.
+### Minimal-lowat sweep -> GO/NO-GO (the win needs a big, prod-unsafe lowat)
+
+`measure-recvzc-ab.sh recvzc 48 18 <rep> <recv_coalesce_size>` -- the coalesce size IS the send size, so
+it sweeps the send_zc crossover. 3 reps each, vs the same copy baseline (cpu/1k 0.501):
+
+| coalesce (= SO_RCVLOWAT) | cpu/1k | vs copy   | instr/req | send_zc/req |
+| ------------------------ | ------ | --------- | --------- | ----------- |
+| copy (baseline)          | 0.501  | —         | 1078K     | 0           |
+| recvzc 256K              | 0.365  | **-27%**  | 592K      | 4           |
+| recvzc 128K              | 0.450  | **-10%**  | 887K      | 8           |
+| recvzc 64K               | 0.577  | **+15%**  | 1307K     | 16          |
+
+The win scales with the send size because send_zc's per-send notification (F_NOTIF) roundtrip only
+amortizes over LARGE sends: 256K -> 4 sends/req (-27%); 128K -> 8 sends (-10%, marginal); 64K -> 16
+sends (+15%, LOSES -- per-send overhead > the memcpy it saves). So a NET win needs >= ~128K coalesce
+(really 256K), i.e. a HIGH SO_RCVLOWAT.
+
+**VERDICT: NO-GO for general production.** The win only exists at a high lowat (>=128K), which is exactly
+what's UNSAFE for TLS/H2 (the next-step byte count is unpredictable -> a high lowat stalls). And for H2
+it's moot regardless: `Http2DataFrame::write_to` (Http2Frame.cc) memcpy's the body into the H2 OUTPUT
+buffer during framing ("...to reduce SSL_write() calls"), so the bytes the NIC DMAs are a fresh copy, not
+the arena recv block -- arena-backing the recv buffer is wasted under H2. recv-coalesce-ZC is therefore a
+NICHE optimization: plain-HTTP/1.1 large-object pass-through with known-large Content-Length where a high
+lowat is acceptable. Keep it OFF by default (it is); do not invest further. The general win is the
+disk-served send-ZC arena (-44%) above.
+
+CAVEAT: recvzc also shows MORE wrk timeouts at 256K (16/42/66 vs copy 13) = coalesce latency.
 
 ## `SO_RCVLOWAT` + io_uring recv spike (scratchpad/rcvlowat_spike.c)
 
