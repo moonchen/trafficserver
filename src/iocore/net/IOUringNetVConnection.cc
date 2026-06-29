@@ -890,6 +890,28 @@ IOUringNetVConnection::do_io_close(int alerrno)
   super::do_io_close(alerrno);
 }
 
+VIO *
+IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner)
+{
+  // A null reader is the "stop writing" call a tunnel teardown uses (abort_tunnel's
+  // do_io_write(this, 0, nullptr)). On epoll that synchronously stops the write; an in-flight
+  // io_uring send cannot be. Cancel it and mark it abandoned so the resuming _write skips its
+  // stale consume + signal against the source buffer the caller is about to free (the source
+  // blocks stay pinned, so the send itself is safe). This is the quick_server fix: the
+  // early-response teardown freed the POST buffer while the origin body-write send was in
+  // flight, and the resuming _write then consumed the recycled reader.
+  //
+  // Note this is NOT mirrored for do_io_read: do_io_read(0,nullptr) is also the routine
+  // keep-alive "pause reading" call, made while a recv is legitimately in flight waiting for
+  // the next request --- cancelling there loses the recv. A send never lingers that way, so
+  // an in-flight send at do_io_write(0,nullptr) really is an abandoned transfer.
+  if (_write_op != nullptr && buf == nullptr) {
+    _write_abandoned = true;
+    cancel_in_flight(_write_op);
+  }
+  return super::do_io_write(c, nbytes, buf, owner);
+}
+
 void
 IOUringNetVConnection::net_write_io(NetHandler *nh)
 {
@@ -1055,8 +1077,11 @@ IOUringNetVConnection::_write()
         }
         tiovec[niov].iov_len  = len;
         tiovec[niov].iov_base = tmp->start();
+        // Pin the source block across the await: the kernel reads it asynchronously, and the
+        // caller (a tunnel teardown such as abort_tunnel) may free the source MIOBuffer before
+        // this send's CQE. The blocks are RefCountObj, so the MIOBuffer can go while these live.
+        anchor[niov] = tmp->block;
         if (use_zc) {
-          anchor[niov] = tmp->block;
           // send_zc_fixed needs one registered buffer over a contiguous range. Track whether
           // every iovec block so far is the same registered buf_index and abuts the previous
           // (e.g. the body windows of one cache fragment); the leading HTTP-header block, a
@@ -1150,10 +1175,22 @@ IOUringNetVConnection::_write()
       _write_op = &op;
       wr        = co_await op;
       _write_op = nullptr;
+      for (auto &a : anchor) {
+        a = nullptr; // non-ZC: the kernel copied the source at send time, so release the pins now
+      }
     }
 
     if (_closing) {
       _complete_deferred_close();
+      co_return;
+    }
+    if (_write_abandoned) {
+      // do_io_write(null) stopped this write VIO while the send was in flight (a tunnel teardown
+      // such as abort_tunnel); the source buffer may now be freed/recycled, so skip the stale
+      // consume + signal. The send itself was safe (source blocks were pinned). Re-drive
+      // net_write_io for whatever the VIO holds now (a fresh transfer, or a disable).
+      _write_abandoned = false;
+      writeReschedule(nh);
       co_return;
     }
 

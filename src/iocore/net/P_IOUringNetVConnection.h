@@ -90,6 +90,15 @@ public:
   // resume into a freed `this` (the net-iouring branch's use-after-free).
   void do_io_close(int lerrno = -1) override;
 
+  // do_io_write(this, 0, nullptr) is the epoll-era "stop writing" a tunnel teardown relies on
+  // (e.g. abort_tunnel). On epoll the send is synchronous so it stops immediately; an in-flight
+  // io_uring send cannot. Cancel it and mark it abandoned so the resuming _write skips its
+  // now-stale consume + signal against the source buffer the caller is about to free. The
+  // source blocks stay pinned across the await, so the send itself is always safe regardless.
+  // Not mirrored for do_io_read: do_io_read(0,nullptr) is also the routine keep-alive "pause"
+  // made while a recv legitimately waits for the next request --- cancelling there loses it.
+  VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
+
   // Re-arm a multishot read that parked on -ENOBUFS (shared ring exhausted). Called
   // by the file-local read buffer ring when a buffer recycles. Public so the ring can
   // reach it; _rbuf_* are the ring's intrusive wait-list bookkeeping for this VC.
@@ -136,6 +145,7 @@ private:
   IOUringCompletionHandler *_connect_op         = nullptr;
   bool                      _closing            = false;
   int                       _close_errno        = -1;
+  bool                      _write_abandoned    = false; // do_io_write(null) stopped the write VIO mid-send
   bool                      _recv_poll_first    = false; // arm reads with IORING_RECVSEND_POLL_FIRST
   int64_t                   _recv_coalesce_size = 0;     // SO_RCVLOWAT target for coalesced reads
   int                       _recv_lowat_cur     = 0;     // last SO_RCVLOWAT we set (redundant-call guard)
