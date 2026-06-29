@@ -622,6 +622,17 @@ IOUringNetVConnection::_read()
         nh->free_netevent(this);
         co_return;
       }
+      // The read VIO's buffer was cleared while this recv was in flight: the producer was
+      // destroyed (HttpTunnel::abort_tunnel frees the read buffer, then detaches the producer
+      // with do_io_read(this, 0, nullptr), which clears the writer). There is no destination, so
+      // drop the recv --- the dest blocks were pinned, so the recv itself was safe --- and stop;
+      // without this, a recv that returns data (r > 0) after the producer is gone would fill()
+      // through a null writer. (Keep-alive "pause" also calls do_io_read(0,nullptr), but re-arms
+      // with a buffer before the recv resumes, so writer() is non-null there --- only a genuine
+      // producer destroy leaves it null.)
+      if (s->vio.buffer.writer() == nullptr) {
+        co_return;
+      }
 
       if (r <= 0) {
         if (r == -EAGAIN || r == -ENOTCONN) {
