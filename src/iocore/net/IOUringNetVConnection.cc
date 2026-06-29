@@ -486,6 +486,41 @@ IOUringNetVConnection::_read()
   NetState   *s  = &this->read;
   NetHandler *nh = this->nh;
 
+  // Deliver bytes parked by a recv that completed while the read was disabled (see the
+  // !s->enabled branch below). Re-enable (reenable / do_io_read) routed us here; fill the
+  // now-re-armed buffer and signal before reading more, mirroring epoll's level-triggered
+  // delivery of bytes that "waited in the socket." The re-armed buffer must be the same
+  // MIOBuffer the recv targeted (every disable->re-enable on this path re-arms the same
+  // buffer); the assert guards that invariant.
+  if (_held_read_bytes > 0 && s->enabled) {
+    MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
+    if (!lock.is_locked()) {
+      readReschedule(nh);
+      co_return;
+    }
+    if (this->closed) {
+      nh->free_netevent(this);
+      co_return;
+    }
+    ink_release_assert(s->vio.buffer.writer() == _held_read_buf);
+    int64_t held     = _held_read_bytes;
+    _held_read_bytes = 0;
+    _held_read_buf   = nullptr;
+    s->vio.buffer.writer()->fill(held);
+    s->vio.ndone += held;
+    this->netActivity();
+    if (s->vio.ntodo() <= 0) {
+      _read_signal_done(VC_EVENT_READ_COMPLETE);
+      co_return;
+    }
+    if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
+      co_return; // EVENT_DONE: the VC was freed during the signal
+    }
+    if (this->closed) {
+      co_return;
+    }
+  }
+
   // Read until a short read (socket has no more data right now), a full read
   // buffer (backpressure), or the read VIO is satisfied/disabled. A full recvmsg
   // (filled the iovec) may mean more is buffered, so loop; a short recvmsg means
@@ -504,8 +539,9 @@ IOUringNetVConnection::_read()
     IOVec              tiovec[IOU_FRAME_IOV];
     Ptr<IOBufferBlock> anchor[IOU_FRAME_IOV];
     struct msghdr      msg;
-    int                fd         = this->con.sock.get_fd();
-    int64_t            rattempted = 0;
+    int                fd          = this->con.sock.get_fd();
+    int64_t            rattempted  = 0;
+    MIOBuffer         *read_target = nullptr; // the buffer this recv reads into (for the held-read path)
 
     // Build the next read request under the VIO mutex.
     {
@@ -532,6 +568,7 @@ IOUringNetVConnection::_read()
         read_disable(nh, this);
         co_return;
       }
+      read_target    = buf.writer();
       int64_t toread = buf.writer()->write_avail();
       if (toread > s->vio.ntodo()) {
         toread = s->vio.ntodo();
@@ -600,9 +637,11 @@ IOUringNetVConnection::_read()
         sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
       }
     });
-    _read_op = &op;
-    int r    = co_await op;
-    _read_op = nullptr;
+    _read_op           = &op;
+    _read_inflight_buf = read_target; // the buffer this recv is filling (for the do_io_read swap check)
+    int r              = co_await op;
+    _read_op           = nullptr;
+    _read_inflight_buf = nullptr;
 
     // do_io_close deferred teardown to us (it cancelled this recv). Free once no
     // op is in flight (a sendmsg may still be outstanding), then stop touching `this`.
@@ -622,15 +661,20 @@ IOUringNetVConnection::_read()
         nh->free_netevent(this);
         co_return;
       }
-      // The read VIO's buffer was cleared while this recv was in flight: the producer was
-      // destroyed (HttpTunnel::abort_tunnel frees the read buffer, then detaches the producer
-      // with do_io_read(this, 0, nullptr), which clears the writer). There is no destination, so
-      // drop the recv --- the dest blocks were pinned, so the recv itself was safe --- and stop;
-      // without this, a recv that returns data (r > 0) after the producer is gone would fill()
-      // through a null writer. (Keep-alive "pause" also calls do_io_read(0,nullptr), but re-arms
-      // with a buffer before the recv resumes, so writer() is non-null there --- only a genuine
-      // producer destroy leaves it null.)
-      if (s->vio.buffer.writer() == nullptr) {
+      // The read was disabled while this recv was in flight --- a tunnel teardown's
+      // do_io_read(this,0,nullptr), the keep-alive pause, or vc->disable(). On epoll a disabled
+      // read produces no signal: the bytes wait in the socket until re-enable. io_uring's recv
+      // already pulled them, so don't fill()/signal here (that would leak a read event the
+      // consumer disabled) --- park the bytes and deliver them when the read re-enables (see the
+      // top of _read). Only one op is ever in flight, so a single pending slot suffices. r <= 0
+      // (EOS/error) needs no parking: the recv issued on re-enable re-detects it. A close-bound
+      // disable (e.g. abort_tunnel, which also frees the buffer) never re-enables, so the parked
+      // bytes are simply freed at teardown (the dest blocks were pinned, so the recv was safe).
+      if (!s->enabled) {
+        if (r > 0) {
+          _held_read_buf   = read_target;
+          _held_read_bytes = r;
+        }
         co_return;
       }
 
@@ -921,6 +965,22 @@ IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferRead
     cancel_in_flight(_write_op);
   }
   return super::do_io_write(c, nbytes, buf, owner);
+}
+
+VIO *
+IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
+{
+  // Re-targeting the read to a DIFFERENT buffer while a recv is in flight would mis-place that
+  // recv's bytes: the kernel wrote them into the in-flight buffer, but the completion fills
+  // whatever the VIO points at now. That must not happen. A SAME-buffer re-arm while a recv is
+  // in flight is fine and routine --- the keep-alive teardown pauses (do_io_read(0,nullptr)) and
+  // then re-arms do_io_read(INT64_MAX, read_buffer) on the session's single read_buffer while the
+  // abort-watch recv into that same buffer is still in flight. A null buffer is the disable/pause
+  // itself (the recv is parked and replayed on re-enable; see _read). Only the default _read path
+  // tracks _read_inflight_buf; the experimental provided-buffer read leaves it null (it attaches
+  // kernel-filled blocks rather than fill()ing into the VIO buffer), so the check is skipped there.
+  ink_release_assert(buf == nullptr || _read_op == nullptr || _read_inflight_buf == nullptr || buf == _read_inflight_buf);
+  return super::do_io_read(c, nbytes, buf);
 }
 
 void

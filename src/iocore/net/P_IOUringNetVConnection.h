@@ -95,9 +95,16 @@ public:
   // io_uring send cannot. Cancel it and mark it abandoned so the resuming _write skips its
   // now-stale consume + signal against the source buffer the caller is about to free. The
   // source blocks stay pinned across the await, so the send itself is always safe regardless.
-  // Not mirrored for do_io_read: do_io_read(0,nullptr) is also the routine keep-alive "pause"
-  // made while a recv legitimately waits for the next request --- cancelling there loses it.
   VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
+
+  // Re-targeting a read to a DIFFERENT buffer while a recv is in flight would mis-place the
+  // in-flight recv's bytes (the kernel wrote into the in-flight buffer; the completion would fill
+  // whatever the VIO points at now) --- serving uninitialized/stale memory as request data, so
+  // assert it never happens. A SAME-buffer re-arm while a recv is in flight is routine and
+  // allowed (the keep-alive teardown re-arms the session's single read_buffer while its
+  // abort-watch recv is still pending). do_io_read(c,0,nullptr), the disable/pause, keeps
+  // buf==nullptr and is handled by holding the recv (see _read).
+  VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
 
   // Re-arm a multishot read that parked on -ENOBUFS (shared ring exhausted). Called
   // by the file-local read buffer ring when a buffer recycles. Public so the ring can
@@ -140,15 +147,21 @@ private:
 
   // The in-flight recvmsg / sendmsg / connect ops, reachable for cancellation. Each
   // address is the SQE user_data; non-null only while that op is actually in flight.
-  IOUringCompletionHandler *_read_op            = nullptr;
-  IOUringCompletionHandler *_write_op           = nullptr;
-  IOUringCompletionHandler *_connect_op         = nullptr;
-  bool                      _closing            = false;
-  int                       _close_errno        = -1;
-  bool                      _write_abandoned    = false; // do_io_write(null) stopped the write VIO mid-send
-  bool                      _recv_poll_first    = false; // arm reads with IORING_RECVSEND_POLL_FIRST
-  int64_t                   _recv_coalesce_size = 0;     // SO_RCVLOWAT target for coalesced reads
-  int                       _recv_lowat_cur     = 0;     // last SO_RCVLOWAT we set (redundant-call guard)
+  IOUringCompletionHandler *_read_op         = nullptr;
+  IOUringCompletionHandler *_write_op        = nullptr;
+  IOUringCompletionHandler *_connect_op      = nullptr;
+  bool                      _closing         = false;
+  int                       _close_errno     = -1;
+  bool                      _write_abandoned = false; // do_io_write(null) stopped the write VIO mid-send
+  // A recv that completed while the read was disabled: its bytes are already in _held_read_buf
+  // (written by the kernel, not yet fill()'d). Held here and delivered when the read re-enables,
+  // so a disabled read produces no signal (the epoll contract) and no pulled bytes are lost.
+  MIOBuffer *_held_read_buf      = nullptr;
+  int64_t    _held_read_bytes    = 0;
+  MIOBuffer *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling (do_io_read swap check)
+  bool       _recv_poll_first    = false;   // arm reads with IORING_RECVSEND_POLL_FIRST
+  int64_t    _recv_coalesce_size = 0;       // SO_RCVLOWAT target for coalesced reads
+  int        _recv_lowat_cur     = 0;       // last SO_RCVLOWAT we set (redundant-call guard)
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
