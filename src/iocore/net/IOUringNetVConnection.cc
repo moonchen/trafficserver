@@ -639,6 +639,7 @@ IOUringNetVConnection::_read()
     });
     _read_op           = &op;
     _read_inflight_buf = read_target; // the buffer this recv is filling (for the do_io_read swap check)
+    _read_redirect_buf = nullptr;     // a re-target during the await (below) sets this
     int r              = co_await op;
     _read_op           = nullptr;
     _read_inflight_buf = nullptr;
@@ -661,6 +662,8 @@ IOUringNetVConnection::_read()
         nh->free_netevent(this);
         co_return;
       }
+      MIOBuffer *redirect = _read_redirect_buf;
+      _read_redirect_buf  = nullptr;
       // The read was disabled while this recv was in flight --- a tunnel teardown's
       // do_io_read(this,0,nullptr), the keep-alive pause, or vc->disable(). On epoll a disabled
       // read produces no signal: the bytes wait in the socket until re-enable. io_uring's recv
@@ -677,6 +680,38 @@ IOUringNetVConnection::_read()
         }
         co_return;
       }
+
+      if (redirect != nullptr && r > 0) {
+        // do_io_read re-targeted the read to `redirect` while this recv was in flight (e.g. the
+        // origin keep-alive pool re-arm onto the session read_buffer, while the chunked read-ahead
+        // recv was still filling the tunnel body buffer). The kernel wrote r bytes into the
+        // in-flight buffer's blocks (pinned by anchor[], so still valid even though that buffer may
+        // now be freed); copy them into `redirect` so they reach the read that is now armed --- for
+        // the pool case those bytes are the start of the next response and belong in the session
+        // buffer. This delivers the recv's real bytes (never uninitialized memory) into the right
+        // buffer, then reads on into it.
+        int64_t rem = r;
+        for (unsigned i = 0; i < msg.msg_iovlen && rem > 0; i++) {
+          int64_t n = rem < static_cast<int64_t>(tiovec[i].iov_len) ? rem : static_cast<int64_t>(tiovec[i].iov_len);
+          redirect->write(tiovec[i].iov_base, n);
+          rem -= n;
+        }
+        s->vio.ndone += r;
+        this->netActivity();
+        if (s->vio.ntodo() <= 0) {
+          _read_signal_done(VC_EVENT_READ_COMPLETE);
+          co_return;
+        }
+        if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
+          co_return; // EVENT_DONE: the VC was freed during the signal
+        }
+        if (this->closed) {
+          co_return;
+        }
+        continue; // read on into the re-targeted buffer
+      }
+      // redirect != nullptr && r <= 0: no bytes to copy; the EOS/error below is delivered to the
+      // re-armed read's continuation, which is correct.
 
       if (r <= 0) {
         if (r == -EAGAIN || r == -ENOTCONN) {
@@ -978,8 +1013,10 @@ IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *bu
   // abort-watch recv into that same buffer is still in flight. A null buffer is the disable/pause
   // itself (the recv is parked and replayed on re-enable; see _read). Only the default _read path
   // tracks _read_inflight_buf; the experimental provided-buffer read leaves it null (it attaches
-  // kernel-filled blocks rather than fill()ing into the VIO buffer), so the check is skipped there.
-  ink_release_assert(buf == nullptr || _read_op == nullptr || _read_inflight_buf == nullptr || buf == _read_inflight_buf);
+  // kernel-filled blocks rather than fill()ing into the VIO buffer), so no redirect is recorded.
+  if (buf != nullptr && _read_op != nullptr && _read_inflight_buf != nullptr && buf != _read_inflight_buf) {
+    _read_redirect_buf = buf;
+  }
   return super::do_io_read(c, nbytes, buf);
 }
 

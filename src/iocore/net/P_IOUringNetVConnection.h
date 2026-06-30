@@ -97,13 +97,14 @@ public:
   // source blocks stay pinned across the await, so the send itself is always safe regardless.
   VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
 
-  // Re-targeting a read to a DIFFERENT buffer while a recv is in flight would mis-place the
-  // in-flight recv's bytes (the kernel wrote into the in-flight buffer; the completion would fill
-  // whatever the VIO points at now) --- serving uninitialized/stale memory as request data, so
-  // assert it never happens. A SAME-buffer re-arm while a recv is in flight is routine and
-  // allowed (the keep-alive teardown re-arms the session's single read_buffer while its
-  // abort-watch recv is still pending). do_io_read(c,0,nullptr), the disable/pause, keeps
-  // buf==nullptr and is handled by holding the recv (see _read).
+  // Re-targeting a read to a DIFFERENT buffer while a recv is in flight (e.g. the origin
+  // keep-alive pool re-arm onto the session read_buffer, while a chunked read-ahead recv is still
+  // filling the tunnel body buffer) records a redirect; _read copies the recv's bytes into the
+  // new buffer when it completes, rather than mis-placing them (a fill through the new buffer
+  // would expose its stale bytes) or losing them. A SAME-buffer re-arm while a recv is in flight
+  // is routine (the keep-alive teardown re-arms the session's single read_buffer while its
+  // abort-watch recv is still pending) and needs no redirect. do_io_read(c,0,nullptr), the
+  // disable/pause, keeps buf==nullptr and is handled by holding the recv (see _read).
   VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
 
   // Re-arm a multishot read that parked on -ENOBUFS (shared ring exhausted). Called
@@ -158,7 +159,8 @@ private:
   // so a disabled read produces no signal (the epoll contract) and no pulled bytes are lost.
   MIOBuffer *_held_read_buf      = nullptr;
   int64_t    _held_read_bytes    = 0;
-  MIOBuffer *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling (do_io_read swap check)
+  MIOBuffer *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling
+  MIOBuffer *_read_redirect_buf  = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
   bool       _recv_poll_first    = false;   // arm reads with IORING_RECVSEND_POLL_FIRST
   int64_t    _recv_coalesce_size = 0;       // SO_RCVLOWAT target for coalesced reads
   int        _recv_lowat_cur     = 0;       // last SO_RCVLOWAT we set (redundant-call guard)
