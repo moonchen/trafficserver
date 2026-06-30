@@ -751,7 +751,7 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.net.io_uring.enabled", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.net.io_uring.read_provided_buffers", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.net.io_uring.read_provided_buffers", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.net.io_uring.read_buffer_count", RECD_INT, "1024", RECU_RESTART_TS, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,

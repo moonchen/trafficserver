@@ -157,13 +157,20 @@ private:
   // A recv that completed while the read was disabled: its bytes are already in _held_read_buf
   // (written by the kernel, not yet fill()'d). Held here and delivered when the read re-enables,
   // so a disabled read produces no signal (the epoll contract) and no pulled bytes are lost.
-  MIOBuffer *_held_read_buf      = nullptr;
-  int64_t    _held_read_bytes    = 0;
-  MIOBuffer *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling
-  MIOBuffer *_read_redirect_buf  = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
-  bool       _recv_poll_first    = false;   // arm reads with IORING_RECVSEND_POLL_FIRST
-  int64_t    _recv_coalesce_size = 0;       // SO_RCVLOWAT target for coalesced reads
-  int        _recv_lowat_cur     = 0;       // last SO_RCVLOWAT we set (redundant-call guard)
+  MIOBuffer *_held_read_buf   = nullptr;
+  int64_t    _held_read_bytes = 0;
+  // The provided-buffer analogue (_read_provided): a buffer-select recv that completed while the
+  // read was disabled already pulled bytes off the socket (destructive, unrecoverable). Wrap the
+  // kernel-filled ring buffer in a block and hold it here; deliver it to the consumer's buffer when
+  // the read re-enables, so the stream behaves as if the bytes had stayed in the socket. If the VC
+  // is freed first, the Ptr releases and the ring buffer recycles automatically.
+  Ptr<IOBufferBlock> _held_pbuf_block;
+  int64_t            _held_pbuf_bytes    = 0;
+  MIOBuffer         *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling
+  MIOBuffer         *_read_redirect_buf  = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
+  bool               _recv_poll_first    = false;   // arm reads with IORING_RECVSEND_POLL_FIRST
+  int64_t            _recv_coalesce_size = 0;       // SO_RCVLOWAT target for coalesced reads
+  int                _recv_lowat_cur     = 0;       // last SO_RCVLOWAT we set (redundant-call guard)
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;

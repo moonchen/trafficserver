@@ -468,7 +468,11 @@ IOUringNetVConnection::net_read_io(NetHandler *nh)
   // With read_provided_buffers, each single-shot recv selects a buffer from a shared
   // provided-buffer ring (late binding + zero-copy attach); otherwise the per-edge
   // single-shot recvmsg loop into the VIO's own MIOBuffer.
-  if (read_provided_enabled() && read_buf_ring() != nullptr) {
+  // Prefer the provided-buffer path, except when the single-shot path parked bytes that
+  // completed while the read was disabled (_held_read_bytes): only _read delivers those, so
+  // route back to it until they are handed off. (_read_provided can reach _read as an ENOBUFS
+  // heap fallback, which is the path that parks that single-shot held state.)
+  if (read_provided_enabled() && read_buf_ring() != nullptr && _held_read_bytes == 0) {
     _read_provided();
   } else {
     _read();
@@ -800,6 +804,34 @@ IOUringNetVConnection::_read_provided()
         read_disable(nh, this);
         co_return;
       }
+      // Deliver bytes parked by a recv that completed while the read was disabled (see the r > 0
+      // re-validation below). On epoll those bytes would have waited in the socket until re-enable;
+      // io_uring's recv already pulled them, so we held the kernel-filled block and now hand it to
+      // the re-armed consumer buffer --- mirroring epoll's level-triggered redelivery. Only one recv
+      // is ever in flight, so a single held slot suffices. We are past the enabled / op==READ /
+      // ntodo>0 / buffer-present gates, so the consumer can take it now.
+      if (_held_pbuf_bytes > 0) {
+        int64_t held = _held_pbuf_bytes;
+        s->vio.buffer.writer()->append_block(_held_pbuf_block.get());
+        _held_pbuf_block = nullptr;
+        _held_pbuf_bytes = 0;
+        Metrics::Counter::increment(net_rsb.read_bytes, held);
+        Metrics::Counter::increment(net_rsb.read_bytes_count);
+        s->vio.ndone += held;
+        this->netActivity();
+        if (s->vio.ntodo() <= 0) {
+          _read_signal_done(VC_EVENT_READ_COMPLETE);
+          co_return;
+        }
+        if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
+          co_return; // EVENT_DONE: the VC was freed during the signal
+        }
+        if (this->closed) {
+          co_return;
+        }
+        // Read on: loop again to re-evaluate the VIO and issue the next recv.
+        continue;
+      }
       // Cap the recv to the VIO's remaining bytes (and one buffer). The kernel keeps a
       // nonzero len <= the selected buffer's size, so this is an exact upper bound.
       want = s->vio.ntodo();
@@ -848,11 +880,28 @@ IOUringNetVConnection::_read_provided()
       }
 
       if (r <= 0) {
-        if (r == -ENOBUFS) {
-          // Shared ring exhausted (no buffer was consumed). Park on the wait list and
-          // stop; a recycle re-arms us via rearm_read_for_buffers().
-          ring->add_waiter(this);
+        if (!s->enabled || s->vio.op != VIO::READ || s->vio.is_disabled()) {
+          // The read was disabled while this recv was in flight (a write-side completion's
+          // do_io_read(0,nullptr) keep-alive pause, vc->disable(), or a tunnel teardown). On epoll
+          // a disabled read produces no signal. EOF/error is sticky and idempotent, so suppress it
+          // here (signaling would deliver a stray read event to a consumer that stopped the read,
+          // e.g. the SM in kill_this -> HttpSM assert); the recv issued on re-enable re-detects it.
+          // -ENOBUFS consumed no buffer, so there is nothing to recycle either.
           read_disable(nh, this);
+          co_return;
+        }
+        if (r == -ENOBUFS) {
+          // Shared ring exhausted (no buffer was consumed). Parking until a buffer recycles
+          // deadlocks when this same connection must buffer more than the entire ring before it
+          // can drain --- e.g. a redirect that fully buffers the request body (post_copy): every
+          // ring buffer ends up pinned in that buffer, so none ever recycles and the read stalls
+          // forever. Fall back to the single-shot heap read for this drive: it reads into the
+          // consumer's own growable MIOBuffer (no ring buffer), so the connection keeps making
+          // progress and the pinned ring buffers recycle once the consumer drains. net_read_io
+          // re-selects the provided path on the next drive, once the ring has buffers again.
+          // (ATS mutexes are recursive and _read releases the VIO lock before its await, so
+          // launching it while we still hold the lock here is safe.)
+          _read();
           co_return;
         }
         if (r == -EAGAIN || r == -ENOTCONN) {
@@ -871,10 +920,17 @@ IOUringNetVConnection::_read_provided()
       // session release -> do_io_read(0,nullptr) then keep-alive read) can have stopped or
       // reconfigured the read while this recv was in flight. If it can still take data,
       // append to the current buffer (a freshly attached keep-alive buffer is fine --- the
-      // bytes are the next request and belong there); otherwise drop the buffer and stop.
+      // bytes are the next request and belong there). Otherwise the consumer cannot take the
+      // bytes right now --- but the recv already pulled them off the socket (destructive,
+      // unrecoverable), so dropping them would desync a live keep-alive connection. Wrap the
+      // kernel-filled ring buffer in a block and hold it; the top of the loop delivers it once
+      // the consumer re-arms a buffer it can take, so the stream behaves as if the bytes had
+      // stayed in the socket. If the VC is freed first, the held Ptr releases and the buffer
+      // recycles automatically.
       if (!s->enabled || s->vio.op != VIO::READ || s->vio.is_disabled() || s->vio.ntodo() <= 0 ||
           s->vio.buffer.writer() == nullptr) {
-        ring->recycle(flgs >> IORING_CQE_BUFFER_SHIFT);
+        _held_pbuf_block = ring->wrap(flgs >> IORING_CQE_BUFFER_SHIFT, r);
+        _held_pbuf_bytes = r;
         read_disable(nh, this);
         co_return;
       }
