@@ -66,7 +66,7 @@ big_body = ("io_uring_zc_variant." * 26214) + "END_BIG_BODY_MARKER"  # ~512 KB
 
 for path, body in (("med", med_body), ("big", big_body)):
     response_header = {
-        "headers": "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {0}\r\n\r\n".format(len(body)),
+        "headers": "HTTP/1.1 200 OK\r\nContent-Length: {0}\r\n\r\n".format(len(body)),
         "timestamp": "1469733493.993",
         "body": body
     }
@@ -81,6 +81,11 @@ for path, body in (("med", med_body), ("big", big_body)):
 def _records(read_provided):
     return {
         'proxy.config.net.io_uring.enabled': 1,
+        # Close the ATS<->origin connection per request (the origin server serves one request per
+        # connection) while keeping the client-facing response keep-alive-able, so the client-side
+        # curls reuse one connection instead of reconnecting per request and piling up TIME_WAIT /
+        # half-closed sockets on the recycled autest listen ports.
+        'proxy.config.http.keep_alive_enabled_out': 0,
         'proxy.config.net.io_uring.read_provided_buffers': read_provided,
         'proxy.config.net.io_uring.write_zerocopy': 1,
         # Low threshold so any >= 4 KiB body engages zero-copy deterministically.
@@ -103,14 +108,19 @@ def _records(read_provided):
 
 # Two ATS processes: one on the single-shot read path (coalescing active), one on the default
 # provided-buffer path (coalescing inert). They differ only in read_provided_buffers.
-ts_single = Test.MakeATSProcess("ts_single")
+# enable_uds=False: nothing here talks over the UDS listener, and this test's long name pushes
+# the default <sandbox>/<testdir>/<ts-name>/runtime/uds.socket past the AF_UNIX 108-byte
+# sun_path limit. ATS silently truncates the listen path (ats_unix_set), which binds a stray
+# mangled path -- or Fatals "Could not bind or listen to port 0 ... Address already in use"
+# when the truncation lands exactly on the runtime/ directory (sandbox-name-length dependent).
+ts_single = Test.MakeATSProcess("ts_single", enable_uds=False)
 ts_single.Disk.records_config.update(_records(read_provided=0))
 ts_single.Disk.remap_config.AddLine('map http://www.example.com http://127.0.0.1:{0}'.format(server.Variables.Port))
 ts_single.Disk.plugin_config.AddLine('stats_over_http.so _stats')
 ts_single.Disk.diags_log.Content = Testers.ContainsExpression(
     "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active (single-shot)")
 
-ts_provided = Test.MakeATSProcess("ts_provided")
+ts_provided = Test.MakeATSProcess("ts_provided", enable_uds=False)
 ts_provided.Disk.records_config.update(_records(read_provided=1))
 ts_provided.Disk.remap_config.AddLine('map http://www.example.com http://127.0.0.1:{0}'.format(server.Variables.Port))
 ts_provided.Disk.plugin_config.AddLine('stats_over_http.so _stats')
@@ -124,9 +134,8 @@ ts_provided.Disk.diags_log.Content = Testers.ContainsExpression(
 # Phase 1a: ~128 KB pass-through body -> anonymous multi-block zero-copy send.
 tr = Test.AddTestRun("single-shot: ~128 KB pass-through -> anonymous multi-block zero-copy")
 tr.Processes.Default.Command = (
-    'for i in $$(seq 1 8); do '
-    'curl -s -o - "http://127.0.0.1:{port}/med" -H "Host: www.example.com"; '
-    'done'.format(port=ts_single.Variables.port))
+    'curl -s -o - $$(for i in $$(seq 1 8); do echo "http://127.0.0.1:{port}/med"; done) '
+    '-H "Host: www.example.com"'.format(port=ts_single.Variables.port))
 tr.Processes.Default.StartBefore(server)
 tr.Processes.Default.StartBefore(ts_single)
 tr.Processes.Default.ReturnCode = 0
@@ -138,9 +147,8 @@ tr.StillRunningAfter = server
 # Phase 1b: ~512 KB pass-through body -> coalesced read into an arena block -> send_zc_fixed.
 tr = Test.AddTestRun("single-shot: ~512 KB coalesced pass-through -> send_zc_fixed")
 tr.Processes.Default.Command = (
-    'for i in $$(seq 1 8); do '
-    'curl -s -o - "http://127.0.0.1:{port}/big" -H "Host: www.example.com"; '
-    'done'.format(port=ts_single.Variables.port))
+    'curl -s -o - $$(for i in $$(seq 1 8); do echo "http://127.0.0.1:{port}/big"; done) '
+    '-H "Host: www.example.com"'.format(port=ts_single.Variables.port))
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
     "END_BIG_BODY_MARKER", "the full ~512 KB body must survive the coalesced send_zc_fixed serve")
@@ -174,9 +182,8 @@ tr.StillRunningAfter = ts_single
 # unregistered ring buffers, so coalescing cannot back the body with the arena.
 tr = Test.AddTestRun("provided: ~512 KB pass-through -> coalescing inert, anonymous zero-copy")
 tr.Processes.Default.Command = (
-    'for i in $$(seq 1 8); do '
-    'curl -s -o - "http://127.0.0.1:{port}/big" -H "Host: www.example.com"; '
-    'done'.format(port=ts_provided.Variables.port))
+    'curl -s -o - $$(for i in $$(seq 1 8); do echo "http://127.0.0.1:{port}/big"; done) '
+    '-H "Host: www.example.com"'.format(port=ts_provided.Variables.port))
 tr.Processes.Default.StartBefore(ts_provided)
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(

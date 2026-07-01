@@ -44,6 +44,14 @@ freelist "bad list" abort / failed assertion across the churn.
 
 Test.ContinueOnFail = True
 
+# Read metrics over the stats_over_http HTTP endpoint rather than traffic_ctl: traffic_ctl's
+# ~200ms non-tunable connect budget against ATS's single-threaded jsonrpc server flakes under
+# concurrent-suite load, and a deep sandbox root can push the jsonrpc UDS path
+# (<sandbox>/<testdir>/<ts-name>/runtime/jsonrpc20.sock) past the AF_UNIX 108-byte sun_path
+# limit entirely -- ATS then never starts the jsonrpc server ("File name too long") and this
+# test's path is only a few bytes under. The HTTP endpoint has neither problem.
+Test.SkipUnless(Condition.PluginExists('stats_over_http.so'))
+
 COUNT = 40  # POST iterations per race (widens the in-flight teardown window)
 
 _server_script = 'io_uring_post_abort_server.py'
@@ -111,6 +119,7 @@ class IOUringPostAbortTest:
         ts.Disk.remap_config.AddLine(f'map http://early.test/ http://127.0.0.1:{early_port}/')
         ts.Disk.remap_config.AddLine(f'map http://rst.test/ http://127.0.0.1:{rst_port}/')
         ts.Disk.remap_config.AddLine(f'map http://health.test/ http://127.0.0.1:{health.Variables.Port}/')
+        ts.Disk.plugin_config.AddLine('stats_over_http.so _stats')
 
         ts.Disk.diags_log.Content = Testers.ContainsExpression(
             "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active")
@@ -162,13 +171,18 @@ class IOUringPostAbortTest:
         # Metric: teardowns with an op in flight increment vc_deferred_close. Retry to let the
         # last completions settle.
         tr = Test.AddTestRun(f"[{label}] vc_deferred_close metric engaged")
+        # Wall-clock deadline loop reading the metric over the stats_over_http CSV endpoint. A
+        # transient HTTP failure (endpoint not yet serving) leaves the value empty and is retried
+        # rather than misread as a genuine zero. The strict "-gt 0" assertion is unchanged, so an
+        # unmoved metric still fails.
         tr.Processes.Default.Command = (
-            'for i in $$(seq 1 50); do '
-            "dc=$$(traffic_ctl metric get proxy.process.net.io_uring.vc_deferred_close | grep -oE '[0-9]+$$'); "
-            'if [ "$${dc:-0}" -gt 0 ]; then echo "DEFERRED_CLOSE_OK count=$$dc"; exit 0; fi; '
-            'sleep 0.2; done; echo DEFERRED_CLOSE_FAIL; '
-            'traffic_ctl metric match proxy.process.net.io_uring; exit 1')
-        tr.Processes.Default.Env = ts.Env
+            'deadline=$$(( $$(date +%s) + 60 )); '
+            'while [ $$(date +%s) -lt $$deadline ]; do '
+            "csv=$$(curl -s --max-time 5 -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts.Variables.port) + "/_stats/csv\"); "
+            "dc=$$(printf '%s' \"$$csv\" | grep '^proxy.process.net.io_uring.vc_deferred_close,' | cut -d, -f2); "
+            'if [ "$${dc:-0}" -gt 0 ] 2>/dev/null; then echo "DEFERRED_CLOSE_OK count=$$dc"; exit 0; fi; '
+            'sleep 0.3; done; echo DEFERRED_CLOSE_FAIL; exit 1')
+        tr.TimeOut = 90
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
             "DEFERRED_CLOSE_OK", "close-with-op-in-flight must have incremented vc_deferred_close")

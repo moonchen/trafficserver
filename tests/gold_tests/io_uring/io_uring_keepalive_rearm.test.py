@@ -41,6 +41,16 @@ and =1 (kernel provided-buffer _read_provided, the default).
 
 Test.ContinueOnFail = False
 
+# Read metrics over the stats_over_http HTTP endpoint rather than traffic_ctl, which fails two
+# ways here. (a) Deterministic: this test's jsonrpc UDS path (<sandbox>/<testdir>/<ts-name>/
+# runtime/jsonrpc20.sock) overflows the AF_UNIX 108-byte sun_path limit under a deep sandbox
+# root (e.g. anything at or below this repo's tests/ dir), so ATS never starts the jsonrpc
+# server ("JSONRPC server could not be started ... File name too long" in diags.log) and every
+# traffic_ctl query fails. (b) Transient: even where the path fits, traffic_ctl's ~200ms
+# non-tunable connect budget against ATS's single-threaded RPC server flakes under
+# concurrent-suite load. The HTTP endpoint has neither problem.
+Test.SkipUnless(Condition.PluginExists('stats_over_http.so'))
+
 REPLAY = "io_uring_keepalive_rearm.replay.yaml"
 
 
@@ -51,10 +61,9 @@ class KeepAliveRearmTest:
         self._rpb = read_provided_buffers
         label = "provided" if read_provided_buffers else "singleshot"
         # Keep process names short: ATS's jsonrpc UDS lives at
-        # <sandbox>/<testdir>/<ts-name>/runtime/jsonrpc20.sock, and AF_UNIX
-        # sun_path truncates at 107 bytes. A long ts name pushes the socket past
-        # that limit -- ATS then binds a truncated path while traffic_ctl looks
-        # for the full one (ENOENT), silently breaking every metric query.
+        # <sandbox>/<testdir>/<ts-name>/runtime/jsonrpc20.sock, and past the
+        # AF_UNIX 108-byte sun_path limit ATS refuses to start the jsonrpc
+        # server ("File name too long"), breaking every traffic_ctl query.
         slug = "pb" if read_provided_buffers else "ss"
         self._name = f"kar-{slug}"
         tr = Test.AddTestRun(f"keep-alive origin reuse over io_uring read path ({label})")
@@ -89,6 +98,7 @@ class KeepAliveRearmTest:
             })
         ts.Disk.remap_config.AddLine(
             'map http://keepalive.rearm.test http://127.0.0.1:{0}'.format(self._server.Variables.http_port))
+        ts.Disk.plugin_config.AddLine('stats_over_http.so _stats')
         # Prove the io_uring VC actually engaged (not a silent UnixNetVConnection
         # fallback that would pass this test for the wrong reason).
         ts.Disk.diags_log.Content = Testers.ContainsExpression(
@@ -114,13 +124,19 @@ class KeepAliveRearmTest:
         # otherwise the re-arm-onto-session-read_buffer branch never runs). The
         # counter should climb toward the 39 reuses of a 40-transaction session.
         tr = Test.AddTestRun(f"{self._name}: origin session reuse engaged")
+        # Wall-clock deadline loop reading the metric over the stats_over_http CSV endpoint. A
+        # transient HTTP failure (endpoint not yet serving) leaves the value empty and is retried
+        # rather than misread as a genuine zero. The strict "-gt 0" assertion is unchanged, so an
+        # unmoved metric still fails.
+        port = self._ts.Variables.port
         tr.Processes.Default.Command = (
-            'for i in $$(seq 1 50); do '
-            "n=$$(traffic_ctl metric get proxy.process.http.origin.reuse | grep -oE '[0-9]+$$'); "
-            'if [ "$${n:-0}" -gt 0 ]; then echo "REUSE_OK reuse=$$n"; exit 0; fi; '
-            'sleep 0.2; done; echo REUSE_FAIL; '
-            'traffic_ctl metric get proxy.process.http.origin.reuse; exit 1')
-        tr.Processes.Default.Env = self._ts.Env
+            'deadline=$$(( $$(date +%s) + 60 )); '
+            'while [ $$(date +%s) -lt $$deadline ]; do '
+            "csv=$$(curl -s --max-time 5 -H 'Accept: text/csv' \"http://127.0.0.1:" + str(port) + "/_stats/csv\"); "
+            "n=$$(printf '%s' \"$$csv\" | grep '^proxy.process.http.origin.reuse,' | cut -d, -f2); "
+            'if [ "$${n:-0}" -gt 0 ] 2>/dev/null; then echo "REUSE_OK reuse=$$n"; exit 0; fi; '
+            'sleep 0.3; done; echo REUSE_FAIL; exit 1')
+        tr.TimeOut = 90
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
             "REUSE_OK", "the ATS<->origin keep-alive session must have been reused")

@@ -17,6 +17,9 @@ do_io_close while an io_uring op is in flight: cancel-then-unwind + deferred fre
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
+import sys
+
 Test.Summary = '''
 Exercise the io_uring do_io_close cancel-then-unwind path: a client aborts / RSTs mid-transfer
 while ATS still has an io_uring op in flight (a recv on the request/keep-alive read, or a plain
@@ -35,6 +38,17 @@ fatal-signal noise. write_zerocopy stays off (default), so sends take the plain 
 '''
 
 Test.ContinueOnFail = False
+
+# Read the vc_deferred_close metric over the stats_over_http HTTP endpoint rather than
+# traffic_ctl: traffic_ctl's ~200ms non-tunable connect budget against ATS's single-threaded
+# jsonrpc server flakes under concurrent-suite load, and a deep sandbox root can push the
+# jsonrpc UDS path past the AF_UNIX 108-byte sun_path limit entirely (ATS then never starts
+# the jsonrpc server, "File name too long"). The HTTP endpoint has neither problem.
+Test.SkipUnless(Condition.PluginExists('stats_over_http.so'))
+
+# Shared with io_uring_timeout_variants: connects, sends a partial request line, then idles
+# until ATS closes the connection (prints SERVER_CLOSED/SERVER_SENT).
+IDLE_CLIENT = os.path.join(Test.TestDirectory, "io_uring_timeout_variants_idle_client.py")
 
 server = Test.MakeOriginServer("server")
 
@@ -94,9 +108,14 @@ def add_phases(read_provided):
             'proxy.config.net.io_uring.read_buffer_count': 4096,
             'proxy.config.net.io_uring.read_buffer_size': 8192,
             'proxy.config.io_uring.entries': 8192,
+            # For the deterministic deferred-close phase: an idled inbound transaction is torn
+            # down after 5s with its request recv still parked. Wide enough that the active
+            # transfers of the churn/follow-up phases never idle into it under load.
+            'proxy.config.http.transaction_no_activity_timeout_in': 5,
         })
 
     ts.Disk.remap_config.AddLine('map http://www.example.com http://127.0.0.1:{0}'.format(server.Variables.Port))
+    ts.Disk.plugin_config.AddLine('stats_over_http.so _stats')
 
     ts.Disk.diags_log.Content = Testers.ContainsExpression(
         "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active ({0})".format(label))
@@ -145,15 +164,35 @@ def add_phases(read_provided):
     tr.StillRunningAfter = ts
     tr.StillRunningAfter = server
 
-    # Phase 4: the deferred-close metric must have engaged. Retry-poll to let the last cancel CQEs
-    # settle (mirrors the write_zerocopy metric phase).
+    # Phase 3b: one deferred close that cannot race. A client that sends a partial request and
+    # idles forces the inbound no-activity timeout to tear the VC down while its request recv
+    # is parked in the kernel on the quiet socket, so the timeout/free_thread teardown must
+    # defer the free (vc_deferred_close++). The abort/duplex churn above races HttpSM's close
+    # against the RST-driven error CQEs -- under heavy load every in-flight op can complete
+    # (with error) before the close runs, legitimately deferring nothing -- so the metric gate
+    # below needs this one guaranteed engagement.
+    tr = Test.AddTestRun("[{0}] idle partial request: timeout close with recv parked".format(label))
+    tr.Processes.Default.Command = "{0} {1} 127.0.0.1 {2}".format(sys.executable, IDLE_CLIENT, port)
+    tr.Processes.Default.ReturnCode = 0
+    tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
+        "SERVER_", "ATS must close the idled connection via the inbound no-activity timeout")
+    tr.TimeOut = 60
+    tr.StillRunningAfter = ts
+    tr.StillRunningAfter = server
+
+    # Phase 4: the deferred-close metric must have engaged. Wall-clock deadline loop over the
+    # stats_over_http CSV endpoint: a transient HTTP failure leaves the value empty and is
+    # retried rather than misread as a genuine zero. The strict "-gt 0" assertion is unchanged,
+    # so an unmoved metric still fails.
     tr = Test.AddTestRun("[{0}] vc_deferred_close engaged".format(label))
     tr.Processes.Default.Command = (
-        'for i in $$(seq 1 50); do '
-        "dc=$$(traffic_ctl metric get proxy.process.net.io_uring.vc_deferred_close | grep -oE '[0-9]+$$'); "
-        'if [ "$${dc:-0}" -gt 0 ]; then echo "DEFERRED_OK deferred_close=$$dc"; exit 0; fi; '
-        'sleep 0.2; done; echo DEFERRED_FAIL; traffic_ctl metric match proxy.process.net.io_uring; exit 1')
-    tr.Processes.Default.Env = ts.Env
+        'deadline=$$(( $$(date +%s) + 60 )); '
+        'while [ $$(date +%s) -lt $$deadline ]; do '
+        "csv=$$(curl -s --max-time 5 -H 'Accept: text/csv' \"http://127.0.0.1:" + str(port) + "/_stats/csv\"); "
+        "dc=$$(printf '%s' \"$$csv\" | grep '^proxy.process.net.io_uring.vc_deferred_close,' | cut -d, -f2); "
+        'if [ "$${dc:-0}" -gt 0 ] 2>/dev/null; then echo "DEFERRED_OK deferred_close=$$dc"; exit 0; fi; '
+        'sleep 0.3; done; echo DEFERRED_FAIL; exit 1')
+    tr.TimeOut = 90
     tr.Processes.Default.ReturnCode = 0
     tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
         "DEFERRED_OK", "do_io_close must have deferred at least one free past an in-flight op")

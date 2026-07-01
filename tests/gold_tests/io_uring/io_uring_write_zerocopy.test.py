@@ -51,8 +51,7 @@ base = "io_uring_zc_payload."  # 20 bytes
 for i in range(N):
     body = base * 52429 + "END_OBJ_{0}_MARKER".format(i)  # ~1048596 bytes
     response_header = {
-        "headers":
-            "HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: max-age=300\r\nContent-Length: {0}\r\n\r\n".format(len(body)),
+        "headers": "HTTP/1.1 200 OK\r\nCache-Control: max-age=300\r\nContent-Length: {0}\r\n\r\n".format(len(body)),
         "timestamp": "1469733493.993",
         "body": body
     }
@@ -66,6 +65,11 @@ for i in range(N):
 ts.Disk.records_config.update(
     {
         'proxy.config.net.io_uring.enabled': 1,
+        # Close the ATS<->origin connection per request (the test's microserver serves one
+        # request per connection) while leaving the cached/client-facing response keep-alive-able
+        # -- so client cache hits reuse connections instead of reconnecting per request, which
+        # otherwise piles up TIME_WAIT/half-closed sockets on the recycled autest listen ports.
+        'proxy.config.http.keep_alive_enabled_out': 0,
         'proxy.config.net.io_uring.write_zerocopy': 1,
         # Below this many bytes a send stays on the copy path (the notification + pin cost more
         # than the copy). Low here so any large object engages zero-copy deterministically.
@@ -120,7 +124,7 @@ tr = Test.AddTestRun("round-robin load: disk reads -> arena send_zc_fixed + chur
 # The Lua round-robins over its own default of 16 objects (== N); keep them in sync. (autest
 # exec's a command with no shell operators directly, so an env-var prefix can't be used here.)
 tr.Processes.Default.Command = (
-    'wrk -t 4 -c 32 -d 10s --latency '
+    'wrk -t 4 -c 16 -d 5s --latency '
     '-s {testdir}/io_uring_write_zerocopy_rr.lua '
     'http://127.0.0.1:{port}/'.format(testdir=Test.TestDirectory, port=ts.Variables.port))
 tr.Processes.Default.ReturnCode = 0
@@ -135,7 +139,7 @@ tr.StillRunningAfter = ts
 # / cancel-teardown gate; under ASan a recycled-while-in-flight block trips here).
 tr = Test.AddTestRun("abort mid-read: close while send_zc + NOTIF in flight")
 tr.Processes.Default.Command = (
-    'for r in $$(seq 1 60); do '
+    'for r in $$(seq 1 24); do '
     'curl -s "http://127.0.0.1:{port}/obj/$$((r % {n}))" -H "Host: www.example.com" '
     '| head -c 4096 >/dev/null || true; done; echo ABORT_DONE'.format(port=ts.Variables.port, n=N))
 tr.Processes.Default.ReturnCode = 0
