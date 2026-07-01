@@ -109,6 +109,17 @@ crashlog_write_backtrace(FILE *fp, pid_t pid, const crashlog_target &)
     return false;
   }
 
+  if (trace == nullptr || trace[0] == '\0') {
+    // ServerBacktrace() reports success but yields no frames when the target's thread
+    // list is empty -- e.g. /proc/<pid>/task is unreadable because a fast-aborting target
+    // already exited/was reaped by the time the forked helper attached. Emit a well-formed
+    // report instead of passing NULL to fprintf("%s") and crashing the crash reporter.
+    fprintf(fp, "No backtrace available (no readable threads for target pid %ld; it may have already exited)\n",
+            static_cast<long>(pid));
+    free(trace); // free(nullptr) is a no-op
+    return false;
+  }
+
   fprintf(fp, "%s", trace);
   free(trace);
   return true;
