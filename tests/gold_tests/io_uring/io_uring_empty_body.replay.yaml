@@ -1,0 +1,142 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+# One keep-alive session, four transactions replayed in order over a SINGLE inbound
+# connection. Three empty-body responses (204, Content-Length: 0, HEAD) each drive the
+# io_uring inbound read VC through the ntodo() <= 0 read-disable gate and a header-only
+# write, then the idle keep-alive VC (no read buffer bound yet -> buffer.writer() ==
+# nullptr) must re-arm cleanly for the next request without a stray read event. The final
+# bodied GET proves the empty-body VC re-armed and reads/writes a real body normally.
+#
+# Because all four transactions share one session, proxy-verifier replays them on one
+# connection; if ATS dropped that connection after any empty-body response the later
+# transactions would fail. A passing run therefore requires the inbound VC to survive and
+# re-arm across the empty-body responses.
+
+meta:
+  version: "1.0"
+
+sessions:
+- transactions:
+
+  # T1: 204 No Content -- no body at all. Header-only write; the request-read VC then
+  # hits the ntodo() <= 0 gate and must re-arm for the next request on this connection.
+  - client-request:
+      method: "GET"
+      version: "1.1"
+      url: /empty/no-content
+      headers:
+        fields:
+        - [ Host, www.example.com ]
+        - [ uuid, 1 ]
+
+    server-response:
+      status: 204
+      reason: No Content
+      headers:
+        fields:
+        - [ X-Body-Kind, none-204 ]
+
+    proxy-response:
+      status: 204
+      headers:
+        fields:
+        - [ X-Body-Kind, { value: none-204, as: equal } ]
+
+  # T2: 200 with an explicit Content-Length: 0 -- header-only write, empty body.
+  - client-request:
+      method: "GET"
+      version: "1.1"
+      url: /empty/content-length-zero
+      headers:
+        fields:
+        - [ Host, www.example.com ]
+        - [ uuid, 2 ]
+
+      # Let ATS settle the previous transaction's keep-alive re-arm.
+      delay: 100ms
+
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, 0 ]
+        - [ X-Body-Kind, none-cl0 ]
+
+    proxy-response:
+      status: 200
+      headers:
+        fields:
+        - [ X-Body-Kind, { value: none-cl0, as: equal } ]
+
+  # T3: HEAD -- the response carries a Content-Length but no body is sent (method HEAD),
+  # so ATS does a header-only write and the read VC re-arms without a body read.
+  - client-request:
+      method: "HEAD"
+      version: "1.1"
+      url: /head/object
+      headers:
+        fields:
+        - [ Host, www.example.com ]
+        - [ uuid, 3 ]
+
+      delay: 100ms
+
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, 24 ]
+        - [ X-Body-Kind, head-nobody ]
+
+    proxy-response:
+      status: 200
+      headers:
+        fields:
+        - [ X-Body-Kind, { value: head-nobody, as: equal } ]
+
+  # T4: a normal bodied GET on the SAME connection -- proves the empty-body VC re-armed
+  # and the read/write path handles a real body after the header-only transactions.
+  - client-request:
+      method: "GET"
+      version: "1.1"
+      url: /has/body
+      headers:
+        fields:
+        - [ Host, www.example.com ]
+        - [ uuid, 4 ]
+
+      delay: 100ms
+
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, 24 ]
+        - [ X-Body-Kind, real-body ]
+      content:
+        encoding: plain
+        data: "IO_URING_EMPTY_BODY_DONE"
+
+    proxy-response:
+      status: 200
+      headers:
+        fields:
+        - [ X-Body-Kind, { value: real-body, as: equal } ]
+        - [ Content-Length, { value: "24", as: equal } ]
