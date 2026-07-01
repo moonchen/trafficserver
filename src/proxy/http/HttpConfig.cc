@@ -854,6 +854,20 @@ HttpConfig::startup()
   http_config_enum_read("proxy.config.http.server_session_sharing.pool", SessionSharingPoolStrings, c.server_session_sharing_pool);
   httpSessionManager.set_pool_type(c.server_session_sharing_pool);
 
+#if TS_USE_LINUX_IO_URING
+  // io_uring NetVConnections are thread-confined: an in-flight op lives on the owning EThread's
+  // ring and can only be cancelled from that thread. The global/hybrid session pools migrate a
+  // pooled origin session to the acquiring thread, which breaks that confinement (the cancel
+  // would target the wrong ring, plus a data race on the VC's op state). Refuse the combination
+  // at startup rather than corrupt state at runtime; io_uring requires the per-thread pool.
+  if (RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0 &&
+      c.server_session_sharing_pool != TS_SERVER_SESSION_SHARING_POOL_THREAD) {
+    Fatal("proxy.config.net.io_uring.enabled=1 requires proxy.config.http.server_session_sharing.pool=thread: "
+          "the global/hybrid pools migrate origin sessions across threads, which io_uring's thread-confined "
+          "connections do not support");
+  }
+#endif
+
   RecRegisterConfigUpdateCb("proxy.config.http.insert_forwarded", &http_insert_forwarded_cb, &c);
   {
     char str[512];

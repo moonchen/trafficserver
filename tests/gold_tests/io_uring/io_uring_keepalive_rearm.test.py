@@ -78,9 +78,12 @@ class KeepAliveRearmTest:
             {
                 'proxy.config.net.io_uring.enabled': 1,
                 'proxy.config.net.io_uring.read_provided_buffers': self._rpb,
-                # Reuse a single pooled origin session across all transactions so
-                # the pool re-arm onto the session read_buffer is exercised.
-                'proxy.config.http.server_session_sharing.pool': 'global',
+                # Reuse a pooled origin session across transactions so the pool re-arm onto the
+                # session read_buffer is exercised. Must be the per-thread pool: io_uring VCs are
+                # thread-confined and cannot be migrated across threads, so the global/hybrid pools
+                # are rejected at startup with io_uring (see HttpConfig). A keep-alive client keeps
+                # its transactions on one net thread, so the thread pool reuses the same session.
+                'proxy.config.http.server_session_sharing.pool': 'thread',
                 'proxy.config.http.server_session_sharing.match': 'both',
                 'proxy.config.http.keep_alive_enabled_out': 1,
             })
