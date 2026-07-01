@@ -90,17 +90,56 @@ struct NoopCompletion : public IOUringCompletionHandler {
 NoopCompletion noop_completion;
 
 // Submit an async cancel for an in-flight op (keyed on its SQE user_data); the
-// op then completes with -ECANCELED and resumes its coroutine. No-op if null.
-void
+// op then completes with -ECANCELED and resumes its coroutine. Returns true if
+// there was nothing to cancel or the cancel SQE was queued; false if next_sqe()
+// could not hand out an SQE (the SQ is unflushable --- CQ overflow / -EBUSY), so
+// the caller must retry the cancel later.
+bool
 cancel_in_flight(IOUringCompletionHandler *op)
 {
   if (op == nullptr) {
-    return;
+    return true;
   }
   io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&noop_completion);
-  if (sqe != nullptr) {
-    io_uring_prep_cancel(sqe, op, 0);
+  if (sqe == nullptr) {
+    return false;
   }
+  io_uring_prep_cancel(sqe, op, 0);
+  return true;
+}
+
+// Per-thread list of VCs whose deferred-close cancel SQE could not be submitted
+// (next_sqe returned null under CQ overflow / -EBUSY). Retried from the event loop
+// (iouring_drain_pending_cancels) once the ring has space. The retry is deferred ---
+// not reaped inline in do_io_close/free_thread --- because reaping the CQ there could
+// resume this VC's own op completion and free `this` mid-teardown (a use-after-free).
+thread_local IOUringNetVConnection *cancel_retry_head = nullptr;
+
+void
+queue_cancel_retry(IOUringNetVConnection *vc)
+{
+  if (vc->_cancel_retry_pending) {
+    return;
+  }
+  vc->_cancel_retry_pending = true;
+  vc->_cancel_retry_next    = cancel_retry_head;
+  cancel_retry_head         = vc;
+}
+
+void
+unqueue_cancel_retry(IOUringNetVConnection *vc)
+{
+  if (!vc->_cancel_retry_pending) {
+    return;
+  }
+  for (IOUringNetVConnection **pp = &cancel_retry_head; *pp != nullptr; pp = &(*pp)->_cancel_retry_next) {
+    if (*pp == vc) {
+      *pp = vc->_cancel_retry_next;
+      break;
+    }
+  }
+  vc->_cancel_retry_next    = nullptr;
+  vc->_cancel_retry_pending = false;
 }
 } // namespace
 
@@ -343,12 +382,19 @@ IOUringNetVConnection::free_thread(EThread *t)
   if (_read_op != nullptr || _write_op != nullptr || _connect_op != nullptr) {
     if (!_closing) {
       _closing = true;
-      cancel_in_flight(_read_op);
-      cancel_in_flight(_write_op);
-      cancel_in_flight(_connect_op);
+      // Count this deferred close too: a timeout teardown reaches the actual free via
+      // free_netevent->free_thread (bypassing our do_io_close override), so without this
+      // the vc_deferred_close metric silently undercounts every deferred close that the
+      // free_thread path (not do_io_close) initiates.
+      Metrics::Counter::increment(deferred_close_stat);
+      _try_cancel_inflight_ops();
     }
     return;
   }
+
+  // Reaching the actual free: make sure a freed VC is never left on the cancel-retry
+  // list (all ops may have completed naturally before a queued retry ran).
+  unqueue_cancel_retry(this);
 
   // A faithful copy of UnixNetVConnection::free_thread, differing only in the
   // allocator the object is returned to. The base hardcodes netVCAllocator, so
@@ -1010,6 +1056,45 @@ IOUringNetVConnection::_complete_deferred_close()
   }
 }
 
+// Cancel every in-flight op (attempt all three, since each is independently in
+// flight). If any cancel SQE could not be submitted (SQ unflushable), park this VC
+// on the per-thread retry list so iouring_drain_pending_cancels re-attempts from the
+// event loop --- an uncancelled op never completes, so the deferred close would never
+// finish and the VC/fd/coroutine frame would leak (e.g. an idle keep-alive recv).
+bool
+IOUringNetVConnection::_try_cancel_inflight_ops()
+{
+  bool r  = cancel_in_flight(_read_op);
+  bool w  = cancel_in_flight(_write_op);
+  bool c  = cancel_in_flight(_connect_op);
+  bool ok = r && w && c;
+  if (!ok) {
+    queue_cancel_retry(this);
+  }
+  return ok;
+}
+
+// Retry the deferred-close cancels that could not be submitted earlier. Called from
+// NetHandler::waitForActivity's io_uring branch after submit_and_wait/service, when the
+// CQ has been reaped and the SQ has space. Detach the whole list first and clear each
+// VC's pending flag before re-attempting, so a still-starved VC can re-queue itself
+// without corrupting the walk. Each VC's op pointers are re-read live: an op that
+// completed naturally is null (skipped); a still-in-flight op's frame is alive (safe to
+// cancel). A freed VC is never on this list (free_thread unqueues on the free path).
+void
+iouring_drain_pending_cancels()
+{
+  IOUringNetVConnection *vc = cancel_retry_head;
+  cancel_retry_head         = nullptr;
+  while (vc != nullptr) {
+    IOUringNetVConnection *next = vc->_cancel_retry_next;
+    vc->_cancel_retry_next      = nullptr;
+    vc->_cancel_retry_pending   = false;
+    vc->_try_cancel_inflight_ops();
+    vc = next;
+  }
+}
+
 void
 IOUringNetVConnection::do_io_close(int alerrno)
 {
@@ -1028,9 +1113,7 @@ IOUringNetVConnection::do_io_close(int alerrno)
     this->closed = (alerrno == -1) ? 1 : -1;
 
     Metrics::Counter::increment(deferred_close_stat);
-    cancel_in_flight(_read_op);
-    cancel_in_flight(_write_op);
-    cancel_in_flight(_connect_op);
+    _try_cancel_inflight_ops();
     return;
   }
   super::do_io_close(alerrno);

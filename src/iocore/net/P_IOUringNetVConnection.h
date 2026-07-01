@@ -114,6 +114,14 @@ public:
   IOUringNetVConnection *_rbuf_wait_next = nullptr;
   bool                   _rbuf_waiting   = false;
 
+  // Cancel every in-flight op for a deferred close; returns false (and parks this VC on
+  // the per-thread cancel-retry list) if any cancel SQE could not be submitted because
+  // the SQ was unflushable. Public so the file-local retry list can link this VC and
+  // iouring_drain_pending_cancels can re-drive it, mirroring _rbuf_*.
+  bool                   _try_cancel_inflight_ops();
+  IOUringNetVConnection *_cancel_retry_next    = nullptr;
+  bool                   _cancel_retry_pending = false;
+
   // Recv coalescing (T3.4, "pass-through send-ZC"): set SO_RCVLOWAT so reads return only once a large
   // contiguous chunk is buffered, and mark reads to use IORING_RECVSEND_POLL_FIRST (without which
   // io_uring's inline non-blocking recv ignores SO_RCVLOWAT). The recv is NOT zero-copy; paired with an
@@ -174,5 +182,9 @@ private:
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
+
+// Retry deferred-close cancels that could not be submitted when the SQ was full.
+// Called from NetHandler::waitForActivity's io_uring branch once the ring has space.
+void iouring_drain_pending_cancels();
 
 #endif // TS_USE_LINUX_IO_URING

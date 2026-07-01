@@ -27,6 +27,7 @@
 #include "iocore/net/PollCont.h"
 #if TS_USE_LINUX_IO_URING
 #include "iocore/io_uring/IO_URING.h"
+#include "P_IOUringNetVConnection.h"
 #include <poll.h>
 #include <unistd.h>
 #endif
@@ -486,7 +487,11 @@ NetHandler::waitForActivity(ink_hrtime timeout)
       epd->process_event(e_flags);
       ev_next_event(pd, x);
     }
-    pd->result      = 0;
+    pd->result = 0;
+    // Retry any deferred-close cancels that could not be submitted earlier: the CQ was
+    // just reaped and the SQ has space. Safe here (not inline in do_io_close) because a
+    // resuming op completion can no longer free a VC mid-teardown.
+    iouring_drain_pending_cancels();
     ink_hrtime post = ink_get_hrtime();
     this->thread->metrics.current_slice.load(std::memory_order_acquire)->record_io_stats(post - mid, mid - pre);
     return EVENT_CONT;
