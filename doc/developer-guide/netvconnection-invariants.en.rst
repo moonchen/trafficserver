@@ -22,19 +22,18 @@
 NetVConnection Invariants
 *************************
 
-A :class:`NetVConnection` is the proxy's unit of transport: it exposes
+A ``NetVConnection`` is the proxy's unit of transport: it exposes
 ``do_io_read`` / ``do_io_write`` / ``do_io_close`` plus a ``Continuation``/VIO
 event interface, and the entire proxy (HttpSM, HTTP/2, tunnels, transforms) is
 written against *only* that interface, independent of how bytes actually move
-(plain TCP via epoll, TLS over an inner VC, io_uring, ...). That independence is
+(plain TCP via epoll, TLS, io_uring, ...). That independence is
 real only if every transport implementation upholds the same behavioural
 contract.
 
 This document collects that contract as a checklist of **invariants**. Each was
-either codified by the framework from the start or learned the hard way --- most
-of the read/write/lifecycle invariants were extracted while debugging the
-layered TLS VConnection refactor and the io_uring NetVConnection port. It is a
-*living*
+either codified by the framework from the start or learned the hard way from
+transport bugs that stall or corrupt one flow, under one workload, at a time. It
+is a *living*
 document: when a new invariant is discovered (ideally because a bug proved it),
 append it here with the code path and the failure it prevents.
 
@@ -42,7 +41,7 @@ The mental model
 ================
 
 Every read flow is a chain of producer -> buffer -> consumer stages. The socket
-:class:`NetVConnection` is the first producer; HttpSM / HTTP/2 / tunnel /
+``NetVConnection`` is the first producer; HttpSM / HTTP/2 / tunnel /
 transforms are consumers (and often producers for the next stage). Writes run
 the same chain in reverse. **Liveness depends on who is responsible for
 re-waking a stalled stage**, and the framework pushes most of that onto the
@@ -85,8 +84,11 @@ header(+payload), etc. **Why:** a fresh ``READ_READY`` arrives only when the
 producer reads *new* socket bytes; the framework never re-signals for data
 already buffered. A complete unit left behind strands until more socket data
 happens to arrive --- and if the buffer is also full, the producer disabled
-itself on ``!write_avail()`` and can never re-fill: hard deadlock. *Proven by*
-``SSLNetVConnection::_trigger_ssl_read`` delivering one TLS record per call.
+itself on ``!write_avail()`` and can never re-fill: hard deadlock. Multiple
+complete units per signal is the normal case, not an edge case: the producer's
+drain loop (INV-R3, ``UnixNetVConnection::net_read_io``) moves everything the
+socket holds in one pass --- several pipelined requests, dozens of HTTP/2
+frames --- before signalling once.
 
 .. rubric:: INV-R2 --- reenable re-drives the PRODUCER; buffered data is never re-signalled
 
@@ -107,23 +109,25 @@ reenables, ``read_reschedule`` (``triggered && enabled``) re-drives the producer
 into the freed space. That persistence is the *only* thing that resumes a
 producer stopped on a full buffer.
 
-The **io_uring** transport faces the same requirement for the same reason: a
-completion-driven recvmsg must *drain the socket per readiness edge* (loop
-recvmsg until a short read / full buffer / VIO satisfied) before yielding back to
-epoll, or it strands bytes identically. This was proven during the port: a first
-cut that issued one recvmsg per trigger stalled a large body (``curl`` partial
-transfer + multi-second hang) until the drain loop was added.
+A **completion-driven** transport (io_uring) faces the same requirement for the
+same reason: a recvmsg completion is a one-shot notification for that one op,
+and nothing re-notifies for bytes that were already readable when the handler
+stopped short. The read drive must therefore keep the socket drained --- loop
+recvmsg until a short read, a full buffer, or a satisfied VIO, or re-arm the
+next receive before parking. Issuing a single recvmsg per wakeup and then
+waiting strands buffered socket bytes exactly like a swallowed edge.
 
 .. rubric:: INV-R4 --- a stage that is both consumer and producer must SELF-DRIVE its input
 
-A VC that consumes an input buffer and produces into a downstream buffer (a TLS
-layer decrypting into plaintext, any transform) must, on each drive, drain its
-input up to the downstream's capacity *or* schedule its own continuation to
-finish --- it must not rely on its upstream to "wake me for buffered input",
-because the upstream only re-signals on new *external* bytes (INV-R2). For a
-layered TLS VC: after freeing downstream room, if the read BIO still holds
-ciphertext, schedule an off-stack read drive rather than reenabling the
-transport read.
+A VC that consumes an input buffer and produces into a downstream buffer (any
+transform; a TLS layer decrypting an inner VC's ciphertext into plaintext would
+be another) must, on each drive, drain its input up to the downstream's capacity
+*or* schedule its own continuation to finish --- it must not rely on its
+upstream to "wake me for buffered input", because the upstream only re-signals
+on new *external* bytes (INV-R2). A layered TLS VC, for example, would have to
+schedule its own off-stack read drive whenever downstream room frees while
+undecrypted input is still buffered: reenabling the inner transport read
+delivers nothing until new socket bytes arrive.
 
 .. rubric:: INV-R5 --- EOS / ERROR is a persistent STATE, not an edge
 
@@ -181,8 +185,10 @@ Protocol setup (layered transports)
 
 .. rubric:: INV-S1 --- protocol setup must not be gated on consumer-VIO state
 
-A layered/wrapped VC must drive its protocol setup (e.g. a TLS handshake) for
-every transport event, on both faces, regardless of whether a consumer has
+Design guidance for any VC that would layer a protocol over an inner transport
+(|TS| today implements TLS as a socket-VC subclass, but the constraint binds
+any wrapped/layered design): drive the protocol setup (e.g. a TLS handshake)
+for every transport event, on both faces, regardless of whether a consumer has
 attached or enabled a user VIO --- consumer-VIO gates govern *post-setup* data
 delivery only. With an intermediate read buffer the read face is the only
 deliverer of arrived handshake bytes (INV-R2: nobody re-signals buffered data),
@@ -206,8 +212,9 @@ is in progress. On the plain socket VC this is the ``recursion`` counter around
 
 .. rubric:: INV-L2 --- an async transport must cancel-then-unwind, never free with an op in flight
 
-When the transport's I/O is asynchronous (io_uring SQEs in the kernel, an async
-handshake), an in-flight operation holds a pointer into the VC (or into a
+When the transport's I/O is asynchronous (io_uring SQEs in the kernel, a TLS
+handshake offloaded to an async crypto engine), an in-flight operation holds a
+pointer into the VC (or into a
 coroutine frame that references the VC). Freeing the VC while that op is
 outstanding is a use-after-free when the completion later fires. ``do_io_close``
 must instead cancel the in-flight op and defer teardown until the (cancelled)
@@ -237,13 +244,14 @@ touch the VC concurrently. Nothing else may touch a VC from another thread.
 How the io_uring NetVConnection honors these
 ============================================
 
-:class:`IOUringNetVConnection` (``src/iocore/net/IOUringNetVConnection.{h,cc}``,
-gated by ``proxy.config.net.io_uring.enabled``) is a :class:`UnixNetVConnection`
+``IOUringNetVConnection`` (``src/iocore/net/IOUringNetVConnection.{h,cc}``,
+gated by ``proxy.config.net.io_uring.enabled``) is a ``UnixNetVConnection``
 subclass that swaps individual I/O seams to io_uring while inheriting the rest.
-The read and write paths are converted (recvmsg / sendmsg via the coroutine
-runtime) and the fd is driven purely by io_uring completions with no epoll
-registration; accept/connect and TLS are not yet converted. Status of each
-invariant:
+The read, write, and connect paths are converted (recvmsg / sendmsg / connect
+via the coroutine runtime), accept is served by an io_uring accept on the
+listener, and the fd is driven purely by io_uring completions with no epoll
+registration; TLS is not converted (TLS does not route through this VC). Status
+of each invariant:
 
 .. list-table::
    :header-rows: 1
@@ -365,7 +373,6 @@ express. Guidelines used (and to keep using) in this port:
 
 .. note::
 
-   This file is maintained alongside the io_uring networking work. When a leaf of
-   the net path is converted (write, accept/connect, TLS), update the status
-   table above and add any newly discovered invariant with the bug that proved
-   it.
+   This file is maintained alongside the io_uring networking work. When a
+   further leaf of the net path is converted (TLS), update the status table
+   above and add any newly discovered invariant with the bug that proved it.
