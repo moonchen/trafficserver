@@ -147,8 +147,8 @@ unqueue_cancel_retry(IOUringNetVConnection *vc)
 namespace
 {
 // One buffer group per thread; every io_uring read coroutine on the thread arms its
-// multishot recv against this group, and the kernel picks a buffer from the shared
-// ring for each completion.
+// single-shot buffer-select recv against this group, and the kernel picks a buffer
+// from the shared ring for each completion.
 constexpr int IOU_READ_BGID = 1;
 
 bool
@@ -206,14 +206,13 @@ public:
 // The shared per-thread provided-buffer ring. Lazily set up on first use; if setup
 // fails (old kernel / no memory) the read path falls back to single-shot recvmsg.
 struct ReadBufRing {
-  io_uring_buf_ring     *_br      = nullptr;
-  char                  *_pool    = nullptr; // _nbuf contiguous buffers of _bufsize
-  unsigned               _nbuf    = 0;
-  unsigned               _bufsize = 0;
-  int                    _mask    = 0;
-  int64_t                _sizeidx = 0; // IOBufferData size index whose block_size() == _bufsize
-  RingBufferData        *_free    = nullptr;
-  IOUringNetVConnection *_wait    = nullptr; // intrusive stack of VCs parked on -ENOBUFS
+  io_uring_buf_ring *_br      = nullptr;
+  char              *_pool    = nullptr; // _nbuf contiguous buffers of _bufsize
+  unsigned           _nbuf    = 0;
+  unsigned           _bufsize = 0;
+  int                _mask    = 0;
+  int64_t            _sizeidx = 0; // IOBufferData size index whose block_size() == _bufsize
+  RingBufferData    *_free    = nullptr;
 
   bool
   ok() const
@@ -227,47 +226,12 @@ struct ReadBufRing {
     return _pool + static_cast<size_t>(id) * _bufsize;
   }
 
-  // Park a VC whose multishot read stopped on -ENOBUFS; recycle() re-arms it.
-  void
-  add_waiter(IOUringNetVConnection *vc)
-  {
-    if (vc->_rbuf_waiting) {
-      return;
-    }
-    vc->_rbuf_waiting   = true;
-    vc->_rbuf_wait_next = _wait;
-    _wait               = vc;
-  }
-
-  // Remove a VC from the wait list (it is being torn down, or was just woken).
-  void
-  remove_waiter(IOUringNetVConnection *vc)
-  {
-    if (!vc->_rbuf_waiting) {
-      return;
-    }
-    for (IOUringNetVConnection **pp = &_wait; *pp != nullptr; pp = &(*pp)->_rbuf_wait_next) {
-      if (*pp == vc) {
-        *pp = vc->_rbuf_wait_next;
-        break;
-      }
-    }
-    vc->_rbuf_wait_next = nullptr;
-    vc->_rbuf_waiting   = false;
-  }
-
-  // Hand buffer `id` back to the kernel's ring, then re-arm one VC waiting for a buffer.
+  // Hand buffer `id` back to the kernel's ring.
   void
   recycle(int id)
   {
     io_uring_buf_ring_add(_br, addr(id), _bufsize, id, _mask, 0);
     io_uring_buf_ring_advance(_br, 1);
-    if (IOUringNetVConnection *vc = _wait; vc != nullptr) {
-      _wait               = vc->_rbuf_wait_next;
-      vc->_rbuf_wait_next = nullptr;
-      vc->_rbuf_waiting   = false;
-      vc->rearm_read_for_buffers();
-    }
   }
 
   RingBufferData *
@@ -347,7 +311,7 @@ RingBufferData::free()
   r->put_data(this);
 }
 
-// The thread's read ring, or nullptr if multishot read is off or setup failed.
+// The thread's read ring, or nullptr if the provided-buffer read is off or setup failed.
 ReadBufRing *
 read_buf_ring()
 {
@@ -364,13 +328,6 @@ read_buf_ring()
 void
 IOUringNetVConnection::free_thread(EThread *t)
 {
-  // If this VC parked on the read buffer ring's wait list (-ENOBUFS), unlink it before
-  // the free so a later recycle does not wake a freed VC.
-  if (_rbuf_waiting) {
-    if (ReadBufRing *r = read_buf_ring(); r != nullptr) {
-      r->remove_waiter(this);
-    }
-  }
   // Teardown can reach free_thread (via NetHandler::free_netevent) from paths that
   // bypass our do_io_close override --- notably an inactivity/active timeout, which
   // the inherited mainEvent routes through the base file-static read/write_signal
@@ -662,29 +619,11 @@ IOUringNetVConnection::_read()
     // A single-block read (the common case: a request header fits in one block)
     // needs no msghdr --- recv is lighter in the kernel than recvmsg (no msghdr
     // copy, no peer-address fill-back on a connected socket).
-    // Recv-coalescing (T3.4): cap SO_RCVLOWAT at the bytes we will actually read (rattempted) so the
-    // recv never blocks waiting for more than the body has left -- the origin may keep-alive with no
-    // FIN to flush a short tail. POLL_FIRST (skip io_uring's inline non-blocking recv, which ignores
-    // SO_RCVLOWAT) is used only for a full coalesce chunk; for the partial tail the inline recv grabs
-    // what is there immediately, and a sub-threshold chunk just ships as a copy (see _write re-gate).
-    bool poll_first = false;
-    if (_recv_poll_first && rattempted > 0) {
-      int want = static_cast<int>(rattempted < _recv_coalesce_size ? rattempted : _recv_coalesce_size);
-      if (want != _recv_lowat_cur) {
-        setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &want, sizeof(want));
-        _recv_lowat_cur = want;
-      }
-      poll_first = rattempted >= _recv_coalesce_size;
-    }
-
     ts::iouring::UringOp op([&](io_uring_sqe *sqe) {
       if (msg.msg_iovlen == 1) {
         io_uring_prep_recv(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, 0);
       } else {
         io_uring_prep_recvmsg(sqe, fd, &msg, 0);
-      }
-      if (poll_first) {
-        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
       }
     });
     _read_op           = &op;
@@ -811,9 +750,10 @@ IOUringNetVConnection::_read()
 // zero-copy (RingBufferData recycles it once the consumer is done). sqe->len caps each
 // recv to min(ntodo, bufsize) --- the kernel keeps a nonzero len <= the selected
 // buffer's size --- so a content-length read stops at the boundary and leaves the next
-// pipelined request in the socket. -ENOBUFS (shared ring exhausted) parks the VC on the
-// ring wait list; a recycle re-arms it via rearm_read_for_buffers(). Nothing stays armed
-// across the await, so unlike multishot there is no cancel/drain stop-the-stream window.
+// pipelined request in the socket. -ENOBUFS (shared ring exhausted) falls back to the
+// single-shot _read for that drive, which reads into the consumer's own buffer (see the
+// in-body comment). Nothing stays armed across the await, so unlike a multishot recv
+// there is no cancel/drain stop-the-stream window.
 ts::iouring::DetachedTask
 IOUringNetVConnection::_read_provided()
 {
@@ -1008,44 +948,6 @@ IOUringNetVConnection::_read_provided()
 }
 
 void
-IOUringNetVConnection::rearm_read_for_buffers()
-{
-  // A buffer recycled; the provided-buffer read that parked on -ENOBUFS can run again.
-  // Re-trigger net_read_io via the ready list (it re-arms once the ring has a buffer).
-  if (!this->closed) {
-    readReschedule(this->nh);
-  }
-}
-
-void
-IOUringNetVConnection::set_recv_coalesce(int64_t min_bytes)
-{
-  _recv_poll_first    = true;
-  _recv_coalesce_size = min_bytes;
-  _recv_lowat_cur     = static_cast<int>(min_bytes);
-  int fd              = con.sock.get_fd();
-  if (fd < 0 || min_bytes <= 0) {
-    return;
-  }
-  // SO_RCVLOWAT is capped near SO_RCVBUF/2 (and SO_RCVBUF at net.core.rmem_max), so widen the receive
-  // buffer first. Disabling autotuning is acceptable here: a coalescing read wants a large fixed window.
-  int want_rcvbuf = static_cast<int>(min_bytes * 2);
-  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want_rcvbuf, sizeof(want_rcvbuf));
-  int lowat = static_cast<int>(min_bytes);
-  setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &lowat, sizeof(lowat));
-  // Warn (once) if the kernel capped the low-water below the target: reads then coalesce to less than
-  // min_bytes, so the chunks fall under the send_zc threshold and ship as copies. Raising
-  // net.core.rmem_max lets the coalescing reach the target.
-  int       got = 0;
-  socklen_t gl  = sizeof(got);
-  if (getsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &got, &gl) == 0 && got < min_bytes) {
-    SiteThrottledWarning("io_uring recv coalesce: SO_RCVLOWAT capped at %d B (< %" PRId64
-                         " target); raise net.core.rmem_max for full coalescing",
-                         got, min_bytes);
-  }
-}
-
-void
 IOUringNetVConnection::_complete_deferred_close()
 {
   // Free only once no io_uring op is still in flight; otherwise another op's
@@ -1150,9 +1052,10 @@ IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *bu
   // in flight is fine and routine --- the keep-alive teardown pauses (do_io_read(0,nullptr)) and
   // then re-arms do_io_read(INT64_MAX, read_buffer) on the session's single read_buffer while the
   // abort-watch recv into that same buffer is still in flight. A null buffer is the disable/pause
-  // itself (the recv is parked and replayed on re-enable; see _read). Only the default _read path
-  // tracks _read_inflight_buf; the experimental provided-buffer read leaves it null (it attaches
-  // kernel-filled blocks rather than fill()ing into the VIO buffer), so no redirect is recorded.
+  // itself (the recv is parked and replayed on re-enable; see _read). Only the single-shot _read
+  // path tracks _read_inflight_buf; the provided-buffer read (the default) leaves it null (it
+  // attaches kernel-filled blocks rather than fill()ing into the VIO buffer), so no redirect is
+  // recorded.
   if (buf != nullptr && _read_op != nullptr && _read_inflight_buf != nullptr && buf != _read_inflight_buf) {
     _read_redirect_buf = buf;
   }

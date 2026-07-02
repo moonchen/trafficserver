@@ -1,8 +1,8 @@
 '''
-Zero-copy write variants: anonymous multi-block sendmsg_zc, ZC kernel copy-fallback
-(IORING_NOTIF_USAGE_ZC_COPIED -> write_zerocopy_copied), and recv-coalescing (SO_RCVLOWAT /
-IORING_RECVSEND_POLL_FIRST) on the single-shot read path feeding send_zc_fixed vs. its
-inertness on the default provided-buffer read path.
+Zero-copy write variants: anonymous multi-block sendmsg_zc on both read paths (single-shot
+and provided-buffer), the ZC kernel copy-fallback metric (IORING_NOTIF_USAGE_ZC_COPIED ->
+write_zerocopy_copied), and the registered arena staying out of pass-through sends
+(write_zerocopy_fixed stays 0).
 '''
 #  Licensed to the Apache Software Foundation (ASF) under one
 #  or more contributor license agreements.  See the NOTICE file
@@ -27,24 +27,22 @@ io_uring_write_zerocopy covers:
   (a) Anonymous multi-block zero-copy: a proxied (cache-off pass-through) body whose source
       MIOBuffer blocks are plain heap blocks -- NOT registered arena blocks -- so the send goes
       out as an anonymous send_zc / sendmsg_zc (msg_iovlen>1) and increments write_zerocopy but
-      NOT write_zerocopy_fixed. Assert write_zerocopy > write_zerocopy_fixed with full body
-      integrity.
+      NOT write_zerocopy_fixed. Assert write_zerocopy > 0 with write_zerocopy_fixed == 0 and
+      full body integrity.
 
   (b) ZC kernel copy-fallback: on loopback the kernel commonly declines true zero-copy and copies
       into skbs, reporting IORING_NOTIF_USAGE_ZC_COPIED in the notification -> write_zerocopy_copied.
       Assert the metric exists (and, when the kernel copies, moved) with a clean run.
 
-  (c) Recv coalescing (proxy.config.net.io_uring.recv_coalesce): on the SINGLE-SHOT read path
-      (read_provided_buffers=0) a known-large origin response (Content-Length >= recv_coalesce_size)
-      backs its body buffer with the registered arena, so the client-facing send uses send_zc_fixed
-      -> write_zerocopy_fixed advances. On the DEFAULT provided-buffer path the origin recv fills
-      unregistered provided-ring buffers instead, so coalescing is inert and write_zerocopy_fixed
-      stays low.
+  (c) Both read paths feed the anonymous send: the single-shot read (read_provided_buffers=0)
+      fills the consumer's heap blocks and the default provided-buffer read fills unregistered
+      ring buffers. Neither source is arena-backed, so even with the arena registered a
+      pass-through send never uses send_zc_fixed -- write_zerocopy_fixed stays 0 on both cells.
 
 Expects: full body integrity end-to-end, the write_zerocopy / write_zerocopy_fixed /
 write_zerocopy_copied metrics behaving as above, io_uring active, and no crash / ASan / assertion.
 
-EXPERIMENTAL (write_zerocopy, the arena, and recv_coalesce are all off by default).
+EXPERIMENTAL (write_zerocopy and the arena are both off by default).
 '''
 
 Test.ContinueOnFail = False
@@ -57,11 +55,10 @@ Test.SkipUnless(Condition.PluginExists('stats_over_http.so'))
 # ---- origin: cache is disabled below, so every GET is a fresh pass-through (server transfer) ----
 server = Test.MakeOriginServer("server")
 
-# ~128 KB body: >= write_zerocopy_threshold (4096) but < recv_coalesce_size (262144), so it is NOT
-# coalesced and its non-arena heap blocks go out as an anonymous multi-block zero-copy send.
+# ~128 KB body: >= write_zerocopy_threshold (4096), so its non-arena heap blocks go out as an
+# anonymous multi-block zero-copy send.
 med_body = ("io_uring_zc_variant." * 6553) + "END_MED_BODY_MARKER"  # ~131 KB
-# ~512 KB body: >= recv_coalesce_size, so on the single-shot path its body buffer is arena-backed
-# (send_zc_fixed) and coalesced reads fill it in large chunks.
+# ~512 KB body: spans many more source blocks (a longer sendmsg_zc iovec chain), still anonymous.
 big_body = ("io_uring_zc_variant." * 26214) + "END_BIG_BODY_MARKER"  # ~512 KB
 
 for path, body in (("med", med_body), ("big", big_body)):
@@ -90,24 +87,21 @@ def _records(read_provided):
         'proxy.config.net.io_uring.write_zerocopy': 1,
         # Low threshold so any >= 4 KiB body engages zero-copy deterministically.
         'proxy.config.net.io_uring.write_zerocopy_threshold': 4096,
-        # Registered fixed-buffer arena (64 MiB of 2 MiB blocks). recv_coalesce needs it enabled;
-        # 2 MiB blocks comfortably hold the coalesced ~512 KiB body.
+        # Registered fixed-buffer arena (64 MiB of 2 MiB blocks): registered but expected to stay
+        # out of the send path here -- a pass-through source is never arena-backed, so
+        # write_zerocopy_fixed must remain 0 even with the arena on.
         'proxy.config.net.io_uring.fixed_arena_size': 67108864,
         'proxy.config.net.io_uring.fixed_arena_block_size': 2097152,
-        # Coalesce known-large origin reads into one big (arena) chunk so the client send clears
-        # the send_zc threshold as a fixed send. Inert on the provided-buffer read path.
-        'proxy.config.net.io_uring.recv_coalesce': 1,
-        'proxy.config.net.io_uring.recv_coalesce_size': 262144,
         # Two CQEs per zero-copy send (result + notification); size the ring for that.
         'proxy.config.io_uring.entries': 8192,
-        # Force every request to be a pass-through server transfer (cache-miss path), which is
-        # where recv coalescing + the arena body buffer engage.
+        # Force every request to be a pass-through server transfer (cache-miss path), whose source
+        # blocks are plain heap / provided-ring buffers.
         'proxy.config.http.cache.http': 0,
     }
 
 
-# Two ATS processes: one on the single-shot read path (coalescing active), one on the default
-# provided-buffer path (coalescing inert). They differ only in read_provided_buffers.
+# Two ATS processes: one on the single-shot read path, one on the default provided-buffer
+# path. They differ only in read_provided_buffers.
 # enable_uds=False: nothing here talks over the UDS listener, and this test's long name pushes
 # the default <sandbox>/<testdir>/<ts-name>/runtime/uds.socket past the AF_UNIX 108-byte
 # sun_path limit. ATS silently truncates the listen path (ats_unix_set), which binds a stray
@@ -128,7 +122,7 @@ ts_provided.Disk.diags_log.Content = Testers.ContainsExpression(
     "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active (provided)")
 
 # =====================================================================================
-# Single-shot read path (ts_single): anonymous multi-block ZC + coalesce->fixed + copied
+# Single-shot read path (ts_single): anonymous multi-block ZC + copy-fallback metric
 # =====================================================================================
 
 # Phase 1a: ~128 KB pass-through body -> anonymous multi-block zero-copy send.
@@ -144,43 +138,43 @@ tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
 tr.StillRunningAfter = ts_single
 tr.StillRunningAfter = server
 
-# Phase 1b: ~512 KB pass-through body -> coalesced read into an arena block -> send_zc_fixed.
-tr = Test.AddTestRun("single-shot: ~512 KB coalesced pass-through -> send_zc_fixed")
+# Phase 1b: ~512 KB pass-through body -> a longer anonymous zero-copy iovec chain, same path.
+tr = Test.AddTestRun("single-shot: ~512 KB pass-through -> anonymous zero-copy")
 tr.Processes.Default.Command = (
     'curl -s -o - $$(for i in $$(seq 1 8); do echo "http://127.0.0.1:{port}/big"; done) '
     '-H "Host: www.example.com"'.format(port=ts_single.Variables.port))
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
-    "END_BIG_BODY_MARKER", "the full ~512 KB body must survive the coalesced send_zc_fixed serve")
+    "END_BIG_BODY_MARKER", "the full ~512 KB body must survive the anonymous zero-copy serve")
 tr.StillRunningAfter = ts_single
 
 # Phase 1c: metrics. write_zerocopy counts every ZC send; write_zerocopy_fixed only the arena-backed
-# ones. Both must have engaged, and write_zerocopy > write_zerocopy_fixed proves anonymous (non-arena)
-# multi-block sends also occurred. Report write_zerocopy_copied (loopback copy-fallback).
-tr = Test.AddTestRun("single-shot: zero-copy metrics -- anonymous + fixed both engaged")
+# ones. A pass-through source is never arena-backed, so all sends must be anonymous: write_zerocopy
+# advanced, write_zerocopy_fixed untouched. Report write_zerocopy_copied (loopback copy-fallback).
+tr = Test.AddTestRun("single-shot: zero-copy metrics -- anonymous engaged, fixed untouched")
 tr.Processes.Default.Command = (
     'for i in $$(seq 1 50); do '
     "csv=$$(curl -s -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts_single.Variables.port) + "/_stats/csv\"); "
     "zc=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy,' | cut -d, -f2); "
     "fx=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_fixed,' | cut -d, -f2); "
     "cp=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_copied,' | cut -d, -f2); "
-    'if [ "$${zc:-0}" -gt "$${fx:-0}" ] && [ "$${fx:-0}" -gt 0 ]; then '
+    'if [ "$${zc:-0}" -gt 0 ] && [ "$${fx:-0}" -eq 0 ]; then '
     'echo "SINGLE_OK zerocopy=$$zc fixed=$$fx copied=$${cp:-0}"; exit 0; fi; '
     'sleep 0.2; done; echo "SINGLE_FAIL zerocopy=$${zc:-0} fixed=$${fx:-0} copied=$${cp:-0}"; exit 1')
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.All(
-    Testers.ContainsExpression("SINGLE_OK", "write_zerocopy > write_zerocopy_fixed > 0 (anonymous + fixed both engaged)"),
+    Testers.ContainsExpression("SINGLE_OK", "write_zerocopy > 0 with write_zerocopy_fixed == 0 (all sends anonymous)"),
     Testers.ExcludesExpression("SINGLE_FAIL", "the metrics must settle"),
 )
 tr.StillRunningAfter = ts_single
 
 # =====================================================================================
-# Default provided-buffer read path (ts_provided): coalescing is inert (fixed stays low)
+# Default provided-buffer read path (ts_provided): same anonymous ZC, fixed stays 0
 # =====================================================================================
 
-# Phase 2a: same ~512 KB body, but on the provided-buffer read path the origin recv fills
-# unregistered ring buffers, so coalescing cannot back the body with the arena.
-tr = Test.AddTestRun("provided: ~512 KB pass-through -> coalescing inert, anonymous zero-copy")
+# Phase 2a: same ~512 KB body on the provided-buffer read path: the origin recv fills
+# unregistered ring buffers, so the client-facing send is likewise anonymous zero-copy.
+tr = Test.AddTestRun("provided: ~512 KB pass-through -> anonymous zero-copy")
 tr.Processes.Default.Command = (
     'curl -s -o - $$(for i in $$(seq 1 8); do echo "http://127.0.0.1:{port}/big"; done) '
     '-H "Host: www.example.com"'.format(port=ts_provided.Variables.port))
@@ -190,9 +184,9 @@ tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
     "END_BIG_BODY_MARKER", "the full ~512 KB body must survive on the provided-buffer read path")
 tr.StillRunningAfter = ts_provided
 
-# Phase 2b: metrics. Zero-copy sends still occur (write_zerocopy > 0), but because the provided-buffer
-# reads never fill an arena block, coalescing is inert and write_zerocopy_fixed stays at 0.
-tr = Test.AddTestRun("provided: coalescing inert -- write_zerocopy_fixed stays low")
+# Phase 2b: metrics. Zero-copy sends still occur (write_zerocopy > 0), and because provided-ring
+# buffers are not arena-registered, write_zerocopy_fixed stays at 0.
+tr = Test.AddTestRun("provided: anonymous zero-copy -- write_zerocopy_fixed stays 0")
 tr.Processes.Default.Command = (
     'for i in $$(seq 1 50); do '
     "csv=$$(curl -s -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts_provided.Variables.port) + "/_stats/csv\"); "
@@ -203,7 +197,7 @@ tr.Processes.Default.Command = (
     'sleep 0.2; done; echo "PROVIDED_FAIL zerocopy=$${zc:-0} fixed=$${fx:-0}"; exit 1')
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.All(
-    Testers.ContainsExpression("PROVIDED_OK", "write_zerocopy engaged but write_zerocopy_fixed stayed 0 (coalescing inert)"),
+    Testers.ContainsExpression("PROVIDED_OK", "write_zerocopy engaged but write_zerocopy_fixed stayed 0 (all sends anonymous)"),
     Testers.ExcludesExpression("PROVIDED_FAIL", "the metrics must settle"),
 )
 tr.StillRunningAfter = ts_provided

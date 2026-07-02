@@ -308,18 +308,6 @@ UringFixedBufArena::release(unsigned class_id, RegisteredBufferData *desc)
   }
 }
 
-IOBufferData *
-UringFixedBufArena::block_alloc_hook(int64_t size_index, const char * /* loc */)
-{
-  // Only worth registering blocks large enough to feed a send_zc; below the arena floor the normal
-  // allocator is cheaper. alloc() returns nullptr when the arena is off/exhausted/over-size, which
-  // the MIOBuffer treats as "use the normal allocator".
-  if (size_index < BUFFER_SIZE_INDEX_64K) {
-    return nullptr;
-  }
-  return instance().alloc(index_to_buffer_size(size_index));
-}
-
 void
 RegisteredBufferData::free()
 {

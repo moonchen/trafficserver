@@ -107,26 +107,13 @@ public:
   // disable/pause, keeps buf==nullptr and is handled by holding the recv (see _read).
   VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
 
-  // Re-arm a multishot read that parked on -ENOBUFS (shared ring exhausted). Called
-  // by the file-local read buffer ring when a buffer recycles. Public so the ring can
-  // reach it; _rbuf_* are the ring's intrusive wait-list bookkeeping for this VC.
-  void                   rearm_read_for_buffers();
-  IOUringNetVConnection *_rbuf_wait_next = nullptr;
-  bool                   _rbuf_waiting   = false;
-
   // Cancel every in-flight op for a deferred close; returns false (and parks this VC on
   // the per-thread cancel-retry list) if any cancel SQE could not be submitted because
   // the SQ was unflushable. Public so the file-local retry list can link this VC and
-  // iouring_drain_pending_cancels can re-drive it, mirroring _rbuf_*.
+  // iouring_drain_pending_cancels can re-drive it.
   bool                   _try_cancel_inflight_ops();
   IOUringNetVConnection *_cancel_retry_next    = nullptr;
   bool                   _cancel_retry_pending = false;
-
-  // Recv coalescing (T3.4, "pass-through send-ZC"): set SO_RCVLOWAT so reads return only once a large
-  // contiguous chunk is buffered, and mark reads to use IORING_RECVSEND_POLL_FIRST (without which
-  // io_uring's inline non-blocking recv ignores SO_RCVLOWAT). The recv is NOT zero-copy; paired with an
-  // arena-backed read buffer, the coalesced chunk just becomes large enough to SEND as send_zc_fixed.
-  void set_recv_coalesce(int64_t min_bytes) override;
 
 private:
   // The asynchronous read/write/connect coroutines: drive one io_uring op, await
@@ -173,12 +160,9 @@ private:
   // the read re-enables, so the stream behaves as if the bytes had stayed in the socket. If the VC
   // is freed first, the Ptr releases and the ring buffer recycles automatically.
   Ptr<IOBufferBlock> _held_pbuf_block;
-  int64_t            _held_pbuf_bytes    = 0;
-  MIOBuffer         *_read_inflight_buf  = nullptr; // buffer the in-flight recv is filling
-  MIOBuffer         *_read_redirect_buf  = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
-  bool               _recv_poll_first    = false;   // arm reads with IORING_RECVSEND_POLL_FIRST
-  int64_t            _recv_coalesce_size = 0;       // SO_RCVLOWAT target for coalesced reads
-  int                _recv_lowat_cur     = 0;       // last SO_RCVLOWAT we set (redundant-call guard)
+  int64_t            _held_pbuf_bytes   = 0;
+  MIOBuffer         *_read_inflight_buf = nullptr; // buffer the in-flight recv is filling
+  MIOBuffer         *_read_redirect_buf = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
