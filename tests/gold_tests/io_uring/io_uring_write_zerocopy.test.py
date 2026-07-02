@@ -36,12 +36,22 @@ EXPERIMENTAL (write_zerocopy and the arena are off by default).
 '''
 
 Test.SkipUnless(Condition.HasProgram("wrk", "wrk is needed for the load phase"))
+# Metrics are read over the stats_over_http HTTP endpoint rather than traffic_ctl: under a deep
+# sandbox root this test's jsonrpc UDS path (<sandbox>/<testdir>/<ts-name>/runtime/jsonrpc20.sock)
+# overflows the AF_UNIX 108-byte sun_path limit, so ATS never starts the jsonrpc server ("File
+# name too long") and every traffic_ctl query fails. The HTTP endpoint has no such limit.
+Test.SkipUnless(Condition.PluginExists('stats_over_http.so'))
 
 Test.ContinueOnFail = False
 
 N = 16  # distinct objects; must match the round-robin Lua's default object count
 
-ts = Test.MakeATSProcess("ts")
+# enable_uds=False: nothing here talks over the UDS listener, and under a deep sandbox root the
+# default <sandbox>/<testdir>/<ts-name>/runtime/uds.socket path exceeds the AF_UNIX 108-byte
+# sun_path limit. ATS silently truncates the listen path (ats_unix_set), which binds a stray
+# mangled path -- or Fatals "Could not bind or listen to port 0 ... Address already in use" when
+# the truncation lands exactly on the runtime/ directory (sandbox-name-length dependent).
+ts = Test.MakeATSProcess("ts", enable_uds=False)
 server = Test.MakeOriginServer("server")
 
 # ~1 MiB cacheable bodies, each with a unique end marker (present only if every read landed and
@@ -74,11 +84,12 @@ ts.Disk.records_config.update(
         # Below this many bytes a send stays on the copy path (the notification + pin cost more
         # than the copy). Low here so any large object engages zero-copy deterministically.
         'proxy.config.net.io_uring.write_zerocopy_threshold': 4096,
-        # Registered fixed-buffer arena: 64 blocks x 2 MiB. Cache disk reads >= 64 KiB draw their
-        # Doc buffer from here, enabling send_zc_fixed. A block must hold the whole on-disk Doc
-        # (Doc struct + marshalled header + body), so 2 MiB comfortably fits the ~1 MiB objects --
-        # a 1 MiB block would reject them (req_bytes > block_size) and silently fall back to a
-        # heap buffer (no send_zc_fixed).
+        # Registered fixed-buffer arena: 128 MiB split evenly across the 64K..2M size classes,
+        # so the 2 MiB class gets ~10 blocks. Cache disk reads >= 64 KiB draw their Doc buffer
+        # from here, enabling send_zc_fixed. A block must hold the whole on-disk Doc (Doc struct
+        # + marshalled header + body), so the ~1 MiB objects land in the 2 MiB class -- a 1 MiB
+        # top class would reject them (req_bytes > block_size) and silently fall back to a heap
+        # buffer (no send_zc_fixed).
         'proxy.config.net.io_uring.fixed_arena_size': 134217728,
         'proxy.config.net.io_uring.fixed_arena_block_size': 2097152,
         # Two CQEs per zero-copy send (result + notification); size the ring for that under load.
@@ -90,6 +101,7 @@ ts.Disk.records_config.update(
     })
 
 ts.Disk.remap_config.AddLine('map http://www.example.com http://127.0.0.1:{0}'.format(server.Variables.Port))
+ts.Disk.plugin_config.AddLine('stats_over_http.so _stats')
 
 ts.Disk.diags_log.Content = Testers.ContainsExpression(
     "io_uring NetVConnection enabled", "the io_uring NetVConnection path must be active")
@@ -147,16 +159,21 @@ tr.Processes.Default.Streams.stdout = Testers.ContainsExpression("ABORT_DONE", "
 tr.StillRunningAfter = ts
 
 # Phase 5: the zero-copy + arena metrics must have engaged. write_zerocopy counts every ZC send;
-# write_zerocopy_fixed counts the arena-backed ones (disk-read Doc buffers). Retry briefly to let
-# the last completions settle.
+# write_zerocopy_fixed counts the arena-backed ones (disk-read Doc buffers). Wall-clock deadline
+# loop over the stats_over_http CSV endpoint: a transient HTTP failure (endpoint not yet serving)
+# leaves the values empty and is retried rather than misread as a genuine zero. The strict
+# "-gt 0" assertions are unchanged, so an unmoved metric still fails.
 tr = Test.AddTestRun("zero-copy + arena metrics engaged")
 tr.Processes.Default.Command = (
-    'for i in $$(seq 1 50); do '
-    "zc=$$(traffic_ctl metric get proxy.process.net.io_uring.write_zerocopy | grep -oE '[0-9]+$$'); "
-    "fx=$$(traffic_ctl metric get proxy.process.net.io_uring.write_zerocopy_fixed | grep -oE '[0-9]+$$'); "
-    'if [ "$${zc:-0}" -gt 0 ] && [ "$${fx:-0}" -gt 0 ]; then echo "ZC_OK zerocopy=$$zc fixed=$$fx"; exit 0; fi; '
-    'sleep 0.2; done; echo ZC_FAIL; traffic_ctl metric match proxy.process.net.io_uring; exit 1')
-tr.Processes.Default.Env = ts.Env
+    'deadline=$$(( $$(date +%s) + 60 )); '
+    'while [ $$(date +%s) -lt $$deadline ]; do '
+    "csv=$$(curl -s --max-time 5 -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts.Variables.port) + "/_stats/csv\"); "
+    "zc=$$(printf '%s' \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy,' | cut -d, -f2); "
+    "fx=$$(printf '%s' \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_fixed,' | cut -d, -f2); "
+    'if [ "$${zc:-0}" -gt 0 ] && [ "$${fx:-0}" -gt 0 ] 2>/dev/null; then echo "ZC_OK zerocopy=$$zc fixed=$$fx"; exit 0; fi; '
+    'sleep 0.3; done; echo ZC_FAIL; '
+    "printf '%s\\n' \"$$csv\" | grep '^proxy.process.net.io_uring' || true; exit 1")
+tr.TimeOut = 90
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
     "ZC_OK", "both write_zerocopy and write_zerocopy_fixed must have engaged")
