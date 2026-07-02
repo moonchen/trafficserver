@@ -1,6 +1,6 @@
 /** @file
 
-  Unit tests for the io_uring coroutine runtime (Task / UringOp / UringCancel).
+  Unit tests for the io_uring coroutine runtime (Task / UringOp / UringMultishotOp).
 
   These drive a coroutine over a real per-thread IOUringContext, pumped by hand
   exactly the way NetHandler::waitForActivity pumps it (submit queued SQEs, wait
@@ -38,7 +38,6 @@
 
 using ts::iouring::DetachedTask;
 using ts::iouring::Task;
-using ts::iouring::UringCancel;
 using ts::iouring::UringMultishotOp;
 using ts::iouring::UringOp;
 
@@ -120,10 +119,26 @@ cancellable_recv(int fd, IOUringCompletionHandler **publish, bool *sentinel_dest
   co_return n;
 }
 
-DetachedTask
-do_cancel(IOUringCompletionHandler *target, int *cancel_res)
+// Cancel an in-flight op the way the net path does: a fire-and-forget cancel SQE
+// keyed on the target op's SQE user_data (the target's `this`). The kernel then
+// completes the *target* op with -ECANCELED, resuming the coroutine parked on it;
+// the cancel's own completion is uninteresting and discarded. It still needs a
+// real handler as its user_data because IOUringContext::service() dispatches
+// handle_complete() on every CQE's user_data unconditionally.
+struct NoopCompletion : IOUringCompletionHandler {
+  void
+  handle_complete(io_uring_cqe *) override
+  {
+  }
+};
+NoopCompletion noop_completion;
+
+void
+cancel_in_flight(IOUringCompletionHandler *target)
 {
-  *cancel_res = co_await UringCancel(target);
+  io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(&noop_completion);
+  REQUIRE(sqe != nullptr);
+  io_uring_prep_cancel(sqe, target, 0);
 }
 
 // Arms ONE multishot poll on fd and loops, resuming once per readiness edge: each
@@ -296,14 +311,12 @@ TEST_CASE("an in-flight recv is cancelled and the coroutine unwinds cleanly", "[
   // Flush the recv to the kernel so it is genuinely in flight before we cancel.
   IOUringContext::local_context()->submit();
 
-  int cancel_res = -1;
-  do_cancel(in_flight, &cancel_res);
+  cancel_in_flight(in_flight);
 
   REQUIRE(pump_until([&] { return reader.done(); }));
 
   REQUIRE(reader.result() == -ECANCELED); // the parked recv was cancelled
   REQUIRE(sentinel_destroyed);            // the frame's locals were destroyed (clean unwind)
-  REQUIRE(cancel_res >= 0);               // the cancel itself was accepted by the kernel
 
   ::close(sv[0]);
   ::close(sv[1]);
@@ -352,13 +365,11 @@ TEST_CASE("a multishot poll yields one completion per readiness edge, then cance
   REQUIRE(!poller.done()); // F_MORE kept the stream armed across all three edges
 
   // Cancel the still-armed multishot -> terminal CQE (-ECANCELED, F_MORE clear).
-  int cancel_res = -1;
-  do_cancel(in_flight, &cancel_res);
+  cancel_in_flight(in_flight);
   REQUIRE(pump_until([&] { return poller.done(); }));
 
   REQUIRE(poller.result() == 3);   // exactly three edges consumed before the terminal
   REQUIRE(terminal == -ECANCELED); // the stream ended because it was cancelled
-  REQUIRE(cancel_res >= 0);        // the cancel op itself was accepted
 
   ::close(sv[0]);
   ::close(sv[1]);

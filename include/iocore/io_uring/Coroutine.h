@@ -2,10 +2,9 @@
 
   A minimal C++20 coroutine runtime for the per-thread io_uring context.
 
-  This is the in-tree descendant of the standalone coroutine net spike under
-  experiments/coro-net-prototype/. It provides just enough to drive an io_uring
-  operation from a coroutine that is suspended and resumed on its owning EThread,
-  reusing the existing IOUringContext (one ring per net thread, already pumped by
+  It provides just enough to drive an io_uring operation from a coroutine that
+  is suspended and resumed on its owning EThread, reusing the existing
+  IOUringContext (one ring per net thread, already pumped by
   NetHandler::waitForActivity) --- no new thread and no new event loop.
 
   Three pieces:
@@ -13,8 +12,8 @@
     - UringOp:    an awaitable that *is* an IOUringCompletionHandler. It submits a
                   caller-prepared SQE to this thread's ring and resumes the
                   awaiting coroutine from handle_complete() with the CQE result.
-    - UringCancel: cancels an in-flight op (io_uring_prep_cancel) so a connection
-                  can drain it before teardown (cancel-then-unwind).
+    - UringMultishotOp: the multishot form --- one submitted SQE awaited in a
+                  loop, resuming once per CQE until a terminal completion.
 
   @section license License
 
@@ -42,6 +41,7 @@
 #if TS_USE_LINUX_IO_URING
 
 #include "iocore/io_uring/IO_URING.h"
+#include "tscore/ink_assert.h"
 #include "tscore/ink_queue.h"
 
 #include <cerrno>
@@ -62,8 +62,12 @@ namespace detail
   // ~15-27% throughput vs epoll, recovered by this pool). Frames are allocated and
   // freed on the same EThread (VCs are thread-confined), so the cache is
   // thread_local --- no atomics. It is bounded per size class so it cannot grow
-  // with peak connection count, and uses an intrusive free list (the next pointer
-  // lives in the freed frame) so it needs no bookkeeping allocation of its own.
+  // with peak connection count: the worst case is MAX_CLASSES * CAP frames per
+  // thread (8 * 1024 * ~1 KB, about 8 MB), with CAP sized so roughly a thousand
+  // concurrent in-flight drives on one thread --- a saturated net thread --- stay
+  // pooled before spilling to malloc. It uses an intrusive free list (the next
+  // pointer lives in the freed frame) so it needs no bookkeeping allocation of
+  // its own.
   // Honors traffic_server -f/-F (ink_freelist_global_disabled) so a debug/ASan run
   // routes every frame through malloc/free.
   class FramePool
@@ -215,12 +219,15 @@ struct DetachedTask {
 // An owned coroutine: eager start, but its frame is kept alive at completion
 // (final_suspend suspends) so the owner can observe done() and reclaim the frame
 // deterministically when the Task is destroyed. Move-only; the handle is unique.
+// Task frames come from plain ::operator new --- only DetachedTask, the per-drive
+// hot path, pools its frames.
 //
-// Teardown precondition: only destroy a Task once it is done(). Destroying one
-// whose coroutine is still suspended on an in-flight op would free the awaitable
-// that is the kernel's SQE user_data, and the later completion would dereference
-// freed memory. Drive it to done() --- or cancel-then-unwind (see UringCancel) and
-// then drive to done() --- before letting the Task go.
+// Teardown precondition: only destroy a Task once it is done(); the destructor
+// release-asserts it. Destroying one whose coroutine is still suspended on an
+// in-flight op would free the awaitable that is the kernel's SQE user_data, and
+// the later completion would dereference freed memory. Drive it to done() ---
+// cancelling the in-flight op first if need be, so it resumes with -ECANCELED and
+// the coroutine unwinds --- before letting the Task go.
 template <typename T = void> class Task
 {
 public:
@@ -273,6 +280,10 @@ public:
 
   ~Task()
   {
+    // A coroutine still suspended on an in-flight op is the kernel's SQE
+    // user_data; destroying the frame here would turn the eventual completion
+    // into a use-after-free. Crash loudly instead.
+    ink_release_assert(!_h || _h.done());
     if (_h) {
       _h.destroy();
     }
@@ -500,64 +511,6 @@ private:
 };
 
 template <typename Prep> UringMultishotOp(Prep) -> UringMultishotOp<Prep>;
-
-// Cancels an in-flight UringOp by submitting io_uring_prep_cancel keyed on the
-// target op's SQE user_data (which is the target UringOp's `this`). The kernel
-// completes the *original* op with -ECANCELED; the coroutine awaiting it resumes
-// and unwinds. This awaitable resumes when the cancel SQE itself completes
-// (res 0 = found, -ENOENT = not found, -EALREADY = already completing).
-//
-// Unlike the standalone prototype, which tagged the cancel SQE with a sentinel
-// user_data and filtered it out, here the cancel SQE must carry a real
-// IOUringCompletionHandler: IOUringContext::service() calls handle_complete() on
-// every CQE's user_data unconditionally, so a sentinel would be dereferenced.
-class UringCancel : public IOUringCompletionHandler
-{
-public:
-  explicit UringCancel(IOUringCompletionHandler *target) : _target(target) {}
-
-  UringCancel(const UringCancel &)            = delete;
-  UringCancel &operator=(const UringCancel &) = delete;
-  UringCancel(UringCancel &&)                 = delete;
-  UringCancel &operator=(UringCancel &&)      = delete;
-
-  bool
-  await_ready() const noexcept
-  {
-    return false;
-  }
-
-  bool
-  await_suspend(std::coroutine_handle<> h) noexcept
-  {
-    _waiter           = h;
-    io_uring_sqe *sqe = IOUringContext::local_context()->next_sqe(this); // user_data = this
-    if (sqe == nullptr) {
-      _result = -ENOBUFS;
-      return false;
-    }
-    io_uring_prep_cancel(sqe, _target, 0);
-    return true;
-  }
-
-  int
-  await_resume() const noexcept
-  {
-    return _result;
-  }
-
-  void
-  handle_complete(io_uring_cqe *cqe) override
-  {
-    _result = cqe->res;
-    _waiter.resume();
-  }
-
-private:
-  IOUringCompletionHandler *_target;
-  std::coroutine_handle<>   _waiter{};
-  int                       _result{0};
-};
 
 } // namespace ts::iouring
 
