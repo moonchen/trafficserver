@@ -85,8 +85,22 @@ public:
 
   // Register a fixed ("registered") buffer region on this ring so send_zc_fixed can DMA
   // from it without a per-send pin/IOMMU-map. Returns 0 on success or -errno. The region
-  // becomes registered buffer index 0 on this ring (prototype: one region per ring).
+  // becomes registered buffer index 0 on this ring.
   int register_fixed_buffers(void *base, size_t len);
+
+  // Clone the fixed-buffer registration from another ring (IORING_REGISTER_CLONE_BUFFERS): the
+  // arena's pinned pages are registered once on a source ring, then shared into this ring's buffer
+  // table at the same index, so N rings pin the region 1x instead of N times. Returns 0 on success
+  // or -errno (the caller falls back to register_fixed_buffers). src_ring_fd must be a ring that has
+  // already registered the region.
+  int clone_fixed_buffers(int src_ring_fd);
+
+  // This ring's fd, for publishing as a clone source. Valid only after a successful setup.
+  int
+  ring_fd() const
+  {
+    return ring.ring_fd;
+  }
 
   // assigns the global iouring config
   static void            set_config(const IOUringConfig &);

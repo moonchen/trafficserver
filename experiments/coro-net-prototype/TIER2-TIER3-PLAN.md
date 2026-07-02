@@ -117,11 +117,20 @@ T3.1 **Drop the global mutex** -- DONE (2026-06-28). Replaced `UringFixedBufAren
   6/6 under ASan (write_zerocopy drives the arena under live net-thread concurrency). 9-agent adversarial
   review: lock-free correct, alignment concern refuted, no material findings.
 
-T3.2 **IORING_REGISTER_CLONE_BUFFERS** (1x pinning). Goal: register the arena ONCE then clone into every
-  ET_NET ring instead of independent per-ring registration (N x memlock). Kernel 6.12+ (box is 6.17);
-  liburing helper may be absent -> raw `io_uring_register(ring_fd, IORING_REGISTER_CLONE_BUFFERS, &arg)`.
-  Needs startup ordering (one ring registers first; others clone). Accept: 1x RLIMIT_MEMLOCK accounting;
-  `send_zc_fixed` still works cross-thread (buf_index identical on all rings).
+T3.2 **IORING_REGISTER_CLONE_BUFFERS** -- DONE (2026-07-02). The arena region is registered ONCE on the
+  first ring to need it (elected by a CAS on a process-global atomic that publishes that ring's fd), and
+  every other ET_NET ring clones that registration instead of registering independently -- so the region
+  is pinned 1x, not N x. liburing 2.4 AND this box's linux-libc-dev uapi header both predate the opcode
+  (they stop at IORING_REGISTER_PBUF_STATUS=26), so `clone_fixed_buffers` issues the raw
+  `syscall(__NR_io_uring_register, ring_fd, IORING_REGISTER_CLONE_BUFFERS=30, &io_uring_clone_buffers{...}, 1)`
+  with a header-guarded opcode+struct def. A thread that races in during the tiny publish window, or whose
+  clone fails, falls back to an independent registration (correct, just not shared) -- so the worst case is
+  the old N-x behavior, never a failure. VERIFIED: io_uring_write_zerocopy autest (arena on, 4 ET_NET
+  threads: 1 source + 3 clones from its ring fd, 0 fallbacks) -> VmPin 128832 KB ~= 1x the 125 MB region
+  (independent would be ~4x); body integrity intact so send_zc_fixed works cross-thread at buf_index 0 on
+  the cloned rings; full io_uring_* suite 21/21 ASan-clean. NOTE: io_uring buffer pinning shows in
+  /proc/<pid>/status **VmPin** (pin_user_pages), NOT VmLck. A dedicated `io_uring_arena` debug tag logs the
+  per-ring registration path (source / cloned / independent-fallback).
 
 T3.3 **Size classes** -- DONE (2026-06-28). The single registered region is now partitioned into
   power-of-two size classes following the ATS IOBuffer size-index scheme (64K..top), so a read takes
@@ -201,7 +210,7 @@ NEXT (Track B = bank the proven win toward shipping):
 2. T2.3 master-TSan differential for the net path (the lock-free arena was already TSan-clean modulo
    the benign InkAtomicList race).
 3. Widen the force-on differential further (more plain-HTTP autests, skip TLS).
-4. T3.2 clone buffers (1x memlock).
+4. T3.2 clone buffers (1x memlock). -- DONE 2026-07-02 (see T3.2 above).
 5. Then scope the upstream PR (TLS-independent net path + arena -- TLS/H2 over io_uring is blocked on
    the TLS refactor, see [[io-uring-tls-depends-on-tls-refactor]]).
 

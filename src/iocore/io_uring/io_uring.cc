@@ -28,6 +28,25 @@ Linux io_uring helper library
 #include <stdexcept>
 
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <cerrno>
+#include <cstdint>
+
+// IORING_REGISTER_CLONE_BUFFERS (kernel 6.12+) is newer than this box's liburing and its
+// linux-libc-dev uapi header (which stops at IORING_REGISTER_PBUF_STATUS=26), so define the raw
+// opcode + arg struct. Guarded so a newer header that already provides them wins. Fields are
+// uint32_t (== the kernel's __u32) so the layout matches the ABI regardless of header order.
+#ifndef IORING_REGISTER_CLONE_BUFFERS
+#define IORING_REGISTER_CLONE_BUFFERS 30
+struct io_uring_clone_buffers {
+  uint32_t src_fd;
+  uint32_t flags;
+  uint32_t src_off;
+  uint32_t dst_off;
+  uint32_t nr;
+  uint32_t pad[3];
+};
+#endif
 
 #include "iocore/io_uring/IO_URING.h"
 #include "tscore/ink_hrtime.h"
@@ -277,6 +296,20 @@ IOUringContext::register_fixed_buffers(void *base, size_t len)
     base, len
   };
   return io_uring_register_buffers(&ring, &iov, 1);
+}
+
+int
+IOUringContext::clone_fixed_buffers(int src_ring_fd)
+{
+  // Clone the single registered buffer (the arena region, index 0) from src_ring_fd into this
+  // ring's table at the same index, sharing the pinned pages (1x memlock). liburing has no wrapper
+  // in this version, so issue the register syscall directly.
+  struct io_uring_clone_buffers arg;
+  memset(&arg, 0, sizeof(arg));
+  arg.src_fd = static_cast<uint32_t>(src_ring_fd);
+  arg.nr     = 1; // one registered buffer; src_off/dst_off/flags all 0 (fresh dst table at index 0)
+  long ret   = syscall(__NR_io_uring_register, ring.ring_fd, IORING_REGISTER_CLONE_BUFFERS, &arg, 1);
+  return ret < 0 ? -errno : static_cast<int>(ret);
 }
 
 IOUringContext *

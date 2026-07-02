@@ -38,6 +38,16 @@ using ts::Metrics;
 
 namespace
 {
+DbgCtl dbg_ctl_fixed_arena{"io_uring_arena"};
+
+// Clone-source election for the arena's fixed-buffer registration. -1 = unclaimed, -2 = a thread
+// is registering (source not published yet), >= 0 = the source ring fd others clone from. One
+// thread registers the pinned region on its ring and publishes its fd; the rest clone from it
+// (IORING_REGISTER_CLONE_BUFFERS) so the region is pinned 1x, not once per ring. A thread that
+// arrives during the tiny -2 window, or whose clone fails, falls back to an independent
+// registration -- correct, just not memlock-shared, so the worst case is the old N-x behavior.
+std::atomic<int> arena_clone_src_fd{-1};
+
 // The smallest size class the arena offers. The cache only draws from the arena for reads >=
 // 64 KiB (CacheVC::handleRead), so a 64 KiB floor wastes nothing on tiny reads. Classes run
 // from here up to a configurable top (<= 2 MiB = MAX_BUFFER_SIZE_INDEX), following the ATS
@@ -202,17 +212,42 @@ UringFixedBufArena::ensure_registered()
   if (_region == nullptr) {
     return;
   }
-  // Prototype: register the single region (== buffer index 0) independently on each ring. All
-  // size classes live within this one region, so send_zc_fixed addresses any block by index 0.
-  // Production: register once, then IORING_REGISTER_CLONE_BUFFERS into the other rings.
+  // The single region (== buffer index 0) is registered on one ring and cloned into the others, so
+  // all rings share one pinned copy. All size classes live within this region, so send_zc_fixed
+  // addresses any block by index 0 no matter which ring cloned it.
   static thread_local bool registered = false;
   if (registered) {
     return;
   }
   registered = true;
-  int rc     = IOUringContext::local_context()->register_fixed_buffers(_region, _region_len);
+  auto *ctx  = IOUringContext::local_context();
+
+  // Elect a single clone source: the first thread here registers the region and publishes its ring
+  // fd; everyone else clones from it (1x pin). CAS -1 -> -2 claims the source role.
+  int expected = -1;
+  if (arena_clone_src_fd.compare_exchange_strong(expected, -2, std::memory_order_acq_rel)) {
+    int rc = ctx->register_fixed_buffers(_region, _region_len);
+    if (rc < 0) {
+      Warning("io_uring fixed arena: register_buffers failed (%d) on the source ring", rc);
+      arena_clone_src_fd.store(-1, std::memory_order_release); // release the role; let another try
+      return;
+    }
+    arena_clone_src_fd.store(ctx->ring_fd(), std::memory_order_release); // publish: clones may proceed
+    Dbg(dbg_ctl_fixed_arena, "fixed arena: registered as the clone source (ring fd %d)", ctx->ring_fd());
+    return;
+  }
+
+  // Not the source. Clone from it if it is ready; otherwise register independently (safe fallback).
+  if (int src = arena_clone_src_fd.load(std::memory_order_acquire); src >= 0 && ctx->clone_fixed_buffers(src) == 0) {
+    Dbg(dbg_ctl_fixed_arena, "fixed arena: cloned registration from source ring fd %d", src);
+    return; // shares the source's pinned pages -- no extra memlock
+  }
+  // src still registering (-2), or clone unsupported/failed: independent registration (old path).
+  int rc = ctx->register_fixed_buffers(_region, _region_len);
   if (rc < 0) {
     Warning("io_uring fixed arena: register_buffers failed (%d) on this ring", rc);
+  } else {
+    Dbg(dbg_ctl_fixed_arena, "fixed arena: independent registration (clone source not ready / unsupported)");
   }
 }
 

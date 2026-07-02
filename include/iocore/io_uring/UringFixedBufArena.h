@@ -54,7 +54,8 @@
 // cold allocator (one alloc per >=64 KiB disk fragment), so it uses the atomic pool directly.
 // TODO(perf): if the arena ever goes hot, add a ProxyAllocator-style thread-local magazine
 //   (thread_freelist_high/low_watermark) over these per-class pools.
-// Still open: IORING_REGISTER_CLONE_BUFFERS (register once, clone into the other rings -> 1x pin).
+// The region is pinned once: one ring registers it and the rest clone that registration
+// (IORING_REGISTER_CLONE_BUFFERS), so RLIMIT_MEMLOCK accounts the region 1x, not once per ring.
 class RegisteredBufferData;
 
 class UringFixedBufArena
