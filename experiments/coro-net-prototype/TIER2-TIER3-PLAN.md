@@ -191,15 +191,19 @@ recorded in experiments/coro-net-prototype/PERF-RESULTS-2026-06-28.md = canonica
 but FOUND a ship-blocker, below).
 
 NEXT (Track B = bank the proven win toward shipping):
-1. **FIX the io_uring pipelining stall** (SHIP-BLOCKER found by the force-on differential 2026-06-28:
-   HTTP/1.1 pipelined requests stall under io_uring, pass epoll; `_read` never re-signals already-
-   buffered data on consumer re-arm). Full hypothesis + the ready `pipeline` regression test in
-   [[io-uring-pipelining-stall-bug]]. Do this first.
-2. Widen the force-on differential further (more plain-HTTP autests, skip TLS); T2.3 master-TSan
-   differential for the net path (the lock-free arena was already TSan-clean modulo the benign
-   InkAtomicList race); T3.2 clone buffers (1x memlock); then scope the upstream PR (TLS-independent
-   net path + arena -- TLS/H2 over io_uring is blocked on the TLS refactor, see
-   [[io-uring-tls-depends-on-tls-refactor]]).
+1. **The io_uring "pipelining stall" is RESOLVED** -- it was mis-titled, NOT a read-path re-signal bug.
+   The `_read` re-signal hypothesis was disproved via a literal-IP-remap differential (pipelining
+   works). Real cause: io_uring net threads block in the ring and never poll their epoll-registered
+   DNS UDP sockets, so async DNS (hostname remaps) hung at "Doing DNS Lookup". Fixed `4253f384c0`
+   (IOUringPollBridge multishot-polls the thread's epoll fd into the ring + non-blocking do_poll(0)
+   harvest in waitForActivity); CI guard `e11d06b145` (io_uring_dns.test.py). See
+   [[io-uring-pipelining-stall-bug]].
+2. T2.3 master-TSan differential for the net path (the lock-free arena was already TSan-clean modulo
+   the benign InkAtomicList race).
+3. Widen the force-on differential further (more plain-HTTP autests, skip TLS).
+4. T3.2 clone buffers (1x memlock).
+5. Then scope the upstream PR (TLS-independent net path + arena -- TLS/H2 over io_uring is blocked on
+   the TLS refactor, see [[io-uring-tls-depends-on-tls-refactor]]).
 
 T3.6 **ZC disk read (read_fixed)** -- ON THE ROADMAP, LOW PRIORITY / LOW RISK (user, 2026-06-28). Use
 io_uring_prep_read_fixed for the cache disk read into the already-registered arena block (read-side
