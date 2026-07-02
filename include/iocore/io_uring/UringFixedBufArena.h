@@ -42,10 +42,12 @@
 // The single registered region is partitioned into power-of-two SIZE CLASSES following the
 // ATS IOBuffer size-index scheme (64K..2M): a read takes the smallest class that fits, which
 // mirrors how the normal allocator (iobuffer_size_to_index) rounds a Doc up to a power-of-two
-// class. This matters because the arena is the only allocator that can be "too small": a Doc
-// larger than the one block size used to make alloc() decline silently (no send_zc_fixed). The
-// classes share ONE registered region (== buffer index 0), so registered_index() is 0 for every
-// block and the send path is unchanged -- the classes are purely an allocator-internal split.
+// class. This matters because the arena is the only allocator that can be "too small": alloc()
+// declines (silently, falling back to heap blocks and plain sends) whenever no class fits, so
+// the classes must span the whole disk-fragment size range or oversized Docs never get
+// send_zc_fixed. The classes share ONE registered region (== buffer index 0), so
+// registered_index() is 0 for every block and the send path is unchanged -- the classes are
+// purely an allocator-internal split.
 //
 // Each class is a LOCK-FREE pool: an InkAtomicList (ATS's ABA-safe Treiber stack) of descriptors
 // pre-bound to blocks. alloc() pops, free() pushes -- one CAS each, no mutex. This is the same

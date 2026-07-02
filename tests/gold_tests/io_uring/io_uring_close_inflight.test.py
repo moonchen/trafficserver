@@ -34,7 +34,7 @@ recvmsg (read_provided_buffers=0) and the default provided-buffer ring (read_pro
 
 Asserts: the vc_deferred_close metric moved (>0), a follow-up full GET still returns 200 with the
 correct body, ATS is StillRunningAfter, and traffic.out is clean of bad-list / ASan / assertion /
-fatal-signal noise. write_zerocopy stays off (default), so sends take the plain send/sendmsg path.
+fatal-signal noise. Sends take the plain send/sendmsg path (no zero-copy configuration is set).
 '''
 
 Test.ContinueOnFail = False
@@ -101,8 +101,8 @@ def add_phases(read_provided):
         {
             'proxy.config.net.io_uring.enabled': 1,
             'proxy.config.net.io_uring.read_provided_buffers': read_provided,
-            # write_zerocopy stays default-off: response body sends take the plain send/sendmsg
-            # path, so the in-flight op cancelled at close is a plain _write_op (not send_zc+NOTIF).
+            # Nothing here configures zero-copy, so response body sends take the plain
+            # send/sendmsg path and the in-flight op cancelled at close is a plain _write_op.
             # Cache /big so the churn phase hammers ATS's serve+close path, not the Python origin.
             'proxy.config.http.cache.required_headers': 0,
             # Generous ring + provided-buffer working set so a cache-miss read never parks on

@@ -218,8 +218,7 @@ pointer into the VC (or into a
 coroutine frame that references the VC). Freeing the VC while that op is
 outstanding is a use-after-free when the completion later fires. ``do_io_close``
 must instead cancel the in-flight op and defer teardown until the (cancelled)
-completion is observed, then free. *Proven by* the original net-iouring branch's
-``do_io_close`` doing ``delete this`` with a recvmsg still in the ring.
+completion is observed, then free.
 
 The cancel-then-unwind must cover *every* free path, not just ``do_io_close``.
 An inactivity/active timeout closes the VC through the inherited ``mainEvent`` and
@@ -262,52 +261,79 @@ of each invariant:
      - How / where
    * - INV-C1
      - held
-     - Inherits the base ``do_io_*`` / VIO facade; only ``net_read_io`` and
-       ``do_io_close`` are overridden.
+     - The ``do_io_*``/VIO facade is the base's (``do_io_read`` is fully
+       inherited); what is overridden is the machinery underneath it:
+       ``net_read_io`` / ``net_write_io`` (the completion-driven drives),
+       ``connectUp`` (io_uring connect), ``do_io_close`` and ``free_thread``
+       (deferred teardown, INV-L2), ``do_io_write`` (cancels + abandons an
+       in-flight send on the stop-write call), and ``reenable`` /
+       ``reenable_re`` (nothing else sets ``triggered`` with epoll off; both
+       defer to the ready list). Which events fire, in what order, with what
+       VIO/buffer state is unchanged; the ``io_uring_netvc`` gold test guards
+       the parity.
    * - INV-C2
      - held
-     - ``_read`` takes ``read.vio.mutex`` before fill + signal.
+     - ``_read`` / ``_read_provided`` / ``_write`` take ``vio.mutex``
+       (``MUTEX_TRY_LOCK``) around buffer fill/attach + signal; on contention
+       they reschedule, parking a completed recv's bytes rather than delivering
+       unlocked.
    * - INV-R1
      - n/a
      - Consumer-side; this VC is the producer.
    * - INV-R2
      - held
-     - Inherited; reenable re-drives via ``net_read_io``.
+     - ``reenable``/``reenable_re`` enqueue the VC to the ready list, which
+       re-drives ``net_read_io``; buffered data is never re-signalled. Bytes an
+       earlier recv pulled while the consumer could not take them are parked on
+       the VC and delivered on the next re-arm, exactly as if they had still
+       been in the socket.
    * - INV-R3
-     - n/a (no epoll)
-     - The fd is not registered with epoll (``ep.syscall == false``); there is no
-       readiness edge to drain. Re-arm is ``reenable`` -> submit a recv directly,
-       and a short recv simply re-submits an op that waits in the kernel. The
-       edge-trigger latch is gone.
+     - held (completion form)
+     - No epoll edge exists (``ep.syscall == false``); the completion-driven
+       form of the requirement applies. ``_read`` / ``_read_provided`` loop one
+       recv at a time until a short read, a full/absent buffer, or a satisfied
+       VIO; every stop either leaves a recv in flight (which needs no
+       readiness) or is re-driven by ``reenable`` (``read_disable`` + ready
+       list), so no readable bytes are stranded.
    * - INV-R4
      - n/a
      - Plain VC is not a transform (relevant once TLS layers on top).
    * - INV-R5
-     - partial
-     - EOS / EAGAIN / ERROR handled per read; relies on the inherited epoll
-       re-trigger. Re-verify if the read path stops using the epoll trigger.
+     - held
+     - Terminal state stays in the socket, as on epoll: an EOS/error completion
+       that arrives while the read is disabled is not latched or parked --- the
+       recv issued on the next re-enable re-reads EOF/error from the socket and
+       re-delivers it, so no suppressed signal can strand a later consumer.
    * - INV-W1
      - held
      - ``_write`` is demand-driven: it signals ``WRITE_READY`` to let the user
        produce more before sending, rather than buffering ahead.
    * - INV-W2
      - n/a (plain)
-     - A plain socket VC has no staging buffer between ``SSL_write`` and the
-       socket, so ``WRITE_COMPLETE`` after the sendmsg completion is safe inline
-       (the base does the same). The off-stack rule applies to a layered VC; the
-       io_uring write path must preserve it when TLS layers on top.
+     - A plain socket VC has no staging buffer between the user's bytes and the
+       socket: ``WRITE_COMPLETE`` is signalled only after the send's CQE, when
+       the bytes have already drained to the kernel, so the inline signal is
+       safe (the base does the same). The off-stack rule applies to a layered
+       VC; the io_uring write path must preserve it when TLS layers on top.
    * - INV-B1
      - held
-     - Inherited; ``_read`` honors ``write_avail()`` and stops on a full buffer
-       (backpressure via ``read_disable`` + base reenable).
+     - ``_read`` honors ``write_avail()`` and stops on a full buffer
+       (``read_disable``; reenable re-drives into the freed space).
+       ``_read_provided`` reads into ring buffers instead of the consumer's
+       MIOBuffer, so its backpressure is the ring itself: unconsumed data pins
+       ring buffers, and exhaustion (``-ENOBUFS``) falls back to ``_read``,
+       which stops on the full buffer.
    * - INV-S1
      - n/a
-     - Not a layered VC yet.
+     - Not a layered VC. The write drive nonetheless runs the setup seam
+       (``_isReadyToTransferData`` / ``_beReadyToTransferData``) before any
+       consumer-VIO gate, preserving the ordering a layered subclass needs.
    * - INV-L1
      - held
-     - Reimplements the ``recursion`` / ``closed`` contract
-       (``_read_signal_and_update`` / ``_read_signal_done``) because the base
-       helpers are file-static.
+     - Reimplements the ``recursion`` / ``closed`` contract for both directions
+       (``_read/_write_signal_and_update`` / ``_signal_done``) because the base
+       helpers are file-static; the unwind-free additionally waits until no
+       io_uring op is in flight (INV-L2).
    * - INV-L2
      - held
      - ``do_io_close`` *and* ``free_thread`` both cancel whichever of the in-flight
@@ -320,9 +346,11 @@ of each invariant:
        ``proxy.process.net.io_uring.vc_deferred_close``.
    * - INV-L3
      - held
-     - One ring per EThread (``thread_local``), so a recvmsg CQE drains and
-       resumes on the submitting thread; no per-VC mutex added. Migration not
-       yet supported.
+     - One ring per EThread (``thread_local``), so a CQE drains and resumes on
+       the submitting thread; no per-VC mutex added. The one channel that would
+       move a VC across threads --- global/hybrid session-pool migration --- is
+       refused at startup (``proxy.config.net.io_uring.enabled=1`` requires the
+       per-thread session pool), so a VC never changes threads.
 
 Type-structuring guidance
 =========================

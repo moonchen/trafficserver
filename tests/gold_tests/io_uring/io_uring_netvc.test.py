@@ -19,9 +19,10 @@ Plain HTTP through IOUringNetVConnection (proxy.config.net.io_uring.enabled=1).
 
 Test.Summary = '''
 Plain HTTP proxied through IOUringNetVConnection, selected by
-proxy.config.net.io_uring.enabled. While IOUringNetVConnection is a behavioral
-clone of UnixNetVConnection this passes identically to the default net path; it
-is the regression guard for swapping the read/write path to io_uring.
+proxy.config.net.io_uring.enabled. IOUringNetVConnection drives the whole
+socket lifecycle (accept/connect/read/write/close) from io_uring completions
+instead of epoll readiness, but must present the same VIO/event behavior as
+the default net path; this test is that parity guard.
 '''
 
 Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
