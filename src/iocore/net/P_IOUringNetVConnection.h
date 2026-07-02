@@ -64,6 +64,11 @@ public:
   // (no readiness to wait for), so mark triggered before delegating. The base
   // reenable then enqueues us to the ready/enable list, which drives
   // net_read_io / net_write_io --- with no epoll edge involved.
+  //
+  // reenable_re routes through the same deferred path rather than the base's
+  // synchronous drive: a completion-driven drive coroutine may be mid-loop when a
+  // VIO signal it delivers calls reenable_re, and an inline nested drive could arm
+  // a second op for the same direction (see the definition).
   void reenable(VIO *vio) override;
   void reenable_re(VIO *vio) override;
 
@@ -87,8 +92,9 @@ public:
   int connectUp(EThread *t, int fd) override;
 
   // If an io_uring op is in flight, cancel it and defer teardown until the
-  // (cancelled) completion(s) resume the coroutine(s) --- freeing now would
-  // resume into a freed `this` (the net-iouring branch's use-after-free).
+  // (cancelled) completion(s) resume the coroutine(s): an in-flight op holds a
+  // pointer into this VC, so freeing before the completion is observed is a
+  // use-after-free when it later resumes.
   void do_io_close(int lerrno = -1) override;
 
   // do_io_write(this, 0, nullptr) is the epoll-era "stop writing" a tunnel teardown relies on

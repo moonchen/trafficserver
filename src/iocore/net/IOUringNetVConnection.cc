@@ -41,6 +41,8 @@
 
 #include "tsutil/Metrics.h"
 
+#include <algorithm>
+
 using ts::Metrics;
 
 // Zero-copy-send constants, in case the kernel uapi header pulled in by liburing predates
@@ -465,8 +467,18 @@ IOUringNetVConnection::reenable(VIO *vio)
 void
 IOUringNetVConnection::reenable_re(VIO *vio)
 {
-  (vio == &read.vio ? read : write).triggered = 1;
-  super::reenable_re(vio);
+  // Route through the deferred drive (reenable -> ready list) instead of the base's
+  // synchronous net_read_io / net_write_io call. With an op in flight the synchronous
+  // drive would be a no-op anyway (the _read_op / _write_op guards at the top of
+  // net_read_io / net_write_io); but with none in flight --- e.g. a reenable_re issued
+  // from inside a VIO signal, which the drive coroutine delivers between its awaits ---
+  // the base's inline drive would launch a nested drive coroutine whose op the
+  // still-running outer loop cannot see, and both could then arm an op for the same
+  // direction (two recvs into one buffer, and an overwritten _read_op/_write_op slot).
+  // Deferring keeps one drive per direction by construction, and is within
+  // reenable_re's contract: the base itself falls back to reenable whenever the
+  // NetHandler lock is not already held.
+  this->reenable(vio);
 }
 
 void
@@ -527,6 +539,45 @@ wrap_recv_bytes(const IOVec *iov, const Ptr<IOBufferBlock> *anchor, unsigned nio
   return head;
 }
 
+// Detach the first `take` bytes of a held chain into their own chain of read-only refs,
+// leaving `chain` holding the remainder (the boundary block is split by cloning the
+// shared-data ref). Used when the armed VIO asks for fewer bytes than are held: delivery
+// must stop at ntodo --- on epoll a read never pulls past the current ntodo, the excess
+// stays in the socket --- so the excess stays parked for the next re-arm instead.
+Ptr<IOBufferBlock>
+split_held_bytes(Ptr<IOBufferBlock> &chain, int64_t take)
+{
+  Ptr<IOBufferBlock> head;
+  IOBufferBlock     *tail = nullptr;
+  while (chain != nullptr && take > 0) {
+    int64_t avail = chain->read_avail();
+    if (avail <= take) {
+      Ptr<IOBufferBlock> rest = chain->next;
+      chain->next             = nullptr;
+      if (tail == nullptr) {
+        head = chain;
+      } else {
+        tail->next = chain;
+      }
+      tail   = chain.get();
+      chain  = rest;
+      take  -= avail;
+    } else {
+      IOBufferBlock *b = chain->clone(); // shares the data; clamp the copy to the first `take` bytes
+      b->_end          = b->_start + take;
+      b->_buf_end      = b->_end;
+      if (tail == nullptr) {
+        head = b;
+      } else {
+        tail->next = b;
+      }
+      chain->consume(take);
+      take = 0;
+    }
+  }
+  return head;
+}
+
 // True when the read VIO's writer is exactly where a completed recv put its bytes: the same
 // MIOBuffer the recv filled, with its write cursor still at the first kernel-written byte. Then
 // the bytes already sit in the armed buffer past the cursor and delivery is a plain fill().
@@ -572,24 +623,30 @@ IOUringNetVConnection::_read()
       nh->free_netevent(this);
       co_return;
     }
-    // A VIO that cannot take the bytes right now (not a read, disabled, no buffer) keeps them
-    // parked; the loop below disables the read and a later re-arm redelivers.
-    if (s->vio.op == VIO::READ && !s->vio.is_disabled() && s->vio.buffer.writer() != nullptr) {
-      MIOBuffer         *w     = s->vio.buffer.writer();
-      Ptr<IOBufferBlock> chain = _held_read_chain;
-      int64_t            held  = _held_read_bytes;
-      MIOBuffer         *fbuf  = _held_read_buf;
-      _held_read_chain         = nullptr;
-      _held_read_bytes         = 0;
-      _held_read_buf           = nullptr;
-      if (recv_filled_in_place(w, fbuf, chain->start())) {
-        w->fill(held);
+    // A VIO that cannot take the bytes right now (not a read, disabled, no buffer, nothing
+    // left to do) keeps them parked; the loop below disables the read and a later re-arm
+    // redelivers.
+    if (s->vio.op == VIO::READ && !s->vio.is_disabled() && s->vio.buffer.writer() != nullptr && s->vio.ntodo() > 0) {
+      MIOBuffer *w = s->vio.buffer.writer();
+      // Deliver no more than the VIO asks for: the consumer may have re-armed with a smaller
+      // nbytes than the recv that pulled these bytes was clamped to, and on epoll a read
+      // never pulls past the current ntodo (the excess waits in the socket). The excess
+      // stays parked for the next re-arm instead.
+      int64_t            take      = std::min(_held_read_bytes, s->vio.ntodo());
+      bool               in_place  = recv_filled_in_place(w, _held_read_buf, _held_read_chain->start());
+      Ptr<IOBufferBlock> chain     = split_held_bytes(_held_read_chain, take);
+      _held_read_bytes            -= take;
+      if (_held_read_bytes == 0) {
+        _held_read_buf = nullptr; // split_held_bytes emptied _held_read_chain with it
+      }
+      if (in_place) {
+        w->fill(take);
       } else {
         w->append_block(chain.get());
       }
-      Metrics::Counter::increment(net_rsb.read_bytes, held);
+      Metrics::Counter::increment(net_rsb.read_bytes, take);
       Metrics::Counter::increment(net_rsb.read_bytes_count);
-      s->vio.ndone += held;
+      s->vio.ndone += take;
       this->netActivity();
       if (s->vio.ntodo() <= 0) {
         _read_signal_done(VC_EVENT_READ_COMPLETE);
@@ -765,19 +822,35 @@ IOUringNetVConnection::_read()
         co_return;
       }
 
-      // Enabled, but the VIO cannot place data (re-armed as a non-read or without a buffer):
-      // park, exactly as the disabled case; the loop below disables until a usable re-arm.
-      if (s->vio.op != VIO::READ || s->vio.is_disabled() || s->vio.buffer.writer() == nullptr) {
+      // Enabled, but the VIO cannot place data (re-armed as a non-read, without a buffer, or
+      // with nothing left to do): park, exactly as the disabled case; the loop below disables
+      // until a usable re-arm.
+      if (s->vio.op != VIO::READ || s->vio.is_disabled() || s->vio.buffer.writer() == nullptr || s->vio.ntodo() <= 0) {
         _held_read_chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
         _held_read_bytes = r;
         _held_read_buf   = read_target;
         co_return;
       }
 
-      Metrics::Counter::increment(net_rsb.read_bytes, r);
-      Metrics::Counter::increment(net_rsb.read_bytes_count);
-      MIOBuffer *w = s->vio.buffer.writer();
-      if (recv_filled_in_place(w, read_target, static_cast<char *>(tiovec[0].iov_base))) {
+      // Deliver no more than the VIO asks for. This recv was clamped to ntodo at arm time,
+      // but the consumer may have re-armed with a smaller nbytes while it was in flight; on
+      // epoll the re-armed read is clamped to the new ntodo and the excess waits in the
+      // socket, so here the excess stays parked for the next re-arm.
+      MIOBuffer *w        = s->vio.buffer.writer();
+      int64_t    take     = std::min(static_cast<int64_t>(r), s->vio.ntodo());
+      bool       in_place = recv_filled_in_place(w, read_target, static_cast<char *>(tiovec[0].iov_base));
+      if (take < r) {
+        Ptr<IOBufferBlock> whole   = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
+        Ptr<IOBufferBlock> deliver = split_held_bytes(whole, take);
+        if (in_place) {
+          w->fill(take);
+        } else {
+          w->append_block(deliver.get());
+        }
+        _held_read_chain = whole;
+        _held_read_bytes = r - take;
+        _held_read_buf   = read_target;
+      } else if (in_place) {
         w->fill(r);
       } else {
         // do_io_read re-targeted the read to a different buffer while this recv was in flight
@@ -790,7 +863,9 @@ IOUringNetVConnection::_read()
         Ptr<IOBufferBlock> chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
         w->append_block(chain.get());
       }
-      s->vio.ndone += r;
+      Metrics::Counter::increment(net_rsb.read_bytes, take);
+      Metrics::Counter::increment(net_rsb.read_bytes_count);
+      s->vio.ndone += take;
       this->netActivity();
 
       if (s->vio.ntodo() <= 0) {
@@ -869,13 +944,15 @@ IOUringNetVConnection::_read_provided()
       // is ever in flight, so a single held slot suffices. We are past the enabled / op==READ /
       // ntodo>0 / buffer-present gates, so the consumer can take it now.
       if (_held_pbuf_bytes > 0) {
-        int64_t held = _held_pbuf_bytes;
-        s->vio.buffer.writer()->append_block(_held_pbuf_block.get());
-        _held_pbuf_block = nullptr;
-        _held_pbuf_bytes = 0;
-        Metrics::Counter::increment(net_rsb.read_bytes, held);
+        // Deliver no more than the VIO asks for (see _read's replay: the consumer may have
+        // re-armed with a smaller nbytes); the excess stays parked for the next re-arm.
+        int64_t            take     = std::min(_held_pbuf_bytes, s->vio.ntodo());
+        Ptr<IOBufferBlock> deliver  = split_held_bytes(_held_pbuf_block, take);
+        _held_pbuf_bytes           -= take;
+        s->vio.buffer.writer()->append_block(deliver.get());
+        Metrics::Counter::increment(net_rsb.read_bytes, take);
         Metrics::Counter::increment(net_rsb.read_bytes_count);
-        s->vio.ndone += held;
+        s->vio.ndone += take;
         this->netActivity();
         if (s->vio.ntodo() <= 0) {
           _read_signal_done(VC_EVENT_READ_COMPLETE);
@@ -992,10 +1069,22 @@ IOUringNetVConnection::_read_provided()
         read_disable(nh, this);
         co_return;
       }
-      s->vio.buffer.writer()->append_block(ring->wrap(flgs >> IORING_CQE_BUFFER_SHIFT, r));
-      Metrics::Counter::increment(net_rsb.read_bytes, r);
+      // Deliver no more than the VIO asks for. This recv's len was capped to ntodo at arm
+      // time, but the consumer may have re-armed with a smaller nbytes while it was in
+      // flight (see _read); the excess stays parked for the next re-arm.
+      Ptr<IOBufferBlock> pblock = make_ptr(ring->wrap(flgs >> IORING_CQE_BUFFER_SHIFT, r));
+      int64_t            take   = std::min(static_cast<int64_t>(r), s->vio.ntodo());
+      if (take < r) {
+        Ptr<IOBufferBlock> deliver = split_held_bytes(pblock, take);
+        s->vio.buffer.writer()->append_block(deliver.get());
+        _held_pbuf_block = pblock;
+        _held_pbuf_bytes = r - take;
+      } else {
+        s->vio.buffer.writer()->append_block(pblock.get());
+      }
+      Metrics::Counter::increment(net_rsb.read_bytes, take);
       Metrics::Counter::increment(net_rsb.read_bytes_count);
-      s->vio.ndone += r;
+      s->vio.ndone += take;
       this->netActivity();
 
       if (s->vio.ntodo() <= 0) {
@@ -1256,9 +1345,12 @@ IOUringNetVConnection::_write()
         co_return;
       }
 
-      // Zero-copy send is gated on size: below the threshold the per-byte copy is cheaper
-      // than the extra notification CQE (and the page pinning).
-      use_zc = write_zc_enabled() && towrite >= write_zc_threshold();
+      // Zero-copy send is gated on size --- below the threshold the per-byte copy is cheaper
+      // than the extra notification CQE (and the page pinning) --- and on address family:
+      // the kernel supports IORING_OP_SEND_ZC / SENDMSG_ZC only on INET/INET6 sockets, and
+      // this VC also carries AF_UNIX connections (UDS listeners), where a zero-copy send
+      // completes -EOPNOTSUPP and would surface as a connection-killing write error.
+      use_zc = write_zc_enabled() && towrite >= write_zc_threshold() && !ats_is_unix(this->get_local_addr());
 
       // Build the iovec from a clone of the reader (so the real reader is not consumed
       // until the send actually completes). For zero-copy the kernel DMAs from these source
