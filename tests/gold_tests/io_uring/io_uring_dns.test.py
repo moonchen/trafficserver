@@ -29,6 +29,8 @@ exercises async resolution, and it covers both DNS thread modes
 (proxy.config.dns.dedicated_thread 0 and 1, which both run the io_uring net loop).
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 

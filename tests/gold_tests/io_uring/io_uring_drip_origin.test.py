@@ -26,12 +26,14 @@ Test.Summary = '''
 With proxy.config.net.io_uring.enabled=1, proxy from an origin that trickles the
 full Content-Length body back in 64-byte pieces with a 50ms gap between each. Each
 io_uring recv on the origin VC returns far less than it attempted (a short read),
-so the read coroutine re-arms and blocks in the kernel for the next piece
-(_read short-read re-arm 749-754; _read_provided short-read re-arm 953-957). The
+so the read coroutine re-arms and blocks in the kernel for the next piece (the
+short-read re-arm branch in _read, mirrored in _read_provided). The
 full body must be reassembled in order with no premature EOS. Run over BOTH read
 paths: single-shot recvmsg (read_provided_buffers=0) and the default kernel
 provided-buffer ring (read_provided_buffers=1).
 '''
+
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 
 Test.ContinueOnFail = True
 

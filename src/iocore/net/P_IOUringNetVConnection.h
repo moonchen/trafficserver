@@ -1,18 +1,19 @@
 /** @file
 
-  A NetVConnection whose socket I/O is (incrementally) moved onto io_uring.
+  A NetVConnection whose full socket lifecycle is driven by io_uring
+  completions instead of epoll readiness.
 
-  IOUringNetVConnection derives from UnixNetVConnection and, for now, is a
-  behavioral clone of it: every do_io_* / read / write path is inherited
-  unchanged. Pieces are then swapped to io_uring (driven by the per-thread
-  IOUringContext via the coroutine runtime in iocore/io_uring/Coroutine.h) one
-  at a time, so each step is independently testable against the inherited
-  baseline. Selected at accept time by proxy.config.net.io_uring.enabled (see
+  IOUringNetVConnection derives from UnixNetVConnection and overrides every
+  do_io_* / read / write / connect seam to submit an io_uring op and resume a
+  coroutine (driven by the per-thread IOUringContext via the coroutine
+  runtime in iocore/io_uring/Coroutine.h) on its completion; epoll plays no
+  part once a VC is on this path (see the constructor's ep.syscall = false).
+  Selected at accept time by proxy.config.net.io_uring.enabled (see
   UnixNetProcessor::allocate_vc).
 
-  This mirrors how SSLNetVConnection derives from UnixNetVConnection and
-  overrides only the seams it needs (net_read_io, load_buffer_and_write,
-  do_io_close).
+  TLS is not converted: SSLNetVConnection still runs the epoll-driven base
+  path unchanged, so this class only ever carries plain (non-TLS)
+  connections.
 
   @section license License
 

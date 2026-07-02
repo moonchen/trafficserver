@@ -35,6 +35,7 @@ socket / non-2xx errors under load, and no crash across connection churn + mid-w
 EXPERIMENTAL (write_zerocopy and the arena are off by default).
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 Test.SkipUnless(Condition.HasProgram("wrk", "wrk is needed for the load phase"))
 # Metrics are read over the stats_over_http HTTP endpoint rather than traffic_ctl: under a deep
 # sandbox root this test's jsonrpc UDS path (<sandbox>/<testdir>/<ts-name>/runtime/jsonrpc20.sock)

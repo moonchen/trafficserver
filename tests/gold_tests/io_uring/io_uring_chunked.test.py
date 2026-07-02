@@ -40,6 +40,8 @@ Runs the whole matrix twice -- once with the single-shot recvmsg read path
 -- so both io_uring read paths are covered.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = False
 
 # A ~200 KB upload with a unique end marker: only present in the echo if the whole chunked/CL body

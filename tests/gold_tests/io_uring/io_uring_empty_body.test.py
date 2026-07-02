@@ -36,6 +36,8 @@ following an empty-body response -- was served on that one reused inbound VC (ha
 dropped the connection after an empty-body response, the later transactions would fail).
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = False
 
 replay_file = "io_uring_empty_body.replay.yaml"

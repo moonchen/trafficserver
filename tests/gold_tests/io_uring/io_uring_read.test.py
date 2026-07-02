@@ -1,5 +1,6 @@
 '''
-Load + large-body test for the io_uring recvmsg read path.
+Load + large-body test for the io_uring read path at its default configuration
+(the provided-buffer ring).
 '''
 #  Licensed to the Apache Software Foundation (ASF) under one
 #  or more contributor license agreements.  See the NOTICE file
@@ -18,14 +19,18 @@ Load + large-body test for the io_uring recvmsg read path.
 #  limitations under the License.
 
 Test.Summary = '''
-Drive the io_uring recvmsg read path hard with proxy.config.net.io_uring.enabled=1:
+Drive the io_uring read path hard with proxy.config.net.io_uring.enabled=1, leaving
+read_provided_buffers at its default (1), so the reads land on _read_provided() -- the
+per-thread provided-buffer ring -- not the single-shot recvmsg _read() (see
+io_uring_read_singleshot for that path):
   1. a large (256 KB) body proxied once, to exercise the read coroutine's drain
-     loop (many recvmsg per epoll trigger over edge-triggered epoll);
+     loop (many recvs per completion);
   2. a wrk load of many concurrent connections and requests against the cached
      object, to stress request reads, connection churn, and the close path under
      load --- expecting zero socket errors and zero non-2xx responses.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 Test.SkipUnless(Condition.HasProgram("wrk", "wrk is needed for the load phase"))
 
 Test.ContinueOnFail = False

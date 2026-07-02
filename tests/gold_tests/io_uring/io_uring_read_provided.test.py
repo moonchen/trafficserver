@@ -25,14 +25,14 @@ A large body exercises the read + recycle path across many reads; a wrk load str
 request reads + connection churn. Expect the full body reassembled and zero socket / non-2xx
 errors.
 
-EXPERIMENTAL (read_provided_buffers is off by default). Zero-copy attach pins each provided
-buffer until the slowest downstream consumer releases it. The cache-write consumer accumulates
-up to proxy.config.cache.target_fragment_size (default 1 MB) before writing a fragment and
-releasing, so the ring must hold >= that working set across concurrent cache-miss reads or a
-read can park on -ENOBUFS waiting for a buffer the cache will not free until EOS. This test
-sizes the ring generously to stay clear of that floor.
+Zero-copy attach pins each provided buffer until the slowest downstream consumer releases it. The
+cache-write consumer accumulates up to proxy.config.cache.target_fragment_size (default 1 MB)
+before writing a fragment and releasing, so the ring must hold >= that working set across
+concurrent cache-miss reads or a read can park on -ENOBUFS waiting for a buffer the cache will not
+free until EOS. This test sizes the ring generously to stay clear of that floor.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 Test.SkipUnless(Condition.HasProgram("wrk", "wrk is needed for the load phase"))
 
 Test.ContinueOnFail = False

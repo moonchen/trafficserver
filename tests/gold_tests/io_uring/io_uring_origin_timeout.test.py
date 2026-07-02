@@ -29,6 +29,8 @@ the ASan build, the teardown must be memory-safe (no UAF when the cancelled recv
 completes into the VC).
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 # An origin that accepts and then hangs (never responds). Reserve its port via a
@@ -50,7 +52,6 @@ ts = Test.MakeATSProcess("ts")
 ts.Command += " -F"  # disable the ProxyAllocator freelist so ASan sees VC frees (teardown UAF guard)
 
 # Reserve a port for the hang origin.
-hang_port = ts.Variables.get("hang_port", None)
 import socket as _socket
 
 _s = _socket.socket()

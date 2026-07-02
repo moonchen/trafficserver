@@ -44,6 +44,8 @@ into /a). The ASan build must stay memory-safe.
 
 import os
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = False
 
 # Distinct, differently-sized cacheable bodies with distinct markers. Distinct

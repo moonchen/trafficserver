@@ -30,10 +30,12 @@ proxy.config.net.io_uring.read_provided_buffers=0) and drive its body-read branc
      short read (socket drained -> re-arm), reassembled in order;
   3. a no-Content-Length Connection:close body that ends by an origin FIN -> the r==0 clean-EOS arm.
 
-io_uring_read.test.py claims recvmsg coverage but runs with the provided-buffer ring left at its
-default (on), so it silently exercises _read_provided() instead. This test pins read_provided_buffers=0
-so the single-shot _read() coroutine is the one under test.
+Unlike io_uring_read.test.py, which leaves the provided-buffer ring at its default (on) and so
+exercises _read_provided(), this test pins read_provided_buffers=0 so the single-shot _read()
+coroutine is the one under test.
 '''
+
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 
 Test.ContinueOnFail = False
 

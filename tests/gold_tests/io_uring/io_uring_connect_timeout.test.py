@@ -43,6 +43,8 @@ no RST). This is distinct from io_uring_connect's refused case (prompt -ECONNREF
       under -F any resume-into-freed-VC surfaces as an ASan use-after-free.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 ORIGIN_SCRIPT = os.path.join(Test.TestDirectory, "io_uring_connect_timeout_origin.py")

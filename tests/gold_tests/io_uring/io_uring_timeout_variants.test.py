@@ -45,6 +45,8 @@ the default provided-buffer path (read_provided_buffers=1). The teardown must be
 memory-safe (no UAF/assert/crash) on both.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 ORIGIN_SCRIPT = os.path.join(Test.TestDirectory, "io_uring_timeout_variants_origin.py")

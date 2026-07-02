@@ -26,8 +26,8 @@ ways while ATS is reading it over io_uring:
   (a) truncated Content-Length: a 200 promises 1000 body bytes but the origin
       writes ~100 then a clean FIN (shutdown(SHUT_WR)). The in-flight recv
       completes r==0 -> the read coroutine takes the VC_EVENT_EOS arm with the
-      VIO's Content-Length unsatisfied (single-shot _read line 725-728, provided
-      _read_provided line 911-914).
+      VIO's Content-Length unsatisfied (the r==0/-ECONNRESET EOS branch shared
+      by both _read and _read_provided).
 
   (b) reset: the origin sends full headers + a few body bytes, then close()s a
       socket with SO_LINGER{onoff=1,linger=0} so the kernel emits an RST. The
@@ -44,6 +44,8 @@ Parametrized over proxy.config.net.io_uring.read_provided_buffers 0 (single-shot
 recvmsg into the VIO buffer) and 1 (kernel provided-buffer ring) so BOTH read
 paths' r<=0 EOS arms are exercised.
 '''
+
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 
 Test.ContinueOnFail = True
 

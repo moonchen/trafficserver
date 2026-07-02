@@ -34,10 +34,9 @@ This is the exact fallback branch io_uring_read_provided (a generously sized rin
 Correctness bar: the connection must NOT deadlock (a park-on-ENOBUFS bug would hang to the test
 timeout) and must NOT drop bytes -- the full body reassembles and there are zero socket / non-2xx
 errors under load. Success under a 2-buffer ring is only possible if the -ENOBUFS -> _read fallback ran.
-
-EXPERIMENTAL (read_provided_buffers is off by default).
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 Test.SkipUnless(Condition.HasProgram("wrk", "wrk is needed for the load phase"))
 
 Test.ContinueOnFail = False

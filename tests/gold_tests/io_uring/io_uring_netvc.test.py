@@ -24,6 +24,8 @@ clone of UnixNetVConnection this passes identically to the default net path; it
 is the regression guard for swapping the read/write path to io_uring.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 ts = Test.MakeATSProcess("ts")

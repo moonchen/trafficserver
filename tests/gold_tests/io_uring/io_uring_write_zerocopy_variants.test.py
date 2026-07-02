@@ -47,6 +47,8 @@ EXPERIMENTAL (write_zerocopy and the arena are both off by default).
 
 Test.ContinueOnFail = False
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 # Metrics are read over the stats_over_http plugin's HTTP endpoint rather than traffic_ctl: this
 # test's long name pushes the jsonrpc UDS path past the AF_UNIX 108-byte limit, so traffic_ctl
 # cannot connect. The HTTP endpoint has no such limit.

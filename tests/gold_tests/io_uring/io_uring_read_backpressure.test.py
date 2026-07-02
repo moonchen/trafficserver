@@ -31,7 +31,8 @@ the whole transfer. The slow client also forces short sends, driving the _write 
 short-send writeReschedule loop.
 
 Run twice, once per read path:
-  - read_provided_buffers=0  -> single-shot recvmsg _read (ntodo / write_avail gate at 570-574);
+  - read_provided_buffers=0  -> single-shot recvmsg _read (its write_avail backpressure gate,
+                                which read_disable()s the VC when the destination buffer is full);
   - read_provided_buffers=1  -> provided-buffer _read_provided (buffer-gated backpressure, and
                                 the -ENOBUFS fall-back to single-shot _read).
 
@@ -39,6 +40,8 @@ There is no dedicated backpressure metric, so correctness is proven by the outco
 happen if backpressure re-armed correctly: the full byte-exact body arrives at the slow client
 (HTTP 200 + exact size + tail marker) and the run completes within the timeout (no stall).
 '''
+
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
 
 Test.ContinueOnFail = False
 

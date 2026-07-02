@@ -43,6 +43,8 @@ freelist "bad list" abort / failed assertion across the churn.
 
 Test.ContinueOnFail = True
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 # Read metrics over the stats_over_http HTTP endpoint rather than traffic_ctl: traffic_ctl's
 # ~200ms non-tunable connect budget against ATS's single-threaded jsonrpc server flakes under
 # concurrent-suite load, and a deep sandbox root can push the jsonrpc UDS path

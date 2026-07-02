@@ -6,8 +6,8 @@ back to ATS in small (64-byte) pieces with a short sleep between each piece.
 
 Each io_uring recv on the ATS origin VC therefore returns far fewer bytes than it
 attempted (a short read), forcing the read coroutine to re-arm and block in the
-kernel for the next piece -- the short-read / re-arm path (_read 749-754,
-_read_provided 953-957) that a bulk-send origin never exercises. The full body
+kernel for the next piece -- the short-read re-arm branch in _read (mirrored in
+_read_provided) that a bulk-send origin never exercises. The full body
 must still be reassembled in order (no premature EOS) across the many recvs.
 """
 #  Licensed to the Apache Software Foundation (ASF) under one

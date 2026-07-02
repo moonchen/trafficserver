@@ -41,6 +41,8 @@ and =1 (kernel provided-buffer _read_provided, the default).
 
 Test.ContinueOnFail = False
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 # Read metrics over the stats_over_http HTTP endpoint rather than traffic_ctl, which fails two
 # ways here. (a) Deterministic: this test's jsonrpc UDS path (<sandbox>/<testdir>/<ts-name>/
 # runtime/jsonrpc20.sock) overflows the AF_UNIX 108-byte sun_path limit under a deep sandbox

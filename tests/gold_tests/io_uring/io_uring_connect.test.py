@@ -25,6 +25,8 @@ complete (the fd is not in epoll). A refused origin connect must surface as a 5x
 to the client (async VC_EVENT_ERROR, matching the epoll path) --- not a hang.
 '''
 
+Test.SkipUnless(Condition.HasATSFeature('TS_USE_LINUX_IO_URING'))
+
 Test.ContinueOnFail = True
 
 ts = Test.MakeATSProcess("ts")
