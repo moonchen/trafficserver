@@ -23,8 +23,7 @@ import sys
 
 Test.Summary = '''
 Drive two POST-teardown races through IOUringNetVConnection (proxy.config.net.io_uring.enabled=1),
-under -F so ASan sees VC frees on the freelist, on the default provided-buffer read path
-(read_provided_buffers=1):
+under -F so ASan sees VC frees on the freelist, once per read path (read_provided_buffers=0 and 1):
 
   (a) EARLY: the origin sends a final response mid-POST, before draining the body. HttpSM's
       abort_tunnel then calls do_io_write(this, 0, nullptr) on the origin VC while the body send is
@@ -189,13 +188,5 @@ class IOUringPostAbortTest:
         tr.StillRunningAfter = ts
 
 
-# The default provided-buffer read path is memory-safe under these teardown races. The
-# single-shot path (read_provided_buffers=0) is NOT covered here: it hits a distinct,
-# currently-unfixed bug in _read's held-read-bytes replay -- when HttpSM re-arms the inbound
-# read on a DIFFERENT MIOBuffer during the POST teardown while a recv's bytes are parked in
-# _held_read_buf, the "same-buffer" invariant at IOUringNetVConnection.cc:509 is violated and
-# the ink_release_assert aborts the process (signal 6). Exercising it here would crash ATS and
-# make this test a permanent red; it should be re-enabled with read_provided in [False, True]
-# once the single-shot replay path copies-back / re-targets instead of asserting.
-for read_provided in [True]:
+for read_provided in [False, True]:
     IOUringPostAbortTest(read_provided).run()

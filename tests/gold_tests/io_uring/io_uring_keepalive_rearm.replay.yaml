@@ -18,8 +18,8 @@
 # distinct transactions. With cache off and origin session sharing on, ATS reuses a
 # single ATS<->origin session across all of them, re-arming do_io_read onto the
 # session read_buffer between responses while a body read-ahead recv may still be in
-# flight -- the io_uring _read/_read_provided redirect copy-back + held-bytes replay
-# path. Each response body is byte-exact and distinctly sized so any cross-request
+# flight -- the io_uring _read/_read_provided zero-copy re-target attach + held-bytes
+# replay path. Each response body is byte-exact and distinctly sized so any cross-request
 # byte bleed is caught by the verifier.
 
 meta:

@@ -27,10 +27,10 @@ the origin and reuses a single ATS<->origin session across all of them. Between
 responses the session returns to the pool and do_io_read is re-armed onto a
 DIFFERENT MIOBuffer (the session read_buffer) while the prior body read-ahead
 recv may still be in flight. When that recv completes it must deliver the
-next response's leading bytes into the re-armed buffer -- the redirect copy-back
+next response's leading bytes into the re-armed buffer -- the zero-copy attach
 (_read) / _held_pbuf hold + delivery (_read_provided) path, and the disabled-in-
-flight HOLD + top-of-loop replay guarded by ink_release_assert(writer ==
-_held_read_buf). A byte that bled from response k into response k+1 would break
+flight HOLD (_held_read_chain) + top-of-loop replay onto whatever buffer is
+armed then. A byte that bled from response k into response k+1 would break
 framing or content; each of the 40 sequential responses carries a distinct
 marker and a distinct length so the Proxy Verifier client catches any bleed as a
 violation.

@@ -353,6 +353,16 @@ IOUringNetVConnection::free_thread(EThread *t)
   // list (all ops may have completed naturally before a queued retry ran).
   unqueue_cancel_retry(this);
 
+  // Drop any parked recv. These Ptr members are all that keeps that data alive, and the
+  // allocator free below does not run the destructor (ClassAllocator does not destruct on
+  // free), so an unreleased ref here would leak the data --- and, for a held provided
+  // buffer, permanently shrink the shared ring.
+  _held_read_chain = nullptr;
+  _held_read_bytes = 0;
+  _held_read_buf   = nullptr;
+  _held_pbuf_block = nullptr;
+  _held_pbuf_bytes = 0;
+
   // A faithful copy of UnixNetVConnection::free_thread, differing only in the
   // allocator the object is returned to. The base hardcodes netVCAllocator, so
   // it cannot be reused for a differently-typed subclass without corrupting that
@@ -487,18 +497,69 @@ IOUringNetVConnection::net_read_io(NetHandler *nh)
   }
 }
 
+namespace
+{
+// Wrap the first `nbytes` a completed recv wrote (laid out per iov[]/anchor[]) in a chain of
+// IOBufferBlock refs sharing the destination blocks' IOBufferData --- no copy. The refs pin the
+// data itself, so the chain stays valid even if the MIOBuffer that owned the destination blocks
+// is freed while the bytes are parked. Each ref is clamped read-only (clone() semantics): a
+// buffer it is appended to must allocate fresh space rather than write into the shared data.
+Ptr<IOBufferBlock>
+wrap_recv_bytes(const IOVec *iov, const Ptr<IOBufferBlock> *anchor, unsigned niov, int64_t nbytes)
+{
+  Ptr<IOBufferBlock> head;
+  IOBufferBlock     *tail = nullptr;
+  for (unsigned i = 0; i < niov && nbytes > 0; ++i) {
+    int64_t        n = nbytes < static_cast<int64_t>(iov[i].iov_len) ? nbytes : static_cast<int64_t>(iov[i].iov_len);
+    IOBufferBlock *b = new_IOBufferBlock_internal("io_uring/held_recv");
+    b->set(anchor[i]->data.get(), n, static_cast<char *>(iov[i].iov_base) - anchor[i]->buf());
+    b->_buf_end = b->end();
+    if (tail == nullptr) {
+      head = b;
+    } else {
+      tail->next = b;
+    }
+    tail    = b;
+    nbytes -= n;
+  }
+  return head;
+}
+
+// True when the read VIO's writer is exactly where a completed recv put its bytes: the same
+// MIOBuffer the recv filled, with its write cursor still at the first kernel-written byte. Then
+// the bytes already sit in the armed buffer past the cursor and delivery is a plain fill().
+// The cursor comparison is what makes this safe against MIOBuffer recycling: a different buffer
+// that got the same heap address (freelist reuse) has its own freshly allocated blocks, which
+// cannot point into data still pinned by the recv's block refs.
+bool
+recv_filled_in_place(MIOBuffer *writer, MIOBuffer *filled, const char *first_byte)
+{
+  if (writer != filled) {
+    return false;
+  }
+  for (IOBufferBlock *b = writer->first_write_block(); b != nullptr; b = b->next.get()) {
+    if (b->write_avail() > 0) {
+      return b->end() == first_byte;
+    }
+  }
+  return false;
+}
+} // namespace
+
 ts::iouring::DetachedTask
 IOUringNetVConnection::_read()
 {
   NetState   *s  = &this->read;
   NetHandler *nh = this->nh;
 
-  // Deliver bytes parked by a recv that completed while the read was disabled (see the
-  // !s->enabled branch below). Re-enable (reenable / do_io_read) routed us here; fill the
-  // now-re-armed buffer and signal before reading more, mirroring epoll's level-triggered
-  // delivery of bytes that "waited in the socket." The re-armed buffer must be the same
-  // MIOBuffer the recv targeted (every disable->re-enable on this path re-arms the same
-  // buffer); the assert guards that invariant.
+  // Deliver bytes parked by a recv that completed while the consumer could not take them (see
+  // the parking branches below). Re-enable (reenable / do_io_read) routed us here; deliver into
+  // whatever buffer is armed NOW and signal before reading more, mirroring epoll's
+  // level-triggered delivery of bytes that "waited in the socket." If the armed buffer is still
+  // the one the recv filled with its write cursor unmoved, the bytes are already in place and a
+  // fill() publishes them; otherwise the consumer re-targeted its read while the bytes were
+  // parked (e.g. HttpSM re-arming the inbound session buffer after a POST teardown) and the
+  // held refs are attached to the new buffer zero-copy, accounted exactly as a fill.
   if (_held_read_bytes > 0 && s->enabled) {
     MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
     if (!lock.is_locked()) {
@@ -509,22 +570,35 @@ IOUringNetVConnection::_read()
       nh->free_netevent(this);
       co_return;
     }
-    ink_release_assert(s->vio.buffer.writer() == _held_read_buf);
-    int64_t held     = _held_read_bytes;
-    _held_read_bytes = 0;
-    _held_read_buf   = nullptr;
-    s->vio.buffer.writer()->fill(held);
-    s->vio.ndone += held;
-    this->netActivity();
-    if (s->vio.ntodo() <= 0) {
-      _read_signal_done(VC_EVENT_READ_COMPLETE);
-      co_return;
-    }
-    if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
-      co_return; // EVENT_DONE: the VC was freed during the signal
-    }
-    if (this->closed) {
-      co_return;
+    // A VIO that cannot take the bytes right now (not a read, disabled, no buffer) keeps them
+    // parked; the loop below disables the read and a later re-arm redelivers.
+    if (s->vio.op == VIO::READ && !s->vio.is_disabled() && s->vio.buffer.writer() != nullptr) {
+      MIOBuffer         *w     = s->vio.buffer.writer();
+      Ptr<IOBufferBlock> chain = _held_read_chain;
+      int64_t            held  = _held_read_bytes;
+      MIOBuffer         *fbuf  = _held_read_buf;
+      _held_read_chain         = nullptr;
+      _held_read_bytes         = 0;
+      _held_read_buf           = nullptr;
+      if (recv_filled_in_place(w, fbuf, chain->start())) {
+        w->fill(held);
+      } else {
+        w->append_block(chain.get());
+      }
+      Metrics::Counter::increment(net_rsb.read_bytes, held);
+      Metrics::Counter::increment(net_rsb.read_bytes_count);
+      s->vio.ndone += held;
+      this->netActivity();
+      if (s->vio.ntodo() <= 0) {
+        _read_signal_done(VC_EVENT_READ_COMPLETE);
+        co_return;
+      }
+      if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
+        co_return; // EVENT_DONE: the VC was freed during the signal
+      }
+      if (this->closed) {
+        co_return;
+      }
     }
   }
 
@@ -548,7 +622,7 @@ IOUringNetVConnection::_read()
     struct msghdr      msg;
     int                fd          = this->con.sock.get_fd();
     int64_t            rattempted  = 0;
-    MIOBuffer         *read_target = nullptr; // the buffer this recv reads into (for the held-read path)
+    MIOBuffer         *read_target = nullptr; // the buffer this recv reads into (identity tag for delivery/parking)
 
     // Build the next read request under the VIO mutex.
     {
@@ -626,12 +700,9 @@ IOUringNetVConnection::_read()
         io_uring_prep_recvmsg(sqe, fd, &msg, 0);
       }
     });
-    _read_op           = &op;
-    _read_inflight_buf = read_target; // the buffer this recv is filling (for the do_io_read swap check)
-    _read_redirect_buf = nullptr;     // a re-target during the await (below) sets this
-    int r              = co_await op;
-    _read_op           = nullptr;
-    _read_inflight_buf = nullptr;
+    _read_op = &op;
+    int r    = co_await op;
+    _read_op = nullptr;
 
     // do_io_close deferred teardown to us (it cancelled this recv). Free once no
     // op is in flight (a sendmsg may still be outstanding), then stop touching `this`.
@@ -640,10 +711,19 @@ IOUringNetVConnection::_read()
       co_return;
     }
 
-    // Fill + signal under the VIO mutex.
+    // Deliver + signal under the VIO mutex.
     {
       MUTEX_TRY_LOCK(lock, s->vio.mutex, this->thread);
       if (!lock.is_locked()) {
+        // The consumer holds the VIO lock right now. The recv's bytes are already off the
+        // socket, so they cannot wait there like they would on epoll: park them (the refs keep
+        // them alive) and let the rescheduled drive deliver via the top of _read. Dropping them
+        // instead would desync the stream --- the next recv would rewrite the same blocks.
+        if (r > 0) {
+          _held_read_chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
+          _held_read_bytes = r;
+          _held_read_buf   = read_target;
+        }
         readReschedule(nh);
         co_return;
       }
@@ -651,56 +731,24 @@ IOUringNetVConnection::_read()
         nh->free_netevent(this);
         co_return;
       }
-      MIOBuffer *redirect = _read_redirect_buf;
-      _read_redirect_buf  = nullptr;
       // The read was disabled while this recv was in flight --- a tunnel teardown's
       // do_io_read(this,0,nullptr), the keep-alive pause, or vc->disable(). On epoll a disabled
       // read produces no signal: the bytes wait in the socket until re-enable. io_uring's recv
-      // already pulled them, so don't fill()/signal here (that would leak a read event the
+      // already pulled them, so don't deliver/signal here (that would leak a read event the
       // consumer disabled) --- park the bytes and deliver them when the read re-enables (see the
-      // top of _read). Only one op is ever in flight, so a single pending slot suffices. r <= 0
-      // (EOS/error) needs no parking: the recv issued on re-enable re-detects it. A close-bound
-      // disable (e.g. abort_tunnel, which also frees the buffer) never re-enables, so the parked
-      // bytes are simply freed at teardown (the dest blocks were pinned, so the recv was safe).
+      // top of _read). Only one op is ever in flight, so a single held chain suffices. The refs
+      // keep the bytes alive even when the disable is close-bound and frees the destination
+      // buffer (e.g. abort_tunnel): a later re-arm onto a different buffer gets them attached
+      // zero-copy, and a teardown that never re-enables drops them with the VC. r <= 0
+      // (EOS/error) needs no parking: the recv issued on re-enable re-detects it.
       if (!s->enabled) {
         if (r > 0) {
-          _held_read_buf   = read_target;
+          _held_read_chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
           _held_read_bytes = r;
+          _held_read_buf   = read_target;
         }
         co_return;
       }
-
-      if (redirect != nullptr && r > 0) {
-        // do_io_read re-targeted the read to `redirect` while this recv was in flight (e.g. the
-        // origin keep-alive pool re-arm onto the session read_buffer, while the chunked read-ahead
-        // recv was still filling the tunnel body buffer). The kernel wrote r bytes into the
-        // in-flight buffer's blocks (pinned by anchor[], so still valid even though that buffer may
-        // now be freed); copy them into `redirect` so they reach the read that is now armed --- for
-        // the pool case those bytes are the start of the next response and belong in the session
-        // buffer. This delivers the recv's real bytes (never uninitialized memory) into the right
-        // buffer, then reads on into it.
-        int64_t rem = r;
-        for (unsigned i = 0; i < msg.msg_iovlen && rem > 0; i++) {
-          int64_t n = rem < static_cast<int64_t>(tiovec[i].iov_len) ? rem : static_cast<int64_t>(tiovec[i].iov_len);
-          redirect->write(tiovec[i].iov_base, n);
-          rem -= n;
-        }
-        s->vio.ndone += r;
-        this->netActivity();
-        if (s->vio.ntodo() <= 0) {
-          _read_signal_done(VC_EVENT_READ_COMPLETE);
-          co_return;
-        }
-        if (_read_signal_and_update(VC_EVENT_READ_READY) != EVENT_CONT) {
-          co_return; // EVENT_DONE: the VC was freed during the signal
-        }
-        if (this->closed) {
-          co_return;
-        }
-        continue; // read on into the re-targeted buffer
-      }
-      // redirect != nullptr && r <= 0: no bytes to copy; the EOS/error below is delivered to the
-      // re-armed read's continuation, which is correct.
 
       if (r <= 0) {
         if (r == -EAGAIN || r == -ENOTCONN) {
@@ -715,9 +763,31 @@ IOUringNetVConnection::_read()
         co_return;
       }
 
+      // Enabled, but the VIO cannot place data (re-armed as a non-read or without a buffer):
+      // park, exactly as the disabled case; the loop below disables until a usable re-arm.
+      if (s->vio.op != VIO::READ || s->vio.is_disabled() || s->vio.buffer.writer() == nullptr) {
+        _held_read_chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
+        _held_read_bytes = r;
+        _held_read_buf   = read_target;
+        co_return;
+      }
+
       Metrics::Counter::increment(net_rsb.read_bytes, r);
       Metrics::Counter::increment(net_rsb.read_bytes_count);
-      s->vio.buffer.writer()->fill(r);
+      MIOBuffer *w = s->vio.buffer.writer();
+      if (recv_filled_in_place(w, read_target, static_cast<char *>(tiovec[0].iov_base))) {
+        w->fill(r);
+      } else {
+        // do_io_read re-targeted the read to a different buffer while this recv was in flight
+        // (e.g. the origin keep-alive pool re-arm onto the session read_buffer, while the
+        // chunked read-ahead recv was still filling the tunnel body buffer). The kernel wrote r
+        // bytes into the old buffer's blocks (pinned by anchor[], so valid even though that
+        // buffer may now be freed); attach refs over them to the buffer that is armed now ---
+        // for the pool case those bytes are the start of the next response and belong in the
+        // session buffer.
+        Ptr<IOBufferBlock> chain = wrap_recv_bytes(tiovec, anchor, msg.msg_iovlen, r);
+        w->append_block(chain.get());
+      }
       s->vio.ndone += r;
       this->netActivity();
 
@@ -1041,25 +1111,6 @@ IOUringNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferRead
     cancel_in_flight(_write_op);
   }
   return super::do_io_write(c, nbytes, buf, owner);
-}
-
-VIO *
-IOUringNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
-{
-  // Re-targeting the read to a DIFFERENT buffer while a recv is in flight would mis-place that
-  // recv's bytes: the kernel wrote them into the in-flight buffer, but the completion fills
-  // whatever the VIO points at now. That must not happen. A SAME-buffer re-arm while a recv is
-  // in flight is fine and routine --- the keep-alive teardown pauses (do_io_read(0,nullptr)) and
-  // then re-arms do_io_read(INT64_MAX, read_buffer) on the session's single read_buffer while the
-  // abort-watch recv into that same buffer is still in flight. A null buffer is the disable/pause
-  // itself (the recv is parked and replayed on re-enable; see _read). Only the single-shot _read
-  // path tracks _read_inflight_buf; the provided-buffer read (the default) leaves it null (it
-  // attaches kernel-filled blocks rather than fill()ing into the VIO buffer), so no redirect is
-  // recorded.
-  if (buf != nullptr && _read_op != nullptr && _read_inflight_buf != nullptr && buf != _read_inflight_buf) {
-    _read_redirect_buf = buf;
-  }
-  return super::do_io_read(c, nbytes, buf);
 }
 
 void
@@ -1487,34 +1538,54 @@ IOUringNetVConnection::_connect()
     co_return;
   }
 
-  // The connecting continuation is thread-confined to this EThread, so its mutex
-  // is uncontended here (we resume on the owning thread from service()).
-  MUTEX_TRY_LOCK(lock, action_.continuation->mutex, this_ethread());
-  ink_release_assert(lock.is_locked());
+  // The connecting continuation is thread-confined to this EThread, so its mutex is
+  // normally uncontended here (we resume on the owning thread from service()) --- but it
+  // can be held elsewhere (e.g. a plugin continuation locked from another thread).
+  // Try-lock and retry like the read/write drives do; a connect has no ready-list to be
+  // rescheduled from, so the retry await is a short io_uring timeout on this ring. The
+  // timeout op is registered as _connect_op so a deferred close can still cancel it.
+  for (;;) {
+    {
+      MUTEX_TRY_LOCK(lock, action_.continuation->mutex, this_ethread());
+      if (lock.is_locked()) {
+        if (action_.cancelled) {
+          nh->free_netevent(this);
+          co_return;
+        }
 
-  if (action_.cancelled) {
-    nh->free_netevent(this);
-    co_return;
+        if (res < 0) {
+          // -ECANCELED == the linked timeout fired (treat as a connect timeout); other
+          // negatives are the real connect error (-ECONNREFUSED, ...).
+          int err      = (res == -ECANCELED) ? ETIMEDOUT : -res;
+          this->lerrno = err;
+          action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(-err)));
+          nh->free_netevent(this);
+          co_return;
+        }
+
+        // Handshake complete: NET_EVENT_OPEN now means the connection is really up.
+        con.is_connected = true;
+        Metrics::Gauge::increment(net_rsb.connections_currently_open);
+        SET_HANDLER(&UnixNetVConnection::mainEvent);
+        nh->startCop(this);
+        set_inactivity_timeout(0);
+        this->set_local_addr();
+        action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+        co_return;
+      }
+    }
+
+    __kernel_timespec    retry = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000}; // 10 ms, the net retry cadence
+    ts::iouring::UringOp rop([&](io_uring_sqe *sqe) { io_uring_prep_timeout(sqe, &retry, 0, 0); });
+    _connect_op = &rop;
+    co_await rop;
+    _connect_op = nullptr;
+
+    if (_closing) {
+      _complete_deferred_close();
+      co_return;
+    }
   }
-
-  if (res < 0) {
-    // -ECANCELED == the linked timeout fired (treat as a connect timeout); other
-    // negatives are the real connect error (-ECONNREFUSED, ...).
-    int err      = (res == -ECANCELED) ? ETIMEDOUT : -res;
-    this->lerrno = err;
-    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(-err)));
-    nh->free_netevent(this);
-    co_return;
-  }
-
-  // Handshake complete: NET_EVENT_OPEN now means the connection is really up.
-  con.is_connected = true;
-  Metrics::Gauge::increment(net_rsb.connections_currently_open);
-  SET_HANDLER(&UnixNetVConnection::mainEvent);
-  nh->startCop(this);
-  set_inactivity_timeout(0);
-  this->set_local_addr();
-  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
 }
 
 #endif // TS_USE_LINUX_IO_URING

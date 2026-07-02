@@ -97,16 +97,6 @@ public:
   // source blocks stay pinned across the await, so the send itself is always safe regardless.
   VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
 
-  // Re-targeting a read to a DIFFERENT buffer while a recv is in flight (e.g. the origin
-  // keep-alive pool re-arm onto the session read_buffer, while a chunked read-ahead recv is still
-  // filling the tunnel body buffer) records a redirect; _read copies the recv's bytes into the
-  // new buffer when it completes, rather than mis-placing them (a fill through the new buffer
-  // would expose its stale bytes) or losing them. A SAME-buffer re-arm while a recv is in flight
-  // is routine (the keep-alive teardown re-arms the session's single read_buffer while its
-  // abort-watch recv is still pending) and needs no redirect. do_io_read(c,0,nullptr), the
-  // disable/pause, keeps buf==nullptr and is handled by holding the recv (see _read).
-  VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
-
   // Cancel every in-flight op for a deferred close; returns false (and parks this VC on
   // the per-thread cancel-retry list) if any cancel SQE could not be submitted because
   // the SQ was unflushable. Public so the file-local retry list can link this VC and
@@ -149,20 +139,28 @@ private:
   bool                      _closing         = false;
   int                       _close_errno     = -1;
   bool                      _write_abandoned = false; // do_io_write(null) stopped the write VIO mid-send
-  // A recv that completed while the read was disabled: its bytes are already in _held_read_buf
-  // (written by the kernel, not yet fill()'d). Held here and delivered when the read re-enables,
-  // so a disabled read produces no signal (the epoll contract) and no pulled bytes are lost.
-  MIOBuffer *_held_read_buf   = nullptr;
-  int64_t    _held_read_bytes = 0;
+  // A single-shot recv that completed while the consumer could not take it (the read was
+  // disabled, the VIO had no usable buffer, or the VIO lock was contended): the kernel already
+  // pulled the bytes off the socket (destructive, unrecoverable), so the VC owns them until
+  // delivery. _held_read_chain is a chain of IOBufferBlock refs over the kernel-filled regions
+  // of the recv's destination blocks; the refs keep the underlying IOBufferData alive even if
+  // the consumer frees the destination MIOBuffer while the bytes are parked (e.g. a POST-body
+  // buffer torn down on an early origin response). _read delivers on re-enable: in place
+  // (fill()) when the armed buffer is still the recv's destination with an unmoved write
+  // cursor, otherwise attached zero-copy (append_block) to the re-targeted buffer. If the VC
+  // is freed first, free_thread drops the refs and the data goes with them.
+  Ptr<IOBufferBlock> _held_read_chain;
+  int64_t            _held_read_bytes = 0;
+  // Identity tag for in-place delivery: the MIOBuffer the recv filled. Compared, never
+  // dereferenced --- it may dangle once the consumer frees that buffer.
+  MIOBuffer *_held_read_buf = nullptr;
   // The provided-buffer analogue (_read_provided): a buffer-select recv that completed while the
   // read was disabled already pulled bytes off the socket (destructive, unrecoverable). Wrap the
   // kernel-filled ring buffer in a block and hold it here; deliver it to the consumer's buffer when
   // the read re-enables, so the stream behaves as if the bytes had stayed in the socket. If the VC
   // is freed first, the Ptr releases and the ring buffer recycles automatically.
   Ptr<IOBufferBlock> _held_pbuf_block;
-  int64_t            _held_pbuf_bytes   = 0;
-  MIOBuffer         *_read_inflight_buf = nullptr; // buffer the in-flight recv is filling
-  MIOBuffer         *_read_redirect_buf = nullptr; // do_io_read re-targeted mid-recv: copy the recv's bytes here on resume
+  int64_t            _held_pbuf_bytes = 0;
 };
 
 extern ClassAllocator<IOUringNetVConnection> ioUringNetVCAllocator;
