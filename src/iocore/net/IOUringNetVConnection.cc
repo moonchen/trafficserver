@@ -172,7 +172,9 @@ write_zc_enabled()
 int64_t
 write_zc_threshold()
 {
-  static const int64_t t = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy_threshold").value_or(4096);
+  // The fallback mirrors the RecordsConfig default (262144): below ~256 KiB the notification
+  // CQE + per-send page pin cost more than the copy, so small sends stay on the copy path.
+  static const int64_t t = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy_threshold").value_or(262144);
   return t;
 }
 
@@ -1283,18 +1285,22 @@ IOUringNetVConnection::_write()
         // this send's CQE. The blocks are RefCountObj, so the MIOBuffer can go while these live.
         anchor[niov] = tmp->block;
         if (use_zc) {
-          // send_zc_fixed needs one registered buffer over a contiguous range. Track whether
-          // every iovec block so far is the same registered buf_index and abuts the previous
-          // (e.g. the body windows of one cache fragment); the leading HTTP-header block, a
-          // non-arena buffer, fails this and keeps that send on the copy/anonymous path.
+          // send_zc_fixed needs one registered buffer over a contiguous range, so a registered
+          // (arena) run stops at the first block that is a different registered buffer or does
+          // not abut the previous block (the body windows of one cache fragment do abut). An
+          // anonymous run has no such constraint -- sendmsg_zc takes discontiguous blocks -- so
+          // it keeps accumulating up to IOU_FRAME_IOV, stopping only ahead of a registered
+          // block so an arena run behind a heap block (e.g. the HTTP-header block in front of
+          // an arena-backed body) still goes out as its own send_zc_fixed.
           int   reg  = (tmp->block && tmp->block->data) ? tmp->block->data->registered_index() : -1;
           char *base = static_cast<char *>(tiovec[niov].iov_base);
           if (niov == 0) {
             reg_idx  = reg;
             fixed_ok = (reg >= 0);
-          } else if (reg != reg_idx || base != fixed_end) {
-            break; // stop the iovec at a registered-ness / contiguity boundary, so the leading
-                   // HTTP-header block and the registered body run go out as separate sends
+          } else if (fixed_ok && (reg != reg_idx || base != fixed_end)) {
+            break; // end of the registered run; the boundary block starts the next send
+          } else if (!fixed_ok && reg >= 0) {
+            break; // a registered run starts here; leave it for its own fixed send
           }
           fixed_end = base + len;
         }
@@ -1332,7 +1338,12 @@ IOUringNetVConnection::_write()
       // so the anchors are held and the consume is deferred until the notification drains.
       Metrics::Counter::increment(write_zc_stat);
       if (fixed_ok) {
-        UringFixedBufArena::instance().ensure_registered(); // idempotent: register the arena on this ring
+        // send_zc_fixed requires the arena registered on THIS ring; if that fails (e.g.
+        // RLIMIT_MEMLOCK refuses both the clone and an independent registration), issuing it
+        // anyway would fail every send outright, so degrade to the anonymous zero-copy path.
+        fixed_ok = UringFixedBufArena::instance().ensure_registered();
+      }
+      if (fixed_ok) {
         Metrics::Counter::increment(write_zc_fixed_stat);
       }
       ts::iouring::UringMultishotOp op([&](io_uring_sqe *sqe) {
@@ -1355,6 +1366,11 @@ IOUringNetVConnection::_write()
       // Drain the notification (and any cancel terminal): F_MORE means another CQE follows.
       // The notification's res carries IORING_NOTIF_USAGE_ZC_COPIED if the kernel fell back
       // to copying (the fast path did not engage).
+      //
+      // Suspending here until the F_NOTIF -- rather than consuming/continuing on the send-result
+      // CQE and releasing the anchors later -- is a deliberate lifetime simplification, not a
+      // requirement: only the anchors must survive to the notification. It serializes sends per
+      // VC, and the measured large-object zero-copy wins already include that cost.
       while (op.more()) {
         int n = co_await op;
         if ((op.flags() & IORING_CQE_F_NOTIF) && (static_cast<unsigned>(n) & IORING_NOTIF_USAGE_ZC_COPIED)) {

@@ -33,10 +33,12 @@ race:freelist_new
 # (hit by every ET_NET thread) rather than a per-thread ProxyAllocator.
 race:ink_freelist_free
 
-# The io_uring registered-buffer arena (UringFixedBufArena) is a direct InkAtomicList user:
-# per-class lock-free Treiber stacks of buffer descriptors. pop/push intentionally read and write
-# the intrusive `_flink` link of the head node without per-field locking -- correctness comes from
-# the 128-bit CAS + version counter (ABA), which TSan cannot reason about. Same benign class as the
-# freelist entries above (ink_freelist is itself built on this primitive).
+# InkAtomicList (ATS's lock-free Treiber stack): pop/push intentionally read and write the
+# intrusive next-link of the head node without per-field locking -- correctness comes from the
+# 128-bit CAS + version counter (ABA), which TSan cannot reason about. Same benign class as the
+# freelist entries above (ink_freelist is itself built on this primitive). NOTE: these are
+# function-level suppressions, so they cover EVERY InkAtomicList user in the process (event
+# queues, freelists, the io_uring fixed-buffer arena's per-class descriptor pools, ...), not any
+# one data structure.
 race:ink_atomiclist_pop
 race:ink_atomiclist_push

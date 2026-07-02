@@ -48,12 +48,14 @@ DbgCtl dbg_ctl_fixed_arena{"io_uring_arena"};
 // registration -- correct, just not memlock-shared, so the worst case is the old N-x behavior.
 std::atomic<int> arena_clone_src_fd{-1};
 
-// The smallest size class the arena offers. The cache only draws from the arena for reads >=
-// 64 KiB (CacheVC::handleRead), so a 64 KiB floor wastes nothing on tiny reads. Classes run
-// from here up to a configurable top (<= 2 MiB = MAX_BUFFER_SIZE_INDEX), following the ATS
-// IOBuffer power-of-two size-index scheme so a class id is the IOBuffer size index.
+// The smallest size class the arena offers (exported as MIN_BLOCK_SIZE, the floor callers gate
+// their draws on -- a 64 KiB floor wastes nothing on tiny reads). Classes run from here up to a
+// configurable top (<= 2 MiB = MAX_BUFFER_SIZE_INDEX), following the ATS IOBuffer power-of-two
+// size-index scheme so a class id is the IOBuffer size index.
 constexpr int MIN_ARENA_INDEX = BUFFER_SIZE_INDEX_64K;
 constexpr int MAX_CLASSES     = MAX_BUFFER_SIZE_INDEX - MIN_ARENA_INDEX + 1;
+static_assert((int64_t{DEFAULT_BUFFER_BASE_SIZE} << MIN_ARENA_INDEX) == UringFixedBufArena::MIN_BLOCK_SIZE,
+              "the exported floor must match the smallest size class");
 
 int64_t
 index_block_size(int idx)
@@ -83,8 +85,8 @@ UringFixedBufArena::UringFixedBufArena()
 {
   int64_t total = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_size").value_or(0);
   // fixed_arena_block_size is the largest size class (rounded down to a power-of-two IOBuffer
-  // index, capped at 2 MiB). It used to be the ONE block size, which silently declined any Doc
-  // bigger than it -- a nominal 1 MiB object (1 MiB body + Doc header) needs the 2 MiB class.
+  // index, capped at 2 MiB). A block must hold a whole on-disk Doc -- body plus Doc/header
+  // overhead -- so a nominal 1 MiB object needs the 2 MiB class; hence the 2 MiB default.
   int64_t bsz = RecGetRecordInt("proxy.config.net.io_uring.fixed_arena_block_size").value_or(2097152);
   build(total, bsz, /* with_metrics */ true);
 }
@@ -206,21 +208,23 @@ UringFixedBufArena::build(int64_t total_bytes, int64_t max_block_size, bool with
   }
 }
 
-void
+bool
 UringFixedBufArena::ensure_registered()
 {
   if (_region == nullptr) {
-    return;
+    return false;
   }
   // The single region (== buffer index 0) is registered on one ring and cloned into the others, so
   // all rings share one pinned copy. All size classes live within this region, so send_zc_fixed
   // addresses any block by index 0 no matter which ring cloned it.
+  //
+  // Only success is cached: a failed attempt (e.g. RLIMIT_MEMLOCK, or the clone source still
+  // registering) is retried on the next call rather than wedging this thread on false forever.
   static thread_local bool registered = false;
   if (registered) {
-    return;
+    return true;
   }
-  registered = true;
-  auto *ctx  = IOUringContext::local_context();
+  auto *ctx = IOUringContext::local_context();
 
   // Elect a single clone source: the first thread here registers the region and publishes its ring
   // fd; everyone else clones from it (1x pin). CAS -1 -> -2 claims the source role.
@@ -230,25 +234,29 @@ UringFixedBufArena::ensure_registered()
     if (rc < 0) {
       Warning("io_uring fixed arena: register_buffers failed (%d) on the source ring", rc);
       arena_clone_src_fd.store(-1, std::memory_order_release); // release the role; let another try
-      return;
+      return false;
     }
     arena_clone_src_fd.store(ctx->ring_fd(), std::memory_order_release); // publish: clones may proceed
     Dbg(dbg_ctl_fixed_arena, "fixed arena: registered as the clone source (ring fd %d)", ctx->ring_fd());
-    return;
+    registered = true;
+    return true;
   }
 
   // Not the source. Clone from it if it is ready; otherwise register independently (safe fallback).
   if (int src = arena_clone_src_fd.load(std::memory_order_acquire); src >= 0 && ctx->clone_fixed_buffers(src) == 0) {
     Dbg(dbg_ctl_fixed_arena, "fixed arena: cloned registration from source ring fd %d", src);
-    return; // shares the source's pinned pages -- no extra memlock
+    registered = true;
+    return true; // shares the source's pinned pages -- no extra memlock
   }
   // src still registering (-2), or clone unsupported/failed: independent registration (old path).
   int rc = ctx->register_fixed_buffers(_region, _region_len);
   if (rc < 0) {
     Warning("io_uring fixed arena: register_buffers failed (%d) on this ring", rc);
-  } else {
-    Dbg(dbg_ctl_fixed_arena, "fixed arena: independent registration (clone source not ready / unsupported)");
+    return false;
   }
+  Dbg(dbg_ctl_fixed_arena, "fixed arena: independent registration (clone source not ready / unsupported)");
+  registered = true;
+  return true;
 }
 
 RegisteredBufferData *

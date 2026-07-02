@@ -73,9 +73,15 @@ public:
     return _region != nullptr;
   }
 
-  // Register the arena on the current thread's ring (idempotent per thread). Must run on a
-  // net thread before it issues send_zc_fixed from an arena block.
-  void ensure_registered();
+  // The smallest size class the arena offers (== the 64 KiB IOBuffer class). Requests below it
+  // are not worth an arena block; callers (CacheVC::handleRead) gate their draw on this floor.
+  static constexpr int64_t MIN_BLOCK_SIZE = int64_t{DEFAULT_BUFFER_BASE_SIZE} << BUFFER_SIZE_INDEX_64K;
+
+  // Register the arena on the current thread's ring, returning whether this ring now has the
+  // registration (success is cached per thread; failure is retried on the next call). A net
+  // thread must see true before it issues send_zc_fixed from an arena block -- on false (e.g.
+  // RLIMIT_MEMLOCK) the caller must stay on the anonymous/copy send path.
+  bool ensure_registered();
 
   // A free block wrapped as a RegisteredBufferData drawn from the smallest size class that fits
   // req_bytes, or nullptr if disabled / the request exceeds the top class (over-size) / the

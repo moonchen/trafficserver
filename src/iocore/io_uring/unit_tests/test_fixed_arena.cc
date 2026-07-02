@@ -107,8 +107,8 @@ TEST_CASE("a request larger than the top class falls through (counted oversize)"
 
 TEST_CASE("a 1 MiB object's Doc engages the arena under the default 2M top class", "[arena]")
 {
-  // The headline bug T3.3 fixes: with a 1 MiB top class a 1 MiB body + Doc overhead exceeds
-  // the block and silently declines; the 2 MiB top class captures it.
+  // With a 1 MiB top class a 1 MiB body + Doc overhead exceeds the block and silently
+  // declines; the 2 MiB top class (the default) captures it.
   UringFixedBufArena    a(64 * MiB, 2 * MiB);
   RegisteredBufferData *d = a.alloc(1 * MiB + 4 * KiB);
   REQUIRE(d != nullptr);

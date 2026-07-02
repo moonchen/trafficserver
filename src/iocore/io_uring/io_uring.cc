@@ -36,6 +36,9 @@ Linux io_uring helper library
 // linux-libc-dev uapi header (which stops at IORING_REGISTER_PBUF_STATUS=26), so define the raw
 // opcode + arg struct. Guarded so a newer header that already provides them wins. Fields are
 // uint32_t (== the kernel's __u32) so the layout matches the ABI regardless of header order.
+// This is the 6.13+ layout; 6.12's struct is {src_fd, flags, pad[6]} (src_off/dst_off/nr arrived
+// in 6.13) and rejects any nonzero pad byte with -EINVAL, so those three fields must stay zero
+// for the call to work on 6.12.
 #ifndef IORING_REGISTER_CLONE_BUFFERS
 #define IORING_REGISTER_CLONE_BUFFERS 30
 struct io_uring_clone_buffers {
@@ -301,13 +304,18 @@ IOUringContext::register_fixed_buffers(void *base, size_t len)
 int
 IOUringContext::clone_fixed_buffers(int src_ring_fd)
 {
-  // Clone the single registered buffer (the arena region, index 0) from src_ring_fd into this
-  // ring's table at the same index, sharing the pinned pages (1x memlock). liburing has no wrapper
-  // in this version, so issue the register syscall directly.
+  // Clone the source ring's whole registered-buffer table (here: the single arena region, index 0)
+  // into this ring's, sharing the pinned pages (1x memlock). liburing has no wrapper in this
+  // version, so issue the register syscall directly.
+  //
+  // Everything but src_fd stays zero. nr == 0 means "clone the entire source table" on 6.13+
+  // (io_clone_buffers expands !nr to the source's table size), and on 6.12 -- where the trailing
+  // fields are pad bytes that must be zero and clone-all is the only mode -- the same zeroed
+  // struct is valid. Minimum kernel is thus 6.12 (where the opcode appeared); older kernels
+  // reject the unknown opcode cleanly and the caller falls back to a per-ring registration.
   struct io_uring_clone_buffers arg;
   memset(&arg, 0, sizeof(arg));
   arg.src_fd = static_cast<uint32_t>(src_ring_fd);
-  arg.nr     = 1; // one registered buffer; src_off/dst_off/flags all 0 (fresh dst table at index 0)
   long ret   = syscall(__NR_io_uring_register, ring.ring_fd, IORING_REGISTER_CLONE_BUFFERS, &arg, 1);
   return ret < 0 ? -errno : static_cast<int>(ret);
 }

@@ -480,7 +480,7 @@ CacheVC::handleRead(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
   // from it can use send_zc_fixed (no per-send pin). The RAM cache promotes it by reference,
   // so RAM hits inherit the registration. Falls back to a heap buffer if the arena is off,
   // exhausted, or the read is too big for a block.
-  if (io.aiocb.aio_nbytes >= 65536) {
+  if (io.aiocb.aio_nbytes >= static_cast<size_t>(UringFixedBufArena::MIN_BLOCK_SIZE)) {
     buf = UringFixedBufArena::instance().alloc(io.aiocb.aio_nbytes);
   }
 #endif
