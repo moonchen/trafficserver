@@ -104,8 +104,9 @@ struct Sentinel {
 // Arms a recv that will never complete on its own (the peer sends nothing) and
 // parks on it, after publishing the in-flight op so an outside caller can cancel
 // it. On cancel the recv resumes with -ECANCELED and the coroutine unwinds as
-// ordinary straight-line code --- the prototype's cancel-then-unwind, the fix for
-// net-iouring's `delete this`-with-an-op-in-flight use-after-free.
+// ordinary straight-line code. This is the cancel-then-unwind teardown pattern:
+// freeing an op's owner while the op is still in the ring is a use-after-free,
+// so cancellation must resume the awaiter and let it unwind before teardown.
 Task<int>
 cancellable_recv(int fd, IOUringCompletionHandler **publish, bool *sentinel_destroyed)
 {
