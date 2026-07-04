@@ -22,10 +22,16 @@
  */
 
 #pragma once
+#include "tscore/ink_config.h"
 #include "iocore/net/NetProcessor.h"
 #include "P_NetAccept.h"
 
 class UnixNetVConnection;
+
+#if TS_USE_LINUX_IO_URING
+// proxy.config.net.io_uring.enabled (restart-required), read once at first use.
+bool net_io_uring_enabled();
+#endif
 
 //////////////////////////////////////////////////////////////////
 //

@@ -32,7 +32,7 @@
 #include "P_IOUringNetAccept.h"
 
 // proxy.config.net.io_uring.enabled (restart-required), read once.
-static bool
+bool
 net_io_uring_enabled()
 {
   static const bool enabled = RecGetRecordInt("proxy.config.net.io_uring.enabled").value_or(0) != 0;

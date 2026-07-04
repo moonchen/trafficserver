@@ -32,6 +32,9 @@
 #include "P_SSLConfig.h"
 #include "iocore/eventsystem/Action.h"
 #include "iocore/net/NetVConnection.h"
+#if TS_USE_LINUX_IO_URING
+#include "P_IOUringNetAccept.h"
+#endif
 
 //
 // Global Data
@@ -87,6 +90,17 @@ SSLNetProcessor::start(int, size_t stacksize)
 NetAccept *
 SSLNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 {
+#if TS_USE_LINUX_IO_URING
+  // TLS rides the same transport gate as plain ports. The io_uring accept object
+  // allocates the (gated, plain) inner VC via the unix netProcessor;
+  // SSLNextProtocolAccept then layers the SSL VC over it, so nothing SSL-specific
+  // is lost by not using SSLNetAccept here (its getNetProcessor() override is
+  // unused on the TCP accept path).
+  if (net_io_uring_enabled()) {
+    Note("io_uring accept enabled for TLS port %d", opt.local_port);
+    return new IOUringNetAccept(opt);
+  }
+#endif
   return new SSLNetAccept(opt);
 }
 
