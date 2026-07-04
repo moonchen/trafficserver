@@ -325,7 +325,8 @@ struct MIMEHdrImpl : public HdrHeapObjImpl {
   void check_strings(HeapCheck *heaps, int num_heaps);
 
   // Cooked values
-  void recompute_cooked_stuff(MIMEField *changing_field_or_null = nullptr);
+  void recompute_cooked_stuff(MIMEField *changing_field_or_null = nullptr, const std::string_view *targeted_headers = nullptr,
+                              size_t targeted_headers_count = 0);
   void recompute_accelerators_and_presence_bits();
 
   // Utility
@@ -602,6 +603,8 @@ extern c_str_view MIME_VALUE_COMPRESS;
 extern c_str_view MIME_VALUE_DEFLATE;
 extern c_str_view MIME_VALUE_GZIP;
 extern c_str_view MIME_VALUE_BROTLI;
+extern c_str_view MIME_VALUE_ZSTD;
+
 extern c_str_view MIME_VALUE_IDENTITY;
 extern c_str_view MIME_VALUE_KEEP_ALIVE;
 extern c_str_view MIME_VALUE_MAX_AGE;

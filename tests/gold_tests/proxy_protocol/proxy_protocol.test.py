@@ -27,18 +27,30 @@ class ProxyProtocolInTest:
 
     replay_file = "replay/proxy_protocol_in.replay.yaml"
 
-    def __init__(self):
-        self.setupOriginServer()
-        self.setupTS()
+    def __init__(self, name, enable_cp=False):
+        self.setupOriginServer(name)
+        self.setupTS(name, enable_cp)
+        self.name = name
 
-    def setupOriginServer(self):
-        self.server = Test.MakeVerifierServerProcess("pp-in-server", self.replay_file)
+    def setupOriginServer(self, name):
+        self.server = Test.MakeVerifierServerProcess(f"pp-in-server-{name}", self.replay_file)
 
-    def setupTS(self):
-        self.ts = Test.MakeATSProcess("ts_in", enable_tls=True, enable_cache=False, enable_proxy_protocol=True)
+    def setupTS(self, name, enable_cp):
+        self.ts = Test.MakeATSProcess(
+            f"ts_in_{name}",
+            enable_tls=True,
+            enable_cache=False,
+            enable_proxy_protocol=True,
+            enable_proxy_protocol_cp_src=enable_cp)
 
         self.ts.addDefaultSSLFiles()
-        self.ts.Disk.ssl_multicert_config.AddLine("dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key")
+        self.ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
         self.ts.Disk.remap_config.AddLine(f"map / http://127.0.0.1:{self.server.Variables.http_port}/")
 
@@ -46,8 +58,10 @@ class ProxyProtocolInTest:
             {
                 "proxy.config.http.proxy_protocol_allowlist": "127.0.0.1",
                 "proxy.config.http.insert_forwarded": "for|by=ip|proto",
-                "proxy.config.ssl.server.cert.path": f"{self.ts.Variables.SSLDir}",
-                "proxy.config.ssl.server.private_key.path": f"{self.ts.Variables.SSLDir}",
+                "proxy.config.http.insert_client_ip": 2,
+                "proxy.config.http.insert_squid_x_forwarded_for": 1,
+                "proxy.config.ssl.server.cert.path": self.ts.Variables.SSLDir,
+                "proxy.config.ssl.server.private_key.path": self.ts.Variables.SSLDir,
                 "proxy.config.diags.debug.enabled": 1,
                 "proxy.config.diags.debug.tags": "proxyprotocol",
             })
@@ -57,7 +71,7 @@ class ProxyProtocolInTest:
 logging:
   formats:
     - name: access
-      format: '%<chi> %<pps>'
+      format: '%<chi> %<pps> %<rchi>'
 
   logs:
     - filename: access
@@ -65,13 +79,12 @@ logging:
 '''.split("\n"))
 
     def runTraffic(self):
-        tr = Test.AddTestRun("Verify correct handling of incoming PROXY header.")
+        tr = Test.AddTestRun(f"Verify correct handling of incoming PROXY header. {self.name}")
         tr.AddVerifierClientProcess(
-            "pp-in-client",
+            f"pp-in-client-{self.name}",
             self.replay_file,
             http_ports=[self.ts.Variables.proxy_protocol_port],
-            https_ports=[self.ts.Variables.proxy_protocol_ssl_port],
-            other_args='--thread-limit 1')
+            https_ports=[self.ts.Variables.proxy_protocol_ssl_port])
         tr.Processes.Default.StartBefore(self.server)
         tr.Processes.Default.StartBefore(self.ts)
         tr.StillRunningAfter = self.server
@@ -81,19 +94,91 @@ logging:
         """
         check access log
         """
-        Test.Disk.File(os.path.join(self.ts.Variables.LOGDIR, 'access.log'), exists=True, content='gold/access.gold')
+        Test.Disk.File(os.path.join(self.ts.Variables.LOGDIR, 'access.log'), exists=True, content=f"gold/access-{self.name}.gold")
 
-        # Wait for log file to appear, then wait one extra second to make sure
-        # TS is done writing it.
-        tr = Test.AddTestRun()
-        tr.Processes.Default.Command = (
-            os.path.join(Test.Variables.AtsTestToolsDir, 'condwait') + ' 60 1 -f ' +
-            os.path.join(self.ts.Variables.LOGDIR, 'access.log'))
-        tr.Processes.Default.ReturnCode = 0
+        Test.AddAwaitFileContainsTestRun(
+            f'Await PROXY protocol access log lines. {self.name}',
+            os.path.join(self.ts.Variables.LOGDIR, 'access.log'),
+            r'^127\.0\.0\.1 0 127\.0\.0\.1$',
+            2,
+        )
 
     def run(self):
         self.runTraffic()
         self.checkAccessLog()
+
+
+class ProxyProtocolAllowlistTest:
+    """Test that the PROXY Protocol allowlist applies only to PP-prefaced traffic."""
+
+    replay_file = "replay/proxy_protocol_allowlist.replay.yaml"
+
+    def __init__(self):
+        self.setupOriginServer()
+        self.setupTS()
+
+    def setupOriginServer(self):
+        self.server = Test.MakeVerifierServerProcess("pp-allowlist-server", self.replay_file)
+
+    def setupTS(self):
+        self.ts = Test.MakeATSProcess("ts_pp_allowlist", enable_tls=True, enable_cache=False, enable_proxy_protocol=True)
+
+        self.ts.addDefaultSSLFiles()
+        self.ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
+
+        self.ts.Disk.remap_config.AddLine(f"map / http://127.0.0.1:{self.server.Variables.http_port}/")
+
+        self.ts.Disk.records_config.update(
+            {
+                "proxy.config.http.proxy_protocol_allowlist": "192.0.2.1",
+                "proxy.config.ssl.server.cert.path": self.ts.Variables.SSLDir,
+                "proxy.config.ssl.server.private_key.path": self.ts.Variables.SSLDir,
+                "proxy.config.diags.debug.enabled": 1,
+                "proxy.config.diags.debug.tags": "proxyprotocol",
+            })
+
+    def addCurlRun(self, name, args, return_code=0, expect_status=None, start_processes=False):
+        tr = Test.AddTestRun(name)
+        tr.TimeOut = 10
+        tr.MakeCurlCommand(args, ts=self.ts)
+        tr.Processes.Default.ReturnCode = return_code
+
+        if expect_status is not None:
+            tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(expect_status, f"Expected HTTP {expect_status}")
+
+        if start_processes:
+            tr.Processes.Default.StartBefore(self.server)
+            tr.Processes.Default.StartBefore(self.ts)
+
+        tr.StillRunningAfter = self.server
+        tr.StillRunningAfter = self.ts
+
+    def run(self):
+        self.addCurlRun(
+            "Non-PP HTTP traffic bypasses proxy_protocol_allowlist",
+            f'-sS -o /dev/null -w "%{{http_code}}" -H "uuid: 1" http://127.0.0.1:{self.ts.Variables.proxy_protocol_port}/get',
+            expect_status="200",
+            start_processes=True)
+        self.addCurlRun(
+            "Non-PP TLS traffic bypasses proxy_protocol_allowlist", f'-k -sS -o /dev/null -w "%{{http_code}}" -H "uuid: 2" '
+            f'https://127.0.0.1:{self.ts.Variables.proxy_protocol_ssl_port}/get',
+            expect_status="200")
+        self.addCurlRun(
+            "PP-prefaced HTTP traffic is rejected when peer is not allowlisted",
+            f'-sS -o /dev/null --max-time 5 --haproxy-protocol '
+            f'http://127.0.0.1:{self.ts.Variables.proxy_protocol_port}/get',
+            return_code=Any(52, 56))
+        self.addCurlRun(
+            "PP-prefaced TLS traffic is rejected when peer is not allowlisted",
+            f'-k -sS -o /dev/null --max-time 5 --haproxy-protocol '
+            f'https://127.0.0.1:{self.ts.Variables.proxy_protocol_ssl_port}/get',
+            return_code=Any(35, 52, 56))
 
 
 class ProxyProtocolOutTest:
@@ -141,15 +226,21 @@ class ProxyProtocolOutTest:
         self._ts = tr.MakeATSProcess(process_name, enable_tls=True, enable_cache=False)
 
         self._ts.addDefaultSSLFiles()
-        self._ts.Disk.ssl_multicert_config.AddLine("dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key")
+        self._ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
         scheme = 'https' if self._is_tls_to_origin else 'http'
         server_port = self._server.Variables.https_port if self._is_tls_to_origin else self._server.Variables.http_port
         self._ts.Disk.remap_config.AddLine(f"map / {scheme}://backend.pp.origin.com:{server_port}/")
 
         self._ts.Disk.records_config.update(
             {
-                "proxy.config.ssl.server.cert.path": f"{self._ts.Variables.SSLDir}",
-                "proxy.config.ssl.server.private_key.path": f"{self._ts.Variables.SSLDir}",
+                "proxy.config.ssl.server.cert.path": self._ts.Variables.SSLDir,
+                "proxy.config.ssl.server.private_key.path": self._ts.Variables.SSLDir,
                 "proxy.config.diags.debug.enabled": 1,
                 "proxy.config.diags.debug.tags": "http|proxyprotocol",
                 "proxy.config.http.proxy_protocol_out": self._pp_version,
@@ -210,8 +301,7 @@ class ProxyProtocolOutTest:
             f"pp-out-client-{ProxyProtocolOutTest._client_counter}",
             self._pp_out_replay_file,
             http_ports=[self._ts.Variables.port],
-            https_ports=[self._ts.Variables.ssl_port],
-            other_args='--thread-limit 1')
+            https_ports=[self._ts.Variables.ssl_port])
         ProxyProtocolOutTest._client_counter += 1
         self._ts.StartBefore(self._server)
         self._ts.StartBefore(self._dns)
@@ -221,7 +311,9 @@ class ProxyProtocolOutTest:
         self.setLogExpectations(tr)
 
 
-ProxyProtocolInTest().run()
+ProxyProtocolInTest("nocp", False).run()
+ProxyProtocolInTest("cp", True).run()
+ProxyProtocolAllowlistTest().run()
 
 # non-tunnling HTTP to origin
 ProxyProtocolOutTest(pp_version=-1, is_tunnel=False, is_tls_to_origin=False).run()

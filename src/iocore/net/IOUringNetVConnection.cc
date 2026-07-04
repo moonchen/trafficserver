@@ -33,7 +33,6 @@
 #include "iocore/io_uring/UringFixedBufArena.h"
 #include "iocore/eventsystem/EThread.h"
 #include "iocore/eventsystem/IOBuffer.h"
-#include "../eventsystem/P_IOBuffer.h"
 
 #include "tscore/InkErrno.h"
 #include "tscore/ink_memory.h"

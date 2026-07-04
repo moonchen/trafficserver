@@ -485,7 +485,10 @@ csv_out_stat(TSRecordType /* rec_type ATS_UNUSED */, void *edata, int /* registe
 static
 // Remove this check when we drop support for pre-13 GCC versions.
 #if defined(__cpp_lib_constexpr_string) && __cpp_lib_constexpr_string >= 201907L
+// Clang <= 16 doesn't fully support constexpr std::string.
+#if !defined(__clang__) || __clang_major__ > 16
   constexpr
+#endif
 #endif
   std::string
   sanitize_metric_name_for_prometheus(std::string_view name)
@@ -760,7 +763,7 @@ stats_origin(TSCont contp, TSEvent /* event ATS_UNUSED */, void *edata)
 
   if (auto addr = TSHttpTxnClientAddrGet(txnp); !is_ipmap_allowed(config, addr)) {
     Dbg(dbg_ctl, "not right ip");
-    TSHttpTxnStatusSet(txnp, TS_HTTP_STATUS_FORBIDDEN);
+    TSHttpTxnStatusSet(txnp, TS_HTTP_STATUS_FORBIDDEN, PLUGIN_NAME);
     reenable = TS_EVENT_HTTP_ERROR;
     goto notforme;
   }
@@ -774,7 +777,8 @@ stats_origin(TSCont contp, TSEvent /* event ATS_UNUSED */, void *edata)
   icontp   = TSContCreate(stats_dostuff, TSMutexCreate());
 
   if (path_had_explicit_format) {
-    Dbg(dbg_ctl, "Path had explicit format, ignoring any Accept header: %s", request_path_suffix.data());
+    Dbg(dbg_ctl, "Path had explicit format, ignoring any Accept header: %.*s", static_cast<int>(request_path_suffix.size()),
+        request_path_suffix.data());
     my_state->output_format = format_per_path;
   } else {
     // Check for an Accept header to determine response type.
@@ -803,17 +807,19 @@ stats_origin(TSCont contp, TSEvent /* event ATS_UNUSED */, void *edata)
   accept_encoding_field = TSMimeHdrFieldFind(reqp, hdr_loc, TS_MIME_FIELD_ACCEPT_ENCODING, TS_MIME_LEN_ACCEPT_ENCODING);
   my_state->encoding    = encoding_format_t::NONE;
   if (accept_encoding_field != TS_NULL_MLOC) {
-    int         len = -1;
-    const char *str = TSMimeHdrFieldValueStringGet(reqp, hdr_loc, accept_encoding_field, -1, &len);
-    if (len >= TS_HTTP_LEN_DEFLATE && strstr(str, TS_HTTP_VALUE_DEFLATE) != nullptr) {
+    int              len = -1;
+    const char      *str = TSMimeHdrFieldValueStringGet(reqp, hdr_loc, accept_encoding_field, -1, &len);
+    std::string_view accept_encoding =
+      (str != nullptr && len > 0) ? std::string_view{str, static_cast<size_t>(len)} : std::string_view{};
+    if (len >= TS_HTTP_LEN_DEFLATE && accept_encoding.find(TS_HTTP_VALUE_DEFLATE) != std::string_view::npos) {
       Dbg(dbg_ctl, "Saw deflate in accept encoding");
       my_state->encoding = init_gzip(my_state, DEFLATE_MODE);
-    } else if (len >= TS_HTTP_LEN_GZIP && strstr(str, TS_HTTP_VALUE_GZIP) != nullptr) {
+    } else if (len >= TS_HTTP_LEN_GZIP && accept_encoding.find(TS_HTTP_VALUE_GZIP) != std::string_view::npos) {
       Dbg(dbg_ctl, "Saw gzip in accept encoding");
       my_state->encoding = init_gzip(my_state, GZIP_MODE);
     }
 #if HAVE_BROTLI_ENCODE_H
-    else if (len >= TS_HTTP_LEN_BROTLI && strstr(str, TS_HTTP_VALUE_BROTLI) != nullptr) {
+    else if (len >= TS_HTTP_LEN_BROTLI && accept_encoding.find(TS_HTTP_VALUE_BROTLI) != std::string_view::npos) {
       Dbg(dbg_ctl, "Saw br in accept encoding");
       my_state->encoding = init_br(my_state);
     }
@@ -1133,6 +1139,8 @@ config_handler(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
 #ifdef DEBUG
 // Remove this check when we drop support for pre-13 GCC versions.
 #if defined(__cpp_lib_constexpr_string) && __cpp_lib_constexpr_string >= 201907L
+// Clang <= 16 doesn't fully support constexpr std::string.
+#if !defined(__clang__) || __clang_major__ > 16
 constexpr void
 test_sanitize_metric_name_for_prometheus()
 {
@@ -1204,5 +1212,6 @@ test_sanitize_metric_name_for_prometheus()
   static_assert(sanitize_metric_name_for_prometheus("foo [[[bar]]]") == "foo____bar___");
   static_assert(sanitize_metric_name_for_prometheus("foo@#$%bar") == "foo____bar");
 }
+#endif // !defined(__clang__) || __clang_major__ > 16
 #endif // defined(__cpp_lib_constexpr_string) && __cpp_lib_constexpr_string >= 201907L
 #endif // DEBUG

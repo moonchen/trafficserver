@@ -50,12 +50,17 @@ ts.addSSLfile("ssl/server.key")
 
 ts.Disk.remap_config.AddLine('map / https://foo.com:{1}'.format(ts.Variables.ssl_port, server.Variables.SSL_Port))
 
-ts.Disk.ssl_multicert_config.AddLines(
-    [
-        'ssl_cert_name=signed-foo-ec.pem,signed-foo.pem ssl_key_name=signed-foo-ec.key,signed-foo.key',
-        'ssl_cert_name=signed-san-ec.pem,signed-san.pem ssl_key_name=signed-san-ec.key,signed-san.key',
-        'dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key',
-    ])
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - ssl_cert_name: signed-foo-ec.pem,signed-foo.pem
+    ssl_key_name: signed-foo-ec.key,signed-foo.key
+  - ssl_cert_name: signed-san-ec.pem,signed-san.pem
+    ssl_key_name: signed-san-ec.key,signed-san.key
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 Test.PrepareTestPlugin(os.path.join(Test.Variables.AtsTestPluginsDir, 'ssl_secret_load_test.so'), ts)
 
@@ -90,7 +95,7 @@ tr.Processes.Default.StartBefore(dns)
 tr.Processes.Default.StartBefore(Test.Processes.ts, ready=When.PortOpen(ts.Variables.ssl_port))
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: ECDSA", "Should select EC cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (ECDSA|ecdsa_)", "Should select EC cert")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
 # Should receive a RSA cert
@@ -100,7 +105,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client  -CAfile signer.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: RSA-PSS", "Should select RSA cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (RSA-PSS|rsa_pss_)", "Should select RSA cert")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
 # Should receive a EC cert
@@ -110,7 +115,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client  -CAfile signer.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: ECDSA", "Should select EC cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (ECDSA|ecdsa_)", "Should select EC cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?group.com", "Should select a group SAN")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
@@ -121,7 +126,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client  -CAfile signer.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: RSA-PSS", "Should select RSA cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (RSA-PSS|rsa_pss_)", "Should select RSA cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?group.com", "Should select a group SAN")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
@@ -132,7 +137,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client  -CAfile signer.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: RSA-PSS", "Should select RSA cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (RSA-PSS|rsa_pss_)", "Should select RSA cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?group.com", "Should select a group SAN")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
@@ -143,7 +148,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client  -CAfile signer.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: ECDSA", "Should select EC cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (ECDSA|ecdsa_)", "Should select EC cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?group.com", "Should select a group SAN")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
@@ -169,7 +174,7 @@ tr.DelayStart = 4
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: RSA-PSS", "Should select RSA cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (RSA-PSS|rsa_pss_)", "Should select RSA cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?foo.com", "Should select foo.com")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("unable to verify the first certificate", "Different signer")
 
@@ -179,7 +184,7 @@ tr.Processes.Default.Command = "echo foo | openssl s_client -CAfile signer2.pem 
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: RSA-PSS", "Should select RSA cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (RSA-PSS|rsa_pss_)", "Should select RSA cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?foo.com", "Should select foo.com")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")
 
@@ -190,6 +195,6 @@ tr.Processes.Default.Command = "echo foo | openssl s_client -CAfile signer.pem  
 tr.ReturnCode = 0
 tr.StillRunningAfter = server
 tr.StillRunningAfter = ts
-tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: ECDSA", "Should select EC cert")
+tr.Processes.Default.Streams.All += Testers.ContainsExpression("Peer signature type: (ECDSA|ecdsa_)", "Should select EC cert")
 tr.Processes.Default.Streams.All += Testers.ContainsExpression("CN ?= ?foo.com", "Should select foo.com")
 tr.Processes.Default.Streams.All += Testers.ExcludesExpression("unable to verify the first certificate", "Correct signer")

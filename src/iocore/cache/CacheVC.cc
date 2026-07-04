@@ -74,6 +74,7 @@
 
 namespace
 {
+DbgCtl dbg_ctl_cache_ram{"cache_ram"};
 DbgCtl dbg_ctl_cache_bc{"cache_bc"};
 DbgCtl dbg_ctl_cache_disk_error{"cache_disk_error"};
 DbgCtl dbg_ctl_cache_read{"cache_read"};
@@ -115,9 +116,6 @@ next_in_map(Stripe *stripe, char *vol_map, off_t offset)
   return new_off + start_offset;
 }
 
-// Function in CacheDir.cc that we need for make_vol_map().
-int dir_bucket_loop_fix(Dir *start_dir, int s, Directory *directory);
-
 // TODO: If we used a bit vector, we could make a smaller map structure.
 // TODO: If we saved a high water mark we could have a smaller buf, and avoid searching it
 // when we are asked about the highest interesting offset.
@@ -141,7 +139,7 @@ make_vol_map(Stripe *stripe)
     Dir *seg = stripe->directory.get_segment(s);
     for (int b = 0; b < stripe->directory.buckets; b++) {
       Dir *e = dir_bucket(b, seg);
-      if (dir_bucket_loop_fix(e, s, &stripe->directory)) {
+      if (stripe->directory.bucket_loop_fix(e, s)) {
         break;
       }
       while (e) {
@@ -417,15 +415,17 @@ CacheVC::handleReadDone(int event, Event * /* e ATS_UNUSED */)
       // Put the request in the ram cache only if its a open_read or lookup
       if (vio.op == VIO::READ && okay) {
         bool cutoff_check;
+        // Determine effective cutoff: use per-volume override if set, otherwise use global
+        int64_t effective_cutoff =
+          (stripe->cache_vol->ram_cache_cutoff > 0) ? stripe->cache_vol->ram_cache_cutoff : cache_config_ram_cache_cutoff;
         // cutoff_check :
         // doc_len == 0 for the first fragment (it is set from the vector)
         //                The decision on the first fragment is based on
         //                doc->total_len
         // After that, the decision is based of doc_len (doc_len != 0)
-        // (cache_config_ram_cache_cutoff == 0) : no cutoffs
-        cutoff_check =
-          ((!doc_len && static_cast<int64_t>(doc->total_len) < cache_config_ram_cache_cutoff) ||
-           (doc_len && static_cast<int64_t>(doc_len) < cache_config_ram_cache_cutoff) || !cache_config_ram_cache_cutoff);
+        // (effective_cutoff == 0) : no cutoffs
+        cutoff_check = ((!doc_len && static_cast<int64_t>(doc->total_len) < effective_cutoff) ||
+                        (doc_len && static_cast<int64_t>(doc_len) < effective_cutoff) || !effective_cutoff);
         if (cutoff_check && !f.doc_from_ram_cache) {
           uint64_t o = dir_offset(&dir);
           stripe->ram_cache->put(read_key, buf.get(), doc->len, http_copy_hdr, o);
@@ -452,23 +452,56 @@ Ldone:
 
 int
 CacheVC::handleRead(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
-
 {
   cancel_trigger();
 
   f.doc_from_ram_cache = false;
 
   ink_assert(stripe->mutex->thread_holding == this_ethread());
+
+  // 1. check RAM cache
   if (load_from_ram_cache()) {
-    goto LramHit;
-  } else if (load_from_last_open_read_call()) {
-    goto LmemHit;
-  } else if (load_from_aggregation_buffer()) {
-    io.aio_result = io.aiocb.aio_nbytes;
+    Dbg(dbg_ctl_cache_ram, "RAM cache hit");
+    f.doc_from_ram_cache = true;
+    io.aio_result        = io.aiocb.aio_nbytes;
+
+    Doc *doc = reinterpret_cast<Doc *>(buf->data());
+    if (cache_config_ram_cache_compress && doc->doc_type == CACHE_FRAG_TYPE_HTTP && doc->hlen) {
+      SET_HANDLER(&CacheVC::handleReadDone);
+      return EVENT_RETURN;
+    }
+
+    POP_HANDLER;
+    return EVENT_RETURN;
+  }
+
+  // 2. check last open read cache
+  if (load_from_last_open_read_call()) {
+    Dbg(dbg_ctl_cache_ram, "last open read hit");
+    f.doc_from_ram_cache = true;
+    io.aio_result        = io.aiocb.aio_nbytes;
+
+    POP_HANDLER;
+    return EVENT_RETURN;
+  }
+
+  // 3. check aggregation buffer
+  if (load_from_aggregation_buffer()) {
+    Dbg(dbg_ctl_cache_ram, "aggregation buffer hit");
+    f.doc_from_ram_cache = true;
+    io.aio_result        = io.aiocb.aio_nbytes;
+
     SET_HANDLER(&CacheVC::handleReadDone);
     return EVENT_RETURN;
   }
 
+  // 4. read from Disk (AIO) due to all memory cache miss
+  Dbg(dbg_ctl_cache_ram, "all memory cache miss");
+
+  ts::Metrics::Counter::increment(cache_rsb.all_mem_misses);
+  ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.all_mem_misses);
+
+  // enqueue AIO read
   io.aiocb.aio_fildes = stripe->fd;
   io.aiocb.aio_offset = stripe->vol_offset(&dir);
   if (static_cast<off_t>(io.aiocb.aio_offset + io.aiocb.aio_nbytes) > static_cast<off_t>(stripe->skip + stripe->len)) {
@@ -491,30 +524,14 @@ CacheVC::handleRead(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
   io.action        = this;
   io.thread        = mutex->thread_holding->tt == DEDICATED ? AIO_CALLBACK_THREAD_ANY : mutex->thread_holding;
   SET_HANDLER(&CacheVC::handleReadDone);
-  ink_assert(ink_aio_read(&io) >= 0);
 
-// ToDo: Why are these for debug only ??
-#if DEBUG
+  int res = ink_aio_read(&io);
+  ink_assert(res >= 0);
+
   ts::Metrics::Counter::increment(cache_rsb.pread_count);
   ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.pread_count);
-#endif
 
   return EVENT_CONT;
-
-LramHit: {
-  f.doc_from_ram_cache = true;
-  io.aio_result        = io.aiocb.aio_nbytes;
-  Doc *doc             = reinterpret_cast<Doc *>(buf->data());
-  if (cache_config_ram_cache_compress && doc->doc_type == CACHE_FRAG_TYPE_HTTP && doc->hlen) {
-    SET_HANDLER(&CacheVC::handleReadDone);
-    return EVENT_RETURN;
-  }
-}
-LmemHit:
-  f.doc_from_ram_cache = true;
-  io.aio_result        = io.aiocb.aio_nbytes;
-  POP_HANDLER;
-  return EVENT_RETURN; // allow the caller to release the volume lock
 }
 
 bool
@@ -531,6 +548,8 @@ CacheVC::load_from_last_open_read_call()
 {
   if (*this->read_key == this->stripe->first_fragment_key && dir_offset(&this->dir) == this->stripe->first_fragment_offset) {
     this->buf = this->stripe->first_fragment_data;
+    ts::Metrics::Counter::increment(cache_rsb.last_open_read_hits);
+    ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.last_open_read_hits);
     return true;
   }
   return false;
@@ -548,6 +567,8 @@ CacheVC::load_from_aggregation_buffer()
   [[maybe_unused]] bool success = this->stripe->copy_from_aggregate_write_buffer(doc, dir, this->io.aiocb.aio_nbytes);
   // We already confirmed that the copy was valid, so it should not fail.
   ink_assert(success);
+  ts::Metrics::Counter::increment(cache_rsb.agg_buffer_hits);
+  ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.agg_buffer_hits);
   return true;
 }
 
@@ -644,7 +665,7 @@ CacheVC::scanStripe(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
 
   ReplaceablePtr<CacheHostTable>::ScopedReader hosttable(&theCache->hosttable);
 
-  const CacheHostRecord *rec = &hosttable->gen_host_rec;
+  const CacheHostRecord *rec = hosttable->getGenHostRec();
   if (!hostname.empty()) {
     CacheHostResult res;
     hosttable->Match(hostname, &res);
@@ -762,9 +783,17 @@ CacheVC::scanObject(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
       }
       break;
     }
-    if (doc->data() - buf->data() > static_cast<int>(io.aiocb.aio_nbytes)) {
-      might_need_overlap_read = true;
-      goto Lskip;
+    {
+      size_t const doc_off = reinterpret_cast<char *>(doc) - buf->data();
+      // Bounds-check in unsigned domain: doc must lie within the
+      // buffer, with room for the Doc header, and doc->hlen must
+      // fit in the remaining bytes before doc->hdr() and
+      // HTTPInfo::unmarshal walk it.
+      if (io.aiocb.aio_nbytes < doc_off || (io.aiocb.aio_nbytes - doc_off) < sizeof(Doc) ||
+          (io.aiocb.aio_nbytes - doc_off - sizeof(Doc)) < doc->hlen) {
+        might_need_overlap_read = true;
+        goto Lskip;
+      }
     }
     {
       char *tmp = doc->hdr();

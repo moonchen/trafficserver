@@ -50,7 +50,13 @@ class BackgroundFillTest:
             self.ts[name] = Test.MakeATSProcess(name, select_ports=True, enable_tls=True, enable_cache=True)
 
             self.ts[name].addDefaultSSLFiles()
-            self.ts[name].Disk.ssl_multicert_config.AddLine("dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key")
+            self.ts[name].Disk.ssl_multicert_yaml.AddLines(
+                """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
             self.ts[name].Disk.records_config.update(
                 {
@@ -72,6 +78,8 @@ class BackgroundFillTest:
                     "proxy.config.diags.debug.tags": "http",
                 })
 
+            self.ts[name].Disk.plugin_config.AddLine('xdebug.so --enable=x-cache')
+
             if name == 'for_httpbin' or name == 'default':
                 self.ts[name].Disk.remap_config.AddLines([
                     f"map / http://127.0.0.1:{self.httpbin.Variables.Port}",
@@ -88,7 +96,7 @@ class BackgroundFillTest:
             tr.StillRunningBefore = self.ts['for_httpbin']
             tr.StillRunningBefore = self.ts['for_pv']
         else:
-            tr.Processes.Default.StartBefore(self.httpbin, ready=When.PortOpen(self.httpbin.Variables.Port))
+            tr.Processes.Default.StartBefore(self.httpbin)
             tr.Processes.Default.StartBefore(self.pv_server)
             tr.Processes.Default.StartBefore(self.ts['for_httpbin'])
             tr.Processes.Default.StartBefore(self.ts['for_pv'])
@@ -110,14 +118,13 @@ class BackgroundFillTest:
         tr.MakeCurlCommandMulti(
             f"""
 {{curl}} -X PURGE --http1.1 -vs http://127.0.0.1:{self.ts['for_httpbin'].Variables.port}/drip?duration=4;
-timeout 2 {{curl}} --http1.1 -vs http://127.0.0.1:{self.ts['for_httpbin'].Variables.port}/drip?duration=4;
-sleep 4;
-{{curl}} --http1.1 -vs http://127.0.0.1:{self.ts['for_httpbin'].Variables.port}/drip?duration=4
+timeout 1 {{curl}} --http1.1 -vs http://127.0.0.1:{self.ts['for_httpbin'].Variables.port}/drip?duration=4;
+sleep 5;
+{{curl}} --http1.1 -vs http://127.0.0.1:{self.ts['for_httpbin'].Variables.port}/drip?duration=4 -H "x-debug: x-cache"
 """,
             ts=self.ts['for_httpbin'])
         tr.Processes.Default.ReturnCode = 0
-        tr.Processes.Default.Streams.stderr = Testers.Any(
-            "gold/background_fill_0_stderr_H.gold", "gold/background_fill_0_stderr_W.gold")
+        tr.Processes.Default.Streams.stderr = "gold/background_fill_0_stderr_H.gold"
         self.__checkProcessAfter(tr)
 
     def __testCase1(self):
@@ -129,14 +136,13 @@ sleep 4;
         tr.MakeCurlCommandMulti(
             f"""
 {{curl}} -X PURGE --http1.1 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
-timeout 3 {{curl}} --http1.1 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
+timeout 1 {{curl}} --http1.1 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
 sleep 5;
-{{curl}} --http1.1 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4
+{{curl}} --http1.1 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4 -H "x-debug: x-cache"
 """,
             ts=self.ts['for_httpbin'])
         tr.Processes.Default.ReturnCode = 0
-        tr.Processes.Default.Streams.stderr = Testers.Any(
-            "gold/background_fill_1_stderr_H.gold", "gold/background_fill_1_stderr_W.gold")
+        tr.Processes.Default.Streams.stderr = "gold/background_fill_1_stderr_H.gold"
         self.__checkProcessAfter(tr)
 
     def __testCase2(self):
@@ -148,14 +154,13 @@ sleep 5;
         tr.MakeCurlCommandMulti(
             f"""
 {{curl}} -X PURGE --http2 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
-timeout 3 {{curl}} --http2 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
+timeout 1 {{curl}} --http2 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4;
 sleep 5;
-{{curl}} --http2 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4
+{{curl}} --http2 -vsk https://127.0.0.1:{self.ts['for_httpbin'].Variables.ssl_port}/drip?duration=4 -H "x-debug: x-cache"
 """,
             ts=self.ts['for_httpbin'])
         tr.Processes.Default.ReturnCode = 0
-        tr.Processes.Default.Streams.stderr = Testers.Any(
-            "gold/background_fill_2_stderr_H.gold", "gold/background_fill_2_stderr_W.gold")
+        tr.Processes.Default.Streams.stderr = "gold/background_fill_2_stderr_H.gold"
         self.__checkProcessAfter(tr)
 
     def __testCase3(self):
@@ -168,8 +173,7 @@ sleep 5;
             "pv_client",
             "replay/bg_fill.yaml",
             http_ports=[self.ts['for_pv'].Variables.port],
-            https_ports=[self.ts['for_pv'].Variables.ssl_port],
-            other_args='--thread-limit 1')
+            https_ports=[self.ts['for_pv'].Variables.ssl_port])
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout = "gold/background_fill_3_stdout.gold"
         self.__checkProcessAfter(tr)

@@ -25,6 +25,7 @@
 #pragma once
 
 #include "iocore/eventsystem/Freer.h"
+#include "mgmt/config/ConfigContext.h"
 #include "proxy/http/remap/UrlMapping.h"
 #include "proxy/http/remap/UrlMappingPathIndex.h"
 #include "proxy/http/HttpTransact.h"
@@ -77,14 +78,15 @@ public:
    *
    * @return @c true if the instance state is valid, @c false if not.
    */
-  bool load();
+  bool load(ConfigContext ctx = {});
 
   /** Build the internal url write tables.
    *
    * @param path Path to configuration file.
+   * @param ctx  ConfigContext for reload status tracking.
    * @return 0 on success, non-zero error code on failure.
    */
-  int BuildTable(const char *path);
+  int BuildTable(const char *path, ConfigContext ctx = {});
 
   mapping_type Remap_redirect(HTTPHdr *request_header, URL *redirect_url);
   bool         ReverseMap(HTTPHdr *response_header);
@@ -115,6 +117,18 @@ public:
   is_valid() const
   {
     return _valid;
+  };
+
+  bool
+  is_remap_yaml() const
+  {
+    return _remap_yaml;
+  };
+
+  void
+  set_remap_yaml(bool yaml)
+  {
+    _remap_yaml = yaml;
   };
 
   /// @return  Number of rules defined.
@@ -234,6 +248,7 @@ public:
 
 private:
   bool              _valid               = false;
+  bool              _remap_yaml          = false;
   ACLBehaviorPolicy _acl_behavior_policy = ACLBehaviorPolicy::ACL_BEHAVIOR_LEGACY;
 
   bool _mappingLookup(MappingsStore &mappings, URL *request_url, int request_port, const char *request_host, int request_host_len,
@@ -251,3 +266,7 @@ private:
 };
 
 void url_rewrite_remap_request(const UrlMappingContainer &mapping_container, URL *request_url, int scheme = -1);
+
+mapping_type get_mapping_type(const char *type_str, BUILD_TABLE_INFO *bti);
+
+bool process_regex_mapping_config(const char *from_host_lower, url_mapping *new_mapping, UrlRewrite::RegexMapping *reg_map);

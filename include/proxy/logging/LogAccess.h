@@ -25,12 +25,15 @@
 #pragma once
 
 #include "tscore/ink_align.h"
+#include "proxy/Milestones.h"
+#include "proxy/hdrs/HTTP.h"
 #include "proxy/logging/LogField.h"
 
-class HTTPHdr;
-class HttpSM;
+class TransactionLogData;
 class IpClass;
 union IpEndpoint;
+
+#include <string>
 
 /*-------------------------------------------------------------------------
   LogAccess
@@ -114,7 +117,16 @@ class LogAccess
 {
 public:
   LogAccess() = delete;
-  explicit LogAccess(HttpSM *sm);
+
+  /** Construct from a TransactionLogData instance.
+   *
+   * The caller retains ownership of @a data, which must outlive the
+   * synchronous Log::access() call that marshals this entry.
+   *
+   * @param[in] data Populated TransactionLogData for an HttpSM-backed or
+   *                 non-HttpSM entry.
+   */
+  explicit LogAccess(TransactionLogData &data);
 
   ~LogAccess() {}
   void init();
@@ -124,7 +136,10 @@ public:
   //
   int marshal_client_host_ip(char *);                // STR
   int marshal_host_interface_ip(char *);             // STR
+  int marshal_client_host_ip_verified(char *);       // STR
   int marshal_client_host_port(char *);              // INT
+  int marshal_remote_host_ip(char *);                // STR
+  int marshal_remote_host_port(char *);              // STR
   int marshal_client_auth_user_name(char *);         // STR
   int marshal_client_req_timestamp_sec(char *);      // INT
   int marshal_client_req_timestamp_ms(char *);       // INT
@@ -141,6 +156,7 @@ public:
   int marshal_client_req_protocol_version(char *);   // STR
   int marshal_server_req_protocol_version(char *);   // STR
   int marshal_client_req_squid_len(char *);          // INT
+  int marshal_client_req_squid_len_tls(char *);      // INT
   int marshal_client_req_header_len(char *);         // INT
   int marshal_client_req_content_len(char *);        // INT
   int marshal_client_req_tcp_reused(char *);         // INT
@@ -158,6 +174,9 @@ public:
   int marshal_client_req_uuid(char *);               // STR
   int marshal_client_rx_error_code(char *);          // STR
   int marshal_client_tx_error_code(char *);          // STR
+  int marshal_client_tls_handshake_bytes_rx(char *); // INT
+  int marshal_client_tls_handshake_bytes_tx(char *); // INT
+  int marshal_client_tls_handshake_bytes(char *);    // INT
   int marshal_client_req_all_header_fields(char *);  // STR
 
   //
@@ -166,8 +185,10 @@ public:
   int marshal_proxy_resp_content_type(char *);      // STR
   int marshal_proxy_resp_reason_phrase(char *);     // STR
   int marshal_proxy_resp_squid_len(char *);         // INT
+  int marshal_proxy_resp_squid_len_tls(char *);     // INT
   int marshal_proxy_resp_content_len(char *);       // INT
   int marshal_proxy_resp_status_code(char *);       // INT
+  int marshal_status_plugin_entry(char *);          // STR
   int marshal_proxy_resp_header_len(char *);        // INT
   int marshal_proxy_finish_status_code(char *);     // INT
   int marshal_cache_result_code(char *);            // INT
@@ -238,6 +259,7 @@ public:
   //
   int marshal_cache_write_code(char *);           // INT
   int marshal_cache_write_transform_code(char *); // INT
+  int marshal_cache_key_hash(char *);             // STR
 
   // other fields
   //
@@ -265,6 +287,9 @@ public:
   int marshal_proxy_protocol_src_ip(char *);                       // STR
   int marshal_proxy_protocol_dst_ip(char *);                       // STR
   int marshal_proxy_protocol_authority(char *);                    // STR
+  int marshal_proxy_protocol_tls_cipher(char *);                   // STR
+  int marshal_proxy_protocol_tls_version(char *);                  // STR
+  int marshal_proxy_protocol_tls_group(char *);                    // STR
 
   // named fields from within a http header
   //
@@ -289,15 +314,18 @@ public:
   //
   // milestones access
   //
-  int  marshal_milestone(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_sec(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_squid(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_netscape(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_date(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_time(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_fmt_ms(TSMilestonesType ms, char *buf);
-  int  marshal_milestone_diff(TSMilestonesType ms1, TSMilestonesType ms2, char *buf);
+  int marshal_milestone(TSMilestonesType ms, char *buf);
+  int marshal_milestone_fmt_sec(TSMilestonesType ms, char *buf);
+  int marshal_milestone_fmt_ms(TSMilestonesType ms, char *buf);
+  int marshal_milestone_diff(TSMilestonesType ms1, TSMilestonesType ms2, char *buf);
+  int marshal_milestones_csv(char *buf);
+
+  bool has_http_header_field(LogField::Container container, const char *field) const;
   void set_http_header_field(LogField::Container container, char *field, char *buf, int len);
+
+  // Plugin
+  int marshal_custom_field(char *buf, LogField::Type type, const LogField::CustomMarshalFunc &plugin_marshal_func);
+
   //
   // unmarshalling routines
   //
@@ -309,13 +337,13 @@ public:
   static int     unmarshal_itox(int64_t val, char *dest, int field_width = 0, char leading_char = ' ');
   static int     unmarshal_int_to_str(char **buf, char *dest, int len);
   static int     unmarshal_int_to_str_hex(char **buf, char *dest, int len);
+  static int     unmarshal_milestone_diff(char **buf, char *dest, int len);
   static int     unmarshal_str(char **buf, char *dest, int len, LogSlice *slice, LogEscapeType escape_type);
   static int     unmarshal_ttmsf(char **buf, char *dest, int len);
   static int     unmarshal_int_to_date_str(char **buf, char *dest, int len);
   static int     unmarshal_int_to_time_str(char **buf, char *dest, int len);
   static int     unmarshal_int_to_netscape_str(char **buf, char *dest, int len);
   static int     unmarshal_http_version(char **buf, char *dest, int len);
-  static int     unmarshal_http_text(char **buf, char *dest, int len, LogSlice *slice, LogEscapeType escape_type);
   static int     unmarshal_http_status(char **buf, char *dest, int len);
   static int     unmarshal_ip(char **buf, IpEndpoint *dest);
   static int     unmarshal_ip_to_str(char **buf, char *dest, int len);
@@ -325,18 +353,29 @@ public:
   static int     unmarshal_cache_code(char **buf, char *dest, int len, const Ptr<LogFieldAliasMap> &map);
   static int     unmarshal_cache_hit_miss(char **buf, char *dest, int len, const Ptr<LogFieldAliasMap> &map);
   static int     unmarshal_cache_write_code(char **buf, char *dest, int len, const Ptr<LogFieldAliasMap> &map);
-  static int     unmarshal_client_protocol_stack(char **buf, char *dest, int len, Ptr<LogFieldAliasMap> map);
 
   static int unmarshal_with_map(int64_t code, char *dest, int len, const Ptr<LogFieldAliasMap> &map, const char *msg = nullptr);
 
   static int unmarshal_record(char **buf, char *dest, int len);
 
-  //
-  // our own strlen function that pads strings to even int64_t boundaries
-  // so that there are no alignment problems with the int values.
-  //
-  static int round_strlen(int len);
-  static int strlen(const char *str);
+  /** Find the padded length of a given value for alignment purposes.
+   * @param[in] len The length from which to calculate the padded length.
+   * @return The padded length on an even int64_t boundary.
+   */
+  static int padded_length(int len);
+
+  /** strlen wrapped in @a padded_length for calculaing padded string lengths.
+   *
+   * This is our own version of strlen which takes into account nullptr input
+   * for DEFAULT_STR and adds space for the null terminator. After accounting
+   * for these, it passes the result to @a padded_length to ensure space for
+   * alignment.  This function is useful, for example, when calculating the
+   * length for @a marshal_str.
+   *
+   * @param[in] str The string from which to calculate the padded length.
+   * @return The padded length for the string on an even int64_t boundary.
+   */
+  static int padded_strlen(const char *str);
 
 public:
   static void marshal_int(char *dest, int64_t source);
@@ -350,7 +389,7 @@ public:
   LogAccess &operator=(LogAccess &rhs) = delete; // or assignment
 
 private:
-  HttpSM *m_http_sm = nullptr;
+  TransactionLogData *m_data = nullptr;
 
   Arena m_arena;
 
@@ -379,32 +418,33 @@ private:
   char       *m_cache_lookup_url_canon_str        = nullptr;
   int         m_cache_lookup_url_canon_len        = 0;
 
-  void validate_unmapped_url();
-  void validate_unmapped_url_path();
+  HTTPHdr *header_for_container(LogField::Container container) const;
+  void     validate_unmapped_url();
+  void     validate_unmapped_url_path();
 
   void validate_lookup_url();
 };
 
 inline int
-LogAccess::round_strlen(int len)
+LogAccess::padded_length(int len)
 {
   return INK_ALIGN_DEFAULT(len);
 }
 
 /*-------------------------------------------------------------------------
-  LogAccess::strlen
+  LogAccess::padded_strlen
 
   Take trailing null and alignment padding into account.  This makes sure
   that strings in the LogBuffer are laid out properly.
   -------------------------------------------------------------------------*/
 
 inline int
-LogAccess::strlen(const char *str)
+LogAccess::padded_strlen(const char *str)
 {
   if (str == nullptr || str[0] == 0) {
-    return round_strlen(sizeof(DEFAULT_STR));
+    return padded_length(sizeof(DEFAULT_STR));
   } else {
-    return (int)(round_strlen(((int)::strlen(str) + 1))); // actual bytes for string
+    return (int)(padded_length(((int)::strlen(str) + 1))); // actual bytes for string
   }
 }
 

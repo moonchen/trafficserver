@@ -59,8 +59,8 @@ out the set of bytes to be used.
 Cache storage
 -------------
 
-The raw storage for the |TS| cache is configured in :file:`storage.config`. Each
-line in the file defines a :term:`cache span` which is treated as a uniform
+The raw storage for the |TS| cache is configured in :file:`storage.yaml`. Each
+entry in the file defines a :term:`cache span` which is treated as a uniform
 persistent store.
 
 .. figure:: images/cache-spans.png
@@ -69,7 +69,7 @@ persistent store.
    Two cache spans
 
 This storage is organized into a set of administrative units which are called :term:`cache volumes
-<cache volume>`. These are defined in :file:`volume.config`. Cache volumes can be assigned
+<cache volume>`. These are defined in :file:`storage.yaml`. Cache volumes can be assigned
 different properties in :file:`hosting.config`.
 
 Cache volumes can be defined by a percentage of the total storage or as an absolute amount of
@@ -99,7 +99,7 @@ cache volumes. It's also possible to control which cache spans (and hence,
 which cache stripes) are contained in a specific cache volume.
 
 The layout and structure of the cache spans, the cache volumes, and the cache
-stripes that compose them are derived entirely from :file:`storage.config` and
+stripes that compose them are derived entirely from :file:`storage.yaml` and
 :file:`cache.config` and is recomputed from scratch when the
 :program:`traffic_server` is started. Therefore, any change to those files can
 (and almost always will) invalidate the existing cache in its entirety.
@@ -115,7 +115,14 @@ relationship between a span block and a cache stripe is the same as between a di
 file system. A cache stripe is structured data contained in a span block and always occupies the
 entire span block.
 
-.. figure:: images/span-header.svg
+.. only:: html
+
+   .. figure:: images/span-header.svg
+
+.. only:: latex
+
+   .. figure:: images/span-header.png
+
    :align: center
 
 Stripe Structure
@@ -296,7 +303,14 @@ The header for a stripe is a variably sized instance of :class:`StripeHeaderFoot
 The variable trailing section contains the head indices of the directory entry
 free lists for the segments.
 
-.. figure:: images/stripe-header.svg
+.. only:: html
+
+   .. figure:: images/stripe-header.svg
+
+.. only:: latex
+
+   .. figure:: images/stripe-header.png
+
    :align: center
 
 The trailing :member:`StripeHeaderFooter::freelist` array overlays the disk storage with

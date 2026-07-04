@@ -21,7 +21,7 @@ add_executable(CompileParseRules CompileParseRules.cc)
 
 add_custom_command(
   OUTPUT ParseRulesCType ParseRulesCTypeToUpper ParseRulesCTypeToLower
-  COMMAND CompileParseRules
+  COMMAND ${CMAKE_COMMAND} -E env ASAN_OPTIONS=detect_leaks=0 $<TARGET_FILE:CompileParseRules>
   COMMENT "Generating compile parse rules"
 )
 
@@ -29,8 +29,6 @@ add_custom_target(ParseRules ALL DEPENDS ParseRulesCType ParseRulesCTypeToUpper 
 
 add_library(
   tscore
-  AcidPtr.cc
-  AcidPtr.cc
   Arena.cc
   ArgParser.cc
   BaseLogFile.cc
@@ -40,11 +38,9 @@ add_library(
   Diags.cc
   Encoding.cc
   EventNotify.cc
-  Extendible.cc
   FrequencyCounter.cc
   Hash.cc
   HashFNV.cc
-  HashSip.cc
   HostLookup.cc
   InkErrno.cc
   JeMiAllocator.cc
@@ -111,14 +107,7 @@ else()
 endif()
 
 target_link_libraries(
-  tscore
-  PUBLIC OpenSSL::Crypto
-         PCRE::PCRE
-         libswoc::libswoc
-         yaml-cpp::yaml-cpp
-         systemtap::systemtap
-         resolv::resolv
-         ts::tsutil
+  tscore PUBLIC OpenSSL::Crypto libswoc::libswoc yaml-cpp::yaml-cpp systemtap::systemtap resolv::resolv ts::tsutil
 )
 
 if(TS_USE_POSIX_CAP)
@@ -149,12 +138,11 @@ endif()
 if(BUILD_TESTING)
   add_executable(
     test_tscore
-    unit_tests/test_AcidPtr.cc
     unit_tests/test_ArgParser.cc
     unit_tests/test_CryptoHash.cc
-    unit_tests/test_Extendible.cc
     unit_tests/test_Encoding.cc
     unit_tests/test_FrequencyCounter.cc
+    unit_tests/test_HashAlgorithms.cc
     unit_tests/test_HKDF.cc
     unit_tests/test_Histogram.cc
     unit_tests/test_History.cc
@@ -170,12 +158,17 @@ if(BUILD_TESTING)
     unit_tests/test_Throttler.cc
     unit_tests/test_Tokenizer.cc
     unit_tests/test_arena.cc
+    unit_tests/test_ink_base64.cc
     unit_tests/test_ink_inet.cc
     unit_tests/test_ink_memory.cc
     unit_tests/test_ink_string.cc
+    unit_tests/test_ink_sys_control.cc
     unit_tests/test_layout.cc
     unit_tests/test_scoped_resource.cc
     unit_tests/test_Version.cc
+    unit_tests/test_ArgParser_MutexGroup.cc
+    unit_tests/test_ArgParser_OptionDependencies.cc
+    unit_tests/test_Allocator.cc
   )
   target_link_libraries(
     test_tscore

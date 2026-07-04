@@ -54,6 +54,8 @@
 #include "records/RecHttp.h"
 
 #include "proxy/http/HttpSM.h"
+#include "proxy/http/OverridableConfigDefs.h"
+#include "iocore/net/ConnectionTracker.h"
 #include "tscore/TestBox.h"
 
 namespace
@@ -890,7 +892,21 @@ synserver_delete(SocketServer *s)
 static int
 synserver_vc_refuse(TSCont contp, TSEvent event, void *data)
 {
-  TSAssert((event == TS_EVENT_NET_ACCEPT) || (event == TS_EVENT_NET_ACCEPT_FAILED));
+  if (event != TS_EVENT_NET_ACCEPT && event != TS_EVENT_NET_ACCEPT_FAILED) {
+    intptr_t data_val = reinterpret_cast<intptr_t>(data);
+    // Listening socket closed by synserver_stop while accept was pending.
+    if (event == TS_EVENT_ERROR && data_val == -EBADF) {
+      Dbg(dbg_ctl_SockServer, "synserver_vc_refuse: accept got EBADF, listener likely shut down");
+      return TS_EVENT_IMMEDIATE;
+    }
+    // net_accept() passes negated errno as data on EVENT_ERROR; Linux MAX_ERRNO is 4095
+    if (data_val < 0 && data_val >= -4095) {
+      int err = static_cast<int>(-data_val);
+      ink_abort("synserver_vc_refuse: unexpected event %d, accept errno: %s (%d)", event, strerror(err), err);
+    } else {
+      ink_abort("synserver_vc_refuse: unexpected event %d, data: %p", event, data);
+    }
+  }
 
   SocketServer *s = static_cast<SocketServer *>(TSContDataGet(contp));
   TSAssert(s->magic == MAGIC_ALIVE);
@@ -911,7 +927,21 @@ synserver_vc_refuse(TSCont contp, TSEvent event, void *data)
 static int
 synserver_vc_accept(TSCont contp, TSEvent event, void *data)
 {
-  TSAssert((event == TS_EVENT_NET_ACCEPT) || (event == TS_EVENT_NET_ACCEPT_FAILED));
+  if (event != TS_EVENT_NET_ACCEPT && event != TS_EVENT_NET_ACCEPT_FAILED) {
+    intptr_t data_val = reinterpret_cast<intptr_t>(data);
+    // Listening socket closed by synserver_stop while accept was pending.
+    if (event == TS_EVENT_ERROR && data_val == -EBADF) {
+      Dbg(dbg_ctl_SockServer, "synserver_vc_accept: accept got EBADF, listener likely shut down");
+      return TS_EVENT_IMMEDIATE;
+    }
+    // net_accept() passes negated errno as data on EVENT_ERROR; Linux MAX_ERRNO is 4095
+    if (data_val < 0 && data_val >= -4095) {
+      int err = static_cast<int>(-data_val);
+      ink_abort("synserver_vc_accept: unexpected event %d, accept errno: %s (%d)", event, strerror(err), err);
+    } else {
+      ink_abort("synserver_vc_accept: unexpected event %d, data: %p", event, data);
+    }
+  }
 
   SocketServer *s = static_cast<SocketServer *>(TSContDataGet(contp));
   TSAssert(s->magic == MAGIC_ALIVE);
@@ -3062,6 +3092,7 @@ struct SocketTest {
   bool            test_next_hop_ip_get;
   bool            test_next_hop_name_get;
   bool            test_next_hop_port_get;
+  bool            test_next_hop_strategy_get;
   bool            test_client_protocol_stack_get;
   bool            test_client_protocol_stack_contains;
 
@@ -3153,6 +3184,28 @@ checkHttpTxnClientProtocolStackContains(SocketTest *test, void *data)
     SDK_RPRINT(test->regtest, "TSHttpTxnClientProtocolStackContains", "TestCase2", TC_FAIL, "faulty udp report");
     test->test_client_protocol_stack_contains = false;
   }
+  return TS_EVENT_CONTINUE;
+}
+
+// This func is called by us from mytest_handler to check for TSHttpTxnNextStrategyGet
+static int
+checkHttpTxnNextHopStrategyGet(SocketTest *test, void *data)
+{
+  TSHttpTxn txnp = static_cast<TSHttpTxn>(data);
+
+  // this is an invalid pointer but the contents don't matter for this test.
+  void const *const exp = reinterpret_cast<void *>(0x01);
+
+  void const *const strategy = TSHttpTxnNextHopStrategyGet(txnp);
+  if (strategy == exp) {
+    test->test_next_hop_strategy_get = true;
+    SDK_RPRINT(test->regtest, "TSHttpTxnNextHopStrategyGet", "TestCase1", TC_PASS, "ok");
+  } else {
+    test->test_next_hop_strategy_get = false;
+    SDK_RPRINT(test->regtest, "TSHttpTxnNextHopStrategyGet", "TestCase1", TC_FAIL, "Value's Mismatch [expected '%jx', got '%jx'",
+               exp, strategy);
+  }
+
   return TS_EVENT_CONTINUE;
 }
 
@@ -3485,6 +3538,11 @@ mytest_handler(TSCont contp, TSEvent event, void *data)
       test->hook_mask |= 2;
     }
     TSHttpTxnCntlSet(static_cast<TSHttpTxn>(data), TS_HTTP_CNTL_SKIP_REMAPPING, true);
+
+    // Set the strategy pointer here
+    // this is an invalid pointer but the contents don't matter for this test.
+    TSHttpTxnNextHopStrategySet(static_cast<TSHttpTxn>(data), (void *)0x01);
+
     checkHttpTxnClientReqGet(test, data);
 
     TSHttpTxnReenable(static_cast<TSHttpTxn>(data), TS_EVENT_HTTP_CONTINUE);
@@ -3501,6 +3559,7 @@ mytest_handler(TSCont contp, TSEvent event, void *data)
 
     checkHttpTxnClientIPGet(test, data);
     checkHttpTxnServerIPGet(test, data);
+    checkHttpTxnNextHopStrategyGet(test, data);
 
     TSHttpTxnReenable(static_cast<TSHttpTxn>(data), TS_EVENT_HTTP_CONTINUE);
     test->reenable_mask |= 8;
@@ -3591,7 +3650,7 @@ mytest_handler(TSCont contp, TSEvent event, void *data)
           (test->test_client_remote_port_get != true) || (test->test_client_req_get != true) ||
           (test->test_client_resp_get != true) || (test->test_server_ip_get != true) || (test->test_server_req_get != true) ||
           (test->test_server_resp_get != true) || (test->test_next_hop_ip_get != true) || (test->test_next_hop_name_get != true) ||
-          (test->test_next_hop_port_get != true)) {
+          (test->test_next_hop_port_get != true) || (test->test_next_hop_strategy_get != true)) {
         *(test->pstatus) = REGRESSION_TEST_FAILED;
       }
       // transaction is over. clean up.
@@ -3635,6 +3694,7 @@ EXCLUSIVE_REGRESSION_TEST(SDK_API_HttpHookAdd)(RegressionTest *test, int /* atyp
   socktest->test_next_hop_ip_get          = false;
   socktest->test_next_hop_name_get        = false;
   socktest->test_next_hop_port_get        = false;
+  socktest->test_next_hop_strategy_get    = false;
   socktest->magic                         = MAGIC_ALIVE;
   TSContDataSet(cont, socktest);
 
@@ -5206,6 +5266,14 @@ REGRESSION_TEST(SDK_API_TSMimeHdrField)(RegressionTest *test, int /* atype ATS_U
       field1Value4Get   = TSMimeHdrFieldValueStringGet(bufp1, mime_loc1, field_loc11, 3, &lengthField1Value4);
       field1Value5Get   = TSMimeHdrFieldValueStringGet(bufp1, mime_loc1, field_loc11, 4, &lengthField1Value5);
       field1ValueAllGet = TSMimeHdrFieldValueStringGet(bufp1, mime_loc1, field_loc11, -1, &lengthField1ValueAll);
+
+      std::string_view sv1{field1Value1Get, static_cast<size_t>(lengthField1Value1)};
+      std::string_view sv2{field1Value2Get, static_cast<size_t>(lengthField1Value2)};
+      std::string_view sv3{field1Value3Get, static_cast<size_t>(lengthField1Value3)};
+      std::string_view sv4{field1Value4Get, static_cast<size_t>(lengthField1Value4)};
+      std::string_view sv5{field1Value5Get, static_cast<size_t>(lengthField1Value5)};
+      std::string_view svall{field1ValueAllGet, static_cast<size_t>(lengthField1ValueAll)};
+
       if (((strncmp(field1Value1Get, field1Value1, lengthField1Value1) == 0) &&
            lengthField1Value1 == static_cast<int>(strlen(field1Value1))) &&
           ((strncmp(field1Value2Get, field1Value2, lengthField1Value2) == 0) &&
@@ -5216,11 +5284,8 @@ REGRESSION_TEST(SDK_API_TSMimeHdrField)(RegressionTest *test, int /* atype ATS_U
            lengthField1Value4 == static_cast<int>(strlen(field1Value4))) &&
           ((strncmp(field1Value5Get, field1Value5, lengthField1Value5) == 0) &&
            lengthField1Value5 == static_cast<int>(strlen(field1Value5))) &&
-          (strstr(field1ValueAllGet, field1Value1Get) == field1Value1Get) &&
-          (strstr(field1ValueAllGet, field1Value2Get) == field1Value2Get) &&
-          (strstr(field1ValueAllGet, field1Value3Get) == field1Value3Get) &&
-          (strstr(field1ValueAllGet, field1Value4Get) == field1Value4Get) &&
-          (strstr(field1ValueAllGet, field1Value5Get) == field1Value5Get)) {
+          (svall.find(sv1) != svall.npos) && (svall.find(sv2) != svall.npos) && (svall.find(sv3) != svall.npos) &&
+          (svall.find(sv4) != svall.npos) && (svall.find(sv5) != svall.npos)) {
         SDK_RPRINT(test, "TSMimeHdrFieldValueStringInsert", "TestCase1&2&3&4&5", TC_PASS, "ok");
         SDK_RPRINT(test, "TSMimeHdrFieldValueStringGet", "TestCase1&2&3&4&5", TC_PASS, "ok");
         SDK_RPRINT(test, "TSMimeHdrFieldValueStringGet with IDX=-1", "TestCase1&2&3&4&5", TC_PASS, "ok");
@@ -7331,13 +7396,10 @@ parent_proxy_handler(TSCont contp, TSEvent event, void *edata)
         break;
       }
 
-      if (!ptest->parent_routing_enabled()) {
-        rprintf(ptest->regtest, "waiting for configuration\n");
-        TSContScheduleOnPool(contp, 100, TS_THREAD_POOL_NET);
-        break;
-      }
+      // This test uses TSHttpTxnParentProxySet() to dynamically set the parent proxy via
+      // the API, which works regardless of parent.config configuration.
 
-      // Now that the configuration is applied, it is safe to create a request.
+      // Now it is safe to create a request.
       // HTTP_REQUEST_FORMAT11 is a hostname with a no-cache response, so
       // we will need to set the parent to the synserver to get a
       // response.
@@ -8654,147 +8716,18 @@ EXCLUSIVE_REGRESSION_TEST(SDK_API_TSHttpConnectServerIntercept)(RegressionTest *
 //                    TSHttpTxnConfigStringGet
 ////////////////////////////////////////////////
 
-// The order of these should be the same as TSOverridableConfigKey
+// Generate the SDK_Overridable_Configs array from the X-macro.
+// The order MUST match TSOverridableConfigKey enum order (enforced by static_assert).
 // clang-format off
-std::array<std::string_view, TS_CONFIG_LAST_ENTRY> SDK_Overridable_Configs = {
-  {
-   "proxy.config.url_remap.pristine_host_hdr",
-   "proxy.config.http.chunking_enabled",
-   "proxy.config.http.negative_caching_enabled",
-   "proxy.config.http.negative_caching_lifetime",
-   "proxy.config.http.negative_caching_list",
-   "proxy.config.http.cache.when_to_revalidate",
-   "proxy.config.http.keep_alive_enabled_in",
-   "proxy.config.http.keep_alive_enabled_out",
-   "proxy.config.http.keep_alive_post_out",
-   "proxy.config.http.server_session_sharing.match",
-   "proxy.config.net.sock_recv_buffer_size_out",
-   "proxy.config.net.sock_send_buffer_size_out",
-   "proxy.config.net.sock_option_flag_out",
-   "proxy.config.http.forward.proxy_auth_to_parent",
-   "proxy.config.http.anonymize_remove_from",
-   "proxy.config.http.anonymize_remove_referer",
-   "proxy.config.http.anonymize_remove_user_agent",
-   "proxy.config.http.anonymize_remove_cookie",
-   "proxy.config.http.anonymize_remove_client_ip",
-   "proxy.config.http.insert_client_ip",
-   "proxy.config.http.response_server_enabled",
-   "proxy.config.http.insert_squid_x_forwarded_for",
-   "proxy.config.http.send_http11_requests",
-   "proxy.config.http.cache.http",
-   "proxy.config.http.cache.ignore_client_no_cache",
-   "proxy.config.http.cache.ignore_client_cc_max_age",
-   "proxy.config.http.cache.ims_on_client_no_cache",
-   "proxy.config.http.cache.ignore_server_no_cache",
-   "proxy.config.http.cache.cache_responses_to_cookies",
-   "proxy.config.http.cache.ignore_authentication",
-   "proxy.config.http.cache.cache_urls_that_look_dynamic",
-   "proxy.config.http.cache.required_headers",
-   "proxy.config.http.insert_request_via_str",
-   "proxy.config.http.insert_response_via_str",
-   "proxy.config.http.cache.heuristic_min_lifetime",
-   "proxy.config.http.cache.heuristic_max_lifetime",
-   "proxy.config.http.cache.guaranteed_min_lifetime",
-   "proxy.config.http.cache.guaranteed_max_lifetime",
-   "proxy.config.http.cache.max_stale_age",
-   "proxy.config.http.keep_alive_no_activity_timeout_in",
-   "proxy.config.http.keep_alive_no_activity_timeout_out",
-   "proxy.config.http.transaction_no_activity_timeout_in",
-   "proxy.config.http.transaction_no_activity_timeout_out",
-   "proxy.config.http.transaction_active_timeout_out",
-   "proxy.config.http.connect_attempts_max_retries",
-   "proxy.config.http.connect_attempts_max_retries_down_server",
-   "proxy.config.http.connect_attempts_rr_retries",
-   "proxy.config.http.connect_attempts_timeout",
-   "proxy.config.http.connect_attempts_retry_backoff_base",
-   "proxy.config.http.down_server.cache_time",
-   "proxy.config.http.doc_in_cache_skip_dns",
-   "proxy.config.http.background_fill_active_timeout",
-   "proxy.config.http.response_server_str",
-   "proxy.config.http.cache.heuristic_lm_factor",
-   "proxy.config.http.background_fill_completed_threshold",
-   "proxy.config.net.sock_packet_mark_out",
-   "proxy.config.net.sock_packet_tos_out",
-   "proxy.config.http.insert_age_in_response",
-   "proxy.config.http.chunking.size",
-   "proxy.config.http.flow_control.enabled",
-   "proxy.config.http.flow_control.low_water",
-   "proxy.config.http.flow_control.high_water",
-   "proxy.config.http.cache.range.lookup",
-   "proxy.config.http.default_buffer_size",
-   "proxy.config.http.default_buffer_water_mark",
-   "proxy.config.http.request_header_max_size",
-   "proxy.config.http.response_header_max_size",
-   "proxy.config.http.negative_revalidating_enabled",
-   "proxy.config.http.negative_revalidating_lifetime",
-   "proxy.config.http.negative_revalidating_list",
-   "proxy.config.ssl.hsts_max_age",
-   "proxy.config.ssl.hsts_include_subdomains",
-   "proxy.config.http.cache.open_read_retry_time",
-   "proxy.config.http.cache.max_open_read_retries",
-   "proxy.config.http.cache.range.write",
-   "proxy.config.http.post.check.content_length.enabled",
-   "proxy.config.http.global_user_agent_header",
-   "proxy.config.http.auth_server_session_private",
-   "proxy.config.http.slow.log.threshold",
-   "proxy.config.http.cache.generation",
-   "proxy.config.body_factory.template_base",
-   "proxy.config.http.cache.open_write_fail_action",
-   "proxy.config.http.number_of_redirections",
-   "proxy.config.http.cache.max_open_write_retries",
-   "proxy.config.http.cache.max_open_write_retry_timeout",
-   "proxy.config.http.redirect_use_orig_cache_key",
-   "proxy.config.http.attach_server_session_to_client",
-   "proxy.config.websocket.no_activity_timeout",
-   "proxy.config.websocket.active_timeout",
-   "proxy.config.http.uncacheable_requests_bypass_parent",
-   "proxy.config.http.parent_proxy.total_connect_attempts",
-   "proxy.config.http.transaction_active_timeout_in",
-   "proxy.config.srv_enabled",
-   "proxy.config.http.forward_connect_method",
-   "proxy.config.ssl.client.cert.filename",
-   "proxy.config.ssl.client.cert.path",
-   "proxy.config.http.parent_proxy.mark_down_hostdb",
-   "proxy.config.http.cache.ignore_accept_mismatch",
-   "proxy.config.http.cache.ignore_accept_language_mismatch",
-   "proxy.config.http.cache.ignore_accept_encoding_mismatch",
-   "proxy.config.http.cache.ignore_accept_charset_mismatch",
-   "proxy.config.http.parent_proxy.fail_threshold",
-   "proxy.config.http.parent_proxy.retry_time",
-   "proxy.config.http.parent_proxy.per_parent_connect_attempts",
-   "proxy.config.http.normalize_ae",
-   "proxy.config.http.insert_forwarded",
-   "proxy.config.http.proxy_protocol_out",
-   "proxy.config.http.allow_multi_range",
-   "proxy.config.http.request_buffer_enabled",
-   "proxy.config.http.allow_half_open",
-   ConnectionTracker::CONFIG_SERVER_VAR_MIN,
-   ConnectionTracker::CONFIG_SERVER_VAR_MAX,
-   ConnectionTracker::CONFIG_SERVER_VAR_MATCH,
-   "proxy.config.ssl.client.verify.server.policy",
-   "proxy.config.ssl.client.verify.server.properties",
-   "proxy.config.ssl.client.sni_policy",
-   "proxy.config.ssl.client.private_key.filename",
-   "proxy.config.ssl.client.CA.cert.filename",
-   "proxy.config.ssl.client.alpn_protocols",
-   "proxy.config.hostdb.ip_resolve",
-   "proxy.config.http.connect.down.policy",
-   "proxy.config.http.max_proxy_cycles",
-   "proxy.config.plugin.vc.default_buffer_index",
-   "proxy.config.plugin.vc.default_buffer_water_mark",
-   "proxy.config.net.sock_notsent_lowat",
-   "proxy.config.body_factory.response_suppression_mode",
-   "proxy.config.http.parent_proxy.enable_parent_timeout_markdowns",
-   "proxy.config.http.parent_proxy.disable_parent_markdowns",
-   "proxy.config.net.default_inactivity_timeout",
-   "proxy.config.http.no_dns_just_forward_to_parent",
-   "proxy.config.http.cache.ignore_query",
-   "proxy.config.http.drop_chunked_trailers",
-   "proxy.config.http.cache.post_method",
-   "proxy.config.http.strict_chunk_parsing",
-  }
-};
+#define X_SDK_CONFIG(CONFIG_KEY, MEMBER, RECORD_NAME, DATA_TYPE, CONV) RECORD_NAME,
+std::array<std::string_view, TS_CONFIG_LAST_ENTRY> SDK_Overridable_Configs = {{
+  OVERRIDABLE_CONFIGS(X_SDK_CONFIG)
+}};
+#undef X_SDK_CONFIG
 // clang-format on
+
+static_assert(SDK_Overridable_Configs.size() == TS_CONFIG_LAST_ENTRY,
+              "SDK_Overridable_Configs size must match TS_CONFIG_LAST_ENTRY");
 
 extern ClassAllocator<HttpSM> httpSMAllocator;
 
@@ -8876,9 +8809,11 @@ REGRESSION_TEST(SDK_API_OVERRIDABLE_CONFIGS)(RegressionTest *test, int /* atype 
     case TS_RECORDDATATYPE_STRING:
       TSHttpTxnConfigStringSet(txnp, key, test_string, -1);
       TSHttpTxnConfigStringGet(txnp, key, &sval_read, &len);
-      if (test_string != sval_read) {
-        SDK_RPRINT(test, "TSHttpTxnConfigStringSet", "TestCase1", TC_FAIL, "Failed on %s, %s != %s", conf.data(), sval_read,
-                   test_string);
+      // Compare string content, not pointers - the implementation may store
+      // a copy of the string (e.g., in ParsedConfigCache for efficiency).
+      if (sval_read == nullptr || std::string_view(test_string) != std::string_view(sval_read, len)) {
+        SDK_RPRINT(test, "TSHttpTxnConfigStringSet", "TestCase1", TC_FAIL, "Failed on %s, %s != %s", conf.data(),
+                   sval_read ? sval_read : "(null)", test_string);
         success = false;
         continue;
       }

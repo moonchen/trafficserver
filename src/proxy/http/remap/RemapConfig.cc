@@ -24,6 +24,7 @@
 #include "proxy/http/remap/AclFiltering.h"
 #include "swoc/swoc_file.h"
 
+#include "mgmt/config/ConfigContextDiags.h"
 #include "proxy/http/remap/RemapConfig.h"
 #include "proxy/http/remap/UrlRewrite.h"
 #include "proxy/ReverseProxy.h"
@@ -36,6 +37,9 @@
 #include "tscore/Filenames.h"
 #include "proxy/IPAllow.h"
 #include "proxy/http/remap/PluginFactory.h"
+#include "iocore/cache/Cache.h"
+
+extern CacheHostRecord *createCacheHostRecord(const char *volume_str, char *errbuf, size_t errbufsize);
 
 using namespace std::literals;
 
@@ -48,6 +52,7 @@ namespace
 DbgCtl dbg_ctl_url_rewrite{"url_rewrite"};
 DbgCtl dbg_ctl_remap_plugin{"remap_plugin"};
 DbgCtl dbg_ctl_url_rewrite_regex{"url_rewrite_regex"};
+
 } // end anonymous namespace
 
 /**
@@ -74,6 +79,31 @@ UrlWhack(char *toWhack, int *origLength)
     }
   }
   return length;
+}
+
+const char *
+is_valid_scheme(std::string_view fromScheme, std::string_view toScheme)
+{
+  const char *errStr = nullptr;
+  // Include support for HTTPS scheme
+  // includes support for FILE scheme
+  if ((fromScheme != std::string_view{URL_SCHEME_HTTP} && fromScheme != std::string_view{URL_SCHEME_HTTPS} &&
+       fromScheme != std::string_view{URL_SCHEME_FILE} && fromScheme != std::string_view{URL_SCHEME_TUNNEL} &&
+       fromScheme != std::string_view{URL_SCHEME_WS} && fromScheme != std::string_view{URL_SCHEME_WSS} &&
+       fromScheme != std::string_view{URL_SCHEME_HTTP_UDS} && fromScheme != std::string_view{URL_SCHEME_HTTPS_UDS}) ||
+      (toScheme != std::string_view{URL_SCHEME_HTTP} && toScheme != std::string_view{URL_SCHEME_HTTPS} &&
+       toScheme != std::string_view{URL_SCHEME_TUNNEL} && toScheme != std::string_view{URL_SCHEME_WS} &&
+       toScheme != std::string_view{URL_SCHEME_WSS})) {
+    errStr = "only http, https, http+unix, https+unix, ws, wss, and tunnel remappings are supported";
+    return errStr;
+  }
+
+  // If mapping from WS or WSS we must map out to WS or WSS
+  if ((fromScheme == std::string_view{URL_SCHEME_WSS} || fromScheme == std::string_view{URL_SCHEME_WS}) &&
+      (toScheme != std::string_view{URL_SCHEME_WSS} && toScheme != std::string_view{URL_SCHEME_WS})) {
+    errStr = "WS or WSS can only be mapped out to WS or WSS.";
+  }
+  return errStr;
 }
 
 /**
@@ -175,7 +205,7 @@ process_filter_opt(url_mapping *mp, const BUILD_TABLE_INFO *bti, char *errStrBuf
   return errStr;
 }
 
-static bool
+bool
 is_inkeylist(const char *key, ...)
 {
   va_list ap;
@@ -303,7 +333,7 @@ parse_deactivate_directive(const char *directive, BUILD_TABLE_INFO *bti, char *e
   return nullptr;
 }
 
-static void
+void
 free_directory_list(int n_entries, struct dirent **entrylist)
 {
   for (int i = 0; i < n_entries; ++i) {
@@ -365,7 +395,7 @@ parse_include_directive(const char *directive, BUILD_TABLE_INFO *bti, char *errb
     path = RecConfigReadConfigPath(nullptr, bti->paramv[i]);
 
     if (ink_file_is_directory(path)) {
-      struct dirent **entrylist;
+      struct dirent **entrylist = nullptr;
       int             n_entries;
 
       n_entries = scandir(path, &entrylist, nullptr, alphasort);
@@ -829,6 +859,14 @@ remap_check_option(const char *const *argv, int argc, unsigned long findmode, in
           *argptr = &argv[i][9];
         }
         ret_flags |= REMAP_OPTFLG_STRATEGY;
+      } else if (!strncasecmp(argv[i], "volume=", 7)) {
+        if ((findmode & REMAP_OPTFLG_VOLUME) != 0) {
+          idx = i;
+        }
+        if (argptr) {
+          *argptr = &argv[i][7];
+        }
+        ret_flags |= REMAP_OPTFLG_VOLUME;
       } else {
         Warning("ignoring invalid remap option '%s'", argv[i]);
       }
@@ -968,13 +1006,13 @@ remap_load_plugin(const char *const *argv, int argc, url_mapping *mp, char *errb
     output argument reg_map. It assumes existing data in reg_map is
     inconsequential and will be perfunctorily null-ed;
 */
-static bool
+bool
 process_regex_mapping_config(const char *from_host_lower, url_mapping *new_mapping, UrlRewrite::RegexMapping *reg_map)
 {
   std::string_view to_host{};
   int              to_host_len;
   int              substitution_id;
-  int              captures;
+  int32_t          captures;
 
   reg_map->to_url_host_template     = nullptr;
   reg_map->to_url_host_template_len = 0;
@@ -1009,6 +1047,11 @@ process_regex_mapping_config(const char *from_host_lower, url_mapping *new_mappi
         Warning("Substitution id [%c] has no corresponding capture pattern in regex [%s]", to_host[i + 1], from_host_lower);
         goto lFail;
       }
+      if (reg_map->n_substitutions >= UrlRewrite::MAX_REGEX_SUBS) {
+        Warning("too many substitution markers in regex remap target [%.*s], saw %d markers, max %d", to_host_len, to_host.data(),
+                reg_map->n_substitutions + 1, UrlRewrite::MAX_REGEX_SUBS);
+        goto lFail;
+      }
       reg_map->substitution_markers[reg_map->n_substitutions] = i;
       reg_map->substitution_ids[reg_map->n_substitutions]     = substitution_id;
       ++reg_map->n_substitutions;
@@ -1033,7 +1076,7 @@ lFail:
 }
 
 bool
-remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
+remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti, ConfigContext ctx)
 {
   char        errBuf[1024];
   char        errStrBuf[1024];
@@ -1072,7 +1115,7 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
     return true;
   }
   if (ec.value()) {
-    Warning("Failed to open remapping configuration file %s - %s", path, strerror(ec.value()));
+    CfgLoadLog(ctx, DL_Warning, "Failed to open remapping configuration file %s - %s", path, strerror(ec.value()));
     return false;
   }
 
@@ -1080,7 +1123,7 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
 
   ACLBehaviorPolicy behavior_policy = ACLBehaviorPolicy::ACL_BEHAVIOR_LEGACY;
   if (!UrlRewrite::get_acl_behavior_policy(behavior_policy)) {
-    Warning("Failed to get ACL matching policy.");
+    CfgLoadLog(ctx, DL_Warning, "Failed to get ACL matching policy.");
     return false;
   }
   bti->behavior_policy = behavior_policy;
@@ -1155,28 +1198,8 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
     type_id_str          = is_cur_mapping_regex ? (bti->paramv[0] + 6) : bti->paramv[0];
 
     // Check to see whether is a reverse or forward mapping
-    if (!strcasecmp("reverse_map", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - mapping_type::REVERSE_MAP");
-      maptype = mapping_type::REVERSE_MAP;
-    } else if (!strcasecmp("map", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - %s",
-          ((bti->remap_optflg & REMAP_OPTFLG_MAP_WITH_REFERER) == 0) ? "mapping_type::FORWARD_MAP" :
-                                                                       "mapping_type::FORWARD_MAP_REFERER");
-      maptype =
-        ((bti->remap_optflg & REMAP_OPTFLG_MAP_WITH_REFERER) == 0) ? mapping_type::FORWARD_MAP : mapping_type::FORWARD_MAP_REFERER;
-    } else if (!strcasecmp("redirect", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - mapping_type::PERMANENT_REDIRECT");
-      maptype = mapping_type::PERMANENT_REDIRECT;
-    } else if (!strcasecmp("redirect_temporary", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - mapping_type::TEMPORARY_REDIRECT");
-      maptype = mapping_type::TEMPORARY_REDIRECT;
-    } else if (!strcasecmp("map_with_referer", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - mapping_type::FORWARD_MAP_REFERER");
-      maptype = mapping_type::FORWARD_MAP_REFERER;
-    } else if (!strcasecmp("map_with_recv_port", type_id_str)) {
-      Dbg(dbg_ctl_url_rewrite, "[BuildTable] - mapping_type::FORWARD_MAP_WITH_RECV_PORT");
-      maptype = mapping_type::FORWARD_MAP_WITH_RECV_PORT;
-    } else {
+    maptype = get_mapping_type(type_id_str, bti);
+    if (maptype == mapping_type::NONE) {
       snprintf(errStrBuf, sizeof(errStrBuf), "unknown mapping type at line %d", cln + 1);
       errStr = errStrBuf;
       goto MAP_ERROR;
@@ -1197,9 +1220,71 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
     if ((bti->remap_optflg & REMAP_OPTFLG_MAP_ID) != 0) {
       int idx = 0;
       int ret = remap_check_option(bti->argv, bti->argc, REMAP_OPTFLG_MAP_ID, &idx);
+
       if (ret & REMAP_OPTFLG_MAP_ID) {
-        char *c             = strchr(bti->argv[idx], static_cast<int>('='));
+        char *c = strchr(bti->argv[idx], static_cast<int>('='));
+
         new_mapping->map_id = static_cast<unsigned int>(atoi(++c));
+      }
+    }
+
+    // Parse @volume= option with comma-separated syntax (@volume=3,4)
+    for (int i = 0; i < bti->argc; i++) {
+      if (!strncasecmp(bti->argv[i], "volume=", 7)) {
+        const char *volume_str = &bti->argv[i][7];
+
+        if (!volume_str || !*volume_str) {
+          snprintf(errStrBuf, sizeof(errStrBuf), "Empty @volume= directive at line %d", cln + 1);
+          errStr = errStrBuf;
+          goto MAP_ERROR;
+        }
+
+        {
+          swoc::TextView vol_list{volume_str};
+
+          if (vol_list.back() == ',') {
+            snprintf(errStrBuf, sizeof(errStrBuf), "Invalid @volume=%s at line %d (trailing comma)", volume_str, cln + 1);
+            errStr = errStrBuf;
+            goto MAP_ERROR;
+          }
+          while (!vol_list.empty()) {
+            swoc::TextView span;
+            swoc::TextView token{vol_list.take_prefix_at(',')};
+            auto           n = swoc::svtoi(token, &span);
+
+            if (span.size() != token.size() || token.empty()) {
+              snprintf(errStrBuf, sizeof(errStrBuf), "Invalid @volume=%s at line %d (expected comma-separated numbers 1-255)",
+                       volume_str, cln + 1);
+              errStr = errStrBuf;
+              goto MAP_ERROR;
+            } else if (n < 1 || n > 255) {
+              snprintf(errStrBuf, sizeof(errStrBuf), "Volume number %jd out of range (1-255) in @volume=%s at line %d", n,
+                       volume_str, cln + 1);
+              errStr = errStrBuf;
+              goto MAP_ERROR;
+            }
+          }
+        }
+
+        // Check if cache is ready (will be true during config reload, possibly false during initial startup)
+        if (CacheProcessor::IsCacheEnabled() == CacheInitState::INITIALIZED) {
+          char             volume_errbuf[256];
+          CacheHostRecord *rec = createCacheHostRecord(volume_str, volume_errbuf, sizeof(volume_errbuf));
+
+          if (!rec) {
+            snprintf(errStrBuf, sizeof(errStrBuf), "Failed to build volume record for @volume=%s at line %d: %s", volume_str,
+                     cln + 1, volume_errbuf);
+            errStr = errStrBuf;
+            goto MAP_ERROR;
+          }
+          new_mapping->volume_host_rec.store(rec, std::memory_order_release);
+          Dbg(dbg_ctl_url_rewrite, "[BuildTable] Cache volume directive built: @volume=%s", volume_str);
+        } else {
+          // Store the volume string for lazy initialization after cache is ready
+          new_mapping->setVolume(volume_str);
+          Dbg(dbg_ctl_url_rewrite, "[BuildTable] Cache volume directive stored (deferred): @volume=%s", volume_str);
+        }
+        break;
       }
     }
 
@@ -1251,22 +1336,8 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
     }
     toScheme = new_mapping->toURL.scheme_get();
 
-    // Include support for HTTPS scheme
-    // includes support for FILE scheme
-    if ((fromScheme != std::string_view{URL_SCHEME_HTTP} && fromScheme != std::string_view{URL_SCHEME_HTTPS} &&
-         fromScheme != std::string_view{URL_SCHEME_FILE} && fromScheme != std::string_view{URL_SCHEME_TUNNEL} &&
-         fromScheme != std::string_view{URL_SCHEME_WS} && fromScheme != std::string_view{URL_SCHEME_WSS}) ||
-        (toScheme != std::string_view{URL_SCHEME_HTTP} && toScheme != std::string_view{URL_SCHEME_HTTPS} &&
-         toScheme != std::string_view{URL_SCHEME_TUNNEL} && toScheme != std::string_view{URL_SCHEME_WS} &&
-         toScheme != std::string_view{URL_SCHEME_WSS})) {
-      errStr = "only http, https, ws, wss, and tunnel remappings are supported";
-      goto MAP_ERROR;
-    }
-
-    // If mapping from WS or WSS we must map out to WS or WSS
-    if ((fromScheme == std::string_view{URL_SCHEME_WSS} || fromScheme == std::string_view{URL_SCHEME_WS}) &&
-        (toScheme != std::string_view{URL_SCHEME_WSS} && toScheme != std::string_view{URL_SCHEME_WS})) {
-      errStr = "WS or WSS can only be mapped out to WS or WSS.";
+    errStr = is_valid_scheme(fromScheme, toScheme);
+    if (errStr != nullptr) {
       goto MAP_ERROR;
     }
 
@@ -1473,7 +1544,7 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
   MAP_ERROR:
 
     snprintf(errBuf, sizeof(errBuf), "%s failed to add remap rule at %s line %d: %s", modulePrefix, path, cln + 1, errStr);
-    Error("%s", errBuf);
+    CfgLoadLog(ctx, DL_Error, "%s", errBuf);
 
     delete reg_map;
     delete new_mapping;
@@ -1485,7 +1556,7 @@ remap_parse_config_bti(const char *path, BUILD_TABLE_INFO *bti)
 }
 
 bool
-remap_parse_config(const char *path, UrlRewrite *rewrite)
+remap_parse_config(const char *path, UrlRewrite *rewrite, ConfigContext ctx)
 {
   BUILD_TABLE_INFO bti;
 
@@ -1494,7 +1565,7 @@ remap_parse_config(const char *path, UrlRewrite *rewrite)
   rewrite->pluginFactory.indicatePreReload();
 
   bti.rewrite = rewrite;
-  bool status = remap_parse_config_bti(path, &bti);
+  bool status = remap_parse_config_bti(path, &bti, ctx);
 
   /* Now after we parsed the configuration and (re)loaded plugins and plugin instances
    * accordingly notify all plugins that we are done */

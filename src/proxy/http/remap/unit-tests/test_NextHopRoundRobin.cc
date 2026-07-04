@@ -45,9 +45,8 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'rr-strict'", "[NextHopR
 
   GIVEN("Loading the round-robin-tests.yaml config for round robin 'rr-strict' tests.")
   {
-    std::shared_ptr<NextHopSelectionStrategy> strategy;
-    NextHopStrategyFactory                    nhf(TS_SRC_DIR "/round-robin-tests.yaml");
-    strategy = nhf.strategyInstance("rr-strict-exhaust-ring");
+    NextHopStrategyFactory          nhf(TS_SRC_DIR "/round-robin-tests.yaml");
+    NextHopSelectionStrategy *const strategy = nhf.strategyInstance("rr-strict-exhaust-ring");
 
     WHEN("the config is loaded.")
     {
@@ -170,9 +169,8 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'first-live'", "[NextHop
 
   GIVEN("Loading the round-robin-tests.yaml config for round robin 'first-live' tests.")
   {
-    std::shared_ptr<NextHopSelectionStrategy> strategy;
-    NextHopStrategyFactory                    nhf(TS_SRC_DIR "/round-robin-tests.yaml");
-    strategy = nhf.strategyInstance("first-live");
+    NextHopStrategyFactory          nhf(TS_SRC_DIR "/round-robin-tests.yaml");
+    NextHopSelectionStrategy *const strategy = nhf.strategyInstance("first-live");
 
     WHEN("the config is loaded.")
     {
@@ -239,13 +237,12 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'rr-ip'", "[NextHopRound
 
   GIVEN("Loading the round-robin-tests.yaml config for round robin 'rr-ip' tests.")
   {
-    std::shared_ptr<NextHopSelectionStrategy> strategy;
-    NextHopStrategyFactory                    nhf(TS_SRC_DIR "/round-robin-tests.yaml");
-    strategy        = nhf.strategyInstance("rr-ip");
-    sockaddr_in sa1 = {};
-    sockaddr_in sa2 = {};
-    sa1.sin_port    = 10000;
-    sa1.sin_family  = AF_INET;
+    NextHopStrategyFactory          nhf(TS_SRC_DIR "/round-robin-tests.yaml");
+    NextHopSelectionStrategy *const strategy = nhf.strategyInstance("rr-ip");
+    sockaddr_in                     sa1      = {};
+    sockaddr_in                     sa2      = {};
+    sa1.sin_port                             = 10000;
+    sa1.sin_family                           = AF_INET;
     REQUIRE(inet_pton(AF_INET, "192.168.1.1", &(sa1.sin_addr)) == 1);
     sa2.sin_port   = 10001;
     sa2.sin_family = AF_INET;
@@ -290,6 +287,7 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'rr-ip'", "[NextHopRound
         build_request(10017, &sm, &sa2, "rabbit.net", nullptr);
         result->reset();
         strategy->findNextHop(txnp);
+        REQUIRE(result->hostname != nullptr);
         CHECK(strcmp(result->hostname, "p3.foo.com") == 0);
 
         // call and test parentExists(), this call should not affect
@@ -300,6 +298,7 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'rr-ip'", "[NextHopRound
         build_request(10018, &sm, &sa2, "rabbit.net", nullptr);
         result->reset();
         strategy->findNextHop(txnp);
+        REQUIRE(result->hostname != nullptr);
         CHECK(strcmp(result->hostname, "p3.foo.com") == 0);
 
         // call and test parentExists(), this call should not affect
@@ -327,9 +326,8 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'latched'", "[NextHopRou
 
   GIVEN("Loading the round-robin-tests.yaml config for round robin 'latched' tests.")
   {
-    std::shared_ptr<NextHopSelectionStrategy> strategy;
-    NextHopStrategyFactory                    nhf(TS_SRC_DIR "/round-robin-tests.yaml");
-    strategy = nhf.strategyInstance("latched");
+    NextHopStrategyFactory          nhf(TS_SRC_DIR "/round-robin-tests.yaml");
+    NextHopSelectionStrategy *const strategy = nhf.strategyInstance("latched");
 
     WHEN("the config is loaded.")
     {
@@ -378,6 +376,75 @@ SCENARIO("Testing NextHopRoundRobin class, using policy 'latched'", "[NextHopRou
         build_request(10024, &sm, nullptr, "rabbit.net", nullptr);
         strategy->findNextHop(txnp);
         CHECK(strcmp(result->hostname, "p3.foo.com") == 0);
+      }
+      br_destroy(sm);
+    }
+  }
+}
+
+SCENARIO("Testing NextHopHealthStatus failCount overflow saturation", "[NextHopHealthStatus]")
+{
+  // No thread setup, forbid use of thread local allocators.
+  cmd_disable_pfreelist = true;
+  http_init();
+
+  GIVEN("Loading the round-robin-tests.yaml config for overflow test.")
+  {
+    NextHopStrategyFactory          nhf(TS_SRC_DIR "/round-robin-tests.yaml");
+    NextHopSelectionStrategy *const strategy = nhf.strategyInstance("rr-strict-exhaust-ring");
+
+    REQUIRE(nhf.strategies_loaded == true);
+    REQUIRE(strategy != nullptr);
+
+    WHEN("failCount is near UINT32_MAX and markNextHop is called")
+    {
+      HttpSM        sm;
+      ParentResult *result = &sm.t_state.parent_result;
+      TSHttpTxn     txnp   = reinterpret_cast<TSHttpTxn>(&sm);
+
+      // Select a host so result is populated.
+      build_request(20001, &sm, nullptr, "rabbit.net", nullptr);
+      strategy->findNextHop(txnp);
+      REQUIRE(result->result == ParentResultType::SPECIFIED);
+      REQUIRE(result->hostname != nullptr);
+
+      // Get the HostRecord for the selected host.
+      std::shared_ptr<HostRecord> host_rec;
+      for (auto &group : strategy->host_groups) {
+        for (auto &h : group) {
+          if (h->hostname == result->hostname) {
+            host_rec = h;
+            break;
+          }
+        }
+        if (host_rec) {
+          break;
+        }
+      }
+      REQUIRE(host_rec != nullptr);
+
+      // Set failCount to UINT32_MAX - 1 to test saturation.
+      host_rec->failCount = UINT32_MAX - 1;
+      host_rec->failedAt  = time(nullptr);
+
+      // Set fail_threshold very high so set_unavailable doesn't interfere.
+      extern char _my_txn_conf[];
+      auto       *oride            = reinterpret_cast<OverridableHttpConfigParams *>(_my_txn_conf);
+      oride->parent_fail_threshold = static_cast<int64_t>(UINT32_MAX) + 1;
+      oride->parent_retry_time     = 30; // large retry window so we stay in the increment path
+
+      THEN("failCount saturates at UINT32_MAX and does not wrap to 0")
+      {
+        // First markNextHop: UINT32_MAX-1 -> UINT32_MAX
+        strategy->markNextHop(txnp, result->hostname, result->port, NHCmd::MARK_DOWN);
+        CHECK(host_rec->failCount.load() == UINT32_MAX);
+
+        // Second markNextHop: should stay at UINT32_MAX (saturated)
+        strategy->markNextHop(txnp, result->hostname, result->port, NHCmd::MARK_DOWN);
+        CHECK(host_rec->failCount.load() == UINT32_MAX);
+
+        // Verify host is still available (threshold not met since threshold > UINT32_MAX)
+        CHECK(host_rec->available.load() == true);
       }
       br_destroy(sm);
     }

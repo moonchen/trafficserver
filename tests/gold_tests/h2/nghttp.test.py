@@ -52,7 +52,13 @@ ts.Disk.remap_config.AddLines(
             httpbin.Variables.Port, Test.RunDirectory)
     ])
 
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 ts.Disk.records_config.update(
     {
@@ -71,7 +77,7 @@ tr = Test.AddTestRun()
 tr.TimeOut = 10
 tr.Processes.Default.Command = f"nghttp -vn --no-dep 'https://127.0.0.1:{ts.Variables.ssl_port}/httpbin/post' --trailer 'foo: bar' -d 'post_body'"
 tr.Processes.Default.ReturnCode = 0
-tr.Processes.Default.StartBefore(httpbin, ready=When.PortOpen(httpbin.Variables.Port))
+tr.Processes.Default.StartBefore(httpbin)
 tr.Processes.Default.StartBefore(Test.Processes.ts)
 tr.Processes.Default.Streams.stdout = "gold/nghttp_0_stdout.gold"
 tr.StillRunningAfter = httpbin

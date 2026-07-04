@@ -26,6 +26,7 @@
 #include <ts/ts.h>
 #include <ts/remap.h>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <iostream>
 #include <fstream>
@@ -38,11 +39,7 @@
 #include <maxminddb.h>
 #include "swoc/swoc_ip.h"
 
-#ifdef HAVE_PCRE_PCRE_H
-#include <pcre/pcre.h>
-#else
-#include <pcre.h>
-#endif
+#include "tsutil/Regex.h"
 
 #define PLUGIN_NAME  "maxmind_acl"
 #define CONFIG_TMOUT 60000
@@ -55,8 +52,7 @@ using namespace maxmind_acl_ns;
 
 struct plugin_regex {
   std::string _regex_s;
-  pcre       *_rex;
-  pcre_extra *_extra;
+  Regex       _rex;
 };
 
 enum ipstate { ALLOW_IP, DENY_IP, UNKNOWN_IP };
@@ -74,6 +70,7 @@ public:
   }
 
   bool eval(TSRemapRequestInfo *rri, TSHttpTxn txnp);
+  bool check_bypass(TSHttpTxn txnp) const;
   bool init(char const *filename);
 
   void
@@ -116,6 +113,10 @@ protected:
 
   bool _anonymous_blocking = false;
 
+  // Bypass header fields
+  std::string _bypass_header;
+  std::string _bypass_header_value;
+
   // Do we want to allow by default or not? Useful
   // for deny only rules
   bool default_allow = false;
@@ -126,6 +127,7 @@ protected:
   bool    loaddeny(const YAML::Node &denyNode);
   void    loadhtml(const YAML::Node &htmlNode);
   bool    loadanonymous(const YAML::Node &anonNode);
+  void    loadbypass(const YAML::Node &bypassNode);
   bool    eval_country(MMDB_entry_data_s *entry_data, const std::string &url);
   bool    eval_anonymous(MMDB_entry_s *entry_data);
   void    parseregex(const YAML::Node &regex, bool allow);

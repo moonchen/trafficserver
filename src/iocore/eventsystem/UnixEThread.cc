@@ -31,8 +31,11 @@
 // The EThread Class
 //
 /////////////////////////////////////////////////////////////////////
-#include "P_EventSystem.h"
+#include "iocore/eventsystem/EThread.h"
+#include "iocore/eventsystem/EventProcessor.h"
 #include "iocore/eventsystem/Lock.h"
+#include "tscore/ink_hrtime.h"
+#include "tscore/ink_atomic.h"
 
 #if HAVE_EVENTFD
 #include <sys/eventfd.h>
@@ -52,7 +55,9 @@ char const *const EThread::Metrics::Slice::STAT_NAME[] = {
   "proxy.process.eventloop.io.wait.max", "proxy.process.eventloop.io.work.max",
 };
 
-int thread_max_heartbeat_mseconds = THREAD_MAX_HEARTBEAT_MSECONDS;
+int              thread_max_heartbeat_mseconds = THREAD_MAX_HEARTBEAT_MSECONDS;
+int              loop_time_update_probability  = 10;
+const ink_hrtime DELAY_FOR_RETRY               = HRTIME_MSECONDS(10);
 
 // To define a class inherits from Thread:
 //   1) Define an independent thread_local static member
@@ -144,19 +149,19 @@ EThread::set_event_type(EventType et)
   event_types |= (1 << static_cast<int>(et));
 }
 
-void
-EThread::process_event(Event *e, int calling_code)
+ink_hrtime
+EThread::process_event(Event *e, int calling_code, ink_hrtime event_time)
 {
   ink_assert((!e->in_the_prot_queue && !e->in_the_priority_queue));
   WEAK_MUTEX_TRY_LOCK(lock, e->mutex, this);
   if (!lock.is_locked()) {
-    e->timeout_at = ink_get_hrtime() + DELAY_FOR_RETRY;
+    e->timeout_at = event_time + DELAY_FOR_RETRY;
     EventQueueExternal.enqueue_local(e);
   } else {
     if (e->cancelled) {
       MUTEX_RELEASE(lock);
       free_event(e);
-      return;
+      return event_time;
     }
     Continuation *c_temp = e->continuation;
 
@@ -164,6 +169,13 @@ EThread::process_event(Event *e, int calling_code)
     set_cont_flags(e->continuation->control_flags);
 
     e->continuation->handleEvent(calling_code, e);
+    if (loop_time_update_probability == 100) {
+      event_time = ink_get_hrtime();
+    } else if (loop_time_update_probability > 0) {
+      if (static_cast<int>(generator.random() % 100) < loop_time_update_probability) {
+        event_time = ink_get_hrtime();
+      }
+    }
     ink_assert(!e->in_the_priority_queue);
     ink_assert(c_temp == e->continuation);
     MUTEX_RELEASE(lock);
@@ -172,7 +184,7 @@ EThread::process_event(Event *e, int calling_code)
         if (e->period < 0) {
           e->timeout_at = e->period;
         } else {
-          e->timeout_at = ink_get_hrtime() + e->period;
+          e->timeout_at = event_time + e->period;
         }
         EventQueueExternal.enqueue_local(e);
       }
@@ -180,10 +192,11 @@ EThread::process_event(Event *e, int calling_code)
       free_event(e);
     }
   }
+  return event_time;
 }
 
-void
-EThread::process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_count)
+ink_hrtime
+EThread::process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_count, ink_hrtime event_time)
 {
   Event *e;
 
@@ -198,9 +211,9 @@ EThread::process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_
       free_event(e);
     } else if (!e->timeout_at) { // IMMEDIATE
       ink_assert(e->period == 0);
-      process_event(e, e->callback_event);
+      event_time = process_event(e, e->callback_event, event_time);
     } else if (e->timeout_at > 0) { // INTERVAL
-      EventQueue.enqueue(e, ink_get_hrtime());
+      EventQueue.enqueue(e, event_time);
     } else { // NEGATIVE
       Event *p = nullptr;
       Event *a = NegativeQueue->head;
@@ -216,6 +229,7 @@ EThread::process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_
     }
     ++(*nq_count);
   }
+  return event_time;
 }
 
 void
@@ -228,8 +242,10 @@ EThread::execute_regular()
   ink_hrtime loop_start_time;  // Time the loop started.
   ink_hrtime loop_finish_time; // Time at the end of the loop.
 
+  loop_start_time = ink_get_hrtime();
+
   // Track this so we can update on boundary crossing.
-  auto prev_slice = this->metrics.prev_slice(metrics._slice.data() + (ink_get_hrtime() / HRTIME_SECOND) % Metrics::N_SLICES);
+  auto prev_slice = this->metrics.prev_slice(metrics._slice.data() + (loop_start_time / HRTIME_SECOND) % Metrics::N_SLICES);
 
   int nq_count;
   int ev_count;
@@ -241,9 +257,8 @@ EThread::execute_regular()
 
   // give priority to immediate events
   while (!TSSystemState::is_event_system_shut_down()) {
-    loop_start_time = ink_get_hrtime();
-    nq_count        = 0; // count # of elements put on negative queue.
-    ev_count        = 0; // # of events handled.
+    nq_count = 0; // count # of elements put on negative queue.
+    ev_count = 0; // # of events handled.
 
     current_slice = metrics._slice.data() + (loop_start_time / HRTIME_SECOND) % Metrics::N_SLICES;
     metrics.current_slice.store(current_slice, std::memory_order_release);
@@ -256,37 +271,37 @@ EThread::execute_regular()
     }
     ++(current_slice->_count); // loop started, bump count.
 
-    process_queue(&NegativeQueue, &ev_count, &nq_count);
+    ink_hrtime event_time = process_queue(&NegativeQueue, &ev_count, &nq_count, loop_start_time);
 
     bool done_one;
     do {
       done_one = false;
       // execute all the eligible internal events
-      EventQueue.check_ready(loop_start_time, this);
-      while ((e = EventQueue.dequeue_ready(ink_get_hrtime()))) {
+      EventQueue.check_ready(event_time, this);
+      while ((e = EventQueue.dequeue_ready(event_time))) {
         ink_assert(e);
         ink_assert(e->timeout_at > 0);
         if (e->cancelled) {
           free_event(e);
         } else {
-          done_one = true;
-          process_event(e, e->callback_event);
+          done_one   = true;
+          event_time = process_event(e, e->callback_event, event_time);
         }
       }
     } while (done_one);
 
     // execute any negative (poll) events
     if (NegativeQueue.head) {
-      process_queue(&NegativeQueue, &ev_count, &nq_count);
+      event_time = process_queue(&NegativeQueue, &ev_count, &nq_count, event_time);
 
       // execute poll events
       while ((e = NegativeQueue.dequeue())) {
-        process_event(e, EVENT_POLL);
+        event_time = process_event(e, EVENT_POLL, event_time);
       }
     }
 
     next_time             = EventQueue.earliest_timeout();
-    ink_hrtime sleep_time = next_time - ink_get_hrtime();
+    ink_hrtime sleep_time = next_time - event_time;
     if (sleep_time > 0) {
       if (EventQueueExternal.localQueue.empty()) {
         sleep_time = std::min(sleep_time, HRTIME_MSECONDS(thread_max_heartbeat_mseconds));
@@ -301,17 +316,27 @@ EThread::execute_regular()
     }
 
     // drained the queue by this point
-    ink_hrtime post_drain  = ink_get_hrtime();
+    ink_hrtime post_drain  = event_time;
     ink_hrtime drain_queue = post_drain - loop_start_time;
 
+    // watchdog kick - pre-sleep
+    // Relaxed store because this EThread is the only writer and the watchdog only needs a coherent timestamp.
+    this->heartbeat_state.last_sleep.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+
     tail_cb->waitForActivity(sleep_time);
+
+    // watchdog kick - post-wake
+    // Relaxed store/fetch because the monitor thread is the single reader and per-field coherence is sufficient.
+    this->heartbeat_state.last_wake.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    this->heartbeat_state.seq.fetch_add(1, std::memory_order_relaxed);
 
     // loop cleanup
     loop_finish_time = ink_get_hrtime();
     // @a delta can be negative due to time of day adjustments (which apparently happen quite frequently). I
     // tried using the monotonic clock to get around this but it was *very* stuttery (up to hundreds
     // of milliseconds), far too much to be actually used.
-    delta = std::max<ink_hrtime>(0, loop_finish_time - loop_start_time);
+    delta           = std::max<ink_hrtime>(0, loop_finish_time - loop_start_time);
+    loop_start_time = loop_finish_time;
 
     metrics.decay();
     metrics.record_loop_time(delta);
@@ -416,4 +441,202 @@ EThread::Metrics::summarize(Metrics &global)
     global._loop_timing += _loop_timing;
     global._api_timing  += _api_timing;
   }
+}
+
+void
+EThread::set_tail_handler(LoopTailHandler *handler)
+{
+  ink_atomic_swap(&tail_cb, handler);
+}
+
+Event *
+EThread::schedule_imm(Continuation *cont, int callback_event, void *cookie)
+{
+  Event *e = ::eventAllocator.alloc();
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, 0, 0));
+}
+
+Event *
+EThread::schedule_at(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = ::eventAllocator.alloc();
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, t, 0));
+}
+
+Event *
+EThread::schedule_in(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = ::eventAllocator.alloc();
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, ink_get_hrtime() + t, 0));
+}
+
+Event *
+EThread::schedule_every(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = ::eventAllocator.alloc();
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  if (t < 0) {
+    return schedule(e->init(cont, t, t));
+  } else {
+    return schedule(e->init(cont, ink_get_hrtime() + t, t));
+  }
+}
+
+Event *
+EThread::schedule(Event *e)
+{
+  e->ethread = this;
+  if (tt != REGULAR) {
+    ink_assert(tt == DEDICATED);
+    return eventProcessor.schedule(e, ET_CALL);
+  }
+  if (e->continuation->mutex) {
+    e->mutex = e->continuation->mutex;
+  } else {
+    e->mutex = e->continuation->mutex = e->ethread->mutex;
+  }
+  ink_assert(e->mutex.get());
+
+  // Make sure client IP debugging works consistently
+  // The continuation that gets scheduled later is not always the
+  // client VC, it can be HttpCacheSM etc. so save the flags
+  e->continuation->control_flags.set_flags(get_cont_flags().get_flags());
+
+  if (e->ethread == this_ethread()) {
+    EventQueueExternal.enqueue_local(e);
+  } else {
+    EventQueueExternal.enqueue(e);
+  }
+
+  return e;
+}
+
+Event *
+EThread::schedule_imm_local(Continuation *cont, int callback_event, void *cookie)
+{
+  Event *e = EVENT_ALLOC(eventAllocator, this);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule_local(e->init(cont, 0, 0));
+}
+
+Event *
+EThread::schedule_at_local(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = EVENT_ALLOC(eventAllocator, this);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule_local(e->init(cont, t, 0));
+}
+
+Event *
+EThread::schedule_in_local(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = EVENT_ALLOC(eventAllocator, this);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule_local(e->init(cont, ink_get_hrtime() + t, 0));
+}
+
+Event *
+EThread::schedule_every_local(Continuation *cont, ink_hrtime t, int callback_event, void *cookie)
+{
+  Event *e = EVENT_ALLOC(eventAllocator, this);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  if (t < 0) {
+    return schedule_local(e->init(cont, t, t));
+  } else {
+    return schedule_local(e->init(cont, ink_get_hrtime() + t, t));
+  }
+}
+
+Event *
+EThread::schedule_local(Event *e)
+{
+  if (tt != REGULAR) {
+    ink_assert(tt == DEDICATED);
+    return eventProcessor.schedule(e, ET_CALL);
+  }
+  if (!e->mutex) {
+    e->ethread = this;
+    e->mutex   = e->continuation->mutex;
+  } else {
+    ink_assert(e->ethread == this);
+  }
+  e->globally_allocated = false;
+
+  // Make sure client IP debugging works consistently
+  // The continuation that gets scheduled later is not always the
+  // client VC, it can be HttpCacheSM etc. so save the flags
+  e->continuation->control_flags.set_flags(get_cont_flags().get_flags());
+
+  // If you need to schedule an event from a different thread, use Ethread::schedule_imm/at/in/every functions
+  ink_release_assert(this == this_ethread());
+
+  EventQueueExternal.enqueue_local(e);
+  return e;
+}
+
+Event *
+EThread::schedule_spawn(Continuation *c, int ev, void *cookie)
+{
+  ink_assert(this != this_ethread()); // really broken to call this from the same thread.
+  if (start_event) {
+    free_event(start_event);
+  }
+  start_event          = EVENT_ALLOC(eventAllocator, this);
+  start_event->ethread = this;
+  start_event->mutex   = this->mutex;
+  start_event->init(c);
+  start_event->callback_event = ev;
+  start_event->cookie         = cookie;
+  return start_event;
 }

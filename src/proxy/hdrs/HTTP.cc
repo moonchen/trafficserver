@@ -78,6 +78,7 @@ c_str_view HTTP_VALUE_COMPRESS;
 c_str_view HTTP_VALUE_DEFLATE;
 c_str_view HTTP_VALUE_GZIP;
 c_str_view HTTP_VALUE_BROTLI;
+c_str_view HTTP_VALUE_ZSTD;
 c_str_view HTTP_VALUE_IDENTITY;
 c_str_view HTTP_VALUE_KEEP_ALIVE;
 c_str_view HTTP_VALUE_MAX_AGE;
@@ -183,6 +184,7 @@ http_init()
     HTTP_VALUE_DEFLATE              = hdrtoken_string_to_wks_sv("deflate");
     HTTP_VALUE_GZIP                 = hdrtoken_string_to_wks_sv("gzip");
     HTTP_VALUE_BROTLI               = hdrtoken_string_to_wks_sv("br");
+    HTTP_VALUE_ZSTD                 = hdrtoken_string_to_wks_sv("zstd");
     HTTP_VALUE_IDENTITY             = hdrtoken_string_to_wks_sv("identity");
     HTTP_VALUE_KEEP_ALIVE           = hdrtoken_string_to_wks_sv("keep-alive");
     HTTP_VALUE_MAX_AGE              = hdrtoken_string_to_wks_sv("max-age");
@@ -1141,6 +1143,82 @@ validate_hdr_request_target(int method_wk_idx, URLImpl *url)
   return ret;
 }
 
+bool
+http_parse_host_header(std::string_view value, std::string_view &host, int &port, bool &has_port)
+{
+  swoc::TextView text{value};
+
+  host     = {};
+  port     = 0;
+  has_port = false;
+
+  text.ltrim_if(&ParseRules::is_ws);
+  text.rtrim_if(&ParseRules::is_ws);
+  if (text.empty()) {
+    return false;
+  }
+
+  if ('[' == *text) {
+    // IPv6.
+    auto const close = text.find(']');
+    if (close == swoc::TextView::npos) {
+      // No closing ']', invalid host.
+      return false;
+    }
+
+    host = {text.data(), close + 1};
+    text.remove_prefix(close + 1);
+    if (!text.empty()) {
+      if (':' != text.front()) {
+        // If there are more characters, the next one must be a colon for the port.
+        return false;
+      }
+      text.remove_prefix(1);
+      if (text.empty()) {
+        // Port is indicated but not provided.
+        return false;
+      }
+      has_port = true;
+    }
+  } else {
+    // IPv4 or hostname.
+    auto const first_colon = text.find(':');
+    if (first_colon == swoc::TextView::npos) {
+      host = text;
+    } else {
+      if (text.find(':', first_colon + 1) != swoc::TextView::npos || first_colon == 0) {
+        // Only one colon is allowed, and it can't be the first character (empty host).
+        return false;
+      }
+
+      host = {text.data(), first_colon};
+      text.remove_prefix(first_colon + 1);
+      if (text.empty()) {
+        return false;
+      }
+      has_port = true;
+    }
+  }
+
+  if (!validate_host_name(host)) {
+    return false;
+  }
+
+  if (has_port) {
+    if (text.size() > 5 || !std::all_of(text.begin(), text.end(), &ParseRules::is_digit)) {
+      // Too many characters for a port, or non-digit characters in the port.
+      return false;
+    }
+
+    port = ink_atoi(text.data(), static_cast<int>(text.size()));
+    if (port <= 0 || port > 65535) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 ParseResult
 validate_hdr_host(HTTPHdrImpl *hh)
 {
@@ -1149,26 +1227,14 @@ validate_hdr_host(HTTPHdrImpl *hh)
   if (host_field) {
     if (host_field->has_dups()) {
       ret = ParseResult::ERROR; // can't have more than 1 host field.
+    } else if (auto host{host_field->value_get()}; host.empty()) {
+      ret = ParseResult::ERROR;
     } else {
-      auto             host{host_field->value_get()};
-      std::string_view addr, port, rest;
-      if (0 == ats_ip_parse(host, &addr, &port, &rest)) {
-        if (!port.empty()) {
-          if (port.size() > 5) {
-            return ParseResult::ERROR;
-          }
-          int port_i = ink_atoi(port.data(), port.size());
-          if (port_i >= 65536 || port_i <= 0) {
-            return ParseResult::ERROR;
-          }
-        }
-        if (!validate_host_name(addr)) {
-          return ParseResult::ERROR;
-        }
-        if (ParseResult::DONE == ret && !std::all_of(rest.begin(), rest.end(), &ParseRules::is_ws)) {
-          return ParseResult::ERROR;
-        }
-      } else {
+      std::string_view parsed_host;
+      int              port     = 0;
+      bool             has_port = false;
+
+      if (!http_parse_host_header(host, parsed_host, port, has_port)) {
         ret = ParseResult::ERROR;
       }
     }
@@ -1647,21 +1713,17 @@ HTTPHdr::_fill_target_cache() const
     m_host_mime      = nullptr;
     m_host_length    = static_cast<int>(host.length());
   } else {
-    std::string_view port;
-    std::tie(m_host_mime, host, port) = const_cast<HTTPHdr *>(this)->get_host_port_values();
-    m_host_length                     = static_cast<int>(host.length());
+    m_host_mime   = const_cast<HTTPHdr *>(this)->field_find(static_cast<std::string_view>(MIME_FIELD_HOST));
+    m_host_length = 0;
+    m_port        = 0;
 
-    if (m_host_mime != nullptr) {
-      m_port = 0;
-      if (!port.empty()) {
-        for (auto c : port) {
-          if (isdigit(c)) {
-            m_port = m_port * 10 + c - '0';
-          }
-        }
-      }
-      m_port_in_header = (0 != m_port);
-      m_port           = url_canonicalize_port(url->m_url_impl->m_url_type, m_port);
+    if (m_host_mime != nullptr && http_parse_host_header(m_host_mime->value_get(), host, m_port, m_port_in_header)) {
+      m_host_length = static_cast<int>(host.length());
+      m_port        = url_canonicalize_port(url->m_url_impl->m_url_type, m_port);
+    } else {
+      m_host_mime      = nullptr;
+      m_port           = 0;
+      m_port_in_header = false;
     }
   }
 
@@ -1936,7 +1998,7 @@ HTTPHdrImpl::check_strings(HeapCheck *heaps, int num_heaps)
   }
 }
 
-ClassAllocator<HTTPCacheAlt> httpCacheAltAllocator("httpCacheAltAllocator");
+ClassAllocator<HTTPCacheAlt, false> httpCacheAltAllocator("httpCacheAltAllocator");
 
 /*-------------------------------------------------------------------------
   -------------------------------------------------------------------------*/
@@ -2150,9 +2212,16 @@ HTTPInfo::unmarshal(char *buf, int len, RefCountObj *block_ref)
   len -= HTTP_ALT_MARSHAL_SIZE;
 
   if (alt->m_frag_offset_count > HTTPCacheAlt::N_INTEGRAL_FRAG_OFFSETS) {
-    alt->m_frag_offsets  = reinterpret_cast<FragOffset *>(buf + reinterpret_cast<intptr_t>(alt->m_frag_offsets));
-    len                 -= sizeof(FragOffset) * alt->m_frag_offset_count;
-    ink_assert(len >= 0);
+    // Validate that m_frag_offset_count is sane: the fragment offset table must fit within the remaining buffer.
+    int64_t  frag_table_size = static_cast<int64_t>(sizeof(FragOffset)) * alt->m_frag_offset_count;
+    intptr_t frag_offset     = reinterpret_cast<intptr_t>(alt->m_frag_offsets);
+
+    if (frag_offset < 0 || len < frag_table_size || static_cast<int64_t>(orig_len) - frag_offset < frag_table_size) {
+      Warning("HTTPInfo::unmarshal: m_frag_offset_count or offset exceeds buffer - corrupt cache entry");
+      return -1;
+    }
+    alt->m_frag_offsets  = reinterpret_cast<FragOffset *>(buf + frag_offset);
+    len                 -= static_cast<int>(frag_table_size);
   } else if (alt->m_frag_offset_count > 0) {
     alt->m_frag_offsets = alt->m_integral_frag_offsets;
   } else {
@@ -2217,9 +2286,19 @@ HTTPInfo::unmarshal_v24_1(char *buf, int len, RefCountObj *block_ref)
   len -= HTTP_ALT_MARSHAL_SIZE;
 
   if (alt->m_frag_offset_count > HTTPCacheAlt::N_INTEGRAL_FRAG_OFFSETS) {
+    // Validate that m_frag_offset_count is sane before computing sizes.
+    int64_t  frag_table_size = static_cast<int64_t>(sizeof(FragOffset)) * alt->m_frag_offset_count;
+    int64_t  extra64         = frag_table_size - static_cast<int64_t>(sizeof(alt->m_integral_frag_offsets));
+    intptr_t frag_offset     = reinterpret_cast<intptr_t>(alt->m_frag_offsets);
+
+    if (frag_offset < 0 || len < extra64 || static_cast<int64_t>(orig_len) - frag_offset < extra64) {
+      Warning("HTTPInfo::unmarshal_v24_1: m_frag_offset_count or offset exceeds buffer - corrupt cache entry");
+      return -1;
+    }
+
     // stuff that didn't fit in the integral slots.
-    int   extra     = sizeof(FragOffset) * alt->m_frag_offset_count - sizeof(alt->m_integral_frag_offsets);
-    char *extra_src = buf + reinterpret_cast<intptr_t>(alt->m_frag_offsets);
+    int   extra     = static_cast<int>(extra64);
+    char *extra_src = buf + frag_offset;
     // Actual buffer size, which must be a power of two.
     // Well, technically not, because we never modify an unmarshalled fragment
     // offset table, but it would be a nasty bug should that be done in the

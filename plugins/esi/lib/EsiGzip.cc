@@ -30,13 +30,6 @@
 using std::string;
 using namespace EsiLib;
 
-EsiGzip::EsiGzip() : _downstream_length(0), _total_data_length(0), _crc(0)
-{
-  // Zlib _zstrm variables are initialized when they are required in runDeflateLoop
-  // coverity[uninit_member]
-  // coverity[uninit_ctor]
-}
-
 template <typename T>
 inline void
 append(string &out, T data)
@@ -112,7 +105,7 @@ EsiGzip::stream_encode(const char *data, int data_len, std::string &cdata)
 }
 
 bool
-EsiGzip::stream_finish(std::string &cdata, int &downstream_length)
+EsiGzip::stream_finish(std::string &cdata, int64_t &downstream_length)
 {
   if (_downstream_length == 0) {
     // We need to run encode first to get the gzip header inserted.

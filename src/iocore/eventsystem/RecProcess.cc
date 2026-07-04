@@ -21,15 +21,15 @@
   limitations under the License.
  */
 
+#include "records/RecProcess.h"
+#include "iocore/eventsystem/EventProcessor.h"
 #include "tscore/ink_platform.h"
 #include "tscore/EventNotify.h"
 #include "tsutil/Metrics.h"
 
 #include "iocore/eventsystem/Tasks.h"
 
-#include "P_EventSystem.h"
 #include "../../records/P_RecCore.h"
-#include "../../records/P_RecProcess.h"
 #include "../../records/P_RecMessage.h"
 #include "../../records/P_RecUtils.h"
 #include "../../records/P_RecFile.h"
@@ -45,6 +45,7 @@ static Event      *config_update_cont_event;
 static Event      *sync_cont_event;
 
 static DbgCtl dbg_ctl_statsproc{"statsproc"};
+static DbgCtl dbg_ctl_configproc{"configproc"};
 
 //-------------------------------------------------------------------------
 // Simple setters for the intervals to decouple this from the proxy
@@ -107,7 +108,7 @@ struct config_update_cont : public Continuation {
   exec_callbacks(int /* event */, Event * /* e */)
   {
     RecExecConfigUpdateCbs(REC_PROCESS_UPDATE_REQUIRED);
-    Dbg(dbg_ctl_statsproc, "config_update_cont() processed");
+    Dbg(dbg_ctl_configproc, "config_update_cont() processed");
 
     return EVENT_CONT;
   }

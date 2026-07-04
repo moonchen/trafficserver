@@ -113,7 +113,7 @@ std::optional<ConfReader> openConfig(const std::string &filename);
 class Parser
 {
 public:
-  enum class CondClause { OPER, COND, ELIF, ELSE };
+  enum class CondClause { OPER, COND, ELIF, ELSE, IF, ENDIF };
 
   Parser() = default; // No from/to URLs for this parser
   Parser(char *from_url, char *to_url) : _from_url(from_url), _to_url(to_url) {}
@@ -165,6 +165,18 @@ public:
     return _clause == CondClause::ELIF;
   }
 
+  bool
+  is_if() const
+  {
+    return _clause == CondClause::IF;
+  }
+
+  bool
+  is_endif() const
+  {
+    return _clause == CondClause::ENDIF;
+  }
+
   const std::string &
   get_op() const
   {
@@ -183,11 +195,21 @@ public:
     return _val;
   }
 
+  // Check if the modifier exists and consume it from the list.
   bool
-  mod_exist(const std::string &m) const
+  consume_mod(const std::string &m)
   {
-    return std::find(_mods.begin(), _mods.end(), m) != _mods.end();
+    auto it = std::find(_mods.begin(), _mods.end(), m);
+
+    if (it != _mods.end()) {
+      _mods.erase(it);
+      return true;
+    }
+    return false;
   }
+
+  // Validate that all modifiers were consumed; logs error and returns false if not
+  bool validate_mods() const;
 
   bool cond_is_hook(TSHttpHookID &hook) const;
 

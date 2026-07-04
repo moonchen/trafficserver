@@ -35,11 +35,13 @@
 #include "proxy/ControlMatcher.h"
 #include "records/RecProcess.h"
 #include "tscore/ConsistentHash.h"
+#include "tscore/Hash.h"
 #include "tscore/Tokenizer.h"
 #include "tscore/ink_apidefs.h"
 #include "proxy/HostStatus.h"
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 #define MAX_PARENTS           64
@@ -72,6 +74,8 @@ enum class ParentRetry_t {
   // both simple and unavailable server retry
   BOTH = 3
 };
+
+enum class ParentHashAlgorithm { SIPHASH24 = 0, SIPHASH13 };
 
 struct UnavailableServerResponseCodes {
   UnavailableServerResponseCodes(char *val);
@@ -163,6 +167,11 @@ public:
   int                             max_unavailable_server_retries     = 1;
   int                             secondary_mode                     = 1;
   bool                            ignore_self_detect                 = false;
+  bool                            host_override                      = false;
+  ParentHashAlgorithm             consistent_hash_algorithm          = ParentHashAlgorithm::SIPHASH24;
+  uint64_t                        consistent_hash_seed0              = 0;
+  uint64_t                        consistent_hash_seed1              = 0;
+  int consistent_hash_replicas = 1024; // Number of virtual nodes per host (int to match ATSConsistentHash constructor)
 };
 
 // If the parent was set by the external customer api,
@@ -232,6 +241,20 @@ struct ParentResult {
   retry_type() const
   {
     return is_api_result() ? ParentRetry_t::NONE : rec->parent_retry;
+  }
+
+  bool
+  host_override() const
+  {
+    if (is_api_result()) {
+      return false;
+    }
+
+    if (!is_some()) {
+      return false;
+    }
+
+    return rec->host_override;
   }
 
   unsigned
@@ -422,7 +445,7 @@ class HttpRequestData;
 struct ParentConfig {
 public:
   static void startup();
-  static void reconfigure();
+  static void reconfigure(ConfigContext ctx = {});
   static void print();
   static void set_parent_table(P_table *pTable, ParentRecord *rec, int num_elements);
 
@@ -443,6 +466,10 @@ public:
 
 // Helper Functions
 ParentRecord *createDefaultParent(char *val);
+
+// Hash utility functions
+ParentHashAlgorithm        parseHashAlgorithm(std::string_view name);
+std::unique_ptr<ATSHash64> createHashInstance(ParentHashAlgorithm algo, uint64_t seed0, uint64_t seed1);
 
 // Unit Test Functions
 void show_result(ParentResult *aParentResult);

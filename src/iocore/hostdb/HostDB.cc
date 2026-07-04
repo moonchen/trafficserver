@@ -21,6 +21,7 @@
   limitations under the License.
  */
 
+#include "iocore/hostdb/HostDBProcessor.h"
 #include "swoc/swoc_file.h"
 #include "tscore/Regression.h"
 #include "tsutil/ts_bw_format.h"
@@ -71,7 +72,7 @@ static swoc::file::path hostdb_hostfile_path;
 int                     hostdb_disable_reverse_lookup = 0;
 int                     hostdb_max_iobuf_index        = BUFFER_SIZE_INDEX_32K;
 
-ClassAllocator<HostDBContinuation> hostDBContAllocator("hostDBContAllocator");
+ClassAllocator<HostDBContinuation, false> hostDBContAllocator("hostDBContAllocator");
 
 namespace
 {
@@ -279,9 +280,9 @@ HostDBCache::start(int flags)
   }
 
   // Setup the ref-counted cache (this must be done regardless of syncing or not).
-  this->refcountcache = new RefCountCache<HostDBRecord>(hostdb_partitions, hostdb_max_size, hostdb_max_count, HostDBRecord::Version,
-                                                        "proxy.process.hostdb.cache.");
-  this->pending_dns   = new Queue<HostDBContinuation, Continuation::Link_link>[hostdb_partitions];
+  this->refcountcache =
+    new RefCountCache<HostDBRecord>(hostdb_partitions, hostdb_max_size, hostdb_max_count, "proxy.process.hostdb.cache.");
+  this->pending_dns       = new Queue<HostDBContinuation, Continuation::Link_link>[hostdb_partitions];
   this->remoteHostDBQueue = new Queue<HostDBContinuation, Continuation::Link_link>[hostdb_partitions];
   return 0;
 }
@@ -433,7 +434,7 @@ probe_ip(HostDBHash const &hash)
     Dbg(dbg_ctl_hostdb, "DNS %.*s", int(hash.host_name.size()), hash.host_name.data());
     IpAddr tip;
     if (0 == tip.load(hash.host_name)) {
-      result            = HostDBRecord::Handle{HostDBRecord::alloc(hash.host_name, 1)};
+      result            = HostDBRecord::Handle{HostDBRecord::alloc(hash.host_name, 1, 0, hash.port)};
       result->af_family = tip.family();
       auto &info        = result->rr_info()[0];
       info.assign(tip);
@@ -740,20 +741,17 @@ HostDBContinuation::lookup_done(TextView query_name, ts_seconds answer_ttl, SRVH
   if (query_name.empty()) {
     if (hash.is_byname()) {
       Dbg(dbg_ctl_hostdb, "lookup_done() failed for '%.*s'", int(hash.host_name.size()), hash.host_name.data());
+      record->record_type = HostDBType::ADDR;
     } else if (hash.is_srv()) {
       Dbg(dbg_ctl_dns_srv, "SRV failed for '%.*s'", int(hash.host_name.size()), hash.host_name.data());
+      record->record_type = HostDBType::SRV;
     } else {
       ip_text_buffer b;
       Dbg(dbg_ctl_hostdb, "failed for %s", hash.ip.toString(b, sizeof b));
+      record->record_type = HostDBType::HOST;
     }
     record->ip_timestamp        = hostdb_current_timestamp;
     record->ip_timeout_interval = ts_seconds(std::clamp(hostdb_ip_fail_timeout_interval, 1u, HOST_DB_MAX_TTL));
-
-    if (hash.is_srv()) {
-      record->record_type = HostDBType::SRV;
-    } else if (!hash.is_byname()) {
-      record->record_type = HostDBType::HOST;
-    }
 
     record->set_failed();
 
@@ -785,6 +783,7 @@ HostDBContinuation::lookup_done(TextView query_name, ts_seconds answer_ttl, SRVH
 
     if (hash.is_byname()) {
       Dbg_bw(dbg_ctl_hostdb, "done {} TTL {}", hash.host_name, answer_ttl);
+      record->record_type = HostDBType::ADDR;
     } else if (hash.is_srv()) {
       ink_assert(srv && srv->hosts.size() && srv->hosts.size() <= hostdb_round_robin_max_count);
 
@@ -920,7 +919,7 @@ HostDBContinuation::dnsEvent(int event, HostEnt *e)
 
     // In the event that the lookup failed (SOA response-- for example) we want to use hash.host_name, since it'll be ""
     TextView query_name = (failed || !hash.host_name.empty()) ? hash.host_name : TextView{e->ent.h_name, strlen(e->ent.h_name)};
-    HostDBRecord::Handle r{HostDBRecord::alloc(query_name, valid_records, failed ? 0 : e->srv_hosts.srv_hosts_length)};
+    HostDBRecord::Handle r{HostDBRecord::alloc(query_name, valid_records, failed ? 0 : e->srv_hosts.srv_hosts_length, hash.port)};
     r->key              = hash.hash.fold(); // always set the key
     r->af_family        = af;
     r->flags.f.failed_p = failed;
@@ -1318,14 +1317,16 @@ HostDBRecord::select_best_http(ts_time now, ts_seconds fail_window, sockaddr con
       // Starting at the current target, search for a valid one.
       for (unsigned short i = 0; i < rr_count; i++) {
         auto target = &info[this->rr_idx(i)];
-        if (target->select(now, fail_window)) {
+        if (!target->is_down(now, fail_window)) {
           best_alive = target;
           break;
         }
       }
     }
   } else {
-    best_alive = &info[0];
+    if (!info[0].is_down(now, fail_window)) {
+      best_alive = &info[0];
+    }
   }
 
   return best_alive;
@@ -1543,7 +1544,7 @@ HostDBRecord::free()
 }
 
 HostDBRecord *
-HostDBRecord::alloc(TextView query_name, unsigned int rr_count, size_t srv_name_size)
+HostDBRecord::alloc(TextView query_name, unsigned int rr_count, size_t srv_name_size, in_port_t port)
 {
   const swoc::Scalar<8, ssize_t> qn_size = round_up(query_name.size() + 1);
   const swoc::Scalar<8, ssize_t> r_size  = round_up(sizeof(self_type) + qn_size + rr_count * sizeof(HostDBInfo) + srv_name_size);
@@ -1555,6 +1556,7 @@ HostDBRecord::alloc(TextView query_name, unsigned int rr_count, size_t srv_name_
   new (self) self_type();
   self->_iobuffer_index = iobuffer_index;
   self->_record_size    = r_size;
+  self->_port           = port;
 
   Dbg(dbg_ctl_hostdb, "allocating %ld bytes for %.*s with %d RR records at [%p]", r_size.value(), int(query_name.size()),
       query_name.data(), rr_count, self);
@@ -1570,22 +1572,6 @@ HostDBRecord::alloc(TextView query_name, unsigned int rr_count, size_t srv_name_
     new (&info) std::remove_reference_t<decltype(info)>;
   }
 
-  return self;
-}
-
-HostDBRecord::self_type *
-HostDBRecord::unmarshall(char *buff, unsigned size)
-{
-  if (size < sizeof(self_type)) {
-    return nullptr;
-  }
-  auto src = reinterpret_cast<self_type *>(buff);
-  ink_release_assert(size == src->_record_size);
-  auto ptr  = ioBufAllocator[src->_iobuffer_index].alloc_void();
-  auto self = static_cast<self_type *>(ptr);
-  new (self) self_type();
-  auto delta = sizeof(RefCountObj); // skip the VFTP and ref count.
-  memcpy(static_cast<std::byte *>(ptr) + delta, buff + delta, size - delta);
   return self;
 }
 
@@ -1615,23 +1601,22 @@ HostDBRecord::select_best_srv(char *target, InkRand *rand, ts_time now, ts_secon
 {
   ink_assert(rr_count <= 0 || static_cast<unsigned int>(rr_count) < hostdb_round_robin_max_count);
 
-  int         i      = 0;
   int         live_n = 0;
   uint32_t    weight = 0, p = INT32_MAX;
   HostDBInfo *result = nullptr;
   auto        rr     = this->rr_info();
   // Array of live targets, sized by @a live_n
   HostDBInfo *live[rr.count()];
-  for (auto &target : rr) {
+  for (auto &rr_target : rr) {
     // skip down targets.
-    if (rr[i].is_down(now, fail_window)) {
+    if (rr_target.is_down(now, fail_window)) {
       continue;
     }
 
-    if (target.data.srv.srv_priority <= p) {
-      p               = target.data.srv.srv_priority;
-      weight         += target.data.srv.srv_weight;
-      live[live_n++]  = &target;
+    if (rr_target.data.srv.srv_priority <= p) {
+      p               = rr_target.data.srv.srv_priority;
+      weight         += rr_target.data.srv.srv_weight;
+      live[live_n++]  = &rr_target;
     } else {
       break;
     }
@@ -1641,7 +1626,8 @@ HostDBRecord::select_best_srv(char *target, InkRand *rand, ts_time now, ts_secon
     result = this->select_next_rr(now, fail_window);
   } else {
     uint32_t xx = rand->random() % weight;
-    for (i = 0; i < live_n - 1 && xx >= live[i]->data.srv.srv_weight; ++i) {
+    int      i  = 0;
+    for (; i < live_n - 1 && xx >= live[i]->data.srv.srv_weight; ++i) {
       xx -= live[i]->data.srv.srv_weight;
     }
 
@@ -1661,7 +1647,7 @@ HostDBRecord::select_next_rr(ts_time now, ts_seconds fail_window)
   auto rr_info = this->rr_info();
   for (unsigned idx = 0, limit = rr_info.count(); idx < limit; ++idx) {
     auto &target = rr_info[this->next_rr()];
-    if (target.select(now, fail_window)) {
+    if (!target.is_down(now, fail_window)) {
       return &target;
     }
   }
@@ -1720,13 +1706,19 @@ ResolveInfo::set_active(HostDBInfo *info)
 }
 
 bool
-ResolveInfo::select_next_rr()
+ResolveInfo::select_next_rr(ts_time now, ts_seconds fail_window)
 {
   if (active) {
     if (auto rr_info{this->record->rr_info()}; rr_info.count() > 1) {
-      unsigned limit = active - rr_info.data(), idx = (limit + 1) % rr_info.count();
-      while ((idx = (idx + 1) % rr_info.count()) != limit && !rr_info[idx].is_alive()) {}
-      active = &rr_info[idx];
+      const unsigned limit = active - rr_info.data();
+      size_t         idx   = (limit + 1) % rr_info.count();
+      for (; idx != limit; idx = (idx + 1) % rr_info.count()) {
+        if (!rr_info[idx].is_down(now, fail_window)) {
+          active = &rr_info[idx];
+          break;
+        }
+      }
+
       return idx != limit; // if the active record was actually changed.
     }
   }

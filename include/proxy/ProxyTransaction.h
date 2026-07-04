@@ -24,6 +24,7 @@
 #pragma once
 
 #include "proxy/ProxySession.h"
+#include <cstdint>
 #include <string_view>
 
 class HttpSM;
@@ -128,6 +129,13 @@ public:
   PoolableSession    *get_server_session() const;
   HttpSM             *get_sm() const;
 
+  void            set_verified_client_addr(const sockaddr *addr);
+  sockaddr const *get_verified_client_addr() const;
+
+  // this is the client address for the transaction, which may not be the same as the connection remote address
+  sockaddr const *get_client_addr() const;
+  uint16_t        get_client_port() const;
+
   // This function must return a non-negative number that is different for two in-progress transactions with the same proxy_ssn
   // session.
   //
@@ -137,6 +145,20 @@ public:
   bool support_sni() const;
 
   void mark_as_tunnel_endpoint() override;
+
+  /** Emit a best-effort access log entry for a request without an HttpSM.
+   *
+   * Call this when a malformed request is rejected at the protocol layer
+   * (e.g. during HTTP/2 or HTTP/3 header decoding) and no HttpSM was
+   * created.  The method populates a NonHttpSmLogData from the
+   * session and the partially decoded request, then invokes Log::access.
+   * If an HttpSM exists, callers should use the normal transaction logging
+   * path instead.
+   *
+   * @param[in] request The decoded (possibly partial) request header.
+   * @param[in] protocol_str Protocol string for the log entry (e.g. "http/2").
+   */
+  void log_non_http_sm_access(HTTPHdr const *request, const char *protocol_str);
 
   /// Variables
   //
@@ -150,6 +172,7 @@ protected:
   IOBufferReader *_reader    = nullptr;
 
 private:
+  struct sockaddr_storage _verified_addr = {};
 };
 
 ////////////////////////////////////////////////////////////
@@ -323,5 +346,33 @@ ProxyTransaction::get_remote_addr() const
     return _proxy_ssn->get_remote_addr();
   } else {
     return nullptr;
+  }
+}
+
+inline struct sockaddr const *
+ProxyTransaction::get_verified_client_addr() const
+{
+  return reinterpret_cast<const struct sockaddr *>(&_verified_addr);
+}
+
+inline sockaddr const *
+ProxyTransaction::get_client_addr() const
+{
+  return _proxy_ssn ? _proxy_ssn->get_client_addr() : nullptr;
+}
+
+inline uint16_t
+ProxyTransaction::get_client_port() const
+{
+  return _proxy_ssn ? _proxy_ssn->get_client_port() : 0;
+}
+
+inline void
+ProxyTransaction::set_verified_client_addr(const sockaddr *addr)
+{
+  if (addr->sa_family == AF_INET) {
+    memcpy(&_verified_addr, addr, sizeof(struct sockaddr_in));
+  } else {
+    memcpy(&_verified_addr, addr, sizeof(struct sockaddr_in6));
   }
 }

@@ -22,9 +22,9 @@
 #include "P_RefCountCache.h"
 
 // Since the hashing values are all fixed size, we can simply use a classAllocator to avoid mallocs
-static ClassAllocator<RefCountCacheHashEntry> refCountCacheHashingValueAllocator("refCountCacheHashingValueAllocator");
+static ClassAllocator<RefCountCacheHashEntry, false> refCountCacheHashingValueAllocator("refCountCacheHashingValueAllocator");
 
-ClassAllocator<PriorityQueueEntry<RefCountCacheHashEntry *>> expiryQueueEntry("expiryQueueEntry");
+ClassAllocator<PriorityQueueEntry<RefCountCacheHashEntry *>, false> expiryQueueEntry("expiryQueueEntry");
 
 RefCountCacheHashEntry *
 RefCountCacheHashEntry::alloc()
@@ -37,17 +37,3 @@ RefCountCacheHashEntry::dealloc(RefCountCacheHashEntry *e)
 {
   return refCountCacheHashingValueAllocator.free(e);
 }
-
-RefCountCacheHeader::RefCountCacheHeader(ts::VersionNumber object_version) : object_version(object_version){};
-
-bool
-RefCountCacheHeader::operator==(RefCountCacheHeader const &that) const
-{
-  return this->magic == that.magic && this->version == that.version;
-}
-
-bool
-RefCountCacheHeader::compatible(RefCountCacheHeader *that) const
-{
-  return this->magic == that->magic && this->version == that->version && this->object_version == that->version;
-};

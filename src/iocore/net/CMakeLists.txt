@@ -19,7 +19,8 @@ add_library(
   inknet STATIC
   ALPNSupport.cc
   AsyncSignalEventIO.cc
-  BIO_fastopen.cc
+  AsyncTLSEventIO.cc
+  BIO_MIOBuffer.cc
   BoringSSLUtils.cc
   Connection.cc
   ConnectionTracker.cc
@@ -61,6 +62,8 @@ add_library(
   TLSSessionResumptionSupport.cc
   TLSSNISupport.cc
   TLSTunnelSupport.cc
+  TunnelNetVConnection.cc
+  TLSCertCompression.cc
   UDPEventIO.cc
   UDPIOEvent.cc
   UnixConnection.cc
@@ -109,12 +112,27 @@ target_link_libraries(
          OpenSSL::Crypto
          OpenSSL::SSL
          ts::tsapibackend
-  PRIVATE ts::tsutil yaml-cpp::yaml-cpp
+  PRIVATE ts::config ts::tsutil yaml-cpp::yaml-cpp
 )
 
 # Is this necessary?
 if(TS_USE_LINUX_IO_URING)
   target_link_libraries(inknet PUBLIC ts::inkuring)
+endif()
+
+# Link cert compression libraries after OpenSSL so that OpenSSL include
+# directories appear first in the search order, preventing broad system
+# include paths (e.g. from Homebrew's zstd) from shadowing them.
+if(HAVE_SSL_CTX_ADD_CERT_COMPRESSION_ALG)
+  target_sources(inknet PRIVATE TLSCertCompression_zlib.cc)
+  if(HAVE_BROTLI_ENCODE_H)
+    target_sources(inknet PRIVATE TLSCertCompression_brotli.cc)
+    target_link_libraries(inknet PRIVATE brotli::brotlienc brotli::brotlidec)
+  endif()
+  if(HAVE_ZSTD_H)
+    target_sources(inknet PRIVATE TLSCertCompression_zstd.cc)
+    target_link_libraries(inknet PRIVATE zstd::zstd)
+  endif()
 endif()
 
 if(BUILD_TESTING)
@@ -180,6 +198,10 @@ if(BUILD_TESTING)
     # see remap_test_dlopen_leak_suppression.txt for more info.
     set_tests_properties(test_net PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_odr_violation=0")
   endif()
+
+  add_executable(test_BIO_MIOBuffer BIO_MIOBuffer.cc unit_tests/test_BIO_MIOBuffer.cc)
+  target_link_libraries(test_BIO_MIOBuffer PRIVATE ts::inkevent ts::tscore libswoc::libswoc Catch2::Catch2WithMain)
+  add_catch2_test(NAME test_BIO_MIOBuffer COMMAND test_BIO_MIOBuffer)
 endif()
 
 clang_tidy_check(inknet)

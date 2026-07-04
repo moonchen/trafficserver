@@ -26,10 +26,12 @@
 #include <unordered_map>
 #include <string_view>
 #include <string>
+#include <charconv>
 
 #include "iocore/net/NetVConnection.h"
 #include "iocore/net/NetHandler.h"
 #include "iocore/net/UDPNet.h"
+#include "tscore/ink_config.h"
 #include "tscore/ink_platform.h"
 #include "tscore/ink_base64.h"
 #include "tscore/Encoding.h"
@@ -49,6 +51,7 @@
 #include "proxy/PoolableSession.h"
 #include "proxy/http/HttpSM.h"
 #include "proxy/http/HttpConfig.h"
+#include "proxy/http/OverridableConfigDefs.h"
 #include "proxy/PluginHttpConnect.h"
 #include "../iocore/net/P_Net.h"
 #include "../iocore/net/P_UnixNet.h"
@@ -65,6 +68,7 @@
 #include "iocore/net/SSLAPIHooks.h"
 #include "iocore/net/SSLDiags.h"
 #include "iocore/net/TLSBasicSupport.h"
+#include "iocore/net/TLSSNISupport.h"
 #include "iocore/eventsystem/ConfigProcessor.h"
 #include "proxy/Plugin.h"
 #include "proxy/logging/LogObject.h"
@@ -89,6 +93,7 @@
 
 #include "mgmt/rpc/jsonrpc/JsonRPC.h"
 #include <swoc/bwf_base.h>
+#include <swoc/IPRange.h>
 #include "ts/ts.h"
 
 /****************************************************************
@@ -129,23 +134,20 @@ static ts::Metrics &global_api_metrics = ts::Metrics::instance();
 ConfigUpdateCbTable *global_config_cbs = nullptr;
 
 // Fetchpages SM
-extern ClassAllocator<FetchSM> FetchSMAllocator;
+extern ClassAllocator<FetchSM, false> FetchSMAllocator;
 
 /* From proxy/http/HttpProxyServerMain.c: */
 extern bool ssl_register_protocol(const char *, Continuation *);
 
-extern SSLSessionCache *session_cache; // declared extern in P_SSLConfig.h
-
 // External converters.
 extern MgmtConverter const &HttpDownServerCacheTimeConv;
 
-extern HttpSessionAccept                 *plugin_http_accept;
-extern HttpSessionAccept                 *plugin_http_transparent_accept;
-extern thread_local PluginThreadContext  *pluginThreadContext;
-static ClassAllocator<APIHook>            apiHookAllocator("apiHookAllocator");
-extern ClassAllocator<INKContInternal>    INKContAllocator;
-extern ClassAllocator<INKVConnInternal>   INKVConnAllocator;
-static ClassAllocator<MIMEFieldSDKHandle> mHandleAllocator("MIMEFieldSDKHandle");
+extern HttpSessionAccept                        *plugin_http_accept;
+extern HttpSessionAccept                        *plugin_http_transparent_accept;
+extern thread_local PluginThreadContext         *pluginThreadContext;
+extern ClassAllocator<INKContInternal, false>    INKContAllocator;
+extern ClassAllocator<INKVConnInternal, false>   INKVConnAllocator;
+static ClassAllocator<MIMEFieldSDKHandle, false> mHandleAllocator("MIMEFieldSDKHandle");
 
 // forward declarations
 TSReturnCode sdk_sanity_check_null_ptr(void const *ptr);
@@ -2930,7 +2932,7 @@ TSHttpHdrStatusGet(TSMBuffer bufp, TSMLoc obj)
 }
 
 TSReturnCode
-TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc obj, TSHttpStatus status)
+TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc obj, TSHttpStatus status, TSHttpTxn txnp, std::string_view setter)
 {
   // Allow to modify the buffer only
   // if bufp is modifiable. If bufp is not modifiable return
@@ -2948,7 +2950,19 @@ TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc obj, TSHttpStatus status)
   SET_HTTP_HDR(h, bufp, obj);
   ink_assert(static_cast<HdrHeapObjType>(h.m_http->m_type) == HdrHeapObjType::HTTP_HEADER);
   h.status_set(static_cast<HTTPStatus>(status));
+
+  if (txnp != nullptr && !setter.empty()) {
+    sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+    HttpSM *sm                               = reinterpret_cast<HttpSM *>(txnp);
+    sm->t_state.http_return_code_setter_name = setter;
+  }
   return TS_SUCCESS;
+}
+
+TSReturnCode
+TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc obj, TSHttpStatus status)
+{
+  return TSHttpHdrStatusSet(bufp, obj, status, nullptr, std::string_view{});
 }
 
 const char *
@@ -4289,6 +4303,37 @@ TSHttpTxnCacheLookupStatusSet(TSHttpTxn txnp, int cachelookup)
 }
 
 TSReturnCode
+TSHttpTxnVerifiedAddrSet(TSHttpTxn txnp, const struct sockaddr *addr)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)addr) == TS_SUCCESS);
+
+  HttpSM           *sm     = reinterpret_cast<HttpSM *>(txnp);
+  ProxyTransaction *prxtxn = sm->get_ua_txn();
+
+  prxtxn->set_verified_client_addr(addr);
+
+  return TS_SUCCESS;
+}
+
+TSReturnCode
+TSHttpTxnVerifiedAddrGet(TSHttpTxn txnp, const struct sockaddr **addr)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)addr) == TS_SUCCESS);
+
+  HttpSM           *sm     = reinterpret_cast<HttpSM *>(txnp);
+  ProxyTransaction *prxtxn = sm->get_ua_txn();
+
+  *addr = prxtxn->get_verified_client_addr();
+  if ((*addr)->sa_family == AF_UNSPEC) {
+    return TS_ERROR;
+  }
+
+  return TS_SUCCESS;
+}
+
+TSReturnCode
 TSHttpTxnInfoIntGet(TSHttpTxn txnp, TSHttpTxnInfoKey key, TSMgmtInt *value)
 {
   sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
@@ -4429,6 +4474,35 @@ TSHttpTxnCacheLookupUrlSet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc obj)
     l_url->copy(&u);
   }
 
+  return TS_SUCCESS;
+}
+
+TSReturnCode
+TSHttpTxnCacheKeyDigestGet(TSHttpTxn txnp, char *buffer, int *length)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(length != nullptr);
+
+  HttpSM           *sm              = reinterpret_cast<HttpSM *>(txnp);
+  const CryptoHash &hash            = sm->get_cache_sm().get_cache_key().hash;
+  constexpr int     size            = CRYPTO_HASH_SIZE;
+  int               provided_length = *length;
+
+  *length = size;
+
+  if (hash.is_zero()) {
+    return TS_ERROR;
+  }
+
+  if (buffer == nullptr) {
+    return TS_SUCCESS;
+  }
+
+  if (provided_length < size) {
+    return TS_ERROR;
+  }
+
+  memcpy(buffer, hash.u8, size);
   return TS_SUCCESS;
 }
 
@@ -4648,7 +4722,7 @@ TSHttpSsnClientAddrGet(TSHttpSsn ssnp)
   if (cs == nullptr) {
     return nullptr;
   }
-  return cs->get_remote_addr();
+  return cs->get_client_addr();
 }
 sockaddr const *
 TSHttpTxnClientAddrGet(TSHttpTxn txnp)
@@ -4949,6 +5023,59 @@ TSHttpTxnServerRequestBodySet(TSHttpTxn txnp, char *buf, int64_t buflength)
   s->internal_msg_buffer_fast_allocator_size = -1;
 }
 
+void const *
+TSHttpTxnNextHopStrategyGet(TSHttpTxn txnp)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+
+  auto sm = reinterpret_cast<HttpSM const *>(txnp);
+
+  return static_cast<void *>(sm->t_state.next_hop_strategy);
+}
+
+void
+TSHttpTxnNextHopStrategySet(TSHttpTxn txnp, void const *stratptr)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  // null strategy falls back to parent.config
+  // sdk_assert(sdk_sanity_check_null_ptr(strategy) == TS_SUCCESS);
+
+  auto sm       = reinterpret_cast<HttpSM *>(txnp);
+  auto strategy = reinterpret_cast<NextHopSelectionStrategy const *>(stratptr);
+
+  sm->t_state.next_hop_strategy = const_cast<NextHopSelectionStrategy *>(strategy);
+}
+
+char const *
+TSHttpNextHopStrategyNameGet(void const *stratptr)
+{
+  char const *name = nullptr;
+  if (nullptr != stratptr) {
+    auto strategy = reinterpret_cast<NextHopSelectionStrategy const *>(stratptr);
+    name          = strategy->strategy_name.c_str();
+  }
+
+  return name;
+}
+
+void const *
+TSHttpTxnNextHopNamedStrategyGet(TSHttpTxn txnp, const char *name)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)name) == TS_SUCCESS);
+
+  auto sm = reinterpret_cast<HttpSM const *>(txnp);
+
+  sdk_assert(sdk_sanity_check_null_ptr((void *)sm->m_remap) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)sm->m_remap->strategyFactory) == TS_SUCCESS);
+
+  // HttpSM has a reference count handle to UrlRewrite which has a
+  // pointer to NextHopStrategyFactory
+  NextHopSelectionStrategy const *const strat = sm->m_remap->strategyFactory->strategyInstance(name);
+
+  return static_cast<void const *>(strat);
+}
+
 TSReturnCode
 TSHttpTxnParentProxyGet(TSHttpTxn txnp, const char **hostname, int *port)
 {
@@ -5212,12 +5339,22 @@ TSUserArgGet(void *data, int arg_idx)
 }
 
 void
-TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status)
+TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status, std::string_view setter)
 {
   sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
 
   HttpSM *sm                   = reinterpret_cast<HttpSM *>(txnp);
   sm->t_state.http_return_code = static_cast<HTTPStatus>(status);
+
+  if (!setter.empty()) {
+    sm->t_state.http_return_code_setter_name = setter;
+  }
+}
+
+void
+TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status)
+{
+  TSHttpTxnStatusSet(txnp, status, std::string_view{});
 }
 
 TSHttpStatus
@@ -5436,7 +5573,7 @@ TSVConnIsSslReused(TSVConn sslp)
   NetVConnection    *vc     = reinterpret_cast<NetVConnection *>(sslp);
   SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(vc);
 
-  return ssl_vc ? ssl_vc->getSSLSessionCacheHit() : 0;
+  return ssl_vc ? ssl_vc->getIsResumedSSLSession() : 0;
 }
 
 const char *
@@ -6061,6 +6198,14 @@ TSNetVConnRemoteAddrGet(TSVConn connp)
   return vc->get_remote_addr();
 }
 
+sockaddr const *
+TSNetVConnClientAddrGet(TSVConn connp)
+{
+  sdk_assert(sdk_sanity_check_iocore_structure(connp) == TS_SUCCESS);
+  NetVConnection *vc = reinterpret_cast<NetVConnection *>(connp);
+  return vc->get_effective_remote_addr();
+}
+
 TSAction
 TSNetConnect(TSCont contp, sockaddr const *addr)
 {
@@ -6101,7 +6246,13 @@ TSNetConnectTransparent(TSCont contp, sockaddr const *client_addr, sockaddr cons
 TSCont
 TSNetInvokingContGet(TSVConn conn)
 {
-  NetVConnection     *vc     = reinterpret_cast<NetVConnection *>(conn);
+  NetVConnection *vc = reinterpret_cast<NetVConnection *>(conn);
+  // NOTE: post-refactor an SSLNetVConnection is no longer a UnixNetVConnection,
+  // so this dynamic_cast yields null for an SSL VC and the function returns
+  // nullptr. No in-tree path hands a plugin an SSL outbound VC today (plugin
+  // connects route through unix_netProcessor), so this is latent. If a
+  // TLS-capable plugin connect API is added, give SSLNetVConnection a
+  // get_action() returning its own _action and branch here on the VC type.
   UnixNetVConnection *net_vc = dynamic_cast<UnixNetVConnection *>(vc);
   TSCont              ret    = nullptr;
   if (net_vc) {
@@ -6951,11 +7102,13 @@ TSAIORead(int fd, off_t offset, char *buf, size_t buffSize, TSCont contp)
   pAIO->aiocb.aio_buf = buf;
   pAIO->action        = pCont;
   pAIO->thread        = pCont->mutex->thread_holding;
+  pAIO->from_ts_api   = true;
 
   if (ink_aio_read(pAIO, 1) == 1) {
     return TS_SUCCESS;
   }
 
+  delete pAIO;
   return TS_ERROR;
 }
 
@@ -6990,11 +7143,13 @@ TSAIOWrite(int fd, off_t offset, char *buf, const size_t bufSize, TSCont contp)
   pAIO->aiocb.aio_nbytes = bufSize;
   pAIO->action           = pCont;
   pAIO->thread           = pCont->mutex->thread_holding;
+  pAIO->from_ts_api      = true;
 
   if (ink_aio_write(pAIO, 1) == 1) {
     return TS_SUCCESS;
   }
 
+  delete pAIO;
   return TS_ERROR;
 }
 
@@ -7097,7 +7252,109 @@ _memberp_to_generic(MgmtFloat *ptr, MgmtConverter const *&conv) -> typename std:
   return ptr;
 }
 
-// Little helper function to find the struct member
+/**
+ * X-Macro Dispatch for _conf_to_memberp()
+ *
+ * Don't be intimidated by the macros below - they're simpler than they look!
+ * The end result is just a switch statement with one case per config, like:
+ *
+ *   switch (conf) {
+ *     case TS_CONFIG_HTTP_CHUNKING_ENABLED:
+ *       ret = _memberp_to_generic(&overridableHttpConfig->chunking_enabled, conv);
+ *       break;
+ *     case TS_CONFIG_HTTP_DOWN_SERVER_CACHE_TIME:
+ *       conv = &HttpDownServerCacheTimeConv;
+ *       ret = &overridableHttpConfig->down_server_timeout;
+ *       break;
+ *     // ... ~130 more cases, one per overridable config ...
+ *   }
+ *
+ * The macros just auto-generate these cases from OverridableConfigDefs.h so we
+ * don't have to maintain them by hand. Here's how an entry becomes a case:
+ *
+ * Example 1 - Standard config (GENERIC converter):
+ *   Entry in OverridableConfigDefs.h:
+ *     X(HTTP_CHUNKING_ENABLED, chunking_enabled, "...", INT, GENERIC)
+ *   Generates this case:
+ *     case TS_CONFIG_HTTP_CHUNKING_ENABLED:
+ *       ret = _memberp_to_generic(&overridableHttpConfig->chunking_enabled, conv);
+ *       break;
+ *
+ * Example 2 - Custom converter:
+ *   Entry in OverridableConfigDefs.h:
+ *     X(HTTP_DOWN_SERVER_CACHE_TIME, down_server_timeout, "...", INT, HttpDownServerCacheTimeConv)
+ *   Generates this case:
+ *     case TS_CONFIG_HTTP_DOWN_SERVER_CACHE_TIME:
+ *       conv = &HttpDownServerCacheTimeConv;
+ *       ret = &overridableHttpConfig->down_server_timeout;
+ *       break;
+ *
+ * The magic is in _CONF_CASE_DISPATCH which uses the CONV parameter (5th field)
+ * to select which _CONF_CASE_* macro generates the case. Token pasting (##)
+ * turns "GENERIC" into _CONF_CASE_GENERIC, "NONE" into _CONF_CASE_NONE, etc.
+ *
+ * Built-in converter types:
+ *   - GENERIC: Auto-selects converter based on member type (most common).
+ *   - NONE: No-op for configs handled elsewhere (e.g., SSL strings).
+ *   - Custom: Any other name maps to a _CONF_CASE_<name> macro defined below.
+ *
+ * To add a new custom converter:
+ *   1. Define your MgmtConverter (e.g., MyConv with load/store lambdas).
+ *   2. Add a macro here following this pattern:
+ *        #define _CONF_CASE_MyConv(KEY, MEMBER) \
+ *          case TS_CONFIG_##KEY: conv = &MyConv; \
+ *            ret = &overridableHttpConfig->MEMBER; break;
+ *   3. Add #undef _CONF_CASE_MyConv after _conf_to_memberp().
+ *   4. Use "MyConv" as the CONV parameter in OverridableConfigDefs.h.
+ */
+
+// clang-format off
+
+// GENERIC: Use _memberp_to_generic() which selects converter based on member type.
+#define _CONF_CASE_GENERIC(KEY, MEMBER)                                         \
+  case TS_CONFIG_##KEY: ret = _memberp_to_generic(&overridableHttpConfig->MEMBER, conv); break;
+
+// NONE: No-op case for configs handled specially elsewhere.
+#define _CONF_CASE_NONE(KEY, MEMBER)                                            \
+  case TS_CONFIG_##KEY: break;
+
+// Custom converter: Converts ts_seconds to/from integer seconds.
+#define _CONF_CASE_HttpDownServerCacheTimeConv(KEY, MEMBER)                     \
+  case TS_CONFIG_##KEY: conv = &HttpDownServerCacheTimeConv; ret = &overridableHttpConfig->MEMBER; break;
+
+// Custom converter: Parses/formats HTTP status code lists (e.g., "404 500").
+#define _CONF_CASE_HttpStatusCodeList_Conv(KEY, MEMBER)                         \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &HttpStatusCodeList::Conv; break;
+
+// Custom converters for ConnectionTracker config variables.
+#define _CONF_CASE_ConnectionTracker_MIN_SERVER_CONV(KEY, MEMBER)               \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &ConnectionTracker::MIN_SERVER_CONV; break;
+#define _CONF_CASE_ConnectionTracker_MAX_SERVER_CONV(KEY, MEMBER)               \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &ConnectionTracker::MAX_SERVER_CONV; break;
+#define _CONF_CASE_ConnectionTracker_SERVER_MATCH_CONV(KEY, MEMBER)             \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &ConnectionTracker::SERVER_MATCH_CONV; break;
+
+// Custom converter: Parses/formats host resolution preference strings.
+#define _CONF_CASE_HttpTransact_HOST_RES_CONV(KEY, MEMBER)                      \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &HttpTransact::HOST_RES_CONV; break;
+
+// Custom converter: Parses/formats targeted cache control header lists.
+#define _CONF_CASE_TargetedCacheControlHeaders_Conv(KEY, MEMBER)                \
+  case TS_CONFIG_##KEY: ret = &overridableHttpConfig->MEMBER; conv = &TargetedCacheControlHeaders::Conv; break;
+
+// Dispatcher: Routes to _CONF_CASE_<CONV> based on the CONV parameter.
+#define _CONF_CASE_DISPATCH(KEY, MEMBER, RECORD_NAME, DATA_TYPE, CONV) _CONF_CASE_##CONV(KEY, MEMBER)
+
+// clang-format on
+
+/**
+ * Map a TSOverridableConfigKey to its corresponding struct member pointer.
+ *
+ * @param[in] conf The config key to look up.
+ * @param[in] overridableHttpConfig Pointer to the config struct.
+ * @param[out] conv set to the appropriate MgmtConverter.
+ * @return Pointer to the struct member, or nullptr if not found/applicable.
+ */
 static void *
 _conf_to_memberp(TSOverridableConfigKey conf, OverridableHttpConfigParams *overridableHttpConfig, MgmtConverter const *&conv)
 {
@@ -7105,403 +7362,20 @@ _conf_to_memberp(TSOverridableConfigKey conf, OverridableHttpConfigParams *overr
   conv      = nullptr;
 
   switch (conf) {
-  case TS_CONFIG_URL_REMAP_PRISTINE_HOST_HDR:
-    ret = _memberp_to_generic(&overridableHttpConfig->maintain_pristine_host_hdr, conv);
-    break;
-  case TS_CONFIG_HTTP_CHUNKING_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->chunking_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_CACHING_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->negative_caching_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_CACHING_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->negative_caching_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_CACHING_LIST:
-    ret  = &overridableHttpConfig->negative_caching_list;
-    conv = &HttpStatusCodeList::Conv;
-    break;
-  case TS_CONFIG_HTTP_CACHE_WHEN_TO_REVALIDATE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_when_to_revalidate, conv);
-    break;
-  case TS_CONFIG_HTTP_KEEP_ALIVE_ENABLED_IN:
-    ret = _memberp_to_generic(&overridableHttpConfig->keep_alive_enabled_in, conv);
-    break;
-  case TS_CONFIG_HTTP_KEEP_ALIVE_ENABLED_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->keep_alive_enabled_out, conv);
-    break;
-  case TS_CONFIG_HTTP_KEEP_ALIVE_POST_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->keep_alive_post_out, conv);
-    break;
-  case TS_CONFIG_HTTP_SERVER_SESSION_SHARING_MATCH:
-    ret = _memberp_to_generic(&overridableHttpConfig->server_session_sharing_match, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_RECV_BUFFER_SIZE_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_recv_buffer_size_out, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_SEND_BUFFER_SIZE_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_send_buffer_size_out, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_OPTION_FLAG_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_option_flag_out, conv);
-    break;
-  case TS_CONFIG_HTTP_FORWARD_PROXY_AUTH_TO_PARENT:
-    ret = _memberp_to_generic(&overridableHttpConfig->fwd_proxy_auth_to_parent, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_REMOVE_FROM:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_remove_from, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_REMOVE_REFERER:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_remove_referer, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_REMOVE_USER_AGENT:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_remove_user_agent, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_REMOVE_COOKIE:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_remove_cookie, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_REMOVE_CLIENT_IP:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_remove_client_ip, conv);
-    break;
-  case TS_CONFIG_HTTP_ANONYMIZE_INSERT_CLIENT_IP:
-    ret = _memberp_to_generic(&overridableHttpConfig->anonymize_insert_client_ip, conv);
-    break;
-  case TS_CONFIG_HTTP_RESPONSE_SERVER_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->proxy_response_server_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_INSERT_SQUID_X_FORWARDED_FOR:
-    ret = _memberp_to_generic(&overridableHttpConfig->insert_squid_x_forwarded_for, conv);
-    break;
-  case TS_CONFIG_HTTP_INSERT_FORWARDED:
-    ret = _memberp_to_generic(&overridableHttpConfig->insert_forwarded, conv);
-    break;
-  case TS_CONFIG_HTTP_PROXY_PROTOCOL_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->proxy_protocol_out, conv);
-    break;
-  case TS_CONFIG_HTTP_SEND_HTTP11_REQUESTS:
-    ret = _memberp_to_generic(&overridableHttpConfig->send_http11_requests, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_HTTP:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_http, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_CLIENT_NO_CACHE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ignore_client_no_cache, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_CLIENT_CC_MAX_AGE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ignore_client_cc_max_age, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IMS_ON_CLIENT_NO_CACHE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ims_on_client_no_cache, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_SERVER_NO_CACHE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ignore_server_no_cache, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_CACHE_RESPONSES_TO_COOKIES:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_responses_to_cookies, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_AUTHENTICATION:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ignore_auth, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_QUERY:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_ignore_query, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_REQUIRED_HEADERS:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_required_headers, conv);
-    break;
-  case TS_CONFIG_HTTP_INSERT_REQUEST_VIA_STR:
-    ret = _memberp_to_generic(&overridableHttpConfig->insert_request_via_string, conv);
-    break;
-  case TS_CONFIG_HTTP_INSERT_RESPONSE_VIA_STR:
-    ret = _memberp_to_generic(&overridableHttpConfig->insert_response_via_string, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_HEURISTIC_MIN_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_heuristic_min_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_HEURISTIC_MAX_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_heuristic_max_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_GUARANTEED_MIN_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_guaranteed_min_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_GUARANTEED_MAX_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_guaranteed_max_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_MAX_STALE_AGE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_max_stale_age, conv);
-    break;
-  case TS_CONFIG_HTTP_KEEP_ALIVE_NO_ACTIVITY_TIMEOUT_IN:
-    ret = _memberp_to_generic(&overridableHttpConfig->keep_alive_no_activity_timeout_in, conv);
-    break;
-  case TS_CONFIG_HTTP_KEEP_ALIVE_NO_ACTIVITY_TIMEOUT_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->keep_alive_no_activity_timeout_out, conv);
-    break;
-  case TS_CONFIG_HTTP_TRANSACTION_NO_ACTIVITY_TIMEOUT_IN:
-    ret = _memberp_to_generic(&overridableHttpConfig->transaction_no_activity_timeout_in, conv);
-    break;
-  case TS_CONFIG_HTTP_TRANSACTION_NO_ACTIVITY_TIMEOUT_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->transaction_no_activity_timeout_out, conv);
-    break;
-  case TS_CONFIG_HTTP_TRANSACTION_ACTIVE_TIMEOUT_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->transaction_active_timeout_out, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_ATTEMPTS_MAX_RETRIES:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_attempts_max_retries, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_ATTEMPTS_MAX_RETRIES_DOWN_SERVER:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_attempts_max_retries_down_server, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_DOWN_POLICY:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_down_policy, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_ATTEMPTS_RR_RETRIES:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_attempts_rr_retries, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_ATTEMPTS_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_attempts_timeout, conv);
-    break;
-  case TS_CONFIG_HTTP_CONNECT_ATTEMPTS_RETRY_BACKOFF_BASE:
-    ret = _memberp_to_generic(&overridableHttpConfig->connect_attempts_retry_backoff_base, conv);
-    break;
-  case TS_CONFIG_HTTP_DOWN_SERVER_CACHE_TIME:
-    conv = &HttpDownServerCacheTimeConv;
-    ret  = &overridableHttpConfig->down_server_timeout;
-    break;
-  case TS_CONFIG_HTTP_DOC_IN_CACHE_SKIP_DNS:
-    ret = _memberp_to_generic(&overridableHttpConfig->doc_in_cache_skip_dns, conv);
-    break;
-  case TS_CONFIG_HTTP_BACKGROUND_FILL_ACTIVE_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->background_fill_active_timeout, conv);
-    break;
-  case TS_CONFIG_HTTP_RESPONSE_SERVER_STR:
-    ret = _memberp_to_generic(&overridableHttpConfig->proxy_response_server_string, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_HEURISTIC_LM_FACTOR:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_heuristic_lm_factor, conv);
-    break;
-  case TS_CONFIG_HTTP_BACKGROUND_FILL_COMPLETED_THRESHOLD:
-    ret = _memberp_to_generic(&overridableHttpConfig->background_fill_threshold, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_PACKET_MARK_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_packet_mark_out, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_PACKET_TOS_OUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_packet_tos_out, conv);
-    break;
-  case TS_CONFIG_HTTP_INSERT_AGE_IN_RESPONSE:
-    ret = _memberp_to_generic(&overridableHttpConfig->insert_age_in_response, conv);
-    break;
-  case TS_CONFIG_HTTP_CHUNKING_SIZE:
-    ret = _memberp_to_generic(&overridableHttpConfig->http_chunking_size, conv);
-    break;
-  case TS_CONFIG_HTTP_DROP_CHUNKED_TRAILERS:
-    ret = _memberp_to_generic(&overridableHttpConfig->http_drop_chunked_trailers, conv);
-    break;
-  case TS_CONFIG_HTTP_STRICT_CHUNK_PARSING:
-    ret = _memberp_to_generic(&overridableHttpConfig->http_strict_chunk_parsing, conv);
-    break;
-  case TS_CONFIG_HTTP_FLOW_CONTROL_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->flow_control_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_FLOW_CONTROL_LOW_WATER_MARK:
-    ret = _memberp_to_generic(&overridableHttpConfig->flow_low_water_mark, conv);
-    break;
-  case TS_CONFIG_HTTP_FLOW_CONTROL_HIGH_WATER_MARK:
-    ret = _memberp_to_generic(&overridableHttpConfig->flow_high_water_mark, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_RANGE_LOOKUP:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_range_lookup, conv);
-    break;
-  case TS_CONFIG_HTTP_NORMALIZE_AE:
-    ret = _memberp_to_generic(&overridableHttpConfig->normalize_ae, conv);
-    break;
-  case TS_CONFIG_HTTP_DEFAULT_BUFFER_SIZE:
-    ret = _memberp_to_generic(&overridableHttpConfig->default_buffer_size_index, conv);
-    break;
-  case TS_CONFIG_HTTP_DEFAULT_BUFFER_WATER_MARK:
-    ret = _memberp_to_generic(&overridableHttpConfig->default_buffer_water_mark, conv);
-    break;
-  case TS_CONFIG_HTTP_REQUEST_HEADER_MAX_SIZE:
-    ret = _memberp_to_generic(&overridableHttpConfig->request_hdr_max_size, conv);
-    break;
-  case TS_CONFIG_HTTP_RESPONSE_HEADER_MAX_SIZE:
-    ret = _memberp_to_generic(&overridableHttpConfig->response_hdr_max_size, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->negative_revalidating_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIFETIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->negative_revalidating_lifetime, conv);
-    break;
-  case TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIST:
-    ret  = &overridableHttpConfig->negative_revalidating_list;
-    conv = &HttpStatusCodeList::Conv;
-    break;
-  case TS_CONFIG_SSL_HSTS_MAX_AGE:
-    ret = _memberp_to_generic(&overridableHttpConfig->proxy_response_hsts_max_age, conv);
-    break;
-  case TS_CONFIG_SSL_HSTS_INCLUDE_SUBDOMAINS:
-    ret = _memberp_to_generic(&overridableHttpConfig->proxy_response_hsts_include_subdomains, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_OPEN_READ_RETRY_TIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_open_read_retry_time, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_MAX_OPEN_READ_RETRIES:
-    ret = _memberp_to_generic(&overridableHttpConfig->max_cache_open_read_retries, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_RANGE_WRITE:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_range_write, conv);
-    break;
-  case TS_CONFIG_HTTP_POST_CHECK_CONTENT_LENGTH_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->post_check_content_length_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_POST_METHOD:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_post_method, conv);
-    break;
-  case TS_CONFIG_HTTP_REQUEST_BUFFER_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->request_buffer_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_GLOBAL_USER_AGENT_HEADER:
-    ret = _memberp_to_generic(&overridableHttpConfig->global_user_agent_header, conv);
-    break;
-  case TS_CONFIG_HTTP_AUTH_SERVER_SESSION_PRIVATE:
-    ret = _memberp_to_generic(&overridableHttpConfig->auth_server_session_private, conv);
-    break;
-  case TS_CONFIG_HTTP_SLOW_LOG_THRESHOLD:
-    ret = _memberp_to_generic(&overridableHttpConfig->slow_log_threshold, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_GENERATION:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_generation_number, conv);
-    break;
-  case TS_CONFIG_BODY_FACTORY_TEMPLATE_BASE:
-    ret = _memberp_to_generic(&overridableHttpConfig->body_factory_template_base, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_OPEN_WRITE_FAIL_ACTION:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_open_write_fail_action, conv);
-    break;
-  case TS_CONFIG_HTTP_NUMBER_OF_REDIRECTIONS:
-    ret = _memberp_to_generic(&overridableHttpConfig->number_of_redirections, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_MAX_OPEN_WRITE_RETRIES:
-    ret = _memberp_to_generic(&overridableHttpConfig->max_cache_open_write_retries, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_MAX_OPEN_WRITE_RETRY_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->max_cache_open_write_retry_timeout, conv);
-    break;
-  case TS_CONFIG_HTTP_REDIRECT_USE_ORIG_CACHE_KEY:
-    ret = _memberp_to_generic(&overridableHttpConfig->redirect_use_orig_cache_key, conv);
-    break;
-  case TS_CONFIG_HTTP_ATTACH_SERVER_SESSION_TO_CLIENT:
-    ret = _memberp_to_generic(&overridableHttpConfig->attach_server_session_to_client, conv);
-    break;
-  case TS_CONFIG_HTTP_MAX_PROXY_CYCLES:
-    ret = _memberp_to_generic(&overridableHttpConfig->max_proxy_cycles, conv);
-    break;
-  case TS_CONFIG_WEBSOCKET_NO_ACTIVITY_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->websocket_inactive_timeout, conv);
-    break;
-  case TS_CONFIG_WEBSOCKET_ACTIVE_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->websocket_active_timeout, conv);
-    break;
-  case TS_CONFIG_HTTP_UNCACHEABLE_REQUESTS_BYPASS_PARENT:
-    ret = _memberp_to_generic(&overridableHttpConfig->uncacheable_requests_bypass_parent, conv);
-    break;
-  case TS_CONFIG_HTTP_PARENT_PROXY_TOTAL_CONNECT_ATTEMPTS:
-    ret = _memberp_to_generic(&overridableHttpConfig->parent_connect_attempts, conv);
-    break;
-  case TS_CONFIG_HTTP_TRANSACTION_ACTIVE_TIMEOUT_IN:
-    ret = _memberp_to_generic(&overridableHttpConfig->transaction_active_timeout_in, conv);
-    break;
-  case TS_CONFIG_SRV_ENABLED:
-    ret = _memberp_to_generic(&overridableHttpConfig->srv_enabled, conv);
-    break;
-  case TS_CONFIG_HTTP_FORWARD_CONNECT_METHOD:
-    ret = _memberp_to_generic(&overridableHttpConfig->forward_connect_method, conv);
-    break;
-  case TS_CONFIG_SSL_CLIENT_VERIFY_SERVER_POLICY:
-  case TS_CONFIG_SSL_CLIENT_VERIFY_SERVER_PROPERTIES:
-  case TS_CONFIG_SSL_CLIENT_SNI_POLICY:
-  case TS_CONFIG_SSL_CLIENT_CERT_FILENAME:
-  case TS_CONFIG_SSL_CERT_FILEPATH:
-  case TS_CONFIG_SSL_CLIENT_PRIVATE_KEY_FILENAME:
-  case TS_CONFIG_SSL_CLIENT_CA_CERT_FILENAME:
-  case TS_CONFIG_SSL_CLIENT_ALPN_PROTOCOLS:
-    // String, must be handled elsewhere
-    break;
-  case TS_CONFIG_PARENT_FAILURES_UPDATE_HOSTDB:
-    ret = _memberp_to_generic(&overridableHttpConfig->parent_failures_update_hostdb, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_ACCEPT_MISMATCH:
-    ret = _memberp_to_generic(&overridableHttpConfig->ignore_accept_mismatch, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_ACCEPT_LANGUAGE_MISMATCH:
-    ret = _memberp_to_generic(&overridableHttpConfig->ignore_accept_language_mismatch, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_ACCEPT_ENCODING_MISMATCH:
-    ret = _memberp_to_generic(&overridableHttpConfig->ignore_accept_encoding_mismatch, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_IGNORE_ACCEPT_CHARSET_MISMATCH:
-    ret = _memberp_to_generic(&overridableHttpConfig->ignore_accept_charset_mismatch, conv);
-    break;
-  case TS_CONFIG_HTTP_PARENT_PROXY_FAIL_THRESHOLD:
-    ret = _memberp_to_generic(&overridableHttpConfig->parent_fail_threshold, conv);
-    break;
-  case TS_CONFIG_HTTP_PARENT_PROXY_RETRY_TIME:
-    ret = _memberp_to_generic(&overridableHttpConfig->parent_retry_time, conv);
-    break;
-  case TS_CONFIG_HTTP_PER_PARENT_CONNECT_ATTEMPTS:
-    ret = _memberp_to_generic(&overridableHttpConfig->per_parent_connect_attempts, conv);
-    break;
-  case TS_CONFIG_HTTP_ALLOW_MULTI_RANGE:
-    ret = _memberp_to_generic(&overridableHttpConfig->allow_multi_range, conv);
-    break;
-  case TS_CONFIG_HTTP_ALLOW_HALF_OPEN:
-    ret = _memberp_to_generic(&overridableHttpConfig->allow_half_open, conv);
-    break;
-  case TS_CONFIG_HTTP_PER_SERVER_CONNECTION_MAX:
-    ret  = &overridableHttpConfig->connection_tracker_config.server_max;
-    conv = &ConnectionTracker::MAX_SERVER_CONV;
-    break;
-  case TS_CONFIG_HTTP_SERVER_MIN_KEEP_ALIVE_CONNS:
-    ret  = &overridableHttpConfig->connection_tracker_config.server_min;
-    conv = &ConnectionTracker::MIN_SERVER_CONV;
-    break;
-  case TS_CONFIG_HTTP_PER_SERVER_CONNECTION_MATCH:
-    ret  = &overridableHttpConfig->connection_tracker_config.server_match;
-    conv = &ConnectionTracker::SERVER_MATCH_CONV;
-    break;
-  case TS_CONFIG_HTTP_HOST_RESOLUTION_PREFERENCE:
-    ret  = &overridableHttpConfig->host_res_data;
-    conv = &HttpTransact::HOST_RES_CONV;
-    break;
-  case TS_CONFIG_HTTP_NO_DNS_JUST_FORWARD_TO_PARENT:
-    ret = _memberp_to_generic(&overridableHttpConfig->no_dns_forward_to_parent, conv);
-    break;
-  case TS_CONFIG_PLUGIN_VC_DEFAULT_BUFFER_INDEX:
-    ret = _memberp_to_generic(&overridableHttpConfig->plugin_vc_default_buffer_index, conv);
-    break;
-  case TS_CONFIG_PLUGIN_VC_DEFAULT_BUFFER_WATER_MARK:
-    ret = _memberp_to_generic(&overridableHttpConfig->plugin_vc_default_buffer_water_mark, conv);
-    break;
-  case TS_CONFIG_NET_SOCK_NOTSENT_LOWAT:
-    ret = _memberp_to_generic(&overridableHttpConfig->sock_packet_notsent_lowat, conv);
-    break;
-  case TS_CONFIG_BODY_FACTORY_RESPONSE_SUPPRESSION_MODE:
-    ret = _memberp_to_generic(&overridableHttpConfig->response_suppression_mode, conv);
-    break;
-  case TS_CONFIG_HTTP_ENABLE_PARENT_TIMEOUT_MARKDOWNS:
-    ret = _memberp_to_generic(&overridableHttpConfig->enable_parent_timeout_markdowns, conv);
-    break;
-  case TS_CONFIG_HTTP_DISABLE_PARENT_MARKDOWNS:
-    ret = _memberp_to_generic(&overridableHttpConfig->disable_parent_markdowns, conv);
-    break;
-  case TS_CONFIG_NET_DEFAULT_INACTIVITY_TIMEOUT:
-    ret = _memberp_to_generic(&overridableHttpConfig->default_inactivity_timeout, conv);
-    break;
-  case TS_CONFIG_HTTP_CACHE_CACHE_URLS_THAT_LOOK_DYNAMIC:
-    ret = _memberp_to_generic(&overridableHttpConfig->cache_urls_that_look_dynamic, conv);
-    break;
-
-  // This helps avoiding compiler warnings, yet detect unhandled enum members.
+    // This uses OVERRIDABLE_CONFIGS to generate cases for each config.
+    // For example:
+    //
+    // case TS_CONFIG_HTTP_CHUNKING_ENABLED:
+    //   ret = _memberp_to_generic(&overridableHttpConfig->chunking_enabled, conv);
+    //   break;
+    // case TS_CONFIG_HTTP_DOWN_SERVER_CACHE_TIME:
+    //   conv = &HttpDownServerCacheTimeConv;
+    //   ret = &overridableHttpConfig->down_server_timeout;
+    //   break;
+    //
+    // ... ~130 more cases, one per overridable config ...
+    //
+    OVERRIDABLE_CONFIGS(_CONF_CASE_DISPATCH)
   case TS_CONFIG_NULL:
   case TS_CONFIG_LAST_ENTRY:
     break;
@@ -7509,6 +7383,17 @@ _conf_to_memberp(TSOverridableConfigKey conf, OverridableHttpConfigParams *overr
 
   return ret;
 }
+
+#undef _CONF_CASE_GENERIC
+#undef _CONF_CASE_NONE
+#undef _CONF_CASE_HttpDownServerCacheTimeConv
+#undef _CONF_CASE_HttpStatusCodeList_Conv
+#undef _CONF_CASE_ConnectionTracker_MIN_SERVER_CONV
+#undef _CONF_CASE_ConnectionTracker_MAX_SERVER_CONV
+#undef _CONF_CASE_ConnectionTracker_SERVER_MATCH_CONV
+#undef _CONF_CASE_HttpTransact_HOST_RES_CONV
+#undef _CONF_CASE_TargetedCacheControlHeaders_Conv
+#undef _CONF_CASE_DISPATCH
 
 // 2nd little helper function to find the struct member for getting.
 static const void *
@@ -7654,19 +7539,15 @@ TSHttpTxnConfigStringSet(TSHttpTxn txnp, TSOverridableConfigKey conf, const char
     break;
   case TS_CONFIG_HTTP_INSERT_FORWARDED:
     if (value && length > 0) {
-      swoc::LocalBufferWriter<1024> error;
-      HttpForwarded::OptionBitSet   bs = HttpForwarded::optStrToBitset(std::string_view(value, length), error);
-      if (!error.size()) {
-        s->t_state.my_txn_conf().insert_forwarded = bs;
-      } else {
-        Error("HTTP %.*s", static_cast<int>(error.size()), error.data());
-      }
+      auto &parsed                              = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      s->t_state.my_txn_conf().insert_forwarded = std::get<HttpForwarded::OptionBitSet>(parsed.parsed);
     }
     break;
   case TS_CONFIG_HTTP_SERVER_SESSION_SHARING_MATCH:
     if (value && length > 0) {
-      HttpConfig::load_server_session_sharing_match(value, s->t_state.my_txn_conf().server_session_sharing_match);
-      s->t_state.my_txn_conf().server_session_sharing_match_str = const_cast<char *>(value);
+      auto &parsed                                              = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      s->t_state.my_txn_conf().server_session_sharing_match     = std::get<MgmtByte>(parsed.parsed);
+      s->t_state.my_txn_conf().server_session_sharing_match_str = const_cast<char *>(parsed.conf_value_storage.data());
     }
     break;
   case TS_CONFIG_SSL_CLIENT_VERIFY_SERVER_POLICY:
@@ -7699,6 +7580,11 @@ TSHttpTxnConfigStringSet(TSHttpTxn txnp, TSOverridableConfigKey conf, const char
       s->t_state.my_txn_conf().ssl_client_ca_cert_filename = const_cast<char *>(value);
     }
     break;
+  case TS_CONFIG_SSL_CLIENT_CA_CERT_PATH:
+    if (value && length > 0) {
+      s->t_state.my_txn_conf().ssl_client_ca_cert_path = const_cast<char *>(value);
+    }
+    break;
   case TS_CONFIG_SSL_CLIENT_ALPN_PROTOCOLS:
     if (value && length > 0) {
       s->t_state.my_txn_conf().ssl_client_alpn_protocols = const_cast<char *>(value);
@@ -7709,23 +7595,38 @@ TSHttpTxnConfigStringSet(TSHttpTxn txnp, TSOverridableConfigKey conf, const char
     break;
   case TS_CONFIG_HTTP_NEGATIVE_CACHING_LIST:
     if (value && length > 0) {
-      OverridableHttpConfigParams *target      = &s->t_state.my_txn_conf();
-      target->negative_caching_list.conf_value = const_cast<char *>(value);
-      return _eval_conv(target, conf, value, length);
+      auto &parsed                                   = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      s->t_state.my_txn_conf().negative_caching_list = std::get<HttpStatusCodeList>(parsed.parsed);
     }
     break;
   case TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIST:
     if (value && length > 0) {
-      OverridableHttpConfigParams *target           = &s->t_state.my_txn_conf();
-      target->negative_revalidating_list.conf_value = const_cast<char *>(value);
-      return _eval_conv(target, conf, value, length);
+      auto &parsed                                        = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      s->t_state.my_txn_conf().negative_revalidating_list = std::get<HttpStatusCodeList>(parsed.parsed);
     }
     break;
   case TS_CONFIG_HTTP_HOST_RESOLUTION_PREFERENCE:
     if (value && length > 0) {
-      s->t_state.my_txn_conf().host_res_data.conf_value = const_cast<char *>(value);
+      auto &parsed                           = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      s->t_state.my_txn_conf().host_res_data = std::get<HostResData>(parsed.parsed);
     }
-    [[fallthrough]];
+    break;
+  case TS_CONFIG_HTTP_CACHE_TARGETED_CACHE_CONTROL_HEADERS:
+    if (value && length > 0) {
+      auto &parsed = ParsedConfigCache::lookup(conf, std::string_view(value, length));
+      // This is intentionally a non-owning copy of the parsed representation.
+      // ParsedConfigCache::ParsedValue owns the backing string in conf_value_storage,
+      // and TargetedCacheControlHeaders stores string_view entries into that stable
+      // storage. The per-transaction override struct in HttpTransact::State is raw
+      // storage (not an owning/destructed HttpConfigParams object), so this path
+      // does not free conf_value. Reusing the cached parsed object avoids reparsing
+      // and avoids allocating/duplicating a second backing string on every txn
+      // override update, while preserving valid lifetimes for all string_view data.
+      s->t_state.my_txn_conf().targeted_cache_control_headers = std::get<TargetedCacheControlHeaders>(parsed.parsed);
+    } else {
+      s->t_state.my_txn_conf().targeted_cache_control_headers = TargetedCacheControlHeaders{};
+    }
+    break;
   default: {
     if (value && length > 0) {
       return _eval_conv(&(s->t_state.my_txn_conf()), conf, value, length);
@@ -7761,6 +7662,10 @@ TSHttpTxnConfigStringGet(TSHttpTxn txnp, TSOverridableConfigKey conf, const char
     break;
   case TS_CONFIG_HTTP_SERVER_SESSION_SHARING_MATCH:
     *value  = sm->t_state.txn_conf->server_session_sharing_match_str;
+    *length = *value ? strlen(*value) : 0;
+    break;
+  case TS_CONFIG_SSL_CLIENT_CA_CERT_PATH:
+    *value  = sm->t_state.txn_conf->ssl_client_ca_cert_path;
     *length = *value ? strlen(*value) : 0;
     break;
   default: {
@@ -7997,7 +7902,7 @@ public:
   int
   event_handler(int /* event ATS_UNUSED */, void *)
   {
-    m_tes->reenable(m_event);
+    m_tes->reenable_with_event(m_event);
     delete this;
     return 0;
   }
@@ -8061,6 +7966,37 @@ TSVConnSslSniGet(TSVConn sslp, int *length)
   }
 
   return server_name;
+}
+
+TSClientHello
+TSVConnClientHelloGet(TSVConn sslp)
+{
+  NetVConnection *netvc = reinterpret_cast<NetVConnection *>(sslp);
+  if (netvc == nullptr) {
+    return nullptr;
+  }
+
+  if (auto snis = netvc->get_service<TLSSNISupport>(); snis) {
+    TLSSNISupport::ClientHello *client_hello = snis->get_client_hello();
+    if (client_hello == nullptr) {
+      return nullptr;
+    }
+
+    // Wrap the raw object in the accessor and return
+    return TSClientHello(client_hello);
+  }
+
+  return nullptr;
+}
+
+TSReturnCode
+TSClientHelloExtensionGet(TSClientHello ch, unsigned int type, const unsigned char **out, size_t *outlen)
+{
+  if (static_cast<TLSSNISupport::ClientHello *>(ch._get_internal())->getExtension(type, out, outlen) == 1) {
+    return TS_SUCCESS;
+  }
+
+  return TS_ERROR;
 }
 
 TSSslVerifyCTX
@@ -8436,9 +8372,10 @@ TSVConnProtocolDisable(TSVConn connp, const char *protocol_name)
 TSAcceptor
 TSAcceptorGet(TSVConn sslp)
 {
-  NetVConnection    *vc     = reinterpret_cast<NetVConnection *>(sslp);
-  SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(vc);
-  return ssl_vc ? reinterpret_cast<TSAcceptor>(ssl_vc->accept_object) : nullptr;
+  NetVConnection     *vc      = reinterpret_cast<NetVConnection *>(sslp);
+  SSLNetVConnection  *ssl_vc  = dynamic_cast<SSLNetVConnection *>(vc);
+  UnixNetVConnection *unix_vc = ssl_vc ? ssl_vc->getUnixNetVC() : nullptr;
+  return unix_vc ? reinterpret_cast<TSAcceptor>(unix_vc->accept_object) : nullptr;
 }
 
 TSAcceptor
@@ -8497,7 +8434,7 @@ TSVConnReenableEx(TSVConn vconn, TSEvent event)
     Ptr<ProxyMutex> m = tes->getMutexForTLSEvents();
     MUTEX_TRY_LOCK(trylock, m, eth);
     if (trylock.is_locked()) {
-      tes->reenable(event);
+      tes->reenable_with_event(event);
     } else {
       // We schedule the reenable to the home thread of ssl_vc.
       tes->getThreadForTLSEvents()->schedule_imm(new TSSslCallback(tes, event));
@@ -8573,61 +8510,6 @@ TSVConnPPInfoIntGet(TSVConn vconn, uint16_t key, TSMgmtInt *value)
   }
 
   return TS_SUCCESS;
-}
-
-TSSslSession
-TSSslSessionGet(const TSSslSessionID *session_id)
-{
-  SSL_SESSION *session = nullptr;
-  if (session_id && session_cache) {
-    session_cache->getSession(reinterpret_cast<const SSLSessionID &>(*session_id), &session, nullptr);
-  }
-  return reinterpret_cast<TSSslSession>(session);
-}
-
-int
-TSSslSessionGetBuffer(const TSSslSessionID *session_id, char *buffer, int *len_ptr)
-{
-  int true_len = 0;
-  // Don't get if there is no session id or the cache is not yet set up
-  if (session_id && session_cache && len_ptr) {
-    true_len = session_cache->getSessionBuffer(reinterpret_cast<const SSLSessionID &>(*session_id), buffer, *len_ptr);
-  }
-  return true_len;
-}
-
-TSReturnCode
-TSSslSessionInsert(const TSSslSessionID *session_id, TSSslSession add_session, TSSslConnection ssl_conn)
-{
-  // Don't insert if there is no session id or the cache is not yet set up
-  if (session_id && session_cache) {
-    if (dbg_ctl_ssl_session_cache_insert.on()) {
-      const SSLSessionID *sid = reinterpret_cast<const SSLSessionID *>(session_id);
-      char                buf[sid->len * 2 + 1];
-      sid->toString(buf, sizeof(buf));
-      DbgPrint(dbg_ctl_ssl_session_cache_insert, "TSSslSessionInsert: Inserting session '%s' ", buf);
-    }
-    SSL_SESSION *session = reinterpret_cast<SSL_SESSION *>(add_session);
-    SSL         *ssl     = reinterpret_cast<SSL *>(ssl_conn);
-    session_cache->insertSession(reinterpret_cast<const SSLSessionID &>(*session_id), session, ssl);
-    // insertSession returns void, assume all went well
-    return TS_SUCCESS;
-  } else {
-    return TS_ERROR;
-  }
-}
-
-TSReturnCode
-TSSslSessionRemove(const TSSslSessionID *session_id)
-{
-  // Don't remove if there is no session id or the cache is not yet set up
-  if (session_id && session_cache) {
-    session_cache->removeSession(reinterpret_cast<const SSLSessionID &>(*session_id));
-    // removeSession returns void, assume all went well
-    return TS_SUCCESS;
-  } else {
-    return TS_ERROR;
-  }
 }
 
 // APIs for managing and using UUIDs.
@@ -9114,4 +8996,260 @@ TSHttpTxnTypeGet(TSHttpTxn txnp)
     }
   }
   return retval;
+}
+
+TSReturnCode
+TSConnectionLimitExemptListAdd(std::string_view ip_ranges)
+{
+  swoc::TextView ip_ranges_tv{ip_ranges};
+
+  while (auto ip_range_tv = ip_ranges_tv.take_prefix_at(',')) {
+    swoc::IPRange ip_range;
+
+    if (!ip_range.load(ip_range_tv)) {
+      return TS_ERROR;
+    }
+    bool success = ConnectionTracker::add_client_exempt_range(ip_range);
+
+    if (!success) {
+      return TS_ERROR;
+    }
+  }
+  return TS_SUCCESS;
+}
+
+TSReturnCode
+TSConnectionLimitExemptListRemove(std::string_view ip_ranges)
+{
+  swoc::TextView ip_ranges_tv{ip_ranges};
+
+  while (auto ip_range_tv = ip_ranges_tv.take_prefix_at(',')) {
+    swoc::IPRange ip_range;
+
+    if (!ip_range.load(ip_range_tv)) {
+      return TS_ERROR;
+    }
+    bool success = ConnectionTracker::remove_client_exempt_range(ip_range);
+
+    if (!success) {
+      return TS_ERROR;
+    }
+  }
+  return TS_SUCCESS;
+}
+
+void
+TSConnectionLimitExemptListClear()
+{
+  ConnectionTracker::clear_client_exempt_list();
+}
+
+TSReturnCode
+TSLogFieldRegister(std::string_view name, std::string_view symbol, TSLogType type, TSLogMarshalCallback marshal_cb,
+                   TSLogUnmarshalCallback unmarshal_cb, bool replace)
+{
+  if (auto ite = Log::field_symbol_hash.find(symbol.data()); ite != Log::field_symbol_hash.end()) {
+    if (replace) {
+      // Symbol is registered and the plugin wants to replace it.
+      // Need to unregister the existing entry first.
+      Log::global_field_list.remove(ite->second);
+      Log::field_symbol_hash.erase(ite);
+    } else {
+      // Symbol conflict.
+      return TS_ERROR;
+    }
+  }
+
+  LogField *field = new LogField(
+    name.data(), symbol.data(), static_cast<LogField::Type>(type),
+    [marshal_cb](void *sm, char *buf) -> int { return marshal_cb(reinterpret_cast<TSHttpTxn>(sm), buf); }, unmarshal_cb);
+  Log::global_field_list.add(field, false);
+  Log::field_symbol_hash.emplace(symbol.data(), field);
+
+  return TS_SUCCESS;
+}
+
+int
+TSLogStringMarshal(char *buf, std::string_view str)
+{
+  if (buf) {
+    ink_strlcpy(buf, str.data(), str.length() + 1);
+  }
+  return str.length() + 1;
+}
+
+std::tuple<int, int>
+TSLogStringUnmarshal(char **buf, char *dest, int len)
+{
+  // We cannot use LogAccess::unmarshal_str, etc. here because those internal
+  // functions take care of log buffer alignment. This function needs to be
+  // implemented as if it's a piece of code in plugin code, which is unaware
+  // of the alignment.
+  if (int l = strlen(*buf); l < len) {
+    memcpy(dest, *buf, l);
+    return {l, l};
+  } else {
+    return {-1, -1};
+  }
+}
+
+int
+TSLogIntMarshal(char *buf, int64_t value)
+{
+  if (buf) {
+    *(reinterpret_cast<int64_t *>(buf)) = value;
+  }
+  return sizeof(int64_t);
+}
+
+std::tuple<int, int>
+TSLogIntUnmarshal(char **buf, char *dest, int len)
+{
+  int64_t val     = *(reinterpret_cast<int64_t *>(*buf));
+  auto [end, err] = std::to_chars(dest, dest + len, val);
+  if (err == std::errc()) {
+    *end = '\0';
+    return {sizeof(uint64_t), end - dest};
+  }
+
+  return {-1, -1};
+}
+
+int
+TSLogAddrMarshal(char *buf, sockaddr *addr)
+{
+  LogFieldIpStorage data;
+  int               len = sizeof(data._ip);
+
+  if (nullptr == addr) {
+    data._ip._family = AF_UNSPEC;
+  } else if (ats_is_ip4(addr)) {
+    if (buf) {
+      data._ip4._family = AF_INET;
+      data._ip4._addr   = ats_ip4_addr_cast(addr);
+    }
+    len = sizeof(data._ip4);
+  } else if (ats_is_ip6(addr)) {
+    if (buf) {
+      data._ip6._family = AF_INET6;
+      data._ip6._addr   = ats_ip6_addr_cast(addr);
+    }
+    len = sizeof(data._ip6);
+  } else if (ats_is_unix(addr)) {
+    if (buf) {
+      data._un._family = AF_UNIX;
+      strncpy(data._un._path, ats_unix_cast(addr)->sun_path, TS_UNIX_SIZE);
+    }
+    len = sizeof(data._un);
+  } else {
+    data._ip._family = AF_UNSPEC;
+  }
+
+  if (buf) {
+    memcpy(buf, &data, len);
+  }
+  return len;
+}
+
+std::tuple<int, int>
+TSLogAddrUnmarshal(char **buf, char *dest, int len)
+{
+  IpEndpoint endpoint;
+  int        read_len = sizeof(LogFieldIp);
+
+  LogFieldIp *raw = reinterpret_cast<LogFieldIp *>(*buf);
+  if (AF_INET == raw->_family) {
+    LogFieldIp4 *ip4 = static_cast<LogFieldIp4 *>(raw);
+    ats_ip4_set(&endpoint, ip4->_addr);
+    read_len = sizeof(*ip4);
+  } else if (AF_INET6 == raw->_family) {
+    LogFieldIp6 *ip6 = static_cast<LogFieldIp6 *>(raw);
+    ats_ip6_set(&endpoint, ip6->_addr);
+    read_len = sizeof(*ip6);
+  } else if (AF_UNIX == raw->_family) {
+    LogFieldUn *un = static_cast<LogFieldUn *>(raw);
+    ats_unix_set(&endpoint, un->_path, TS_UNIX_SIZE);
+    read_len = sizeof(*un);
+  } else {
+    ats_ip_invalidate(&endpoint);
+  }
+
+  if (!ats_is_ip(&endpoint) && !ats_is_unix(&endpoint)) {
+    dest[0] = '0';
+    dest[1] = '\0';
+    return {-1, 1};
+  } else if (ats_ip_ntop(&endpoint, dest, len)) {
+    return {read_len, static_cast<int>(::strlen(dest))};
+  }
+
+  return {-1, -1};
+}
+
+bool
+TSClientHello::is_available() const
+{
+  return static_cast<bool>(*this);
+}
+
+uint16_t
+TSClientHello::get_version() const
+{
+  return static_cast<TLSSNISupport::ClientHello *>(_client_hello)->getVersion();
+}
+
+const uint8_t *
+TSClientHello::get_cipher_suites() const
+{
+  return reinterpret_cast<const uint8_t *>(static_cast<TLSSNISupport::ClientHello *>(_client_hello)->getCipherSuites().data());
+}
+
+size_t
+TSClientHello::get_cipher_suites_len() const
+{
+  return static_cast<TLSSNISupport::ClientHello *>(_client_hello)->getCipherSuites().length();
+}
+
+TSClientHello::TSExtensionTypeList::Iterator::Iterator(const void *ite)
+{
+  static_assert(sizeof(_real_iterator) >= sizeof(TLSSNISupport::ClientHello::ExtensionIdIterator));
+
+  ink_assert(_real_iterator);
+  ink_assert(ite);
+  memcpy(_real_iterator, ite, sizeof(TLSSNISupport::ClientHello::ExtensionIdIterator));
+}
+
+TSClientHello::TSExtensionTypeList::Iterator
+TSClientHello::TSExtensionTypeList::begin()
+{
+  ink_assert(_ch);
+  auto ch  = static_cast<TLSSNISupport::ClientHello *>(_ch);
+  auto ite = ch->begin();
+  // The temporal pointer is for the memcpy in the constructor. It's only used in the constructor.
+  return TSClientHello::TSExtensionTypeList::Iterator(&ite);
+}
+
+TSClientHello::TSExtensionTypeList::Iterator
+TSClientHello::TSExtensionTypeList::end()
+{
+  auto ite = static_cast<TLSSNISupport::ClientHello *>(_ch)->end();
+  // The temporal pointer is for the memcpy in the constructor. It's only used in the constructor.
+  return TSClientHello::TSExtensionTypeList::Iterator(&ite);
+}
+
+TSClientHello::TSExtensionTypeList::Iterator &
+TSClientHello::TSExtensionTypeList::Iterator::operator++()
+{
+  ++(*reinterpret_cast<TLSSNISupport::ClientHello::ExtensionIdIterator *>(_real_iterator));
+  return *this;
+}
+
+bool
+TSClientHello::TSExtensionTypeList::Iterator::operator==(const TSClientHello::TSExtensionTypeList::Iterator &b) const
+{
+  return memcmp(_real_iterator, b._real_iterator, sizeof(_real_iterator)) == 0;
+}
+int
+TSClientHello::TSExtensionTypeList::Iterator::operator*() const
+{
+  return *(*reinterpret_cast<const TLSSNISupport::ClientHello::ExtensionIdIterator *>(_real_iterator));
 }

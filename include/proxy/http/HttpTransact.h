@@ -25,6 +25,7 @@
 
 #include <cstddef>
 
+#include "iocore/net/ProxyProtocol.h"
 #include "tsutil/DbgCtl.h"
 #include "tscore/ink_assert.h"
 #include "tscore/ink_platform.h"
@@ -45,6 +46,8 @@
 #include "records/RecHttp.h"
 #include "proxy/ProxySession.h"
 #include "tscore/MgmtDefs.h"
+
+#include "swoc/bwf_ex.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -101,6 +104,7 @@ using ink_time_t = time_t;
 
 struct HttpConfigParams;
 class HttpSM;
+struct CacheHostRecord;
 
 #include "iocore/net/ConnectionTracker.h"
 #include "tscore/InkErrno.h"
@@ -388,7 +392,6 @@ public:
 
     ORIGIN_SERVER_OPEN,
     ORIGIN_SERVER_RAW_OPEN,
-    ORIGIN_SERVER_RR_MARK_DOWN,
 
     READ_PUSH_HDR,
     STORE_PUSH_BODY,
@@ -407,7 +410,6 @@ public:
     SERVER_PARSE_NEXT_HDR,
     TRANSFORM_READ,
     SSL_TUNNEL,
-    CONTINUE,
 
     API_SM_START,
     API_READ_REQUEST_HDR,
@@ -488,11 +490,14 @@ public:
     HTTPInfo         transform_store;
     CacheDirectives  directives;
     HTTPInfo        *object_read          = nullptr;
+    HTTPInfo        *stale_fallback       = nullptr; // Saved stale object for action 6 fallback during retry
     CacheWriteLock_t write_lock_state     = CacheWriteLock_t::INIT;
     int              lookup_count         = 0;
     SquidHitMissCode hit_miss_code        = SQUID_MISS_NONE;
     URL             *parent_selection_url = nullptr;
     URL              parent_selection_url_storage;
+
+    const CacheHostRecord *volume_host_rec = nullptr;
 
     _CacheLookupInfo() {}
   };
@@ -637,6 +642,7 @@ public:
     bool            trust_response_cl          = false;
     ResponseError_t response_error             = ResponseError_t::NO_RESPONSE_HEADER_ERROR;
     bool            extension_method           = false;
+    std::string     server_response_transfer_encoding; ///< Storage for logging.
 
     _HeaderInfo() {}
   };
@@ -651,10 +657,8 @@ public:
   };
 
   using ResponseAction = struct _ResponseAction {
-    bool             handled = false;
-    TSResponseAction action;
-
-    _ResponseAction() {}
+    bool             handled{false};
+    TSResponseAction action{};
   };
 
   struct State {
@@ -664,7 +668,8 @@ public:
     HTTPVersion         updated_server_version = HTTP_INVALID;
     CacheLookupResult_t cache_lookup_result    = CacheLookupResult_t::NONE;
     HTTPStatus          http_return_code       = HTTPStatus::NONE;
-    CacheAuth_t         www_auth_content       = CacheAuth_t::NONE;
+    std::string         http_return_code_setter_name;
+    CacheAuth_t         www_auth_content = CacheAuth_t::NONE;
 
     Arena arena;
 
@@ -682,6 +687,7 @@ public:
     bool api_server_request_body_set  = false;
     bool api_req_cacheable            = false;
     bool api_resp_cacheable           = false;
+    bool api_server_addr_set_retried  = false;
     bool reverse_proxy                = false;
     bool url_remap_success            = false;
     bool api_skip_all_remapping       = false;
@@ -701,16 +707,29 @@ public:
     ///   configuration.
     bool is_cacheable_due_to_negative_caching_configuration = false;
 
+    /// Set when stale content is served due to cache write lock failure.
+    /// Used to correctly attribute statistics and VIA strings.
+    bool serving_stale_due_to_write_lock = false;
+
+    /// Set when CACHE_LOOKUP_COMPLETE hook is deferred for action 5/6.
+    /// The hook will fire later with the final result once we know if
+    /// stale content will be served or if we're going to origin.
+    bool cache_lookup_complete_deferred = false;
+
     MgmtByte cache_open_write_fail_action = 0;
 
-    HttpConfigParams           *http_config_param = nullptr;
-    CacheLookupInfo             cache_info;
+    HttpConfigParams *http_config_param = nullptr;
+    CacheLookupInfo   cache_info;
+
     ResolveInfo                 dns_info;
     RedirectInfo                redirect_info;
     ConnectionTracker::TxnState outbound_conn_track_state;
     ConnectionAttributes        client_info;
     ConnectionAttributes        parent_info;
     ConnectionAttributes        server_info;
+    // This is a copy of the effective client IP address (see pp-clnt) to
+    // ensure this is available for logging
+    IpEndpoint effective_client_addr;
 
     Source_t            source               = Source_t::NONE;
     Source_t            pre_transform_source = Source_t::NONE;
@@ -724,11 +743,11 @@ public:
     //  able to defer some work in building the request
     TransactFunc_t pending_work = nullptr;
 
-    HttpRequestData                           request_data;
-    ParentConfigParams                       *parent_params     = nullptr;
-    std::shared_ptr<NextHopSelectionStrategy> next_hop_strategy = nullptr;
-    ParentResult                              parent_result;
-    CacheControlResult                        cache_control;
+    HttpRequestData           request_data;
+    ParentConfigParams       *parent_params     = nullptr;
+    NextHopSelectionStrategy *next_hop_strategy = nullptr;
+    ParentResult              parent_result;
+    CacheControlResult        cache_control;
 
     StateMachineAction_t next_action                      = StateMachineAction_t::UNDEFINED; // out
     StateMachineAction_t api_next_action                  = StateMachineAction_t::UNDEFINED; // out
@@ -850,6 +869,9 @@ public:
       //      memset((void *)&host_db_info, 0, sizeof(host_db_info));
     }
 
+    // coverity[exn_spec_violation] - destroy() only frees memory and does ref counting
+    ~State() { destroy(); }
+
     void
     destroy()
     {
@@ -858,8 +880,10 @@ public:
       free_internal_msg_buffer();
       ats_free(internal_msg_buffer_type);
 
-      ParentConfig::release(parent_params);
-      parent_params = nullptr;
+      if (parent_params != nullptr) {
+        ParentConfig::release(parent_params);
+        parent_params = nullptr;
+      }
 
       hdr_info.client_request.destroy();
       hdr_info.client_response.destroy();
@@ -878,12 +902,12 @@ public:
       url_map.clear();
       arena.reset();
       unmapped_url.clear();
-      dns_info.~ResolveInfo();
       outbound_conn_track_state.clear();
 
       delete[] ranges;
       ranges      = nullptr;
       range_setup = RangeSetup_t::NONE;
+
       return;
     }
 
@@ -931,7 +955,13 @@ public:
       if (e != EIO) {
         this->cause_of_death_errno = e;
       }
-      Dbg(_dbg_ctl, "Setting upstream connection failure %d to %d", original_connect_result, this->current.server->connect_result);
+
+      if (_dbg_ctl.on()) {
+        std::string buf;
+        swoc::bwprint(buf, "Setting connect_result {::s} to {::s}", swoc::bwf::Errno(original_connect_result),
+                      swoc::bwf::Errno(this->current.server->connect_result));
+        Dbg(_dbg_ctl, "%s", buf.c_str());
+      }
     }
 
     MgmtInt
@@ -973,7 +1003,6 @@ public:
   static void Forbidden(State *s);
   static void SelfLoop(State *s);
   static void TooEarly(State *s);
-  static void OriginDown(State *s);
   static void PostActiveTimeoutResponse(State *s);
   static void PostInactiveTimeoutResponse(State *s);
   static void DecideCacheLookup(State *s);
@@ -988,9 +1017,12 @@ public:
   static void HandleCacheOpenReadHitFreshness(State *s);
   static void HandleCacheOpenReadHit(State *s);
   static void HandleCacheOpenReadMiss(State *s);
+  static void HandleCacheOpenReadMissGoToOrigin(State *s);
   static void set_cache_prepare_write_action_for_new_request(State *s);
   static void build_response_from_cache(State *s, HTTPWarningCode warning_code);
   static void handle_cache_write_lock(State *s);
+  static void handle_cache_write_lock_go_to_origin(State *s);
+  static void handle_cache_write_lock_go_to_origin_continue(State *s);
   static void HandleResponse(State *s);
   static void HandleUpdateCachedObject(State *s);
   static void HandleUpdateCachedObjectContinue(State *s);
@@ -1001,7 +1033,7 @@ public:
   static void handle_response_from_parent_plugin(State *s);
   static void handle_response_from_server(State *s);
   static void delete_server_rr_entry(State *s, int max_retries);
-  static void retry_server_connection_not_open(State *s, ServerState_t conn_state, unsigned max_retries);
+  static void retry_server_connection_not_open(State *s, unsigned max_retries);
   static void error_log_connection_failure(State *s, ServerState_t conn_state);
   static void handle_server_connection_not_open(State *s);
   static void handle_forward_server_connection_open(State *s);
@@ -1045,6 +1077,8 @@ public:
   static bool handle_trace_and_options_requests(State *s, HTTPHdr *incoming_hdr);
   static void bootstrap_state_variables_from_request(State *s, HTTPHdr *incoming_request);
 
+  static uint8_t origin_server_connect_attempts_max_retries(State *s);
+
   // WARNING:  this function may be called multiple times for the same transaction.
   //
   static void initialize_state_variables_from_request(State *s, HTTPHdr *obsolete_incoming_request);
@@ -1083,7 +1117,8 @@ public:
   static void             handle_response_keep_alive_headers(State *s, HTTPVersion ver, HTTPHdr *heads);
   static int              get_max_age(HTTPHdr *response);
   static int              calculate_document_freshness_limit(State *s, HTTPHdr *response, time_t response_date, bool *heuristic);
-  static Freshness_t      what_is_document_freshness(State *s, HTTPHdr *client_request, HTTPHdr *cached_obj_response);
+  static Freshness_t      what_is_document_freshness(State *s, HTTPHdr *client_request, HTTPHdr *cached_obj_response,
+                                                     bool evaluate_actual_freshness = false);
   static Authentication_t AuthenticationNeeded(const OverridableHttpConfigParams *p, HTTPHdr *client_request,
                                                HTTPHdr *obj_response);
   static void             handle_parent_down(State *s);

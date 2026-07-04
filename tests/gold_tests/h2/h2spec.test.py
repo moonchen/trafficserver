@@ -38,7 +38,13 @@ ts = Test.MakeATSProcess("ts", enable_tls=True, enable_cache=False)
 ts.addDefaultSSLFiles()
 
 ts.Disk.remap_config.AddLine('map / http://127.0.0.1:{0}'.format(httpbin.Variables.Port))
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 ts.Disk.records_config.update(
     {
         'proxy.config.http.insert_request_via_str': 1,
@@ -59,7 +65,7 @@ h2spec_targets = "generic http2/3 http2/4 http2/5 http2/6 http2/7 http2/8 hpack"
 test_run = Test.AddTestRun()
 test_run.Processes.Default.Command = 'h2spec {0} -t -k --timeout 10 -p {1}'.format(h2spec_targets, ts.Variables.ssl_port)
 test_run.Processes.Default.ReturnCode = 0
-test_run.Processes.Default.StartBefore(httpbin, ready=When.PortOpen(httpbin.Variables.Port))
+test_run.Processes.Default.StartBefore(httpbin)
 test_run.Processes.Default.StartBefore(Test.Processes.ts)
 test_run.Processes.Default.Streams.stdout = "gold/h2spec_stdout.gold"
 test_run.StillRunningAfter = httpbin

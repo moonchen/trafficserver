@@ -16,287 +16,265 @@
 #  limitations under the License.
 
 from __future__ import annotations
-
-from typing import Callable
+from typing import Final, Callable
+from dataclasses import dataclass
+from hrw4u.generators import get_complete_reverse_resolution_map
 from hrw4u.validation import Validator
-import hrw4u.types as types
+from hrw4u.types import MapParams, SuffixGroup
 from hrw4u.states import SectionType
-from hrw4u.common import MagicStrings, HeaderOperations
+from hrw4u.common import HeaderOperations
 
-HEADER_OPERATIONS = HeaderOperations.OPERATIONS
+# Common section sets for validation
+# HTTP_SECTIONS: All hooks where HTTP transaction data is available (excludes TXN_START/TXN_CLOSE)
+HTTP_SECTIONS: Final[frozenset[SectionType]] = frozenset(
+    {
+        SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST, SectionType.READ_RESPONSE,
+        SectionType.SEND_RESPONSE
+    })
 
-OPERATOR_MAP: dict[str, tuple[str | list[str] | tuple[str, ...], Callable[[str], None] | None, bool, set[SectionType] | None]] = {
-    "http.cntl.": ("set-http-cntl", Validator.suffix_group(types.SuffixGroup.HTTP_CNTL_FIELDS), True, None),
-    "http.status.reason": ("set-status-reason", Validator.quoted_or_simple(), False, None),
-    "http.status": ("set-status", Validator.range(0, 999), False, None),
-    "inbound.conn.dscp": ("set-conn-dscp", Validator.nbit_int(6), False, None),
-    "inbound.cookie.": (["rm-cookie", "set-cookie"], Validator.http_token(), False, None),
-    "inbound.req.": (HEADER_OPERATIONS, Validator.http_token(), False, None),
-    "inbound.resp.body": ("set-body", Validator.quoted_or_simple(), False, None),
-    "inbound.resp.": (HEADER_OPERATIONS, Validator.http_token(), False, None),
-    "inbound.status.reason": ("set-status-reason", Validator.quoted_or_simple(), False, None),
-    "inbound.status": ("set-status", Validator.range(0, 999), False, None),
-    "inbound.url.": (["rm-destination", "set-destination"], Validator.suffix_group(types.SuffixGroup.URL_FIELDS), True, None),
-    "outbound.cookie.": (["rm-cookie", "set-cookie"], Validator.http_token(), False, None),
-    "outbound.req.":
-        (HEADER_OPERATIONS, Validator.http_token(), False, {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST}),
-    "outbound.resp.":
-        (
-            HEADER_OPERATIONS,
-            Validator.http_token(),
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST},
-        ),
-    "outbound.status.reason":
-        (
-            "set-status-reason", Validator.quoted_or_simple(), False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST}),
-    "outbound.status":
-        ("set-status", Validator.range(0, 999), False, {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST}),
+# yapf: disable
+OPERATOR_MAP: dict[str, MapParams] = {
+    "http.cntl.": MapParams(target="set-http-cntl", upper=True, validate=Validator.suffix_group(SuffixGroup.HTTP_CNTL_FIELDS), sections=HTTP_SECTIONS),
+    "http.status.reason": MapParams(target="set-status-reason", validate=Validator.quoted_or_simple(), sections=HTTP_SECTIONS),
+    "http.status": MapParams(target="set-status", validate=Validator.range(0, 999), sections=HTTP_SECTIONS),
+    "inbound.conn.dscp": MapParams(target="set-conn-dscp", validate=Validator.nbit_int(6), sections=HTTP_SECTIONS),
+    "inbound.conn.mark": MapParams(target="set-conn-mark", validate=Validator.nbit_int(32), sections=HTTP_SECTIONS),
+    "outbound.conn.dscp": MapParams(target="set-conn-dscp", validate=Validator.nbit_int(6), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.mark": MapParams(target="set-conn-mark", validate=Validator.nbit_int(32), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "inbound.cookie.": MapParams(target=HeaderOperations.COOKIE_OPERATIONS, validate=Validator.http_token(), sections=HTTP_SECTIONS),
+    "inbound.req.": MapParams(target=HeaderOperations.OPERATIONS, add=True, validate=Validator.http_header_name(), sections=HTTP_SECTIONS),
+    "inbound.resp.body": MapParams(target="set-body", validate=Validator.quoted_or_simple(), sections=HTTP_SECTIONS),
+    "inbound.resp.": MapParams(target=HeaderOperations.OPERATIONS, add=True, validate=Validator.http_header_name(), sections={SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "inbound.status.reason": MapParams(target="set-status-reason", validate=Validator.quoted_or_simple(), sections=HTTP_SECTIONS),
+    "inbound.status": MapParams(target="set-status", validate=Validator.range(0, 999), sections=HTTP_SECTIONS),
+    "inbound.url.": MapParams(target=HeaderOperations.DESTINATION_OPERATIONS, upper=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections=HTTP_SECTIONS),
+    "outbound.cookie.": MapParams(target=HeaderOperations.COOKIE_OPERATIONS, validate=Validator.http_token(), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.req.": MapParams(target=HeaderOperations.OPERATIONS, add=True, validate=Validator.http_header_name(), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.resp.": MapParams(target=HeaderOperations.OPERATIONS, add=True, validate=Validator.http_header_name(), sections={SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.status.reason": MapParams(target="set-status-reason", validate=Validator.quoted_or_simple(), sections=HTTP_SECTIONS),
+    "outbound.status": MapParams(target="set-status", validate=Validator.range(0, 999), sections=HTTP_SECTIONS),
+    "outbound.url.": MapParams(target=HeaderOperations.DESTINATION_OPERATIONS, upper=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections={SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST})
 }
 
-# This map is for functions which can never be used as conditions. We split this out to avoid
-# the conflict that otherwise happens when a function name is also a condition name.
-STATEMENT_FUNCTION_MAP: dict[str, tuple[str, Callable[[list[str]], None] | None]] = {
-    "add-header": ("add-header", Validator.arg_count(2).arg_at(0, Validator.http_token()).arg_at(1, Validator.quoted_or_simple())),
-    "counter": ("counter", Validator.arg_count(1).quoted_or_simple()),
-    "set-debug": ("set-debug", Validator.arg_count(0)),
-    "no-op": ("no-op", Validator.arg_count(0)),
-    "remove_query": ("rm-destination QUERY", Validator.arg_count(1).quoted_or_simple()),
-    "keep_query": ("rm-destination QUERY", Validator.arg_count(1).quoted_or_simple()),
-    "run-plugin": ("run-plugin", Validator.min_args(1).quoted_or_simple()),
-    "set-body-from": ("set-body-from", Validator.arg_count(1).quoted_or_simple()),
-    "set-config": ("set-config", Validator.arg_count(2).quoted_or_simple()),
-    "set-redirect":
-        ("set-redirect", Validator.arg_count(2).arg_at(0, Validator.range(300, 399)).arg_at(1, Validator.quoted_or_simple())),
-    "skip-remap": ("skip-remap", Validator.arg_count(1).suffix_group(types.SuffixGroup.BOOL_FIELDS)),
+STATEMENT_FUNCTION_MAP: dict[str, MapParams] = {
+    "add-header": MapParams(target="add-header", validate=Validator.arg_count(2).arg_at(0, Validator.http_header_name()).arg_at(1, Validator.quoted_or_simple()), sections=HTTP_SECTIONS),
+    "counter": MapParams(target="counter", validate=Validator.arg_count(1).quoted_or_simple()),
+    "set-debug": MapParams(target="set-debug", validate=Validator.arg_count(0)),
+    "no-op": MapParams(target="no-op", validate=Validator.arg_count(0)),
+    "remove_query": MapParams(target="rm-destination QUERY", validate=Validator.arg_count(1).quoted_or_simple(), sections=HTTP_SECTIONS),
+    "keep_query": MapParams(target="rm-destination QUERY", validate=Validator.arg_count(1).quoted_or_simple(), sections=HTTP_SECTIONS),
+    "run-plugin": MapParams(target="run-plugin", validate=Validator.min_args(1).quoted_or_simple(), sections=HTTP_SECTIONS),
+    "set-body-from": MapParams(target="set-body-from", validate=Validator.arg_count(1).quoted_or_simple(), sections=HTTP_SECTIONS),
+    "set-config": MapParams(target="set-config", validate=Validator.arg_count(2).quoted_or_simple(), sections=HTTP_SECTIONS),
+    "set-redirect": MapParams(target="set-redirect", validate=Validator.arg_count(2).arg_at(0, Validator.range(300, 399)).arg_at(1, Validator.quoted_or_simple()), sections=HTTP_SECTIONS),
+    "skip-remap": MapParams(target="skip-remap", validate=Validator.arg_count(1).suffix_group(SuffixGroup.BOOL_FIELDS)._add(Validator.normalize_arg_at(0)), sections={SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST}),
+    "set-plugin-cntl": MapParams(target="set-plugin-cntl", validate=Validator.arg_count(2)._add(Validator.normalize_arg_at(0)).arg_at(0, Validator.suffix_group(SuffixGroup.PLUGIN_CNTL_FIELDS))._add(Validator.normalize_arg_at(1))._add(Validator.conditional_arg_validation(SuffixGroup.PLUGIN_CNTL_MAPPING.value)), sections=HTTP_SECTIONS),
 }
 
-# The function map are for the hybrid functions which map to what looks like conditions,
-# but don't map nicely to the X.y syntax we prefer in HRW4U.
-FUNCTION_MAP = {
-    "access": ("ACCESS", Validator.arg_count(1).quoted_or_simple()),
-    "cache": ("CACHE", Validator.arg_count(0)),
-    "cidr": ("CIDR", Validator.arg_count(2).arg_at(0, Validator.range(1, 32)).arg_at(1, Validator.range(1, 128))),
-    "internal": ("INTERNAL-TRANSACTION", Validator.arg_count(0)),
-    "random": ("RANDOM", Validator.arg_count(1).nbit_int(32)),
-    "ssn-txn-count": ("SSN-TXN-COUNT", Validator.arg_count(0)),
-    "txn-count": ("TXN-COUNT", Validator.arg_count(0)),
+FUNCTION_MAP: dict[str, MapParams] = {
+    "access": MapParams(target="ACCESS", validate=Validator.arg_count(1).quoted_or_simple()),
+    "cache": MapParams(target="CACHE", validate=Validator.arg_count(0)),
+    "cidr": MapParams(target="CIDR", validate=Validator.arg_count(2).arg_at(0, Validator.range(1, 32)).arg_at(1, Validator.range(1, 128))),
+    "internal": MapParams(target="INTERNAL-TRANSACTION", validate=Validator.arg_count(0)),
+    "random": MapParams(target="RANDOM", validate=Validator.arg_count(1).nbit_int(32)),
+    "ssn-txn-count": MapParams(target="SSN-TXN-COUNT", validate=Validator.arg_count(0)),
+    "txn-count": MapParams(target="TXN-COUNT", validate=Validator.arg_count(0)),
 }
 
-CONDITION_MAP: dict[str, tuple[str, Callable[[str], None] | None, bool, set[SectionType] | None, bool, dict | None]] = {
+CONDITION_MAP: dict[str, MapParams] = {
     # Exact matches with reverse mapping info
-    "inbound.ip": ("%{IP:CLIENT}", None, False, None, False, {
-        "reverse_tag": "IP",
-        "reverse_payload": "CLIENT"
-    }),
-    "inbound.method": ("%{METHOD}", None, False, None, False, {
-        "reverse_tag": "METHOD",
-        "ambiguous": True
-    }),
-    "inbound.server": ("%{IP:INBOUND}", None, False, None, False, {
-        "reverse_tag": "IP",
-        "reverse_payload": "INBOUND"
-    }),
-    "inbound.status": ("%{STATUS}", None, False, None, False, {
-        "reverse_tag": "STATUS",
-        "ambiguous": True
-    }),
-    "now": ("%{NOW}", None, False, None, False, None),
-    "outbound.ip":
-        (
-            "%{IP:SERVER}",
-            None,
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST},
-            False,
-            {
-                "reverse_tag": "IP",
-                "reverse_payload": "SERVER"
-            },
-        ),
-    "outbound.method":
-        (
-            "%{METHOD}",
-            None,
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST},
-            False,
-            {
-                "reverse_tag": "METHOD",
-                "ambiguous": True
-            },
-        ),
-    "outbound.server":
-        (
-            "%{IP:OUTBOUND}",
-            None,
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST},
-            False,
-            {
-                "reverse_tag": "IP",
-                "reverse_payload": "OUTBOUND"
-            },
-        ),
-    "outbound.status":
-        (
-            "%{STATUS}",
-            None,
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST},
-            False,
-            {
-                "reverse_tag": "STATUS",
-                "ambiguous": True
-            },
-        ),
-    "tcp.info": ("%{TCP-INFO}", None, False, None, False, None),
+    "inbound.ip": MapParams(target="%{IP:CLIENT}", rev={"reverse_tag": "IP", "reverse_payload": "CLIENT"}),
+    "inbound.method": MapParams(target="%{METHOD}", sections=HTTP_SECTIONS, rev={"reverse_tag": "METHOD", "ambiguous": True}),
+    "inbound.server": MapParams(target="%{IP:INBOUND}", rev={"reverse_tag": "IP", "reverse_payload": "INBOUND"}),
+    "inbound.status": MapParams(target="%{STATUS}", sections=HTTP_SECTIONS, rev={"reverse_tag": "STATUS", "ambiguous": True}),
+    "now": MapParams(target="%{NOW}"),
+    "outbound.ip": MapParams(target="%{IP:SERVER}", sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_tag": "IP", "reverse_payload": "SERVER"}),
+    "outbound.method": MapParams(target="%{METHOD}", sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_tag": "METHOD", "ambiguous": True}),
+    "outbound.server": MapParams(target="%{IP:OUTBOUND}", sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_tag": "IP", "reverse_payload": "OUTBOUND"}),
+    "outbound.status": MapParams(target="%{STATUS}", sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_tag": "STATUS", "ambiguous": True}),
+    "tcp.info": MapParams(target="%{TCP-INFO}"),
 
-    # Prefix matches with reverse mapping info
-    "capture.": ("LAST-CAPTURE", Validator.range(0, 9), False, None, True, None),
-    "client.cert.": ("CLIENT-CERT", None, True, None, True, None),
-    "from.url.": ("FROM-URL", Validator.suffix_group(types.SuffixGroup.URL_FIELDS), True, None, True, None),
-    "geo.": ("GEO", Validator.suffix_group(types.SuffixGroup.GEO_FIELDS), True, None, True, None),
-    "http.cntl.": ("HTTP-CNTL", Validator.suffix_group(types.SuffixGroup.HTTP_CNTL_FIELDS), True, None, False, None),
-    "id.": ("ID", Validator.suffix_group(types.SuffixGroup.ID_FIELDS), True, None, False, None),
-    "inbound.conn.": ("INBOUND", Validator.suffix_group(types.SuffixGroup.CONN_FIELDS), True, None, True, None),
-    "inbound.cookie.": ("COOKIE", Validator.http_token(), False, None, True, {
-        "reverse_fallback": "inbound.cookie."
-    }),
-    "inbound.req.": ("CLIENT-HEADER", None, False, None, True, {
-        "reverse_fallback": "inbound.req."
-    }),
-    "inbound.resp.": ("HEADER", None, False, None, True, {
-        "reverse_context": "header_condition"
-    }),
-    "inbound.url.": ("CLIENT-URL", Validator.suffix_group(types.SuffixGroup.URL_FIELDS), True, None, True, None),
-    "now.": ("NOW", Validator.suffix_group(types.SuffixGroup.DATE_FIELDS), True, None, False, None),
-    "outbound.conn.": ("OUTBOUND", Validator.suffix_group(types.SuffixGroup.CONN_FIELDS), True, None, True, None),
-    "outbound.cookie.": ("COOKIE", Validator.http_token(), False, None, True, {
-        "reverse_fallback": "inbound.cookie."
-    }),
-    "outbound.req.":
-        (
-            "HEADER", None, False, {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST}, True, {
-                "reverse_context": "header_condition"
-            }),
-    "outbound.resp.":
-        (
-            "HEADER",
-            None,
-            False,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST},
-            True,
-            {
-                "reverse_context": "header_condition"
-            },
-        ),
-    "outbound.url.":
-        (
-            "NEXT-HOP",
-            Validator.suffix_group(types.SuffixGroup.URL_FIELDS),
-            True,
-            {SectionType.PRE_REMAP, SectionType.REMAP, SectionType.READ_REQUEST},
-            True,
-            None,
-        ),
-    "to.url.": ("TO-URL", Validator.suffix_group(types.SuffixGroup.URL_FIELDS), True, None, True, None),
+    # Prefix matches
+    "capture.": MapParams(target="LAST-CAPTURE", prefix=True, validate=Validator.range(0, 9)),
+    "from.url.query.": MapParams(target="FROM-URL:QUERY", prefix=True, validate=Validator.http_token(), sections=HTTP_SECTIONS),
+    "from.url.": MapParams(target="FROM-URL", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections=HTTP_SECTIONS),
+    "geo.": MapParams(target="GEO", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.GEO_FIELDS)),
+    "http.cntl.": MapParams(target="HTTP-CNTL", upper=True, validate=Validator.suffix_group(SuffixGroup.HTTP_CNTL_FIELDS), sections=HTTP_SECTIONS),
+    "id.": MapParams(target="ID", upper=True, validate=Validator.suffix_group(SuffixGroup.ID_FIELDS)),
+    "inbound.conn.client-cert.SAN.": MapParams(target="INBOUND:CLIENT-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS)),
+    "inbound.conn.server-cert.SAN.": MapParams(target="INBOUND:SERVER-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS)),
+    "inbound.conn.client-cert.san.": MapParams(target="INBOUND:CLIENT-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS)),
+    "inbound.conn.server-cert.san.": MapParams(target="INBOUND:SERVER-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS)),
+    "inbound.conn.client-cert.": MapParams(target="INBOUND:CLIENT-CERT", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CERT_FIELDS)),
+    "inbound.conn.server-cert.": MapParams(target="INBOUND:SERVER-CERT", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CERT_FIELDS)),
+    "inbound.conn.": MapParams(target="INBOUND", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CONN_FIELDS)),
+    "inbound.cookie.": MapParams(target="COOKIE", prefix=True, validate=Validator.http_token(), sections=HTTP_SECTIONS, rev={"reverse_fallback": "inbound.cookie."}),
+    "inbound.req.": MapParams(target="CLIENT-HEADER", prefix=True, validate=Validator.http_header_name(), sections=HTTP_SECTIONS, rev={"reverse_fallback": "inbound.req."}),
+    "inbound.resp.": MapParams(target="HEADER", prefix=True, validate=Validator.http_header_name(), sections={SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_context": "header_condition"}),
+    "inbound.url.query.": MapParams(target="CLIENT-URL:QUERY", prefix=True, validate=Validator.http_token(), sections=HTTP_SECTIONS),
+    "inbound.url.": MapParams(target="CLIENT-URL", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections=HTTP_SECTIONS),
+    "nexthop.": MapParams(target="NEXT-HOP", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.NEXTHOP_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_fallback": "nexthop."}),
+    "now.": MapParams(target="NOW", upper=True, validate=Validator.suffix_group(SuffixGroup.DATE_FIELDS)),
+    "outbound.conn.client-cert.SAN.": MapParams(target="OUTBOUND:CLIENT-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.server-cert.SAN.": MapParams(target="OUTBOUND:SERVER-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.client-cert.san.": MapParams(target="OUTBOUND:CLIENT-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.server-cert.san.": MapParams(target="OUTBOUND:SERVER-CERT:SAN", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.SAN_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.client-cert.": MapParams(target="OUTBOUND:CLIENT-CERT", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CERT_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.server-cert.": MapParams(target="OUTBOUND:SERVER-CERT", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CERT_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.conn.": MapParams(target="OUTBOUND", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.CONN_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.cookie.": MapParams(target="COOKIE", prefix=True, validate=Validator.http_token(), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_fallback": "inbound.cookie."}),
+    "outbound.req.": MapParams(target="SERVER-HEADER", prefix=True, validate=Validator.http_header_name(), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_fallback": "outbound.req."}),
+    "outbound.resp.": MapParams(target="HEADER", prefix=True, validate=Validator.http_header_name(), sections={SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_context": "header_condition"}),
+    "outbound.url.query.": MapParams(target="SERVER-URL:QUERY", prefix=True, validate=Validator.http_token(), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}),
+    "outbound.url.": MapParams(target="SERVER-URL", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections={SectionType.SEND_REQUEST, SectionType.READ_RESPONSE, SectionType.SEND_RESPONSE}, rev={"reverse_fallback": "outbound.url."}),
+    "to.url.query.": MapParams(target="TO-URL:QUERY", prefix=True, validate=Validator.http_token(), sections=HTTP_SECTIONS),
+    "to.url.": MapParams(target="TO-URL", upper=True, prefix=True, validate=Validator.suffix_group(SuffixGroup.URL_FIELDS), sections=HTTP_SECTIONS),
 }
 
-# Reverse resolution map for inverse symbol resolution
-REVERSE_RESOLUTION_MAP = {
-    # IP payload mappings
-    "IP": {
-        "CLIENT": "inbound.ip",
-        "INBOUND": "inbound.server",
-        "SERVER": "outbound.ip",
-        "OUTBOUND": "outbound.server",
-    },
-    # Ambiguous tag resolution with conditional logic
-    "STATUS":
-        {
-            "outbound_sections":
-                frozenset({SectionType.PRE_REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST, SectionType.READ_RESPONSE}),
-            "outbound_result": "outbound.status",
-            "inbound_result": "inbound.status",
-        },
-    "METHOD":
-        {
-            "outbound_sections": frozenset({SectionType.SEND_REQUEST}),
-            "outbound_result": "outbound.method",
-            "inbound_result": "inbound.method",
-        },
-    # Status target mappings
-    "STATUS_TARGETS":
-        {
-            frozenset({SectionType.REMAP, SectionType.SEND_RESPONSE}): "inbound.status",
-            frozenset({SectionType.PRE_REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST,
-                       SectionType.READ_RESPONSE}): "outbound.status",
-        },
-    "HEADER_CONTEXT_MAP":
-        {
-            SectionType.REMAP: "inbound.req.",
-            frozenset({SectionType.PRE_REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST}): "outbound.req.",
-            SectionType.READ_RESPONSE: "outbound.resp.",
-        },
-    "URL_CONTEXT_MAP":
-        {
-            SectionType.REMAP: "inbound.url.",
-            frozenset({SectionType.PRE_REMAP, SectionType.READ_REQUEST, SectionType.SEND_REQUEST}): "outbound.url.",
-        },
-    "CONTEXT_TYPE_MAP":
-        {
-            "header_condition": ("HEADER_CONTEXT_MAP", "inbound.resp."),
-            "header_ops": ("HEADER_CONTEXT_MAP", "inbound.resp."),
-            "cookie_ops": "inbound.cookie.",
-            "destination_ops": ("URL_CONTEXT_MAP", "inbound.url."),
-        },
-    "FALLBACK_TAG_MAP":
-        {
-            "HEADER": ("header_condition", True),
-            "CLIENT-HEADER": ("inbound.req.", False),
-            "COOKIE": ("inbound.cookie.", False),
-        },
+FALLBACK_TAG_MAP: dict[str, tuple[str, bool]] = {
+    "CLIENT-HEADER": ("inbound.req.", False),
+    "CLIENT-URL:QUERY": ("inbound.url.query.", False),
+    "COOKIE": ("inbound.cookie.", False),
+    "FROM-URL:QUERY": ("from.url.query.", False),
+    "HEADER": ("header_condition", True),
+    "INBOUND:CLIENT-CERT": ("inbound.conn.client-cert.", False),
+    "INBOUND:CLIENT-CERT:SAN": ("inbound.conn.client-cert.SAN.", False),
+    "INBOUND:SERVER-CERT": ("inbound.conn.server-cert.", False),
+    "INBOUND:SERVER-CERT:SAN": ("inbound.conn.server-cert.SAN.", False),
+    "NEXT-HOP": ("nexthop.", False),
+    "OUTBOUND:CLIENT-CERT": ("outbound.conn.client-cert.", False),
+    "OUTBOUND:CLIENT-CERT:SAN": ("outbound.conn.client-cert.SAN.", False),
+    "OUTBOUND:SERVER-CERT": ("outbound.conn.server-cert.", False),
+    "OUTBOUND:SERVER-CERT:SAN": ("outbound.conn.server-cert.SAN.", False),
+    "SERVER-HEADER": ("outbound.req.", False),
+    "SERVER-URL": ("outbound.url.", False),
+    "TO-URL:QUERY": ("to.url.query.", False)
 }
 
-# Pre-computed lookup optimizations for better performance
-_OPERATOR_COMMAND_LOOKUP = {
-    cmd: key for key, (commands, *_) in OPERATOR_MAP.items()
-    for cmd in (commands if isinstance(commands, (list, tuple)) else [commands])
+# Context type to mapping name associations
+CONTEXT_TYPE_MAP: dict[str, str | tuple[str, str]] = {
+    "header_condition": ("HEADER_CONTEXT_MAP", "inbound.resp."),
+    "header_ops": ("HEADER_CONTEXT_MAP", "inbound.resp."),
+    "cookie_ops": "inbound.cookie.",
+    "destination_ops": ("URL_CONTEXT_MAP", "inbound.url.")
 }
 
-_CONDITION_TAG_LOOKUP = {
-    tag.strip().removeprefix("%{").removesuffix("}").split(":", 1)[0]: key
-    for key, (tag, *_) in CONDITION_MAP.items()
-    if not key.endswith(".")
-}
-
-_FUNCTION_TAG_LOOKUP = {tag: func_name for func_name, (tag, _) in FUNCTION_MAP.items()}
-
-
-def get_operator_key_for_command(command: str) -> str | None:
-    """Fast lookup for operator key by command"""
-    return _OPERATOR_COMMAND_LOOKUP.get(command)
-
-
-def get_condition_key_for_tag(tag: str) -> str | None:
-    """Fast lookup for condition key by tag"""
-    return _CONDITION_TAG_LOOKUP.get(tag)
-
-
-def get_function_name_for_tag(tag: str) -> str | None:
-    """Fast lookup for function name by tag"""
-    return _FUNCTION_TAG_LOOKUP.get(tag)
-
-
-AMBIGUOUS_CONTEXT_TAGS = frozenset({"STATUS", "METHOD"})
-
-OPERATOR_COMMAND_MAP = {
+# Operator command mappings for reverse resolution
+OPERATOR_COMMAND_MAP: dict[str, tuple[str, str, Callable, Callable]] = {
+    "add-header": ("header_ops", "header", lambda toks: toks[1], lambda qual: qual),
     "set-header": ("header_ops", "header", lambda toks: toks[1], lambda qual: qual),
     "rm-header": ("header_ops", "header", lambda toks: toks[1], lambda qual: qual),
     "set-cookie": ("cookie_ops", "cookie", lambda toks: toks[1], lambda qual: qual),
     "rm-cookie": ("cookie_ops", "cookie", lambda toks: toks[1], lambda qual: qual),
     "set-destination": ("destination_ops", "destination", lambda toks: toks[1].lower(), lambda qual: qual),
-    "rm-destination": ("destination_ops", "destination", lambda toks: toks[1].lower(), lambda qual: qual),
+    "rm-destination": ("destination_ops", "destination", lambda toks: toks[1].lower(), lambda qual: qual)
 }
+# yapf: enable
+
+REVERSE_RESOLUTION_MAP = get_complete_reverse_resolution_map()
+
+
+@dataclass(slots=True, frozen=True)
+class PatternMatch:
+    """Represents a matched pattern with context information."""
+    pattern: str
+    matched_part: str
+    suffix: str
+    context_type: str
+    field_dict_key: str | None = None
+    maps_to: str | None = None
+
+
+class LSPPatternMatcher:
+
+    FIELD_PATTERNS: Final[dict[str, tuple[str, str, str]]] = {
+        'now.': ('TIME_FIELDS', 'Current Date/Time Field', 'NOW'),
+        'id.': ('ID_FIELDS', 'Transaction/Process Identifier', 'ID'),
+        'geo.': ('GEO_FIELDS', 'Geographic Information', 'GEO'),
+    }
+
+    HEADER_PATTERNS: Final[list[str]] = ['inbound.req.', 'inbound.resp.', 'outbound.req.', 'outbound.resp.']
+    COOKIE_PATTERNS: Final[list[str]] = ['inbound.cookie.', 'outbound.cookie.']
+    CERTIFICATE_PATTERNS: Final[tuple[str, ...]] = (
+        'inbound.conn.client-cert.', 'inbound.conn.server-cert.', 'outbound.conn.client-cert.', 'outbound.conn.server-cert.')
+    CONNECTION_PATTERNS: Final[list[str]] = ['inbound.conn.', 'outbound.conn.']
+
+    @classmethod
+    def match_field_pattern(cls, expression: str) -> PatternMatch | None:
+        """Match field patterns (now., id., geo.) against expression."""
+        for pattern, (field_dict, context, tag) in cls.FIELD_PATTERNS.items():
+            if expression.startswith(pattern):
+                suffix = expression[len(pattern):]
+                return PatternMatch(
+                    pattern=pattern,
+                    matched_part=expression,
+                    suffix=suffix,
+                    context_type=context,
+                    field_dict_key=field_dict,
+                    maps_to=f"%{{{tag}:{suffix.upper()}}}")
+        return None
+
+    @classmethod
+    def match_header_pattern(cls, expression: str) -> PatternMatch | None:
+        """Match header patterns against expression."""
+        for pattern in cls.HEADER_PATTERNS:
+            if expression.startswith(pattern):
+                suffix = expression[len(pattern):]
+                return PatternMatch(
+                    pattern=pattern, matched_part=expression, suffix=suffix, context_type='Header', field_dict_key=None)
+        return None
+
+    @classmethod
+    def match_cookie_pattern(cls, expression: str) -> PatternMatch | None:
+        """Match cookie patterns against expression."""
+        for pattern in cls.COOKIE_PATTERNS:
+            if expression.startswith(pattern):
+                suffix = expression[len(pattern):]
+                return PatternMatch(
+                    pattern=pattern, matched_part=expression, suffix=suffix, context_type='Cookie', field_dict_key=None)
+        return None
+
+    @classmethod
+    def match_certificate_pattern(cls, expression: str) -> PatternMatch | None:
+        """Match certificate patterns against expression."""
+        for pattern in cls.CERTIFICATE_PATTERNS:
+            if expression.startswith(pattern):
+                suffix = expression[len(pattern):]
+                return PatternMatch(
+                    pattern=pattern, matched_part=expression, suffix=suffix, context_type='Certificate', field_dict_key=None)
+        return None
+
+    @classmethod
+    def match_connection_pattern(cls, expression: str) -> PatternMatch | None:
+        """Match connection patterns against expression."""
+        for pattern in cls.CONNECTION_PATTERNS:
+            if expression.startswith(pattern):
+                suffix = expression[len(pattern):]
+                return PatternMatch(
+                    pattern=pattern,
+                    matched_part=expression,
+                    suffix=suffix,
+                    context_type='Connection',
+                    field_dict_key='CONN_FIELDS')
+        return None
+
+    @classmethod
+    def match_any_pattern(cls, expression: str) -> PatternMatch | None:
+        """Try to match expression against all pattern types."""
+
+        if match := cls.match_field_pattern(expression):
+            return match
+
+        if match := cls.match_certificate_pattern(expression):
+            return match
+
+        if match := cls.match_connection_pattern(expression):
+            return match
+
+        if match := cls.match_header_pattern(expression):
+            return match
+
+        if match := cls.match_cookie_pattern(expression):
+            return match
+
+        return None

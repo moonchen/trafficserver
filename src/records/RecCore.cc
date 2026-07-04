@@ -28,6 +28,7 @@
 #include "records/RecDefs.h"
 #include "swoc/swoc_file.h"
 
+#include "ts/apidefs.h"
 #include "tscore/ink_platform.h"
 #include "tscore/ink_memory.h"
 #include "tscore/ink_string.h"
@@ -547,6 +548,23 @@ RecLookupRecord(const char *name, void (*callback)(const RecRecord *, void *), v
     if (lock) {
       ink_rwlock_unlock(&g_records_rwlock);
     }
+
+    // Also check for StaticString metrics
+    if (err == REC_ERR_FAIL) {
+      auto &strings = ts::Metrics::StaticString::instance();
+
+      if (auto m = strings.lookup(std::string{name}); m) {
+        RecRecord r;
+        r.rec_type                = RECT_PLUGIN;
+        r.data_type               = RECD_STRING;
+        r.name                    = name;
+        r.data.rec_string         = const_cast<char *>(m->data());
+        r.data_default.rec_string = const_cast<char *>(m->data());
+
+        callback(&r, data);
+        err = REC_ERR_OKAY;
+      }
+    }
   }
 
   return err;
@@ -556,8 +574,7 @@ RecErrT
 RecLookupMatchingRecords(unsigned rec_type, const char *match, void (*callback)(const RecRecord *, void *), void *data,
                          bool /* lock ATS_UNUSED */)
 {
-  int num_records;
-  DFA regex;
+  Regex regex;
 
   if (!regex.compile(match, RE_CASE_INSENSITIVE | RE_UNANCHORED)) {
     return REC_ERR_FAIL;
@@ -566,22 +583,36 @@ RecLookupMatchingRecords(unsigned rec_type, const char *match, void (*callback)(
   if ((rec_type & (RECT_PROCESS | RECT_NODE | RECT_PLUGIN))) {
     // First find the new metrics, this is a bit of a hack, because we still use the old
     // librecords callback with a "pseudo" record.
-    RecRecord tmp;
-
-    tmp.rec_type = RECT_PROCESS;
-
     for (auto &&[name, type, val] : ts::Metrics::instance()) {
-      if (regex.match(name.data()) >= 0) {
+      if (regex.exec(name.data())) {
+        RecRecord tmp;
+
+        tmp.rec_type = RECT_PROCESS;
+
         tmp.name         = name.data();
         tmp.data_type    = type == ts::Metrics::MetricType::COUNTER ? RECD_COUNTER : RECD_INT;
         tmp.data.rec_int = val;
         callback(&tmp, data);
       }
     }
-    // Fall through to return any matching string metrics
+    // Finally check string metrics
+    ts::Metrics::StaticString::instance().for_each([&](const std::string &name, const std::string &value) {
+      if (regex.exec(name)) {
+        RecRecord tmp;
+
+        tmp.rec_type = RECT_PROCESS;
+
+        tmp.name      = name.data();
+        tmp.data_type = RECD_STRING;
+        // NOTE(cmcfarlen): unfortunate relic here that the callbacks expect a non-const rec_string
+        // This should be temp until traffic_ctl uses ts::Metrics directly
+        tmp.data.rec_string = const_cast<char *>(value.c_str());
+        callback(&tmp, data);
+      }
+    });
   }
 
-  num_records = g_num_records;
+  int num_records = g_num_records;
   for (int i = 0; i < num_records; i++) {
     RecRecord *r = &(g_records[i]);
 
@@ -589,7 +620,7 @@ RecLookupMatchingRecords(unsigned rec_type, const char *match, void (*callback)(
       continue;
     }
 
-    if (regex.match(r->name) < 0) {
+    if (!regex.exec(r->name)) {
       continue;
     }
 
@@ -910,6 +941,12 @@ RecDumpRecords(RecT rec_type, RecDumpEntryCb callback, void *edata)
     callback(RECT_PLUGIN, edata, true, name.data(),
              type == Metrics::MetricType::COUNTER ? TS_RECORDDATATYPE_COUNTER : TS_RECORDDATATYPE_INT, &datum);
   }
+
+  ts::Metrics::StaticString::instance().for_each([&](const std::string &name, const std::string &value) {
+    datum.rec_string = const_cast<char *>(value.c_str());
+
+    callback(RECT_PLUGIN, edata, true, name.data(), TS_RECORDDATATYPE_STRING, &datum);
+  });
 }
 
 void
@@ -1042,16 +1079,20 @@ RecConfigReadPersistentStatsPath()
 //-------------------------------------------------------------------------
 /// Generate a warning if the record is a configuration name/value but is not registered.
 void
-RecConfigWarnIfUnregistered()
+RecConfigWarnIfUnregistered(ConfigContext ctx)
 {
   RecDumpRecords(
     RECT_CONFIG,
-    [](RecT, void *, int registered_p, const char *name, int, RecData *) -> void {
+    [](RecT, void *edata, int registered_p, const char *name, int, RecData *) -> void {
       if (!registered_p) {
-        Warning("Unrecognized configuration value '%s'", name);
+        std::string err;
+        swoc::bwprint(err, "Unrecognized configuration value '{}'", name);
+        Warning("%s", err.c_str());
+        auto *ctx_ptr = static_cast<ConfigContext *>(edata);
+        ctx_ptr->log(err);
       }
     },
-    nullptr);
+    &ctx);
 }
 
 //-------------------------------------------------------------------------

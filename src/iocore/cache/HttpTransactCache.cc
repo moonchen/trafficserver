@@ -954,7 +954,7 @@ HttpTransactCache::calculate_quality_of_accept_encoding_match(MIMEField *accept_
   ///////////////////////////////////////////////////////////////////////
   // if no Accept-Encoding header, only match identity                 //
   //   The 1.1 spec says servers MAY assume that clients will accept   //
-  //   any encoding if no header is sent.  Unforntunately, this does   //
+  //   any encoding if no header is sent.  Unfortunately, this does   //
   //   not work 1.0 clients & is particularly thorny when the proxy    //
   //   created the encoding as the result of a transform.  Http 1.1   //
   //   purists would say that if proxy encodes something it's really   //
@@ -1244,7 +1244,11 @@ HttpTransactCache::CalcVariability(const HttpConfigAccessor *http_config_params,
 
         // Disable Vary mismatch checking for Accept-Encoding.  This is only safe to
         // set if you are promising to fix any Accept-Encoding/Content-Encoding mismatches.
-        if (http_config_params->get_ignore_accept_encoding_mismatch() &&
+        // Only suppress variability checks when the operator explicitly set
+        // proxy.config.http.cache.ignore_accept_encoding_mismatch to 1. The
+        // documented default value of 2 should continue to enforce Vary header
+        // semantics whenever the origin sends one.
+        if ((http_config_params->get_ignore_accept_encoding_mismatch() == 1) &&
             !strcasecmp(const_cast<char *>(field->str), "Accept-Encoding")) {
           continue;
         }

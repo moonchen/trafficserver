@@ -21,9 +21,13 @@
   limitations under the License.
  */
 
+#include "records/RecDefs.h"
 #include "tscore/ink_config.h"
 #include "tscore/Filenames.h"
 #include "records/RecordsConfig.h"
+
+#include <string_view>
+#include <cstddef>
 
 #if TS_USE_REMOTE_UNWINDING
 #define MGMT_CRASHLOG_HELPER "traffic_crashlog"
@@ -72,11 +76,13 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.dump_mem_info_frequency", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   //# 0 == CLOCK_REALTIME, change carefully
-  {RECT_CONFIG, "proxy.config.system_clock", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-9]+", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.system_clock", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.cache.max_disk_errors", RECD_INT, "5", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.cache.persist_bad_disks", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[01]", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.cache.persist_bad_disks", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.cache.default_volumes", RECD_STRING, "", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.output.logfile.name", RECD_STRING, "traffic.out", RECU_RESTART_TS, RR_REQUIRED, RECC_NULL, nullptr,
    RECA_NULL}
@@ -116,6 +122,8 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.exec_thread.affinity", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-4]", RECA_READ_ONLY}
   ,
   {RECT_CONFIG, "proxy.config.exec_thread.listen", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_READ_ONLY}
+  ,
+  {RECT_CONFIG, "proxy.config.exec_thread.loop_time_update_probability", RECD_INT, "10", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-100]", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.accept_threads", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-" TS_STR(TS_MAX_NUMBER_EVENT_THREADS) "]", RECA_READ_ONLY}
   ,
@@ -204,7 +212,7 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.diags.debug.tags", RECD_STRING, "http|dns", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.diags.debug.throttling_interval_msec", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.diags.debug.throttling_interval_msec", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.diags.debug.client_ip", RECD_STRING, nullptr, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
@@ -254,6 +262,12 @@ static constexpr RecordElement RecordsConfig[] =
   //#
   //##############################################################################
   {RECT_CONFIG, "proxy.config.admin.user_id", RECD_STRING, TS_PKGSYSUSER, RECU_NULL, RR_REQUIRED, RECC_NULL, nullptr, RECA_READ_ONLY}
+  ,
+  //# Config reload timeout - supports duration strings: "30s", "5min", "1h", "0" (disabled)
+  {RECT_CONFIG, "proxy.config.admin.reload.timeout", RECD_STRING, "1h", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
+  //# Config reload check interval - how often to check task progress (min: 1s)
+  {RECT_CONFIG, "proxy.config.admin.reload.check_interval", RECD_STRING, "2s", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   //##############################################################################
   //#
@@ -393,6 +407,8 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.net.per_client.max_connections_in", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
+  {RECT_CONFIG, "proxy.config.http.per_client.connection.exempt_list", RECD_STRING, nullptr, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
   {RECT_CONFIG, "proxy.config.http.per_client.connection.alert_delay", RECD_INT, "60", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.net.max_requests_in", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
@@ -409,7 +425,7 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.http.auth_server_session_private", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.http.max_post_size", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.http.max_post_size", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   //        ##############################
   //        # parent proxy configuration #
@@ -435,6 +451,8 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.http.parent_proxy.enable_parent_timeout_markdowns", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.http.parent_proxy.disable_parent_markdowns", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.http.parent_proxy.consistent_hash_algorithm", RECD_STRING, "siphash24", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.http.forward.proxy_auth_to_parent", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
@@ -478,11 +496,13 @@ static constexpr RecordElement RecordsConfig[] =
   //        ##################################
   //        # origin server connect attempts #
   //        ##################################
-  {RECT_CONFIG, "proxy.config.http.connect_attempts_max_retries", RECD_INT, "3", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  {RECT_CONFIG, "proxy.config.http.connect_attempts_max_retries", RECD_INT, "3", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-254]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.http.connect_attempts_max_retries_down_server", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  {RECT_CONFIG, "proxy.config.http.connect_attempts_max_retries_down_server", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-254]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.http.connect_attempts_rr_retries", RECD_INT, "3", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  {RECT_CONFIG, "proxy.config.http.connect_attempts_max_retries_suspect_server", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-254]", RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.http.connect_attempts_rr_retries", RECD_INT, "3", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-254]", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.http.connect_attempts_timeout", RECD_INT, "30", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
@@ -537,7 +557,7 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.http.allow_multi_range", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
   ,
   // This defaults to a special invalid value so the HTTP transaction handling code can tell that it was not explicitly set.
-  {RECT_CONFIG, "proxy.config.http.normalize_ae", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-3]", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.http.normalize_ae", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-5]", RECA_NULL}
   ,
 
   //        ####################################################
@@ -600,13 +620,15 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.http.cache.max_open_write_retry_timeout", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
-  //       #  open_write_fail_action has 3 options:
+  //       #  open_write_fail_action options:
   //       #
   //       #  0 - default. disable cache and goto origin
   //       #  1 - return error if cache miss
   //       #  2 - serve stale until proxy.config.http.cache.max_stale_age, then goto origin, if revalidate
   //       #  3 - return error if cache miss or serve stale until proxy.config.http.cache.max_stale_age, then goto origin, if revalidate
   //       #  4 - return error if cache miss or if revalidate
+  //       #  5 - retry cache read (read-while-writer) on write lock failure, goto origin if retries exhausted
+  //       #  6 - retry cache read on write lock failure, if retries exhausted serve stale if allowed, otherwise goto origin
   {RECT_CONFIG, "proxy.config.http.cache.open_write_fail_action", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   //       #  when_to_revalidate has 4 options:
@@ -632,6 +654,8 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.http.cache.range.lookup", RECD_INT, "1", RECU_NULL, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.http.cache.range.write", RECD_INT, "0", RECU_NULL, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.http.cache.targeted_cache_control_headers", RECD_STRING, "CDN-Cache-Control", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
 
   //        ########################
@@ -846,8 +870,6 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.cache.hosting_filename", RECD_STRING, ts::filename::HOSTING, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.cache.volume_filename", RECD_STRING, ts::filename::VOLUME, RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
-  ,
   {RECT_CONFIG, "proxy.config.cache.permit.pinning", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
   //  # default the ram cache size to AUTO_SIZE (-1)
@@ -868,6 +890,8 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.cache.dir.sync_delay", RECD_INT, "500", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.cache.dir.sync_max_write", RECD_INT, "2097152", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.cache.dir.sync_parallel_tasks", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.cache.hostdb.disable_reverse_lookup", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
@@ -917,7 +941,7 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.dns.retries", RECD_INT, "5", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-9]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.dns.search_default_domains", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.dns.search_default_domains", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.dns.failover_number", RECD_INT, "5", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
@@ -1091,9 +1115,9 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.log.max_line_size", RECD_INT, "9216", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   // How often periodic tasks get executed in the Log.cc infrastructure
-  {RECT_CONFIG, "proxy.config.log.periodic_tasks_interval", RECD_INT, "5", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.log.periodic_tasks_interval", RECD_INT, "5", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.log.throttling_interval_msec", RECD_INT, "60000", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.log.throttling_interval_msec", RECD_INT, "60000", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
 
   //##############################################################################
@@ -1105,6 +1129,8 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.url_remap.filename", RECD_STRING, ts::filename::REMAP, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
+  {RECT_CONFIG, "proxy.config.url_remap_yaml.filename", RECD_STRING, ts::filename::REMAP_YAML, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
   {RECT_CONFIG, "proxy.config.url_remap.strategies.filename", RECD_STRING, "strategies.yaml", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.url_remap.remap_required", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
@@ -1113,7 +1139,7 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.plugin.dynamic_reload_mode", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.url_remap.min_rules_required", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-9]+", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.url_remap.min_rules_required", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.url_remap.acl_behavior_policy", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
@@ -1172,7 +1198,9 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.ssl.server.multicert.filename", RECD_STRING, ts::filename::SSL_MULTICERT, RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.ssl.server.multicert.exit_on_load_fail", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
-,
+  ,
+  {RECT_CONFIG, "proxy.config.ssl.server.multicert.concurrency", RECD_INT, "1", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-256]", RECA_NULL}
+  ,
   {RECT_CONFIG, "proxy.config.ssl.servername.filename", RECD_STRING, ts::filename::SNI, RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.ssl.server.ticket_key.filename", RECD_STRING, nullptr, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
@@ -1209,23 +1237,13 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.ssl.origin_session_cache.size", RECD_INT, "10240", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.mode", RECD_INT, "2", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.enabled", RECD_INT, "2", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.value", RECD_INT, "2", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-2]", RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.size", RECD_INT, "102400", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.num_buckets", RECD_INT, "256", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.skip_cache_on_bucket_contention", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
-  ,
   {RECT_CONFIG, "proxy.config.ssl.max_record_size", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-16383]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.timeout", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
-  ,
-  {RECT_CONFIG, "proxy.config.ssl.session_cache.auto_clear", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  //# High-water mark (bytes) for the per-connection outbound ciphertext buffer. Encryption
+  //# yields once this much enciphered data is queued for the transport, bounding memory and
+  //# propagating backpressure. 0 keeps the buffer to roughly one TLS record.
+  {RECT_CONFIG, "proxy.config.ssl.write_buffer_water_mark", RECD_INT, "65536", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$",
+   RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.ssl.hsts_max_age", RECD_INT, "-1", RECU_DYNAMIC, RR_NULL, RECC_STR, "^-?[0-9]+$", RECA_NULL}
   ,
@@ -1251,6 +1269,10 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.ssl.ktls.enabled", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
+  {RECT_CONFIG, "proxy.config.ssl.server.cert_compression.algorithms", RECD_STRING, nullptr, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
+  {RECT_CONFIG, "proxy.config.ssl.client.cert_compression.algorithms", RECD_STRING, nullptr, RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+  ,
   //##############################################################################
   //#
   //# OCSP (Online Certificate Status Protocol) Stapling Configuration
@@ -1260,16 +1282,16 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.ssl.ocsp.enabled", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
   //        # Number of seconds before an OCSP response expires in the stapling cache. 3600s (1 hour) by default.
-  {RECT_CONFIG, "proxy.config.ssl.ocsp.cache_timeout", RECD_INT, "3600", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.ssl.ocsp.cache_timeout", RECD_INT, "3600", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   //        # Request method "mode" for queries to OCSP responders; 0 is POST, 1 is "prefer GET."
   {RECT_CONFIG, "proxy.config.ssl.ocsp.request_mode", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_INT, "[0-1]", RECA_NULL}
   ,
   //        # Timeout for queries to OCSP responders. 10s by default.
-  {RECT_CONFIG, "proxy.config.ssl.ocsp.request_timeout", RECD_INT, "10", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.ssl.ocsp.request_timeout", RECD_INT, "10", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   //        # Update period for stapling caches. 60s (1 min) by default.
-  {RECT_CONFIG, "proxy.config.ssl.ocsp.update_period", RECD_INT, "60", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.ssl.ocsp.update_period", RECD_INT, "60", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   //        # Base path for OCSP prefetched responses
   {RECT_CONFIG, "proxy.config.ssl.ocsp.response.path", RECD_STRING, TS_BUILD_SYSCONFDIR, RECU_RESTART_TS, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
@@ -1481,13 +1503,13 @@ static constexpr RecordElement RecordsConfig[] =
   ,
   {RECT_CONFIG, "proxy.config.quic.disable_active_migration", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_STR, "[0-1]", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.quic.max_recv_udp_payload_size_in", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.quic.max_recv_udp_payload_size_in", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.quic.max_recv_udp_payload_size_out", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.quic.max_recv_udp_payload_size_out", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.quic.max_send_udp_payload_size_in", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.quic.max_send_udp_payload_size_in", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
-  {RECT_CONFIG, "proxy.config.quic.max_send_udp_payload_size_out", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_INT, "^[0-9]+$", RECA_NULL}
+  {RECT_CONFIG, "proxy.config.quic.max_send_udp_payload_size_out", RECD_INT, "65527", RECU_DYNAMIC, RR_NULL, RECC_STR, "^[0-9]+$", RECA_NULL}
   ,
   {RECT_CONFIG, "proxy.config.quic.disable_http_0_9", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_STR, "[0-1]", RECA_NULL}
   ,
@@ -1545,7 +1567,19 @@ static constexpr RecordElement RecordsConfig[] =
   {RECT_CONFIG, "proxy.config.io_uring.wq_workers_unbounded", RECD_INT, "0", RECU_NULL, RR_NULL, RECC_NULL, nullptr, RECA_NULL},
   {RECT_CONFIG, "proxy.config.aio.mode", RECD_STRING, "auto", RECU_DYNAMIC, RR_NULL, RECC_STR, "(auto|io_uring|thread)", RECA_NULL},
 #endif
+  //###########
+  //#
+  //# Thread watchdog
+  //#
+  //###########
+  {RECT_CONFIG, "proxy.config.exec_thread.watchdog.timeout_ms", RECD_INT, "0", RECU_RESTART_TS, RR_NULL, RECC_INT, "[0-10000]", RECA_NULL},
 
+  //###########
+  //#
+  //# PROXY protocol
+  //#
+  //###########
+  {RECT_CONFIG, "proxy.config.proxy_protocol.max_header_size", RECD_INT, "109", RECU_DYNAMIC, RR_NULL, RECC_INT, "[109-65535]", RECA_NULL},
 };
 // clang-format on
 
@@ -1581,6 +1615,116 @@ validate_check_type_has_regex()
   return true;
 }
 
+//-------------------------------------------------------------------------
+// Compile-time validation helpers for RECC_INT patterns
+//-------------------------------------------------------------------------
+
+namespace
+{
+constexpr bool
+is_digit(char c)
+{
+  return c >= '0' && c <= '9';
+}
+
+/**
+ * Parses an integer (possibly negative) from the given string view at compile time.
+ * Updates the index `i` to point past the parsed number.
+ * Returns true if a valid integer was parsed, false otherwise.
+ *
+ * This function is intended for compile-time validation of integer patterns.
+ * Note: C++23 introduces std::from_chars for constexpr integer parsing.
+ *
+ * @param[in] s The string view to parse.
+ * @param[in,out] i The index into `s` where parsing starts; updated to point past the parsed integer.
+ * @return true if parsing succeeded, false otherwise.
+ */
+constexpr bool
+parse_int(std::string_view s, std::size_t &i)
+{
+  std::size_t start = i;
+
+  // Optional negative sign
+  if (i < s.size() && s[i] == '-') {
+    ++i;
+  }
+
+  // Must have at least one digit
+  if (i >= s.size() || !is_digit(s[i])) {
+    i = start; // restore position on failure
+    return false;
+  }
+
+  // Parse remaining digits
+  while (i < s.size() && is_digit(s[i])) {
+    ++i;
+  }
+
+  return true; // Successfully parsed at least one digit
+}
+
+/**
+ * @brief Validates whether a string matches the [lower-upper] format with integer bounds.
+ *
+ * Supports negative numbers for both bounds.
+ * Examples of valid formats: "[0-255]", "[-100--50]".
+ *
+ * @param s The string to validate.
+ * @return true if the string matches the format, false otherwise.
+ */
+constexpr bool
+matches_bracketed_int_range(std::string_view s)
+{
+  std::size_t i = 0;
+  if (i >= s.size() || s[i++] != '[') {
+    return false;
+  }
+  // Parse first integer (may be negative)
+  if (!parse_int(s, i)) {
+    return false;
+  }
+  // Next character should be the dash separator
+  if (i >= s.size() || s[i++] != '-') {
+    return false;
+  }
+  // Parse second integer (may be negative)
+  if (!parse_int(s, i)) {
+    return false;
+  }
+  if (i >= s.size() || s[i++] != ']') {
+    return false;
+  }
+  return i == s.size(); // must end exactly here
+}
+
+// For string literals: deduces N and strips the trailing '\0'
+template <std::size_t N>
+consteval bool
+matches_bracketed_int_range(const char (&lit)[N])
+{
+  // N includes the null terminator
+  return matches_bracketed_int_range(std::string_view{lit, N - 1});
+}
+
+// Validate all RECC_INT entries in the RecordsConfig array at compile time
+template <std::size_t N>
+consteval bool
+validate_recc_int_patterns(const RecordElement (&config)[N])
+{
+  for (std::size_t i = 0; i < N; ++i) {
+    if (config[i].check == RECC_INT) {
+      if (config[i].regex == nullptr) {
+        return false; // RECC_INT must have a pattern
+      }
+      if (!matches_bracketed_int_range(config[i].regex)) {
+        return false; // Pattern must match [lower-upper] format
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+
 static_assert(validate_regex_has_check_type(),
               "RecordsConfig validation failed: found RecordElement with regex pattern but no check type (RECC_NULL). "
               "Specify appropriate check type like RECC_INT, RECC_STRING, etc.");
@@ -1588,6 +1732,11 @@ static_assert(validate_regex_has_check_type(),
 static_assert(validate_check_type_has_regex(),
               "RecordsConfig validation failed: found RecordElement with check type but no regex pattern. "
               "Provide a regex pattern to validate the input or use RECC_NULL if no validation is needed.");
+
+static_assert(validate_recc_int_patterns(RecordsConfig),
+              "RecordsConfig validation failed: found RECC_INT with invalid pattern. "
+              "RECC_INT patterns must be in format [lower-upper] with integer bounds (negative numbers supported), "
+              "e.g., \"[0-2]\", \"[1-256]\", or \"[-100--50]\".");
 
 void
 RecordsConfigIterate(RecordElementCallback callback, void *data)

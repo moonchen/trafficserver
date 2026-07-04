@@ -26,6 +26,7 @@
 #include "ts/apidefs.h"
 #include "util.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 namespace
@@ -89,27 +90,24 @@ enum HeaderState {
 };
 
 static void
-update_object_size(TSHttpTxn txnp, int64_t size, Config &config)
+update_object_size(std::string_view const url, int64_t size, Config &config)
 {
-  int   urllen = 0;
-  char *urlstr = TSHttpTxnEffectiveUrlStringGet(txnp, &urllen);
-  if (urlstr != nullptr) {
-    if (size <= 0) {
-      DEBUG_LOG("Ignoring invalid content length for %.*s: %" PRId64, urllen, urlstr, size);
-      return;
-    }
-
-    if (static_cast<uint64_t>(size) >= config.m_min_size_to_slice) {
-      config.sizeCacheAdd({urlstr, static_cast<size_t>(urllen)}, static_cast<uint64_t>(size));
-      TSStatIntIncrement(config.stat_TP, 1);
-    } else {
-      config.sizeCacheRemove({urlstr, static_cast<size_t>(urllen)});
-      TSStatIntIncrement(config.stat_FP, 1);
-    }
-
-    TSfree(urlstr);
-  } else {
+  if (url.empty()) {
     ERROR_LOG("Could not get URL from transaction.");
+    return;
+  }
+
+  if (size <= 0) {
+    DEBUG_LOG("Ignoring invalid content length for %.*s: %" PRId64, static_cast<int>(url.size()), url.data(), size);
+    return;
+  }
+
+  if (static_cast<uint64_t>(size) >= config.m_min_size_to_slice) {
+    config.sizeCacheAdd(url, static_cast<uint64_t>(size));
+    TSStatIntIncrement(config.stat_TP, 1);
+  } else {
+    config.sizeCacheRemove(url);
+    TSStatIntIncrement(config.stat_FP, 1);
   }
 }
 
@@ -149,7 +147,7 @@ handleFirstServerHeader(Data *const data, TSCont const contp)
     }
     DEBUG_LOG("Passthru bytes: header: %" PRId64 " body: %" PRId64, hlen, clen);
     if (clen != INT64_MAX) {
-      update_object_size(data->m_txnp, clen, *data->m_config);
+      update_object_size(data->m_effective_url, clen, *data->m_config);
       TSVIONBytesSet(output_vio, hlen + clen);
     } else {
       TSVIONBytesSet(output_vio, clen);
@@ -169,7 +167,7 @@ handleFirstServerHeader(Data *const data, TSCont const contp)
     return HeaderState::Fail;
   }
 
-  update_object_size(data->m_txnp, blockcr.m_length, *data->m_config);
+  update_object_size(data->m_effective_url, blockcr.m_length, *data->m_config);
 
   // set the resource content length from block response
   data->m_contentlen = blockcr.m_length;
@@ -463,14 +461,19 @@ handleNextServerHeader(Data *const data)
       data->m_blockstate = BlockState::PendingRef;
 
       // interior headers for new identifier reference
+      etaglen         = std::min(etaglen, static_cast<int>(sizeof(data->m_etag) - 1));
       data->m_etaglen = etaglen;
       if (0 < etaglen) {
-        strncpy(data->m_etag, etag, etaglen);
+        memcpy(data->m_etag, etag, etaglen);
       }
+      data->m_etag[etaglen] = '\0';
+
+      lastmodifiedlen         = std::min(lastmodifiedlen, static_cast<int>(sizeof(data->m_lastmodified) - 1));
       data->m_lastmodifiedlen = lastmodifiedlen;
       if (0 < lastmodifiedlen) {
-        strncpy(data->m_lastmodified, lastmodified, lastmodifiedlen);
+        memcpy(data->m_lastmodified, lastmodified, lastmodifiedlen);
       }
+      data->m_lastmodified[lastmodifiedlen] = '\0';
 
       // potentially new content length
       data->m_contentlen = blockcr.m_length;
@@ -603,6 +606,8 @@ handle_server_resp(TSCont contp, TSEvent event, Data *const data)
         data->m_blockskip = data->m_req_range.skipBytesForBlock(data->m_config->m_blockbytes, data->m_blocknum);
       } break;
       }
+
+      schedule_prefetch(data);
     }
 
     transfer_content_bytes(data);

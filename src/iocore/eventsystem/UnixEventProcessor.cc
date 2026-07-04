@@ -27,6 +27,8 @@
 #include "records/RecCore.h"
 #include "records/RecProcess.h"
 #include "tscore/ink_align.h"
+#include "tscore/ink_atomic.h"
+#include "tscore/TSSystemState.h"
 #include <sched.h>
 #if TS_USE_HWLOC
 #if __has_include(<alloca.h>)
@@ -86,8 +88,14 @@ ThreadAffinityInitializer Thread_Affinity_Initializer;
 
 namespace
 {
-int
-EventMetricStatSync(const char *, RecDataT, RecData *, RecRawStatBlock *rsb, int)
+struct EventStatsBlock {
+  static constexpr size_t STAT_COUNT =
+    EThread::Metrics::Graph::N_BUCKETS * 2 + EThread::Metrics::Slice::N_STAT_ID * EThread::Metrics::N_TIMESCALES;
+  std::array<ts::Metrics::Gauge::AtomicType *, STAT_COUNT> stats;
+} events_rsb;
+
+void
+EventMetricStatSync()
 {
   using Graph = EThread::Metrics::Graph;
 
@@ -99,15 +107,10 @@ EventMetricStatSync(const char *, RecDataT, RecData *, RecRawStatBlock *rsb, int
     t->metrics.summarize(summary);
   }
 
-  ink_mutex_acquire(&(rsb->mutex));
-
   // Update a specific enumerated stat.
   auto slice_stat_update = [=](EThread::Metrics::Slice::STAT_ID stat_id, int stat_idx, size_t value) {
-    auto idx    = stat_idx + static_cast<unsigned>(stat_id);
-    auto stat   = rsb->global[idx];
-    stat->sum   = value;
-    stat->count = 1;
-    RecRawStatUpdateSum(rsb, idx);
+    auto idx = stat_idx + static_cast<unsigned>(stat_id);
+    ts::Metrics::Gauge::store(events_rsb.stats[idx], value);
   };
 
   // Enumerated stats are first - one set for each time scale.
@@ -129,16 +132,12 @@ EventMetricStatSync(const char *, RecDataT, RecData *, RecRawStatBlock *rsb, int
 
   // Next are the event loop histogram buckets.
   for (Graph::raw_type idx = 0; idx < Graph::N_BUCKETS; ++idx, ++id) {
-    rsb->global[id]->sum   = summary._loop_timing[idx];
-    rsb->global[id]->count = 1;
-    RecRawStatUpdateSum(rsb, id);
+    ts::Metrics::Gauge::store(events_rsb.stats[id], summary._loop_timing[idx]);
   }
 
   // Last are the plugin API histogram buckets.
   for (Graph::raw_type idx = 0; idx < Graph::N_BUCKETS; ++idx, ++id) {
-    rsb->global[id]->sum   = summary._api_timing[idx];
-    rsb->global[id]->count = 1;
-    RecRawStatUpdateSum(rsb, id);
+    ts::Metrics::Gauge::store(events_rsb.stats[id], summary._api_timing[idx]);
   }
 
   // Check if it's time to schedule a decay of the histogram data.
@@ -150,9 +149,6 @@ EventMetricStatSync(const char *, RecDataT, RecData *, RecRawStatBlock *rsb, int
       ++(t->metrics._decay_count);
     }
   }
-
-  ink_mutex_release(&(rsb->mutex));
-  return REC_ERR_OKAY;
 }
 
 /// This is a wrapper used to convert a static function into a continuation. The function pointer is
@@ -524,16 +520,15 @@ EventProcessor::start(int n_event_threads, size_t stacksize)
   thread_group[ET_CALL]._spawnQueue.push(make_event_for_scheduling(&Thread_Affinity_Initializer, EVENT_IMMEDIATE, nullptr));
 
   // Get our statistics set up
-  RecRawStatBlock *rsb      = RecAllocateRawStatBlock(EThread::Metrics::N_STATS);
-  unsigned         stat_idx = 0;
-  char             name[256];
+  unsigned stat_idx = 0;
+  char     name[256];
 
   // Enumerated statistics, one set per time scale.
   for (unsigned ts_idx = 0; ts_idx < EThread::Metrics::N_TIMESCALES; ++ts_idx) {
     auto sample_count = EThread::Metrics::SLICE_SAMPLE_COUNT[ts_idx];
-    for (unsigned id = 0; id < EThread::Metrics::Slice::N_STAT_ID; ++id) {
-      snprintf(name, sizeof(name), "%s.%ds", EThread::Metrics::Slice::STAT_NAME[id], sample_count);
-      RecRegisterRawStat(rsb, RECT_PROCESS, name, RECD_INT, RECP_NON_PERSISTENT, stat_idx++, NULL);
+    for (auto id : EThread::Metrics::Slice::STAT_NAME) {
+      snprintf(name, sizeof(name), "%s.%ds", id, sample_count);
+      events_rsb.stats[stat_idx++] = ts::Metrics::Gauge::createPtr(name);
     }
   }
 
@@ -541,18 +536,19 @@ EventProcessor::start(int n_event_threads, size_t stacksize)
   for (Graph::raw_type id = 0; id < Graph::N_BUCKETS; ++id) {
     snprintf(name, sizeof(name), "%s%zums", EThread::Metrics::LOOP_HISTOGRAM_STAT_STEM.data(),
              static_cast<size_t>(EThread::Metrics::LOOP_HISTOGRAM_BUCKET_SIZE.count() * Graph::min_for_bucket(id)));
-    RecRegisterRawStat(rsb, RECT_PROCESS, name, RECD_INT, RECP_NON_PERSISTENT, stat_idx++, NULL);
+    events_rsb.stats[stat_idx++] = ts::Metrics::Gauge::createPtr(name);
   }
 
   // plugin API timings
   for (Graph::raw_type id = 0; id < Graph::N_BUCKETS; ++id) {
     snprintf(name, sizeof(name), "%s%zums", EThread::Metrics::API_HISTOGRAM_STAT_STEM.data(),
              static_cast<size_t>(EThread::Metrics::API_HISTOGRAM_BUCKET_SIZE.count() * Graph::min_for_bucket(id)));
-    RecRegisterRawStat(rsb, RECT_PROCESS, name, RECD_INT, RECP_NON_PERSISTENT, stat_idx++, NULL);
+    events_rsb.stats[stat_idx++] = ts::Metrics::Gauge::createPtr(name);
   }
 
-  // Name must be that of a stat, pick one at random since we do all of them in one pass/callback.
-  RecRegisterRawStatSyncCb(name, EventMetricStatSync, rsb, 0);
+  debug_assert_message(stat_idx == events_rsb.stats.size(), "events_rsp stats overrun!");
+
+  RecRegNewSyncStatSync(EventMetricStatSync);
 
   this->spawn_event_threads(ET_CALL, n_event_threads, stacksize);
 
@@ -620,4 +616,217 @@ thread_started(EThread *t)
       break;
     }
   }
+}
+
+off_t
+EventProcessor::allocate(int size)
+{
+  static off_t start = INK_ALIGN(offsetof(EThread, thread_private), 16);
+  static off_t loss  = start - offsetof(EThread, thread_private);
+  size               = INK_ALIGN(size, 16); // 16 byte alignment
+
+  int old;
+  do {
+    old = thread_data_used;
+    if (old + loss + size > PER_THREAD_DATA) {
+      return -1;
+    }
+  } while (!ink_atomic_cas(&thread_data_used, old, old + size));
+
+  return (off_t)(old + start);
+}
+
+EThread *
+EventProcessor::assign_thread(EventType etype)
+{
+  int                    next;
+  ThreadGroupDescriptor *tg = &thread_group[etype];
+
+  ink_assert(etype < MAX_EVENT_TYPES);
+  if (tg->_count > 1) {
+    next = ++tg->_next_round_robin % tg->_count;
+  } else {
+    next = 0;
+  }
+  return tg->_thread[next];
+}
+
+// If thread_holding is the correct type, return it.
+//
+// Otherwise check if there is already an affinity associated with the continuation,
+// return it if the type is the same, return the next available thread of "etype" if
+// the type is different.
+//
+// Only assign new affinity when there is currently none.
+EThread *
+EventProcessor::assign_affinity_by_type(Continuation *cont, EventType etype)
+{
+  EThread *ethread = cont->mutex->thread_holding;
+  if (!ethread->is_event_type(etype)) {
+    ethread = cont->getThreadAffinity();
+    if (ethread == nullptr || !ethread->is_event_type(etype)) {
+      ethread = assign_thread(etype);
+    }
+  }
+
+  if (cont->getThreadAffinity() == nullptr) {
+    cont->setThreadAffinity(ethread);
+  }
+
+  return ethread;
+}
+
+Event *
+EventProcessor::schedule(Event *e, EventType etype)
+{
+  ink_assert(etype < MAX_EVENT_TYPES);
+
+  if (TSSystemState::is_event_system_shut_down()) {
+    return nullptr;
+  }
+
+  EThread *affinity_thread = e->continuation->getThreadAffinity();
+  EThread *curr_thread     = this_ethread();
+  if (affinity_thread != nullptr && affinity_thread->is_event_type(etype)) {
+    e->ethread = affinity_thread;
+  } else {
+    // Is the current thread eligible?
+    if (curr_thread != nullptr && curr_thread->is_event_type(etype)) {
+      e->ethread = curr_thread;
+    } else {
+      e->ethread = assign_thread(etype);
+    }
+    if (affinity_thread == nullptr) {
+      e->continuation->setThreadAffinity(e->ethread);
+    }
+  }
+
+  if (e->continuation->mutex) {
+    e->mutex = e->continuation->mutex;
+  }
+
+  if (curr_thread != nullptr && e->ethread == curr_thread) {
+    e->ethread->EventQueueExternal.enqueue_local(e);
+  } else {
+    e->ethread->EventQueueExternal.enqueue(e);
+  }
+
+  return e;
+}
+
+Event *
+EventProcessor::schedule_imm(Continuation *cont, EventType et, int callback_event, void *cookie)
+{
+  Event *e = eventAllocator.alloc();
+
+  ink_assert(et < MAX_EVENT_TYPES);
+#ifdef ENABLE_TIME_TRACE
+  e->start_time = ink_get_hrtime();
+#endif
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, 0, 0), et);
+}
+
+Event *
+EventProcessor::schedule_at(Continuation *cont, ink_hrtime t, EventType et, int callback_event, void *cookie)
+{
+  Event *e = eventAllocator.alloc();
+
+  ink_assert(t > 0);
+  ink_assert(et < MAX_EVENT_TYPES);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, t, 0), et);
+}
+
+Event *
+EventProcessor::schedule_in(Continuation *cont, ink_hrtime t, EventType et, int callback_event, void *cookie)
+{
+  Event *e = eventAllocator.alloc();
+
+  ink_assert(et < MAX_EVENT_TYPES);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  return schedule(e->init(cont, ink_get_hrtime() + t, 0), et);
+}
+
+Event *
+EventProcessor::schedule_every(Continuation *cont, ink_hrtime t, EventType et, int callback_event, void *cookie)
+{
+  Event *e = eventAllocator.alloc();
+
+  ink_assert(t != 0);
+  ink_assert(et < MAX_EVENT_TYPES);
+
+#ifdef ENABLE_EVENT_TRACKER
+  e->set_location();
+#endif
+
+  e->callback_event = callback_event;
+  e->cookie         = cookie;
+  if (t < 0) {
+    return schedule(e->init(cont, t, t), et);
+  } else {
+    return schedule(e->init(cont, ink_get_hrtime() + t, t), et);
+  }
+}
+
+std::vector<TSAction>
+EventProcessor::schedule_entire(Continuation *cont, ink_hrtime t, ink_hrtime p, EventType et, int callback_event, void *cookie)
+{
+  ThreadGroupDescriptor *tg          = &thread_group[et];
+  EThread               *curr_thread = this_ethread();
+
+  std::vector<TSAction> actions;
+
+  for (int i = 0; i < tg->_count; i++) {
+    Event *e = eventAllocator.alloc();
+
+    e->ethread        = tg->_thread[i];
+    e->callback_event = callback_event;
+    e->cookie         = cookie;
+
+    if (t == 0 && p == 0) {
+      e->init(cont, 0, 0);
+    } else if (t != 0 && p == 0) {
+      e->init(cont, ink_get_hrtime() + t, 0);
+    } else if (t == 0 && p != 0) {
+      if (p < 0) {
+        e->init(cont, p, p);
+      } else {
+        e->init(cont, ink_get_hrtime() + p, p);
+      }
+    } else {
+      ink_assert(!"not reached");
+    }
+
+    e->mutex = new_ProxyMutex();
+
+    if (curr_thread != nullptr && e->ethread == curr_thread) {
+      e->ethread->EventQueueExternal.enqueue_local(e);
+    } else {
+      e->ethread->EventQueueExternal.enqueue(e);
+    }
+
+    /* This is a hack. Should be handled in ink_types */
+    actions.push_back((TSAction)((uintptr_t) reinterpret_cast<TSAction>(e) | 0x1));
+  }
+
+  return actions;
 }

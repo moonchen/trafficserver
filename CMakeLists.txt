@@ -24,7 +24,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 cmake_minimum_required(VERSION 3.20..3.27)
-project(ats VERSION 10.2.0)
+project(ats VERSION 11.0.0)
 
 set(TS_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(TS_VERSION_MINOR ${PROJECT_VERSION_MINOR})
@@ -89,6 +89,25 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+# Detect git common directory (works for both regular repos and worktrees).
+if(EXISTS ${CMAKE_SOURCE_DIR}/.git)
+  execute_process(
+    COMMAND git rev-parse --git-common-dir
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMON_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE GIT_RESULT
+    ERROR_QUIET
+  )
+  if(GIT_RESULT EQUAL 0 AND GIT_COMMON_DIR)
+    # Convert to absolute path if relative.
+    if(NOT IS_ABSOLUTE ${GIT_COMMON_DIR})
+      get_filename_component(GIT_COMMON_DIR "${CMAKE_SOURCE_DIR}/${GIT_COMMON_DIR}" ABSOLUTE)
+    endif()
+    message(STATUS "Git common directory: ${GIT_COMMON_DIR}")
+  endif()
+endif()
+
 # Options
 include(AutoOptionHelpers)
 find_package(PkgConfig)
@@ -124,6 +143,7 @@ auto_option(LUAJIT PACKAGE_DEPENDS luajit)
 auto_option(UNWIND FEATURE_VAR TS_USE_REMOTE_UNWINDING PACKAGE_DEPENDS unwind)
 
 option(ENABLE_ASAN "Use address sanitizer (default OFF)")
+option(ENABLE_TSAN "Use thread sanitizer (default OFF)")
 option(ENABLE_FUZZING "Enable fuzzing (default OFF)")
 option(ENABLE_FIPS "Enable fips compliance (default OFF)")
 option(ENABLE_EVENT_TRACKER "Enable event tracking (default OFF)")
@@ -255,7 +275,6 @@ if(LibLZMA_FOUND)
   set(HAVE_LZMA_H TRUE)
 endif()
 
-find_package(PCRE REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 
 include(CheckOpenSSLIsBoringSSL)
@@ -331,6 +350,12 @@ if(ENABLE_ASAN)
   endif()
   add_compile_options(-g -fsanitize=address -fno-omit-frame-pointer)
   add_link_options(-g -fsanitize=address)
+elseif(ENABLE_TSAN)
+  if(ENABLE_JEMALLOC OR ENABLE_MIMALLOC)
+    message(FATAL_ERROR "ENABLE_JEMALLOC and ENABLE_MIMALLOC are not compatible with tsan builds")
+  endif()
+  add_compile_options(-g -fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-g -fsanitize=thread)
 endif()
 
 if(ENABLE_PROBES)
@@ -340,6 +365,33 @@ endif()
 set(TS_USE_MALLOC_ALLOCATOR ${ENABLE_MALLOC_ALLOCATOR})
 set(TS_USE_ALLOCATOR_METRICS ${ENABLE_ALLOCATOR_METRICS})
 find_package(ZLIB REQUIRED)
+
+find_package(zstd CONFIG QUIET)
+if(zstd_FOUND)
+
+  # Provide a compatibility target name if the upstream package does not export it
+  # Our code links against `zstd::zstd`; upstream zstd usually exports
+  # `zstd::libzstd_shared`/`zstd::libzstd_static`. Create an alias if needed.
+  if(NOT TARGET zstd::zstd)
+    if(TARGET zstd::libzstd_shared)
+      set(_zstd_target zstd::libzstd_shared)
+    elseif(TARGET zstd::libzstd_static)
+      set(_zstd_target zstd::libzstd_static)
+    elseif(TARGET zstd::libzstd)
+      set(_zstd_target zstd::libzstd)
+    endif()
+    if(DEFINED _zstd_target)
+      add_library(zstd_zstd INTERFACE)
+      target_link_libraries(zstd_zstd INTERFACE ${_zstd_target})
+      add_library(zstd::zstd ALIAS zstd_zstd)
+      set(HAVE_ZSTD_H TRUE)
+    else()
+      set(HAVE_ZSTD_H FALSE)
+    endif()
+  endif()
+else()
+  set(HAVE_ZSTD_H FALSE)
+endif()
 
 # ncurses is used in traffic_top
 find_package(Curses)
@@ -458,6 +510,7 @@ list(REMOVE_ITEM CMAKE_REQUIRED_LIBRARIES pthread)
 list(APPEND CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
 list(APPEND CMAKE_REQUIRED_LIBRARIES ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
 check_symbol_exists(BIO_meth_new "openssl/bio.h" HAVE_BIO_METH_NEW)
+check_symbol_exists(BIO_meth_set_write_ex "openssl/bio.h" HAVE_BIO_METH_SET_WRITE_EX)
 check_symbol_exists(BIO_set_data "openssl/bio.h" HAVE_BIO_SET_DATA)
 check_symbol_exists(BIO_get_data "openssl/bio.h" HAVE_BIO_GET_DATA)
 check_symbol_exists(BIO_get_shutdown "openssl/bio.h" HAVE_BIO_GET_SHUTDOWN)
@@ -476,8 +529,11 @@ check_symbol_exists(SSL_set1_verify_cert_store "openssl/ssl.h" TS_HAS_VERIFY_CER
 check_symbol_exists(SSL_get_shared_curve "openssl/ssl.h" HAVE_SSL_GET_SHARED_CURVE)
 check_symbol_exists(SSL_get_curve_name "openssl/ssl.h" HAVE_SSL_GET_CURVE_NAME)
 check_symbol_exists(SSL_get0_group_name "openssl/ssl.h" HAVE_SSL_GET0_GROUP_NAME)
+check_symbol_exists(SSL_get_negotiated_group "openssl/ssl.h" HAVE_SSL_GET_NEGOTIATED_GROUP)
+check_symbol_exists(SSL_CTX_get0_implemented_groups "openssl/ssl.h" HAVE_SSL_CTX_GET0_IMPLEMENTED_GROUPS)
 check_symbol_exists(SSL_get_group_id "openssl/ssl.h" HAVE_SSL_GET_GROUP_ID)
 check_symbol_exists(SSL_get_group_name "openssl/ssl.h" HAVE_SSL_GET_GROUP_NAME)
+check_symbol_exists(SSL_group_to_name "openssl/ssl.h" HAVE_SSL_GROUP_TO_NAME)
 check_symbol_exists(SSL_set_max_early_data "openssl/ssl.h" HAVE_SSL_SET_MAX_EARLY_DATA)
 check_symbol_exists(SSL_read_early_data "openssl/ssl.h" HAVE_SSL_READ_EARLY_DATA)
 check_symbol_exists(SSL_write_early_data "openssl/ssl.h" HAVE_SSL_WRITE_EARLY_DATA)
@@ -486,13 +542,15 @@ check_symbol_exists(SSL_error_description "openssl/ssl.h" HAVE_SSL_ERROR_DESCRIP
 check_symbol_exists(SSL_CTX_set_ciphersuites "openssl/ssl.h" TS_USE_TLS_SET_CIPHERSUITES)
 check_symbol_exists(SSL_CTX_set_keylog_callback "openssl/ssl.h" TS_HAS_TLS_KEYLOGGING)
 check_symbol_exists(SSL_CTX_set_tlsext_ticket_key_cb "openssl/ssl.h" HAVE_SSL_CTX_SET_TLSEXT_TICKET_KEY_CB)
+check_symbol_exists(SSL_CTX_add_cert_compression_alg "openssl/ssl.h" HAVE_SSL_CTX_ADD_CERT_COMPRESSION_ALG)
+check_symbol_exists(SSL_CTX_set1_cert_comp_preference "openssl/ssl.h" HAVE_SSL_CTX_SET1_CERT_COMP_PREFERENCE)
 check_symbol_exists(SSL_get_all_async_fds openssl/ssl.h TS_USE_TLS_ASYNC)
 check_symbol_exists(OSSL_PARAM_construct_end "openssl/params.h" HAVE_OSSL_PARAM_CONSTRUCT_END)
 check_symbol_exists(TLS1_3_VERSION "openssl/ssl.h" TS_USE_TLS13)
 check_symbol_exists(MD5_Init "openssl/md5.h" HAVE_MD5_INIT)
-check_symbol_exists(ENGINE_load_dynamic "include/openssl/engine.h" HAVE_ENGINE_LOAD_DYNAMIC)
-check_symbol_exists(ENGINE_get_default_RSA "include/openssl/engine.h" HAVE_ENGINE_GET_DEFAULT_RSA)
-check_symbol_exists(ENGINE_load_private_key "include/openssl/engine.h" HAVE_ENGINE_LOAD_PRIVATE_KEY)
+check_symbol_exists(ENGINE_load_dynamic "openssl/engine.h" HAVE_ENGINE_LOAD_DYNAMIC)
+check_symbol_exists(ENGINE_get_default_RSA "openssl/engine.h" HAVE_ENGINE_GET_DEFAULT_RSA)
+check_symbol_exists(ENGINE_load_private_key "openssl/engine.h" HAVE_ENGINE_LOAD_PRIVATE_KEY)
 check_symbol_exists(sysctlbyname "sys/sysctl.h" HAVE_SYSCTLBYNAME)
 
 if(SSLLIB_IS_OPENSSL3)
@@ -538,6 +596,28 @@ check_cxx_source_compiles(
   }"
   HAVE_CRYPTO_EX_DUP_TYPE1
 )
+if(SSLLIB_IS_BORINGSSL OR SSLLIB_IS_AWSLC)
+  check_cxx_source_compiles(
+    "#include <openssl/asn1.h>
+    namespace bssl {
+      DECLARE_ASN1_ITEM(GENERAL_NAME)
+    };
+    int main() {
+      if (&bssl::GENERAL_NAME_it == reinterpret_cast<void *>(0x01)) {
+        return 1;
+      }
+      return 0;
+    }"
+    HAVE_GENERAL_NAME_IN_BSSL_NAMESPACE
+  )
+else()
+  # This probe is only meaningful for BoringSSL-family libraries. Force it off
+  # for OpenSSL so a stale cache or macro shape change can't enable bssl:: code.
+  set(HAVE_GENERAL_NAME_IN_BSSL_NAMESPACE
+      FALSE
+      CACHE INTERNAL "GENERAL_NAME lives in the bssl namespace" FORCE
+  )
+endif()
 
 set(CMAKE_EXTRA_INCLUDE_FILES netinet/in.h netinet/tcp.h)
 check_type_size("struct tcp_info" STRUCT_TCP_INFO)
@@ -562,7 +642,7 @@ find_package(resolv)
 
 if(ENABLE_DOCS OR ENABLE_AUTEST)
   find_package(Python3 REQUIRED)
-  find_program(PipEnv pipenv REQUIRED)
+  find_program(UV uv REQUIRED)
   find_program(NETCAT_PROGRAM nc REQUIRED)
 endif()
 
@@ -572,20 +652,36 @@ if(ENABLE_DOCS)
     COMPONENTS Runtime
     REQUIRED
   )
+
+  find_program(GRAPHVIZ_DOT dot REQUIRED)
 endif()
 
 if(ENABLE_AUTEST)
+  # Default the sandbox to /tmp to keep paths short. Unix domain socket paths
+  # are limited to 108 characters and deep build directories (e.g. in home
+  # directories) can exceed this limit, causing confusing test failures. A hash
+  # of CMAKE_BINARY_DIR provides per-build isolation while keeping the path
+  # deterministic across runs.
+  string(MD5 _build_dir_hash "${CMAKE_BINARY_DIR}")
+  string(SUBSTRING "${_build_dir_hash}" 0 8 _build_dir_hash)
   set(AUTEST_SANDBOX
-      ${CMAKE_BINARY_DIR}/_sandbox
-      CACHE STRING "Location for autest output (default
-  CMAKE_BINARY_DIR/_sandbox)"
+      "/tmp/sb_${_build_dir_hash}"
+      CACHE STRING "Location for autest output (default /tmp/sb_<hash>)"
   )
   set(AUTEST_OPTIONS
       ""
       CACHE STRING "Additional options for autest (default \"\")"
   )
-  set(PROXY_VERIFIER_VERSION "v2.12.0")
-  set(PROXY_VERIFIER_HASH "SHA1=8e9adc6e0b31251ca8e6fc2064ae54e5d752bb72")
+  # Also create AUTEST_OPTIONS_LIST from the string for use in cmake targets.
+  # This prevents cmake from escaping spaces in the arguments, which confuses
+  # the autest command. The original AUTEST_OPTIONS string is used in the
+  # autest.sh script.
+  separate_arguments(AUTEST_OPTIONS_LIST UNIX_COMMAND "${AUTEST_OPTIONS}")
+  file(READ "${CMAKE_SOURCE_DIR}/tests/proxy-verifier-version.txt" PROXY_VERIFIER_VERSION)
+  string(STRIP "${PROXY_VERIFIER_VERSION}" PROXY_VERIFIER_VERSION)
+  file(READ "${CMAKE_SOURCE_DIR}/tests/proxy-verifier-checksum.txt" PROXY_VERIFIER_SHA1)
+  string(STRIP "${PROXY_VERIFIER_SHA1}" PROXY_VERIFIER_SHA1)
+  set(PROXY_VERIFIER_HASH "SHA1=${PROXY_VERIFIER_SHA1}")
   include(proxy-verifier)
 endif()
 
@@ -669,13 +765,14 @@ file(REMOVE "${PROJECT_SOURCE_DIR}/include/tscore/ink_config.h")
 file(REMOVE "${PROJECT_SOURCE_DIR}/include/ts/apidefs.h")
 file(REMOVE "${PROJECT_SOURCE_DIR}/include/ink_autoconf.h")
 
-configure_file(configs/storage.config.default.in configs/storage.config.default)
+configure_file(configs/storage.yaml.default.in configs/storage.yaml.default)
 configure_file(configs/records.yaml.default.in configs/records.yaml.default)
 configure_file(include/tscore/ink_config.h.cmake.in include/tscore/ink_config.h)
 configure_file(include/ts/apidefs.h.in include/ts/apidefs.h)
 
 add_subdirectory(src/tscpp/api)
 add_subdirectory(src/tsutil)
+add_subdirectory(src/config)
 add_subdirectory(src/tscore)
 add_subdirectory(src/records)
 add_subdirectory(src/iocore)
@@ -738,8 +835,6 @@ if(ENABLE_BENCHMARKS)
   add_subdirectory(tools/benchmark)
 endif()
 
-set(GIT_COMMON_DIR git rev-parse --git-common-dir)
-
 add_custom_target(
   clang-format-install
   COMMAND ${CMAKE_SOURCE_DIR}/tools/clang-format.sh --install
@@ -780,17 +875,6 @@ add_custom_target(
   VERBATIM
 )
 
-# Leave autopep8 for historical reasons, but have it call yapf. It will not do
-# to have conflicting Python formatting targets. This can be removed when at
-# least CI is updated to use yapf instead of autopep8.
-add_custom_target(
-  autopep8
-  ${CMAKE_SOURCE_DIR}/tools/yapf.sh ${CMAKE_SOURCE_DIR}
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  COMMENT "formatting python files"
-  VERBATIM
-)
-
 add_custom_target(
   yapf
   ${CMAKE_SOURCE_DIR}/tools/yapf.sh ${CMAKE_SOURCE_DIR}
@@ -807,17 +891,27 @@ add_custom_target(
   VERBATIM
 )
 
+add_custom_target(
+  whitespace-format
+  ${CMAKE_SOURCE_DIR}/tools/whitespace-format.sh
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "fixing whitespace issues (trailing whitespace, DOS line endings)"
+  VERBATIM
+)
+
 # Add a format target that runs all the formatters.
 add_custom_target(
   format
-  DEPENDS clang-format autopep8 cmake-format
+  DEPENDS clang-format yapf cmake-format whitespace-format
   COMMENT "formatting all files"
 )
 
-if(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/.git)
-  file(TIMESTAMP ${CMAKE_SOURCE_DIR}/.git/hooks/pre-commit PRE_COMMIT_BEFORE)
-  configure_file(${CMAKE_SOURCE_DIR}/tools/git/pre-commit ${CMAKE_SOURCE_DIR}/.git/hooks/pre-commit COPYONLY)
-  file(TIMESTAMP ${CMAKE_SOURCE_DIR}/.git/hooks/pre-commit PRE_COMMIT_AFTER)
+# Install pre-commit hook if this is a git repository (including worktrees).
+if(GIT_COMMON_DIR)
+  set(PRE_COMMIT_HOOK "${GIT_COMMON_DIR}/hooks/pre-commit")
+  file(TIMESTAMP ${PRE_COMMIT_HOOK} PRE_COMMIT_BEFORE)
+  configure_file(${CMAKE_SOURCE_DIR}/tools/git/pre-commit ${PRE_COMMIT_HOOK} COPYONLY)
+  file(TIMESTAMP ${PRE_COMMIT_HOOK} PRE_COMMIT_AFTER)
   if(NOT PRE_COMMIT_BEFORE STREQUAL PRE_COMMIT_AFTER)
     message(STATUS "Installing github hook")
   endif()
@@ -827,7 +921,8 @@ endif()
 add_custom_target(
   rat
   COMMENT "Running Apache RAT"
-  COMMAND java -jar ${CMAKE_SOURCE_DIR}/ci/apache-rat-0.13-SNAPSHOT.jar -E ${CMAKE_SOURCE_DIR}/ci/rat-regex.txt -d
+  COMMAND java -jar ${CMAKE_SOURCE_DIR}/ci/apache-rat-0.17.jar --input-exclude-file
+          ${CMAKE_SOURCE_DIR}/ci/rat-exclude.txt --input-include-file ${CMAKE_SOURCE_DIR}/ci/rat-include.txt --
           ${CMAKE_SOURCE_DIR}
 )
 

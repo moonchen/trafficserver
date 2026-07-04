@@ -29,6 +29,7 @@
 #define _XSTR(s) _STR(s)
 
 #include "iocore/net/SSLSNIConfig.h"
+#include "records/RecCore.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -106,6 +107,13 @@ TEST_CASE("Test SSLSNIConfig")
     REQUIRE(actions.first->size() == 3);
   }
 
+  SECTION("The config matches an SNI for tickets.com")
+  {
+    auto const &actions{params.get("tickets.com", 443)};
+    REQUIRE(actions.first);
+    REQUIRE(actions.first->size() == 4); ///< ticket enabled + ticket number + early data + fqdn
+  }
+
   SECTION("Matching order")
   {
     auto const &actions{params.get("foo.bar.com", 443)};
@@ -173,6 +181,11 @@ TEST_CASE("Test SSLSNIConfig")
 
 TEST_CASE("SNIConfig reconfigure callback is invoked")
 {
+  // Point the config to the test file so reconfigure() doesn't depend on the
+  // system sni.yaml file existing.
+  RecSetRecordString("proxy.config.ssl.servername.filename", _XSTR(LIBINKNET_UNIT_TEST_DIR) "/sni_conf_test.yaml",
+                     REC_SOURCE_EXPLICIT);
+
   int  result{0};
   auto set_result{[&result]() { result = 42; }};
   SNIConfig::set_on_reconfigure_callback(set_result);

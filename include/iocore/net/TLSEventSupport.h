@@ -59,10 +59,10 @@ public:
 
   bool                    callHooks(TSEvent eventId);
   bool                    calledHooks(TSEvent eventId) const;
-  virtual Continuation   *getContinuationForTLSEvents() = 0;
-  virtual EThread        *getThreadForTLSEvents()       = 0;
-  virtual Ptr<ProxyMutex> getMutexForTLSEvents()        = 0;
-  virtual void            reenable(int event)           = 0;
+  virtual Continuation   *getContinuationForTLSEvents()  = 0;
+  virtual EThread        *getThreadForTLSEvents()        = 0;
+  virtual Ptr<ProxyMutex> getMutexForTLSEvents()         = 0;
+  virtual void            reenable_with_event(int event) = 0;
 
 protected:
   void clear();
@@ -78,7 +78,7 @@ protected:
 
 private:
   static int _ex_data_index;
-  SSL       *_ssl;
+  SSL       *_ssl{nullptr};
 
   bool _first_handshake_hooks_pre          = true;
   bool _first_handshake_hooks_outbound_pre = true;

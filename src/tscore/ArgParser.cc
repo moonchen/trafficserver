@@ -42,6 +42,8 @@ int usage_return_code = EX_USAGE;
 
 namespace ts
 {
+bool ArgParser::_test_mode = false;
+
 ArgParser::ArgParser() {}
 
 ArgParser::ArgParser(std::string const &name, std::string const &description, std::string const &envvar, unsigned arg_num,
@@ -59,6 +61,23 @@ ArgParser::add_option(std::string const &long_option, std::string const &short_o
                       std::string const &envvar, unsigned arg_num, std::string const &default_value, std::string const &key)
 {
   return _top_level_command.add_option(long_option, short_option, description, envvar, arg_num, default_value, key);
+}
+
+// Create a mutually exclusive group
+ArgParser::Command &
+ArgParser::add_mutex_group(std::string const &group_name, bool required, std::string const &description)
+{
+  return _top_level_command.add_mutex_group(group_name, required, description);
+}
+
+// Add an option to a mutually exclusive group
+ArgParser::Command &
+ArgParser::add_option_to_group(std::string const &group_name, std::string const &long_option, std::string const &short_option,
+                               std::string const &description, std::string const &envvar, unsigned arg_num,
+                               std::string const &default_value, std::string const &key)
+{
+  return _top_level_command.add_option_to_group(group_name, long_option, short_option, description, envvar, arg_num, default_value,
+                                                key);
 }
 
 // add sub-command with only function
@@ -113,12 +132,15 @@ ArgParser::Command::help_message(std::string_view err) const
     std::cout << "\nOptions ======================= Default ===== Description =============" << std::endl;
     output_option();
   }
-  // output example usage
-  if (!_example_usage.empty()) {
-    std::cout << "\nExample Usage: " << _example_usage << std::endl;
+  // output example usages
+  if (!_example_usages.empty()) {
+    std::cout << "\nExample Usage:" << std::endl;
+    for (const auto &example : _example_usages) {
+      std::cout << "  " << example << std::endl;
+    }
   }
   // standard return code
-  exit(usage_return_code);
+  ArgParser::do_exit(usage_return_code);
 }
 
 void
@@ -127,7 +149,7 @@ ArgParser::Command::version_message() const
   // unified version message of ATS
   AppVersionInfo::setup_version(_name.c_str());
   AppVersionInfo::print_version();
-  exit(0);
+  ArgParser::do_exit(0);
 }
 
 void
@@ -136,12 +158,12 @@ ArgParser::set_default_command(std::string const &cmd)
   if (default_command.empty()) {
     if (_top_level_command._subcommand_list.find(cmd) == _top_level_command._subcommand_list.end()) {
       std::cerr << "Error: Default command " << cmd << "not found" << std::endl;
-      exit(1);
+      ArgParser::do_exit(1);
     }
     default_command = cmd;
   } else if (cmd != default_command) {
     std::cerr << "Error: Default command " << default_command << "already existed" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
 }
 
@@ -158,7 +180,7 @@ ArgParser::parse(const char **argv)
   }
   if (size == 0) {
     std::cout << "Error: invalid argv provided" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
   // the name of the program only
   _argv[0]                 = _argv[0].substr(_argv[0].find_last_of('/') + 1);
@@ -238,20 +260,20 @@ ArgParser::Command::check_option(std::string const &long_option, std::string con
   if (long_option.size() < 3 || long_option[0] != '-' || long_option[1] != '-') {
     // invalid name
     std::cerr << "Error: invalid long option added: '" + long_option + "'" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
   if (short_option.size() > 2 || (short_option.size() > 0 && short_option[0] != '-')) {
     // invalid short option
     std::cerr << "Error: invalid short option added: '" + short_option + "'" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
   // find if existing in option list
   if (_option_list.find(long_option) != _option_list.end()) {
     std::cerr << "Error: long option '" + long_option + "' already existed" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   } else if (_option_map.find(short_option) != _option_map.end()) {
     std::cerr << "Error: short option '" + short_option + "' already existed" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
 }
 
@@ -262,12 +284,12 @@ ArgParser::Command::check_command(std::string const &name, std::string const & /
   if (name.empty()) {
     // invalid name
     std::cerr << "Error: empty command cannot be added" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
   // find if existing in subcommand list
   if (_subcommand_list.find(name) != _subcommand_list.end()) {
     std::cerr << "Error: command already exists: '" + name + "'" << std::endl;
-    exit(1);
+    ArgParser::do_exit(1);
   }
 }
 
@@ -284,6 +306,51 @@ ArgParser::Command::add_option(std::string const &long_option, std::string const
   if (short_option != "-" && !short_option.empty()) {
     _option_map[short_option] = long_option;
   }
+  _last_added_option = long_option; // track for with_required() chaining
+  return *this;
+}
+
+// Create a mutually exclusive group
+ArgParser::Command &
+ArgParser::Command::add_mutex_group(std::string const &group_name, bool required, std::string const &description)
+{
+  if (group_name.empty()) {
+    std::cerr << "Error: Mutex group name cannot be empty" << std::endl;
+    ArgParser::do_exit(1);
+  }
+
+  if (_mutex_groups.find(group_name) != _mutex_groups.end()) {
+    std::cerr << "Error: Mutex group '" << group_name << "' already exists" << std::endl;
+    ArgParser::do_exit(1);
+  }
+  _mutex_groups.emplace(group_name, MutexGroup(group_name, required, description));
+  return *this;
+}
+
+// Add an option to a mutually exclusive group
+ArgParser::Command &
+ArgParser::Command::add_option_to_group(std::string const &group_name, std::string const &long_option,
+                                        std::string const &short_option, std::string const &description, std::string const &envvar,
+                                        unsigned arg_num, std::string const &default_value, std::string const &key)
+{
+  if (group_name.empty()) {
+    std::cerr << "Error: Mutex group name cannot be empty" << std::endl;
+    ArgParser::do_exit(1);
+  }
+
+  auto it_mutex_group = _mutex_groups.find(group_name);
+  if (it_mutex_group == _mutex_groups.end()) {
+    std::cerr << "Error: Mutex group '" << group_name << "' not found" << std::endl;
+    ArgParser::do_exit(1);
+  }
+
+  // Add the option normally (this also sets _last_added_option)
+  add_option(long_option, short_option, description, envvar, arg_num, default_value, key);
+
+  // Track this option in the mutex group
+  it_mutex_group->second.options.push_back(long_option);
+  _option_to_group[long_option] = group_name;
+
   return *this;
 }
 
@@ -312,7 +379,7 @@ ArgParser::Command::add_command(std::string const &cmd_name, std::string const &
 ArgParser::Command &
 ArgParser::Command::add_example_usage(std::string const &usage)
 {
-  _example_usage = usage;
+  _example_usages.push_back(usage);
   return *this;
 }
 
@@ -343,24 +410,36 @@ ArgParser::Command::output_command(std::ostream &out, std::string const &prefix)
 void
 ArgParser::Command::output_option() const
 {
+  // Helper method to build argument message
+  auto arg_msg_builder = [](unsigned num) -> std::string {
+    if (num == 1) {
+      return {" <arg>"};
+    } else if (num == MORE_THAN_ZERO_ARG_N) {
+      return {" [<arg> ...]"};
+    } else if (num == MORE_THAN_ONE_ARG_N) {
+      return {" <arg> ..."};
+    } else {
+      return " <arg1> ... <arg" + std::to_string(num) + ">";
+    }
+  };
+
+  // First, output regular options (excluding those in mutex groups)
   for (const auto &it : _option_list) {
+    // Skip if this option is in a mutex group (it will be displayed in the mutex group)
+    if (_option_to_group.find(it.first) != _option_to_group.end()) {
+      continue;
+    }
+
     std::string msg;
     if (!it.second.short_option.empty()) {
       msg = it.second.short_option + ", ";
     }
-    msg          += it.first;
-    unsigned num  = it.second.arg_num;
-    if (num != 0) {
-      if (num == 1) {
-        msg = msg + " <arg>";
-      } else if (num == MORE_THAN_ZERO_ARG_N) {
-        msg = msg + " [<arg> ...]";
-      } else if (num == MORE_THAN_ONE_ARG_N) {
-        msg = msg + " <arg> ...";
-      } else {
-        msg = msg + " <arg1> ... <arg" + std::to_string(num) + ">";
-      }
+
+    msg += it.first;
+    if (it.second.arg_num != 0) {
+      msg += arg_msg_builder(it.second.arg_num);
     }
+
     if (!it.second.default_value.empty()) {
       if (INDENT_ONE - static_cast<int>(msg.size()) < 0) {
         msg = msg + "\n" + std::string(INDENT_ONE, ' ') + it.second.default_value;
@@ -368,11 +447,72 @@ ArgParser::Command::output_option() const
         msg = msg + std::string(INDENT_ONE - msg.size(), ' ') + it.second.default_value;
       }
     }
-    if (!it.second.description.empty()) {
+    // Build description with dependency info if applicable
+    std::string desc   = it.second.description;
+    auto        dep_it = _option_dependencies.find(it.first);
+    if (dep_it != _option_dependencies.end() && !dep_it->second.empty()) {
+      if (!desc.empty()) {
+        desc += " ";
+      }
+      desc += "(requires";
+      for (size_t i = 0; i < dep_it->second.size(); ++i) {
+        desc += " " + dep_it->second[i];
+        if (i < dep_it->second.size() - 1) {
+          desc += ",";
+        }
+      }
+      desc += ")";
+    }
+
+    if (!desc.empty()) {
       if (INDENT_TWO - static_cast<int>(msg.size()) < 0) {
-        std::cout << msg << "\n" << std::string(INDENT_TWO, ' ') << it.second.description << std::endl;
+        std::cout << msg << "\n" << std::string(INDENT_TWO, ' ') << desc << std::endl;
       } else {
-        std::cout << msg << std::string(INDENT_TWO - msg.size(), ' ') << it.second.description << std::endl;
+        std::cout << msg << std::string(INDENT_TWO - msg.size(), ' ') << desc << std::endl;
+      }
+    }
+  }
+
+  // Then output mutually exclusive groups
+  for (const auto &[group_name, group] : _mutex_groups) {
+    std::cout << "\nGroup (" << group_name;
+    if (group.required) {
+      std::cout << ", required";
+    }
+    std::cout << ")";
+    if (!group.description.empty()) {
+      std::cout << " - " << group.description;
+    }
+    std::cout << std::endl;
+
+    for (const auto &option_name : group.options) {
+      auto const it = _option_list.find(option_name);
+      if (it != _option_list.end()) {
+        std::string msg{"  "}; // Indent group options
+        if (!it->second.short_option.empty()) {
+          msg += it->second.short_option + ", ";
+        }
+
+        msg += it->first;
+        if (it->second.arg_num != 0) {
+          msg += arg_msg_builder(it->second.arg_num);
+        }
+
+        if (!it->second.default_value.empty()) {
+          if (INDENT_ONE - static_cast<int>(msg.size()) < 0) {
+            msg = msg + "\n" + std::string(INDENT_ONE, ' ') + it->second.default_value;
+          } else {
+            msg = msg + std::string(INDENT_ONE - msg.size(), ' ') + it->second.default_value;
+          }
+        }
+
+        if (!it->second.description.empty()) {
+          if (INDENT_TWO - static_cast<int>(msg.size()) < 0) {
+            std::cout << msg << "\n" << std::string(INDENT_TWO, ' ') << it->second.description << std::endl;
+          } else {
+            std::cout << msg << std::string(INDENT_TWO - msg.size(), ' ') << it->second.description << std::endl;
+          }
+        }
       }
     }
   }
@@ -408,6 +548,104 @@ handle_args(Arguments &ret, AP_StrVec &args, std::string const &name, unsigned a
   args.erase(args.begin() + index, args.begin() + index + arg_num + 1);
   index -= 1;
   return "";
+}
+
+// Validate mutually exclusive groups
+void
+ArgParser::Command::validate_mutex_groups(Arguments &ret) const
+{
+  // Check each mutex group
+  for (const auto &[group_name, group] : _mutex_groups) {
+    std::vector<std::string> used_options;
+
+    // Find which options from this group were used
+    for (const auto &option_name : group.options) {
+      auto it = _option_list.find(option_name);
+      if (it != _option_list.end()) {
+        // Check if this option was called
+        if (ret.get(it->second.key)) {
+          used_options.push_back(option_name);
+        }
+      }
+    }
+
+    // Validate: only one option from the group can be used
+    if (used_options.size() > 1) {
+      std::string error_msg = "Error: Options in mutex group '" + group_name + "' are mutually exclusive. Used: ";
+      for (size_t i = 0; i < used_options.size(); ++i) {
+        if (i > 0) {
+          error_msg += ", ";
+        }
+        error_msg += used_options[i];
+      }
+      help_message(error_msg);
+    }
+
+    // Validate: if group is required, at least one option must be used
+    if (group.required && used_options.empty()) {
+      std::string error_msg = "Error: One option from required mutex group '" + group_name + "' must be specified. Options: ";
+      for (size_t i = 0; i < group.options.size(); ++i) {
+        if (i > 0) {
+          error_msg += ", ";
+        }
+        error_msg += group.options[i];
+      }
+      help_message(error_msg);
+    }
+  }
+}
+
+// Specify that the last added option requires another option
+ArgParser::Command &
+ArgParser::Command::with_required(std::string const &required_option)
+{
+  if (_last_added_option.empty()) {
+    std::cerr << "Error: with_required() must be called after add_option()" << std::endl;
+    ArgParser::do_exit(1);
+  }
+
+  // Validate that required option exists
+  if (_option_list.find(required_option) == _option_list.end()) {
+    std::cerr << "Error: Required option '" << required_option << "' not found" << std::endl;
+    ArgParser::do_exit(1);
+  }
+
+  _option_dependencies[_last_added_option].push_back(required_option);
+
+  return *this;
+}
+
+// Validate option dependencies
+void
+ArgParser::Command::validate_dependencies(Arguments &ret) const
+{
+  for (const auto &[dependent, required_list] : _option_dependencies) {
+    // Get the key for the dependent option
+    auto it = _option_list.find(dependent);
+    if (it == _option_list.end()) {
+      continue;
+    }
+
+    const std::string &dep_key = it->second.key;
+
+    // Check if dependent option was used
+    if (ret.get(dep_key)) {
+      // Dependent option was used, check all required options
+      for (const auto &required : required_list) {
+        auto req_it = _option_list.find(required);
+        if (req_it == _option_list.end()) {
+          continue;
+        }
+
+        const std::string &req_key = req_it->second.key;
+
+        if (!ret.get(req_key)) {
+          std::string error_msg = "Option '" + dependent + "' requires '" + required + "' to be specified";
+          help_message(error_msg); // exit with status code 64 (EX_USAGE - command line usage error)
+        }
+      }
+    }
+  }
 }
 
 // Append the args of option to parsed data. Return true if there is any option called
@@ -487,7 +725,14 @@ ArgParser::Command::append_option_data(Arguments &ret, AP_StrVec &args, int inde
       help_message(std::to_string(_option_list.at(it.first).arg_num) + " arguments expected by " + it.first);
     }
   }
-  // put in the default value of options
+}
+
+// Apply default values for options not explicitly set by the user.
+// This must be called AFTER validate_dependencies() so that default values
+// (e.g. --timeout "0") don't falsely trigger dependency checks.
+void
+ArgParser::Command::apply_option_defaults(Arguments &ret) const
+{
   for (const auto &it : _option_list) {
     if (!it.second.default_value.empty() && ret.get(it.second.key).empty()) {
       std::istringstream ss(it.second.default_value);
@@ -504,28 +749,42 @@ bool
 ArgParser::Command::parse(Arguments &ret, AP_StrVec &args)
 {
   bool command_called = false;
-  // iterate through all arguments
-  for (unsigned i = 0; i < args.size(); i++) {
-    if (_name == args[i]) {
-      command_called = true;
-      // handle the option
-      append_option_data(ret, args, i);
-      // handle the action
-      if (_f) {
-        ret._action = _f;
-      }
-      std::string err = handle_args(ret, args, _key, _arg_num, i);
-      if (!err.empty()) {
-        help_message(err);
-      }
-      // set ENV var
-      if (!_envvar.empty()) {
-        const char *const env = getenv(_envvar.c_str());
-        ret.set_env(_key, nullptr != env ? env : "");
-      }
-      break;
+  // Only check the first remaining argument for command name to avoid
+  // treating arguments as commands (e.g., "metric match host" where "host" is an arg, not a command)
+  if (!args.empty() && _name == args[0]) {
+    command_called = true;
+    // Note: handle_args modifies its index parameter (designed for loop usage), but we
+    // discard the result. This causes unsigned underflow (0 - 1 = UINT_MAX) which is
+    // harmless since we don't use index afterward.
+    unsigned index{0};
+    // handle the option
+    append_option_data(ret, args, index);
+    // handle the action
+    if (_f) {
+      ret._action = _f;
     }
+    const std::string err = handle_args(ret, args, _key, _arg_num, index);
+    if (!err.empty()) {
+      help_message(err);
+    }
+    // set ENV var
+    if (!_envvar.empty()) {
+      const char *const env = getenv(_envvar.c_str());
+      ret.set_env(_key, nullptr != env ? env : "");
+    }
+
+    // Validate mutually exclusive groups
+    validate_mutex_groups(ret);
+
+    // Validate option dependencies
+    validate_dependencies(ret);
+
+    // Apply default values after validation so that defaults don't
+    // trigger dependency checks (e.g. --timeout with default "0"
+    // should not require --monitor when not explicitly used).
+    apply_option_defaults(ret);
   }
+
   if (command_called) {
     bool flag = false;
     // recursively call subcommand
@@ -537,7 +796,13 @@ ArgParser::Command::parse(Arguments &ret, AP_StrVec &args)
     }
     // check for command required
     if (!flag && _command_required) {
-      help_message("No subcommand found for " + _name);
+      std::ostringstream msg;
+      if (!args.empty()) {
+        msg << "No sub-command '" << args[0] << "' found for " << _name;
+      } else {
+        msg << "No sub-command found for " << _name;
+      }
+      help_message(msg.str());
     }
     if (_name == parser_program_name) {
       // if we are at the top level
@@ -679,6 +944,22 @@ AP_StrVec::const_iterator
 ArgumentData::end() const noexcept
 {
   return _values.end();
+}
+// protected method for testing
+/*static*/ void
+ArgParser::set_test_mode(bool test)
+{
+  _test_mode = test;
+}
+
+// protected method for testing
+/*static*/ void
+ArgParser::do_exit(int code)
+{
+  if (_test_mode) {
+    throw std::runtime_error("Test mode: exit with code " + std::to_string(code));
+  }
+  exit(code);
 }
 
 } // namespace ts

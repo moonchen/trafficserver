@@ -24,6 +24,7 @@
 #include "P_NetAccept.h"
 #include "P_Net.h"
 #include "P_UnixNet.h"
+#include "P_UnixNetProcessor.h"
 #include "P_UnixNetVConnection.h"
 #include "P_IOUringNetAccept.h"
 #include "iocore/net/ConnectionTracker.h"
@@ -57,8 +58,14 @@ handle_max_client_connections(IpEndpoint const &addr, std::shared_ptr<Connection
 {
   int const client_max = NetHandler::get_per_client_max_connections_in();
   if (client_max > 0) {
-    auto       inbound_tracker = ConnectionTracker::obtain_inbound(addr);
-    auto const tracked_count   = inbound_tracker.reserve();
+    auto inbound_tracker = ConnectionTracker::obtain_inbound(addr);
+    if (inbound_tracker.is_exempt()) {
+      // The user configured connections like this to not be tracked. Simply exempt it.
+      Metrics::Counter::increment(net_rsb.per_client_connections_exempt_in);
+      Dbg(dbg_ctl_iocore_net_accepts, "Ignoring client connection counting for an incoming address in the exempt list.");
+      return true;
+    }
+    auto const tracked_count = inbound_tracker.reserve();
     if (tracked_count > client_max) {
       // close the connection as we are in per client connection throttle state
       inbound_tracker.release();
@@ -66,6 +73,7 @@ handle_max_client_connections(IpEndpoint const &addr, std::shared_ptr<Connection
       inbound_tracker.Warn_Blocked(client_max, 0, tracked_count - 1, addr,
                                    dbg_ctl_iocore_net_accept.on() ? &dbg_ctl_iocore_net_accept : nullptr);
       Metrics::Counter::increment(net_rsb.per_client_connections_throttled_in);
+      Dbg(dbg_ctl_iocore_net_accepts, "Blocking a client connection due to per client connection limit.");
       return false;
     }
     conn_track_group = inbound_tracker.drop();
@@ -127,7 +135,7 @@ net_accept(NetAccept *na, void *ep, bool blockable)
       continue;
     }
 
-    vc = static_cast<UnixNetVConnection *>(na->getNetProcessor()->allocate_vc(e->ethread));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(e->ethread));
     if (!vc) {
       goto Ldone; // note: @a con will clean up the socket when it goes out of scope.
     }
@@ -141,7 +149,7 @@ net_accept(NetAccept *na, void *ep, bool blockable)
     vc->submit_time = ink_get_hrtime();
     vc->action_     = *na->action_;
     vc->set_is_transparent(na->opt.f_inbound_transparent);
-    vc->set_is_proxy_protocol(na->opt.f_proxy_protocol);
+    vc->set_is_proxy_protocol(na->opt.f_proxy_protocol, na->opt.f_proxy_protocol_client_src);
     vc->set_context(NET_VCONNECTION_IN);
     if (na->opt.f_mptcp) {
       vc->set_mptcp_state(); // Try to get the MPTCP state, and update accordingly
@@ -182,7 +190,7 @@ Ldone:
   }
 
   // if we stop looping as a result of hitting the accept limit,
-  // resechedule accepting to the end of the thread event queue
+  // reschedule accepting to the end of the thread event queue
   // for the goal of fairness between accepting and other work
   Dbg(dbg_ctl_iocore_net_accepts, "exited accept loop - count: %d, limit: %d", count, additional_accepts);
   if (count >= additional_accepts) {
@@ -270,7 +278,7 @@ NetAccept::accept_per_thread(int /* event ATS_UNUSED */, void * /* ep ATS_UNUSED
     }
 
     if (do_listen()) {
-      Fatal("[NetAccept::accept_per_thread]:error listenting on ports");
+      Fatal("[NetAccept::accept_per_thread]:error listening on ports");
       return -1;
     }
   }
@@ -313,9 +321,7 @@ NetAccept::init_accept_per_thread()
 void
 NetAccept::stop_accept()
 {
-  if (!action_->cancelled) {
-    action_->cancel();
-  }
+  action_->cancel();
   server.close();
 }
 
@@ -414,7 +420,7 @@ NetAccept::do_blocking_accept(EThread *t)
     Metrics::Counter::increment(net_rsb.tcp_accept);
 
     // Use 'nullptr' to Bypass thread allocator
-    vc = static_cast<UnixNetVConnection *>(this->getNetProcessor()->allocate_vc(nullptr));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(nullptr));
     if (unlikely(!vc)) {
       return -1;
     }
@@ -428,7 +434,7 @@ NetAccept::do_blocking_accept(EThread *t)
     vc->submit_time = ink_get_hrtime();
     vc->action_     = *action_;
     vc->set_is_transparent(opt.f_inbound_transparent);
-    vc->set_is_proxy_protocol(opt.f_proxy_protocol);
+    vc->set_is_proxy_protocol(opt.f_proxy_protocol, opt.f_proxy_protocol_client_src);
     vc->options.sockopt_flags        = opt.sockopt_flags;
     vc->options.packet_mark          = opt.packet_mark;
     vc->options.packet_tos           = opt.packet_tos;
@@ -475,6 +481,7 @@ NetAccept::acceptEvent(int event, void *ep)
   MUTEX_TRY_LOCK(lock, m, e->ethread);
   if (lock.is_locked()) {
     if (action_->cancelled) {
+      // Server was already closed by whoever called cancel().
       e->cancel();
       Metrics::Gauge::decrement(net_rsb.accepts_currently_open);
       delete this;
@@ -483,6 +490,7 @@ NetAccept::acceptEvent(int event, void *ep)
 
     int res;
     if ((res = net_accept(this, e, false)) < 0) {
+      action_->cancel();
       Metrics::Gauge::decrement(net_rsb.accepts_currently_open);
       /* INKqa11179 */
       Warning("Accept on port %d failed with error no %d", ats_ip_port_host_order(&server.addr), res);
@@ -582,7 +590,7 @@ NetAccept::acceptFastEvent(int event, void *ep)
       goto Lerror;
     }
 
-    vc = static_cast<UnixNetVConnection *>(this->getNetProcessor()->allocate_vc(e->ethread));
+    vc = static_cast<UnixNetVConnection *>(unix_netProcessor.allocate_vc(e->ethread));
     ink_release_assert(vc);
     vc->enable_inbound_connection_tracking(conn_track_group);
 
@@ -594,7 +602,7 @@ NetAccept::acceptFastEvent(int event, void *ep)
     vc->submit_time = ink_get_hrtime();
     vc->action_     = *action_;
     vc->set_is_transparent(opt.f_inbound_transparent);
-    vc->set_is_proxy_protocol(opt.f_proxy_protocol);
+    vc->set_is_proxy_protocol(opt.f_proxy_protocol, opt.f_proxy_protocol_client_src);
     vc->options.sockopt_flags        = opt.sockopt_flags;
     vc->options.packet_mark          = opt.packet_mark;
     vc->options.packet_tos           = opt.packet_tos;
@@ -633,6 +641,7 @@ Ldone:
   return EVENT_CONT;
 
 Lerror:
+  action_->cancel();
   server.close();
   e->cancel();
   Metrics::Gauge::decrement(net_rsb.accepts_currently_open);
@@ -652,6 +661,7 @@ NetAccept::acceptLoopEvent(int event, Event *e)
   }
 
   // Don't think this ever happens ...
+  action_->cancel();
   Metrics::Gauge::decrement(net_rsb.accepts_currently_open);
   delete this;
   return EVENT_DONE;
@@ -813,7 +823,7 @@ IOUringNetAccept::handle_complete(io_uring_cqe *cqe)
   vc->submit_time = ink_get_hrtime();
   vc->action_     = *action_;
   vc->set_is_transparent(opt.f_inbound_transparent);
-  vc->set_is_proxy_protocol(opt.f_proxy_protocol);
+  vc->set_is_proxy_protocol(opt.f_proxy_protocol, opt.f_proxy_protocol_client_src);
   vc->options.sockopt_flags        = opt.sockopt_flags;
   vc->options.packet_mark          = opt.packet_mark;
   vc->options.packet_tos           = opt.packet_tos;

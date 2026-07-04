@@ -72,7 +72,6 @@
  ****************************************************************************/
 
 #include "proxy/PluginVC.h"
-#include "../iocore/eventsystem/P_EventSystem.h"
 #include "../iocore/net/P_Net.h"
 #include "tscore/Regression.h"
 #if TS_HAS_TESTS
@@ -397,6 +396,8 @@ PluginVC::do_io_shutdown(ShutdownHowTo_t howto)
 {
   ink_assert(!closed);
   ink_assert(magic == PluginVCMagic_t::ALIVE);
+
+  SCOPED_MUTEX_LOCK(lock, mutex, this_ethread());
 
   switch (howto) {
   case IO_SHUTDOWN_READ:

@@ -25,6 +25,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 #include <openssl/ssl.h>
 
@@ -43,13 +44,15 @@ public:
   static void             bind(SSL *ssl, TLSBasicSupport *srs);
   static void             unbind(SSL *ssl);
 
-  TLSHandle   get_tls_handle() const;
-  const char *get_tls_protocol_name() const;
-  const char *get_tls_cipher_suite() const;
-  const char *get_tls_curve() const;
-  const char *get_tls_group() const;
-  ink_hrtime  get_tls_handshake_begin_time() const;
-  ink_hrtime  get_tls_handshake_end_time() const;
+  TLSHandle        get_tls_handle() const;
+  const char      *get_tls_protocol_name() const;
+  const char      *get_tls_cipher_suite() const;
+  const char      *get_tls_curve() const;
+  std::string_view get_tls_group() const;
+  ink_hrtime       get_tls_handshake_begin_time() const;
+  ink_hrtime       get_tls_handshake_end_time() const;
+  bool             get_tls_handshake_bytes(uint64_t &bytes_in, uint64_t &bytes_out) const;
+
   /**
    * Returns a certificate that need to be verified.
    *
@@ -80,8 +83,9 @@ public:
 protected:
   void clear();
 
-  virtual SSL         *_get_ssl_object() const = 0;
-  virtual ssl_curve_id _get_tls_curve() const  = 0;
+  virtual SSL             *_get_ssl_object() const = 0;
+  virtual ssl_curve_id     _get_tls_curve() const  = 0;
+  virtual std::string_view _get_tls_group() const  = 0;
 
   void _record_tls_handshake_begin_time();
   void _record_tls_handshake_end_time();
@@ -99,6 +103,9 @@ private:
 
   X509_STORE_CTX *_cert_to_verify = nullptr;
 
-  ink_hrtime _tls_handshake_begin_time = 0;
-  ink_hrtime _tls_handshake_end_time   = 0;
+  ink_hrtime       _tls_handshake_begin_time     = 0;
+  ink_hrtime       _tls_handshake_end_time       = 0;
+  mutable bool     _tls_handshake_bytes_measured = false;
+  mutable uint64_t _tls_handshake_bytes_in       = 0;
+  mutable uint64_t _tls_handshake_bytes_out      = 0;
 };

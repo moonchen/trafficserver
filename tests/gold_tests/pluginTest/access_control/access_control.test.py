@@ -39,7 +39,13 @@ class AccessControlTest:
     def setupTS(self):
         self.ts = Test.MakeATSProcess("ts", enable_tls=True)
         self.ts.addDefaultSSLFiles()
-        self.ts.Disk.ssl_multicert_config.AddLine("dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key")
+        self.ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
         self.ts.Disk.records_config.update(
             {
                 "proxy.config.diags.debug.enabled": 1,
@@ -67,11 +73,7 @@ class AccessControlTest:
     def run(self):
         tr = Test.AddTestRun("Session Cookie")
         tr.AddVerifierClientProcess(
-            "verifier-client",
-            self.replayFile,
-            http_ports=[self.ts.Variables.port],
-            https_ports=[self.ts.Variables.ssl_port],
-            other_args='--thread-limit 1')
+            "verifier-client", self.replayFile, http_ports=[self.ts.Variables.port], https_ports=[self.ts.Variables.ssl_port])
         tr.Processes.Default.StartBefore(self.ts)
         tr.Processes.Default.StartBefore(self.server)
         tr.StillRunningAfter = self.ts

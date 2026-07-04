@@ -43,7 +43,7 @@ Stable plugins
 Plugins that are considered stable are installed by default in |TS| releases.
 
 .. toctree::
-   :hidden:
+   :maxdepth: 1
 
    AuthProxy <authproxy.en>
    Background Fetch <background_fetch.en>
@@ -162,21 +162,24 @@ Plugins that are considered experimental are located in the
 directory of the |TS| source tree. Experimental plugins can be compiled by passing the
 ``-DBUILD_EXPERIMENTAL_PLUGINS=ON``` variable to ``cmake`` command when building.
 
-
 .. toctree::
-   :hidden:
+   :maxdepth: 1
 
    Access Control <access_control.en>
    Block Errors <block_errors.en>
    Cache Fill <cache_fill.en>
    Certifier <certifier.en>
    Cert Reporting Tool <cert_reporting_tool.en>
+   Connection Exempt List <connection_exempt_list.en>
    Cookie Remap <cookie_remap.en>
+   Filter Body <filter_body.en>
    GeoIP ACL <geoip_acl.en>
    FQ Pacing <fq_pacing.en>
    Header Frequency <header_freq.en>
    Hook Trace <hook-trace.en>
    ICAP <icap.en>
+   JA4 Fingerprint <ja4_fingerprint.en>
+   JAx Fingerprint <jax_fingerprint.en>
    Maxmind ACL <maxmind_acl.en>
    Memcache <memcache.en>
    Memory Profile <memory_profile.en>
@@ -185,6 +188,7 @@ directory of the |TS| source tree. Experimental plugins can be compiled by passi
    Multiplexer <multiplexer.en>
    OpenTelemetry Tracer <otel_tracer.en>
    Rate Limit <rate_limit.en>
+   Real IP <realip.en>
    URI Signing <uri_signing.en>
    Legacy Signed URLs <url_sig.en>
    Slice <slice.en>
@@ -208,8 +212,15 @@ directory of the |TS| source tree. Experimental plugins can be compiled by passi
 :doc:`Cert Reporting Tool <cert_reporting_tool.en>`
    Examines and logs information on loaded certificates.
 
+:doc:`Connection Exempt List <connection_exempt_list.en>`
+   Provides a way for administrators to set
+   :ts:cv:`proxy.config.http.per_client.connection.exempt_list` via a YAML file.
+
 :doc:`Cookie Remap <cookie_remap.en>`
    Makes decisions on destinations based on cookies.
+
+:doc:`Filter Body <filter_body.en>`
+   Streaming body content inspection with configurable pattern matching for detecting security threats.
 
 :doc:`FQ Pacing <fq_pacing.en>`
    FQ Pacing: Rate Limit TCP connections using Linux's Fair Queuing queue discipline
@@ -222,6 +233,12 @@ directory of the |TS| source tree. Experimental plugins can be compiled by passi
 
 :doc:`ICAP <icap.en>`
    Pass response data to external server for further processing using the ICAP protocol.
+
+:doc:`JA4 Fingerprint <ja4_fingerprint.en>`
+   Calculates JA4 Fingerprints for incoming TLS traffic.
+
+:doc:`JAx Fingerprint <jax_fingerprint.en>`
+   Calculates JAx Fingerprints.
 
 :doc:`MaxMind ACL <maxmind_acl.en>`
    ACL based on the maxmind geo databases (GeoIP2 mmdb and libmaxminddb)
@@ -249,6 +266,9 @@ directory of the |TS| source tree. Experimental plugins can be compiled by passi
 
 :doc:`Rate Limit <rate_limit.en>`
    Simple transaction rate limiting.
+
+:doc:`Real IP <realip.en>`
+   Provides real client's IP address.
 
 :doc:`Remap Purge <remap_purge.en>`
    This remap plugin allows the administrator to easily setup remotely

@@ -22,12 +22,19 @@
 #pragma once
 
 #include <string>
+#include <memory>
 
 #include "ts/ts.h"
 
 #include "operator.h"
 #include "resources.h"
 #include "value.h"
+
+// Forward declarations
+class Parser;
+
+// Full includes needed for member variables
+#include "conditions.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // Operator declarations.
@@ -449,8 +456,8 @@ protected:
   bool exec(const Resources &res) const override;
 
 private:
-  bool           _flag = false;
-  TSHttpCntlType _cntl_qual;
+  bool           _flag{false};
+  TSHttpCntlType _cntl_qual{TS_HTTP_CNTL_LOGGING_MODE}; // always overwritten by initialize()
 };
 
 class OperatorSetPluginCntl : public Operator
@@ -480,8 +487,8 @@ protected:
   }
 
 private:
-  PluginCtrl _name;
-  int        _value;
+  PluginCtrl _name{PluginCtrl::TIMEZONE}; // always overwritten by initialize()
+  int        _value{0};
 };
 
 class RemapPluginInst; // Opaque to the HRW operator, but needed in the implementation.
@@ -540,7 +547,7 @@ private:
 class OperatorSetStateFlag : public Operator
 {
 public:
-  OperatorSetStateFlag()
+  explicit OperatorSetStateFlag(TSUserArgType scope = TS_USER_ARGS_TXN) : _scope(scope)
   {
     static_assert(sizeof(void *) == 8, "State Variables requires a 64-bit system.");
     Dbg(dbg_ctl, "Calling CTOR for OperatorSetStateFlag");
@@ -559,19 +566,26 @@ protected:
   bool
   need_txn_slot() const override
   {
-    return true;
+    return _scope == TS_USER_ARGS_TXN;
+  }
+
+  bool
+  need_ssn_slot() const override
+  {
+    return _scope == TS_USER_ARGS_SSN;
   }
 
 private:
-  int      _flag_ix = -1;
-  int      _flag    = false;
-  uint64_t _mask    = 0;
+  TSUserArgType _scope   = TS_USER_ARGS_TXN;
+  int           _flag_ix = -1;
+  int           _flag    = false;
+  uint64_t      _mask    = 0;
 };
 
 class OperatorSetStateInt8 : public Operator
 {
 public:
-  OperatorSetStateInt8()
+  explicit OperatorSetStateInt8(TSUserArgType scope = TS_USER_ARGS_TXN) : _scope(scope)
   {
     static_assert(sizeof(void *) == 8, "State Variables requires a 64-bit system.");
     Dbg(dbg_ctl, "Calling CTOR for OperatorSetStateInt8");
@@ -590,18 +604,25 @@ protected:
   bool
   need_txn_slot() const override
   {
-    return true;
+    return _scope == TS_USER_ARGS_TXN;
+  }
+
+  bool
+  need_ssn_slot() const override
+  {
+    return _scope == TS_USER_ARGS_SSN;
   }
 
 private:
-  int   _byte_ix = -1;
-  Value _value;
+  TSUserArgType _scope   = TS_USER_ARGS_TXN;
+  int           _byte_ix = -1;
+  Value         _value;
 };
 
 class OperatorSetStateInt16 : public Operator
 {
 public:
-  OperatorSetStateInt16()
+  explicit OperatorSetStateInt16(TSUserArgType scope = TS_USER_ARGS_TXN) : _scope(scope)
   {
     static_assert(sizeof(void *) == 8, "State Variables requires a 64-bit system.");
     Dbg(dbg_ctl, "Calling CTOR for OperatorSetStateInt16");
@@ -620,9 +641,152 @@ protected:
   bool
   need_txn_slot() const override
   {
+    return _scope == TS_USER_ARGS_TXN;
+  }
+
+  bool
+  need_ssn_slot() const override
+  {
+    return _scope == TS_USER_ARGS_SSN;
+  }
+
+private:
+  TSUserArgType _scope = TS_USER_ARGS_TXN;
+  Value         _value;
+};
+
+class OperatorSetEffectiveAddress : public Operator
+{
+public:
+  OperatorSetEffectiveAddress() { Dbg(dbg_ctl, "Calling CTOR for OperatorSetEffectiveAddress"); }
+
+  // noncopyable
+  OperatorSetEffectiveAddress(const OperatorSetEffectiveAddress &) = delete;
+  void operator=(const OperatorSetEffectiveAddress &)              = delete;
+
+  void initialize(Parser &p) override;
+
+protected:
+  void initialize_hooks() override;
+  bool exec(const Resources &res) const override;
+
+  bool
+  need_txn_private_slot() const override
+  {
     return true;
   }
 
 private:
   Value _value;
+};
+
+class OperatorSetNextHopStrategy : public Operator
+{
+public:
+  OperatorSetNextHopStrategy() { Dbg(dbg_ctl, "Calling CTOR for OperatorSetNextHopStrategy"); }
+
+  // noncopyable
+  OperatorSetNextHopStrategy(const OperatorSetNextHopStrategy &) = delete;
+  void operator=(const OperatorSetNextHopStrategy &)             = delete;
+
+  void initialize(Parser &p) override;
+
+protected:
+  void initialize_hooks() override;
+  bool exec(const Resources &res) const override;
+
+private:
+  Value _value;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// OperatorIf class - implements nested if/elif/else as a pseudo-operator.
+// Keep this at the end of the files, since this is not really an Operator.
+//
+class OperatorIf : public Operator
+{
+public:
+  struct CondOpSection {
+    CondOpSection() = default;
+
+    ~CondOpSection() = default;
+
+    CondOpSection(const CondOpSection &)            = delete;
+    CondOpSection &operator=(const CondOpSection &) = delete;
+
+    bool
+    has_operator() const
+    {
+      return ops.oper != nullptr;
+    }
+
+    ConditionGroup                 group;
+    OperatorAndMods                ops;
+    std::unique_ptr<CondOpSection> next; // For elif/else sections
+  };
+
+  OperatorIf() { Dbg(dbg_ctl, "Calling CTOR for OperatorIf"); }
+
+  // noncopyable
+  OperatorIf(const OperatorIf &)     = delete;
+  void operator=(const OperatorIf &) = delete;
+
+  ConditionGroup *new_section(Parser::CondClause clause);
+  bool            add_operator(Parser &p, const char *filename, int lineno);
+  Condition      *make_condition(Parser &p, const char *filename, int lineno);
+  bool            has_operator() const;
+
+  ConditionGroup *
+  get_group()
+  {
+    return &_cur_section->group;
+  }
+
+  Parser::CondClause
+  get_clause() const
+  {
+    return _clause;
+  }
+
+  CondOpSection *
+  cur_section() const
+  {
+    return _cur_section;
+  }
+
+  OperModifiers exec_and_return_mods(const Resources &res) const;
+
+protected:
+  bool
+  exec(const Resources &res) const override
+  {
+    OperModifiers mods = exec_and_return_mods(res);
+    return !(mods & OPER_NO_REENABLE);
+  }
+
+private:
+  OperModifiers exec_section(const CondOpSection *section, const Resources &res) const;
+
+  CondOpSection      _sections;
+  CondOpSection     *_cur_section = &_sections;
+  Parser::CondClause _clause      = Parser::CondClause::COND;
+};
+
+class OperatorSetCCAlgorithm : public Operator
+{
+public:
+  OperatorSetCCAlgorithm() { Dbg(dbg_ctl, "Calling CTOR for OperatorSetCCAlgorithm"); }
+
+  // noncopyable
+  OperatorSetCCAlgorithm(const OperatorSetCCAlgorithm &) = delete;
+  void operator=(const OperatorSetCCAlgorithm &)         = delete;
+
+  void initialize(Parser &p) override;
+
+protected:
+  void initialize_hooks() override;
+  bool exec(const Resources &res) const override;
+
+private:
+  Value _cc_alg;
 };

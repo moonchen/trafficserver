@@ -81,7 +81,12 @@ struct HTTPStatsFormatter {
 struct HTTPStatsConfig {
   explicit HTTPStatsConfig() {}
 
-  ~HTTPStatsConfig() { TSContDestroy(cont); }
+  ~HTTPStatsConfig()
+  {
+    if (cont) {
+      TSContDestroy(cont);
+    }
+  }
   std::string mimeType;
 
   int  maxAge           = 0;
@@ -89,7 +94,7 @@ struct HTTPStatsConfig {
   bool integer_counters = false;
   bool wrap_counters    = false;
 
-  TSCont cont;
+  TSCont cont{nullptr};
 };
 
 struct HTTPStatsRequest;
@@ -580,7 +585,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn rh, TSRemapRequestInfo * /* rri ATS_UNUSED */
 
   if (!cfg) {
     VERROR("No remap context available, check code / config");
-    TSHttpTxnStatusSet(rh, TS_HTTP_STATUS_INTERNAL_SERVER_ERROR);
+    TSHttpTxnStatusSet(rh, TS_HTTP_STATUS_INTERNAL_SERVER_ERROR, PLUGIN);
     return TSREMAP_NO_REMAP;
   }
 

@@ -40,8 +40,9 @@ namespace
 {
 
 DbgCtl dbg_ctl_cache_init{"cache_init"};
+DbgCtl dbg_ctl_cache_free{"cache_free"};
 
-constexpr int DIRECTORY_FOOTER_SIZE{ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter))};
+constexpr int DIRECTORY_FOOTER_SIZE{ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter))};
 
 int
 compare_ushort(void const *a, void const *b)
@@ -154,14 +155,46 @@ Stripe::_init_directory(std::size_t directory_size, int header_size, int footer_
       directory_size, (long long)this->len, percent(directory_size, this->len));
   if (ats_hugepage_enabled()) {
     this->directory.raw_dir = static_cast<char *>(ats_alloc_hugepage(directory_size));
+    if (this->directory.raw_dir != nullptr) {
+      this->directory.raw_dir_huge = true;
+    }
   }
   if (nullptr == this->directory.raw_dir) {
-    this->directory.raw_dir = static_cast<char *>(ats_memalign(ats_pagesize(), directory_size));
+    this->directory.raw_dir      = static_cast<char *>(ats_memalign(ats_pagesize(), directory_size));
+    this->directory.raw_dir_huge = false;
   }
-  this->directory.dir    = reinterpret_cast<Dir *>(this->directory.raw_dir + header_size);
-  this->directory.header = reinterpret_cast<StripteHeaderFooter *>(this->directory.raw_dir);
+  this->directory.raw_dir_size = directory_size;
+  this->directory.dir          = reinterpret_cast<Dir *>(this->directory.raw_dir + header_size);
+  this->directory.header       = reinterpret_cast<StripeHeaderFooter *>(this->directory.raw_dir);
   std::size_t const footer_offset{directory_size - static_cast<std::size_t>(footer_size)};
-  this->directory.footer = reinterpret_cast<StripteHeaderFooter *>(this->directory.raw_dir + footer_offset);
+  this->directory.footer = reinterpret_cast<StripeHeaderFooter *>(this->directory.raw_dir + footer_offset);
+}
+
+// coverity[exn_spec_violation] - ink_assert aborts (doesn't throw), Dbg is exception-safe
+Stripe::~Stripe()
+{
+  if (this->directory.raw_dir != nullptr) {
+    // Debug logging to track cleanup - helps correlate with crash location
+    Dbg(dbg_ctl_cache_free, "Stripe %s: freeing raw_dir=%p size=%zu huge=%s", hash_text.get() ? hash_text.get() : "(null)",
+        this->directory.raw_dir, this->directory.raw_dir_size, this->directory.raw_dir_huge ? "true" : "false");
+
+    // Validate that size is reasonable (catches corruption before free)
+    ink_assert(this->directory.raw_dir_size > 0);
+    ink_assert(this->directory.raw_dir_size < MAX_STRIPE_SIZE);
+
+#ifdef DEBUG
+    // Poison memory before freeing to help detect use-after-free
+    memset(this->directory.raw_dir, 0xDE, this->directory.raw_dir_size);
+#endif
+
+    if (this->directory.raw_dir_huge) {
+      ats_free_hugepage(this->directory.raw_dir, this->directory.raw_dir_size);
+    } else {
+      ats_free(this->directory.raw_dir);
+    }
+    this->directory.raw_dir      = nullptr;
+    this->directory.raw_dir_size = 0;
+  }
 }
 
 int

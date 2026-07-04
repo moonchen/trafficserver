@@ -34,6 +34,7 @@
 #endif
 
 #include <type_traits>
+#include <string_view>
 #include <vector>
 
 #include "tsutil/DbgCtl.h"
@@ -1142,7 +1143,9 @@ TSReturnCode TSHttpHdrUrlGet(TSMBuffer bufp, TSMLoc offset, TSMLoc *locp);
 TSReturnCode TSHttpHdrUrlSet(TSMBuffer bufp, TSMLoc offset, TSMLoc url);
 
 TSHttpStatus TSHttpHdrStatusGet(TSMBuffer bufp, TSMLoc offset);
+/** This is a candidate for deprecation in v10.0.0 in favor of the version that takes the setter. */
 TSReturnCode TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc offset, TSHttpStatus status);
+TSReturnCode TSHttpHdrStatusSet(TSMBuffer bufp, TSMLoc offset, TSHttpStatus status, TSHttpTxn txnp, std::string_view setter);
 const char  *TSHttpHdrReasonGet(TSMBuffer bufp, TSMLoc offset, int *length);
 TSReturnCode TSHttpHdrReasonSet(TSMBuffer bufp, TSMLoc offset, const char *value, int length);
 const char  *TSHttpHdrReasonLookup(TSHttpStatus status);
@@ -1330,6 +1333,52 @@ int TSVConnIsSsl(TSVConn sslp);
  */
 int         TSVConnProvidedSslCert(TSVConn sslp);
 const char *TSVConnSslSniGet(TSVConn sslp, int *length);
+
+/**
+    Retrieve TLS Client Hello information from an SSL virtual connection.
+
+    This function extracts TLS Client Hello data from a TLS handshake.
+    The returned object provides access to version, cipher suites, and extensions
+    in a way that is portable across both BoringSSL and OpenSSL implementations.
+
+    IMPORTANT: This function must be called during the TS_SSL_CLIENT_HELLO_HOOK.
+    The underlying SSL context may not be available at other hooks, particularly
+    for BoringSSL where the SSL_CLIENT_HELLO structure is only valid during
+    specific callback functions. Calling this function outside of the client
+    hello hook may result in unavailable object being returned.
+
+    @param[in] sslp The SSL virtual connection handle. Must not be nullptr.
+    @return A TSClientHello object containing Client Hello data.
+
+    @see TSClientHelloExtensionGet
+ */
+TSClientHello TSVConnClientHelloGet(TSVConn sslp);
+
+/**
+    Retrieve a specific TLS extension from the Client Hello.
+
+    This function looks up a TLS extension by its type (e.g., 0x10 for ALPN,
+    0x00 for SNI) and returns a pointer to its data. The lookup is performed
+    using SSL library-specific functions that work with both BoringSSL and
+    OpenSSL without requiring conditional compilation in the plugin.
+
+    The returned buffer is still owned by the underlying SSL context and must
+    not be freed by the caller. The buffer is valid only in the condition where
+    you can get a TSClientHello object from an SSL virtual connection.
+
+    @param[in]  ch The Client Hello object obtained from TSVConnClientHelloGet().
+    @param[in]  type The TLS extension type to retrieve.
+    @param[out] out Pointer to receive the extension data buffer. Must not be nullptr.
+    @param[out] outlen Pointer to receive the length of the extension data in bytes.
+                  Must not be nullptr.
+
+    @return TS_SUCCESS if the extension was found and retrieved successfully.
+            TS_ERROR if the extension is not present, or if any parameter is nullptr,
+            or if an error occurred during lookup.
+
+    @see TSVConnClientHelloGet
+ */
+TSReturnCode TSClientHelloExtensionGet(TSClientHello ch, unsigned int type, const unsigned char **out, size_t *outlen);
 
 TSSslSession TSSslSessionGet(const TSSslSessionID *session_id);
 int          TSSslSessionGetBuffer(const TSSslSessionID *session_id, char *buffer, int *len_ptr);
@@ -1577,6 +1626,67 @@ void TSHttpTxnErrorBodySet(TSHttpTxn txnp, char *buf, size_t buflength, char *mi
 char *TSHttpTxnErrorBodyGet(TSHttpTxn txnp, size_t *buflength, char **mimetype);
 
 /**
+    Sets the Transaction's Next Hop Parent Strategy.
+    Calling this after TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK will
+    result in bad behavior.
+
+    You can get this strategy pointer by calling TSHttpTxnParentStrategyGet().
+
+    @param txnp HTTP transaction whose parent strategy to set.
+    @param pointer to the given strategy.
+
+ */
+void TSHttpTxnNextHopStrategySet(TSHttpTxn txnp, void const *strategy);
+
+/**
+    Retrieves a pointer to the current next hop selection strategy.
+    This value may be a nullptr due to:
+      - parent proxying not enabled
+      - no parent selection strategy (using parent.config)
+
+    @param txnp HTTP transaction whose next hop strategy to get.
+
+ */
+void const *TSHttpTxnNextHopStrategyGet(TSHttpTxn txnp);
+
+/**
+    Returns either null pointer or null terminated pointer to name.
+                DO NOT FREE.
+
+    This value may be a nullptr due to:
+      - parent proxying not enabled
+      - no parent selection strategy (using parent.config)
+
+    @param txnp HTTP transaction whose next hop strategy to get.
+
+ */
+char const *TSHttpNextHopStrategyNameGet(void const *strategy);
+
+/**
+    Retrieves a pointer to the named strategy in the strategy table.
+    Returns nullptr if no strategy is set.
+    This uses the current transaction's state machine to get
+    access to UrlRewrite's NextHopStrategyFactory.
+
+    @param txnp HTTP transaction which holds the strategy table.
+    @param name of the strategy to look up.
+
+ */
+void const *TSHttpTxnNextHopNamedStrategyGet(TSHttpTxn txnp, const char *name);
+
+/**
+    Sets the parent proxy name and port. The string hostname is copied
+    into the TSHttpTxn; you can modify or delete the string after
+    calling TSHttpTxnParentProxySet().
+
+    @param txnp HTTP transaction whose parent proxy to set.
+    @param hostname parent proxy host name string.
+    @param port parent proxy port to set.
+
+ */
+void TSHttpTxnParentProxySet(TSHttpTxn txnp, const char *hostname, int port);
+
+/**
     Retrieves the parent proxy hostname and port, if parent
     proxying is enabled. If parent proxying is not enabled,
     TSHttpTxnParentProxyGet() sets hostname to nullptr and port to -1.
@@ -1637,7 +1747,35 @@ TSReturnCode TSUserArgIndexLookup(TSUserArgType type, int arg_idx, const char **
 void         TSUserArgSet(void *data, int arg_idx, void *arg);
 void        *TSUserArgGet(void *data, int arg_idx);
 
-void         TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status);
+/** Set the HTTP status code for a transaction.
+ *
+ * Sets the transaction's internal status state, triggering Traffic Server's
+ * error handling system. This is typically used for access control,
+ * authentication failures, and early transaction processing. Traffic Server
+ * will automatically generate an appropriate error response body.
+ *
+ * @note This is a candidate for deprecation in v10.0.0 in favor of the version
+ * that takes the setter.
+ *
+ * @param[in] txnp The associated transaction for the new status.
+ * @param[in] status The HTTP status code to set.
+ */
+void TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status);
+
+/** Set the HTTP status code for a transaction and track the entity that set it.
+ *
+ * Sets the transaction's internal status state, triggering Traffic Server's
+ * error handling system. This is typically used for access control,
+ * authentication failures, and early transaction processing. Traffic Server
+ * will automatically generate an appropriate error response body.
+ *
+ * @param[in] txnp The associated transaction for the new status.
+ * @param[in] status The HTTP status code to set.
+ * @param[in] setter Identifying label for the entity setting the status
+ *   (e.g., plugin name). If empty, clears the current setter information.
+ */
+void TSHttpTxnStatusSet(TSHttpTxn txnp, TSHttpStatus status, std::string_view setter);
+
 TSHttpStatus TSHttpTxnStatusGet(TSHttpTxn txnp);
 
 void TSHttpTxnActiveTimeoutSet(TSHttpTxn txnp, int timeout);
@@ -1944,6 +2082,7 @@ TSVConn TSTransformOutputVConnGet(TSVConn connp);
 /* --------------------------------------------------------------------------
    Net VConnections */
 struct sockaddr const *TSNetVConnRemoteAddrGet(TSVConn vc);
+struct sockaddr const *TSNetVConnClientAddrGet(TSVConn vc);
 
 /**
     Opens a network connection to the host specified by ip on the port
@@ -2629,6 +2768,25 @@ TSReturnCode TSHttpTxnCachedRespModifiableGet(TSHttpTxn txnp, TSMBuffer *bufp, T
 TSReturnCode TSHttpTxnCacheLookupStatusSet(TSHttpTxn txnp, int cachelookup);
 TSReturnCode TSHttpTxnCacheLookupUrlGet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc obj);
 TSReturnCode TSHttpTxnCacheLookupUrlSet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc obj);
+
+/**
+    Gets the effective cache key digest (cryptographic hash) that was
+    used for cache lookup or storage on this transaction.  The digest
+    is returned as raw bytes — 16 bytes for MD5 (default) or 32 bytes
+    for SHA-256 (FIPS mode).  A buffer of at least 32 bytes is
+    recommended to accommodate either configuration.
+
+    @param[in] txnp the transaction.
+    @param[out] buffer caller-provided buffer to receive the raw hash
+      bytes. If @c nullptr, only @a length is set (size query).
+    @param[in,out] length capacity of @a buffer in bytes on input; actual
+      digest size in bytes on output.
+
+    @return @c TS_SUCCESS if a cache key was computed for this
+      transaction, @c TS_ERROR if no cache lookup was performed or if
+      @a buffer is non-null and too small.
+ */
+TSReturnCode TSHttpTxnCacheKeyDigestGet(TSHttpTxn txnp, char *buffer, int *length);
 TSReturnCode TSHttpTxnPrivateSessionSet(TSHttpTxn txnp, int private_session);
 const char  *TSHttpTxnCacheDiskPathGet(TSHttpTxn txnp, int *length);
 int          TSHttpTxnBackgroundFillStarted(TSHttpTxn txnp);
@@ -2866,6 +3024,36 @@ TSReturnCode TSHostStatusGet(const char *hostname, const size_t hostname_len, TS
 void TSHostStatusSet(const char *hostname, const size_t hostname_len, TSHostStatus status, const unsigned int down_time,
                      const unsigned int reason);
 
+/**
+ * Add one or more IP addresses or CIDR ranges to the per-client connection limit exempt list.
+ * This function allows plugins to programmatically add to the list of IP addresses
+ * that should be exempt from per-client connection limits (see
+ * proxy.config.net.per_client.max_connections_in).
+ *
+ * @param ip_ranges The IP address or CIDR range to exempt, or a comma-separated list of ranges.
+ * @return TS_SUCCESS if the exempt list was successfully updated, TS_ERROR otherwise.
+ */
+TSReturnCode TSConnectionLimitExemptListAdd(std::string_view ip_ranges);
+
+/**
+ * Remove one or more IP addresses or CIDR ranges from the per-client connection limit exempt list.
+ * This function allows plugins to programmatically remove from the list of IP addresses
+ * that should be exempt from per-client connection limits (see
+ * proxy.config.net.per_client.max_connections_in).
+ *
+ * @param ip_ranges The IP address or CIDR range to remove, or a comma-separated list of ranges.
+ * @return TS_SUCCESS if the exempt list was successfully updated, TS_ERROR otherwise.
+ */
+TSReturnCode TSConnectionLimitExemptListRemove(std::string_view ip_ranges);
+
+/**
+ * Clear the per-client connection limit exempt list.
+ * This function allows plugins to programmatically clear the list of IP addresses
+ * that should be exempt from per-client connection limits (see
+ * proxy.config.net.per_client.max_connections_in).
+ */
+void TSConnectionLimitExemptListClear();
+
 /*
  * Set or get various HTTP Transaction control settings.
  */
@@ -2994,6 +3182,10 @@ TSReturnCode TSIpStringToAddr(const char *str, size_t str_len, struct sockaddr *
  */
 TSTxnType TSHttpTxnTypeGet(TSHttpTxn txnp);
 
+TSReturnCode TSHttpTxnVerifiedAddrSet(TSHttpTxn txnp, const struct sockaddr *addr);
+
+TSReturnCode TSHttpTxnVerifiedAddrGet(TSHttpTxn txnp, const struct sockaddr **addr);
+
 /* Get Arbitrary Txn info such as cache lookup details etc as defined in TSHttpTxnInfoKey */
 /**
    Return the particular txn info requested.
@@ -3097,3 +3289,47 @@ TSReturnCode TSVConnPPInfoGet(TSVConn vconn, uint16_t key, const char **value, i
 
 */
 TSReturnCode TSVConnPPInfoIntGet(TSVConn vconn, uint16_t key, TSMgmtInt *value);
+
+/**
+   Registers a custom log field, or modifies an existing log field with a new definition.
+
+   @param name a human friendly name
+   @param symbol a symbol to use on the config file
+   @param type a type of the new log field
+   @param marshal_cb a callback function to marshal log  value
+   @param unmarshal_cb a callback function to unmarshal log value
+   @param replace a flag to allow replacing an existing log field
+
+   @return @c TS_SCCESS if the registration successes, TS_ERROR otherwise
+*/
+TSReturnCode TSLogFieldRegister(std::string_view name, std::string_view symbol, TSLogType type, TSLogMarshalCallback marshal_cb,
+                                TSLogUnmarshalCallback unmarshal_cb, bool replace = false);
+/**
+   Helper function to marshal a string
+*/
+int TSLogStringMarshal(char *buf, std::string_view str);
+
+/**
+   Helper function to marshal an integer
+*/
+int TSLogIntMarshal(char *buf, int64_t value);
+
+/**
+   Helper function to marshal an address
+*/
+int TSLogAddrMarshal(char *buf, sockaddr *addr);
+
+/**
+   Helper function to unmarshal a string
+*/
+std::tuple<int, int> TSLogStringUnmarshal(char **buf, char *dest, int len);
+
+/**
+   Helper function to unmarshal an integer
+*/
+std::tuple<int, int> TSLogIntUnmarshal(char **buf, char *dest, int len);
+
+/**
+   Helper function to unmarshal an address
+*/
+std::tuple<int, int> TSLogAddrUnmarshal(char **buf, char *dest, int len);

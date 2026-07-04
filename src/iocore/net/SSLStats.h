@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "tscore/ink_config.h"
 #include "tsutil/Metrics.h"
 
 #include <openssl/ssl.h>
@@ -36,6 +37,18 @@ using ts::Metrics;
 // for ssl_rsb.total_ticket_keys_renewed needs this initialization, but lets be
 // consistent at least.
 struct SSLStatsBlock {
+  Metrics::Counter::AtomicType *cert_compress_zlib                             = nullptr;
+  Metrics::Counter::AtomicType *cert_compress_zlib_failure                     = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_zlib                           = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_zlib_failure                   = nullptr;
+  Metrics::Counter::AtomicType *cert_compress_brotli                           = nullptr;
+  Metrics::Counter::AtomicType *cert_compress_brotli_failure                   = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_brotli                         = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_brotli_failure                 = nullptr;
+  Metrics::Counter::AtomicType *cert_compress_zstd                             = nullptr;
+  Metrics::Counter::AtomicType *cert_compress_zstd_failure                     = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_zstd                           = nullptr;
+  Metrics::Counter::AtomicType *cert_decompress_zstd_failure                   = nullptr;
   Metrics::Counter::AtomicType *early_data_received_count                      = nullptr;
   Metrics::Counter::AtomicType *error_async                                    = nullptr;
   Metrics::Counter::AtomicType *error_ssl                                      = nullptr;
@@ -55,6 +68,8 @@ struct SSLStatsBlock {
   Metrics::Counter::AtomicType *origin_server_wrong_version                    = nullptr;
   Metrics::Counter::AtomicType *origin_session_cache_hit                       = nullptr;
   Metrics::Counter::AtomicType *origin_session_cache_miss                      = nullptr;
+  Metrics::Counter::AtomicType *origin_session_cache_timeout                   = nullptr;
+  Metrics::Counter::AtomicType *origin_session_cross_thread_migration          = nullptr;
   Metrics::Counter::AtomicType *origin_session_reused_count                    = nullptr;
   Metrics::Counter::AtomicType *session_cache_eviction                         = nullptr;
   Metrics::Counter::AtomicType *session_cache_hit                              = nullptr;
@@ -96,23 +111,35 @@ struct SSLStatsBlock {
   Metrics::Counter::AtomicType *user_agent_version_too_high                    = nullptr;
   Metrics::Counter::AtomicType *user_agent_version_too_low                     = nullptr;
   Metrics::Counter::AtomicType *user_agent_wrong_version                       = nullptr;
-  Metrics::Gauge::AtomicType   *user_agent_session_hit                         = nullptr;
-  Metrics::Gauge::AtomicType   *user_agent_session_miss                        = nullptr;
-  Metrics::Gauge::AtomicType   *user_agent_session_timeout                     = nullptr;
-  Metrics::Gauge::AtomicType   *user_agent_sessions                            = nullptr;
+  Metrics::Counter::AtomicType *tls_handshake_bytes_in_total                   = nullptr;
+  Metrics::Counter::AtomicType *tls_handshake_bytes_out_total                  = nullptr;
+
+  // Note: The following user_agent_session_* metrics are implemented as Gauge
+  // types even though they semantically represent cumulative counters. This is
+  // because they are periodically synchronized from external counter sources
+  // (OpenSSL's built-in session cache) and need to be "set" to specific values
+  // rather than incremented. From a monitoring perspective, these should be
+  // treated as counters for calculating rates.
+  Metrics::Gauge::AtomicType *user_agent_session_hit     = nullptr;
+  Metrics::Gauge::AtomicType *user_agent_session_miss    = nullptr;
+  Metrics::Gauge::AtomicType *user_agent_session_timeout = nullptr;
+  Metrics::Gauge::AtomicType *user_agent_sessions        = nullptr;
 };
 
 extern SSLStatsBlock                                                   ssl_rsb;
 extern std::unordered_map<std::string, Metrics::Counter::AtomicType *> cipher_map;
 
-#if defined(OPENSSL_IS_BORINGSSL)
+#if defined(OPENSSL_IS_BORINGSSL) || HAVE_SSL_CTX_GET0_IMPLEMENTED_GROUPS
 extern std::unordered_map<std::string, Metrics::Counter::AtomicType *> tls_group_map;
-#elif defined(SSL_get_negotiated_group)
+extern std::unordered_map<std::string, Metrics::Counter::AtomicType *> tls_group_handshake_time_map;
+#elif HAVE_SSL_GET_NEGOTIATED_GROUP
 extern std::unordered_map<int, Metrics::Counter::AtomicType *> tls_group_map;
+extern std::unordered_map<int, Metrics::Counter::AtomicType *> tls_group_handshake_time_map;
 constexpr int                                                  SSL_GROUP_STAT_OTHER_KEY = 0;
 #endif
 
 // Initialize SSL statistics.
+// Must be called AFTER SSLCertificateConfig::startup() so SSL contexts are loaded.
 void SSLInitializeStatistics();
 
 const std::string SSL_CIPHER_STAT_OTHER = "OTHER";

@@ -78,13 +78,17 @@ Acl::init(char const *filename)
     return status;
   }
 
-  // Associate our config file with remap.config if possible to be able to initiate reloads
+  // Associate our config file with remap.config or .yaml if possible to be able to initiate reloads
   TSMgmtString result;
-  const char  *var_name = "proxy.config.url_remap.filename";
-  if (TS_SUCCESS != TSMgmtStringGet(var_name, &result)) {
-    TSWarning("[%s] Could not retrieve remap filename", PLUGIN_NAME);
-  } else if (TS_SUCCESS != TSMgmtConfigFileAdd(result, configloc.c_str())) {
-    TSWarning("[%s] Error adding mgmt config file", PLUGIN_NAME);
+  const char  *var_name = "proxy.config.url_remap_yaml.filename";
+  if (TS_SUCCESS != TSMgmtStringGet(var_name, &result) || TS_SUCCESS != TSMgmtConfigFileAdd(result, configloc.c_str())) {
+    // Fall back to remap.config
+    var_name = "proxy.config.url_remap.filename";
+    if (TS_SUCCESS != TSMgmtStringGet(var_name, &result)) {
+      TSWarning("[%s] Could not retrieve remap filename", PLUGIN_NAME);
+    } else if (TS_SUCCESS != TSMgmtConfigFileAdd(result, configloc.c_str())) {
+      TSWarning("[%s] Error adding mgmt config file", PLUGIN_NAME);
+    }
   }
 
   // Find our database name and convert to full path as needed
@@ -117,6 +121,9 @@ Acl::init(char const *filename)
   _proxy_over_vpn  = false;
   _smart_dns_proxy = false;
 
+  _bypass_header.clear();
+  _bypass_header_value.clear();
+
   if (loadallow(maxmind["allow"])) {
     Dbg(dbg_ctl, "Loaded Allow ruleset");
     status = true;
@@ -134,6 +141,8 @@ Acl::init(char const *filename)
   loadhtml(maxmind["html"]);
 
   _anonymous_blocking = loadanonymous(maxmind["anonymous"]);
+
+  loadbypass(maxmind["bypass"]);
 
   if (!status) {
     Dbg(dbg_ctl, "Failed to load any rulesets, none specified");
@@ -399,19 +408,12 @@ Acl::parseregex(const YAML::Node &regex, bool allow)
           plugin_regex temp;
           auto         temprule = i.as<std::vector<std::string>>();
           temp._regex_s         = temprule.back();
-          const char *error;
-          int         erroffset;
-          temp._rex = pcre_compile(temp._regex_s.c_str(), 0, &error, &erroffset, nullptr);
+          std::string error;
+          int         erroroffset = 0;
 
-          // Compile the regex for this set of countries
-          if (nullptr != temp._rex) {
-            temp._extra = pcre_study(temp._rex, 0, &error);
-            if ((nullptr == temp._extra) && error && (*error != 0)) {
-              TSError("[%s] Failed to study regular expression in %s:%s", PLUGIN_NAME, temp._regex_s.c_str(), error);
-              return;
-            }
-          } else {
-            TSError("[%s] Failed to compile regular expression in %s: %s", PLUGIN_NAME, temp._regex_s.c_str(), error);
+          if (!temp._rex.compile(temp._regex_s, error, erroroffset)) {
+            TSError("[%s] Failed to compile regular expression in %s, err: %s(%d)", PLUGIN_NAME, temp._regex_s.c_str(),
+                    error.c_str(), erroroffset);
             return;
           }
 
@@ -428,6 +430,58 @@ Acl::parseregex(const YAML::Node &regex, bool allow)
     }
   } catch (const YAML::Exception &e) {
     Dbg(dbg_ctl, "YAML::Exception %s when parsing YAML config file regex allow list for maxmind", e.what());
+    return;
+  }
+}
+
+void
+Acl::loadbypass(const YAML::Node &bypassNode)
+{
+  if (!bypassNode) {
+    Dbg(dbg_ctl, "No bypass set");
+    return;
+  }
+  if (bypassNode.IsNull()) {
+    TSWarning("[%s] bypass node is NULL — bypass disabled", PLUGIN_NAME);
+    return;
+  }
+
+  try {
+    if (bypassNode["header"]) {
+      const YAML::Node &headerNode = bypassNode["header"];
+      if (headerNode.IsNull() || !headerNode.IsScalar()) {
+        TSWarning("[%s] bypass 'header' is null or non-scalar — bypass disabled", PLUGIN_NAME);
+        return;
+      }
+
+      if (!bypassNode["value"]) {
+        TSWarning("[%s] bypass 'header' set without 'value' — bypass disabled; both are required", PLUGIN_NAME);
+        return;
+      }
+      const YAML::Node &valueNode = bypassNode["value"];
+      if (valueNode.IsNull() || !valueNode.IsScalar()) {
+        TSWarning("[%s] bypass 'value' is null or non-scalar — bypass disabled", PLUGIN_NAME);
+        return;
+      }
+
+      _bypass_header_value = valueNode.as<std::string>();
+      if (_bypass_header_value.empty()) {
+        TSWarning("[%s] bypass 'value' is empty — bypass disabled; a non-empty value is required", PLUGIN_NAME);
+        return;
+      }
+      _bypass_header = headerNode.as<std::string>();
+      if (_bypass_header.empty()) {
+        TSWarning("[%s] bypass 'header' is empty — bypass disabled; a non-empty header is required", PLUGIN_NAME);
+        return;
+      }
+      Dbg(dbg_ctl, "bypass header set to: %s", _bypass_header.c_str());
+      Dbg(dbg_ctl, "bypass value set to: %s", _bypass_header_value.c_str());
+    } else {
+      TSWarning("[%s] bypass is set but missing 'header' key — bypass disabled", PLUGIN_NAME);
+      return;
+    }
+  } catch (const YAML::Exception &e) {
+    TSError("[%s] YAML::Exception %s when parsing bypass config", PLUGIN_NAME, e.what());
     return;
   }
 }
@@ -504,6 +558,41 @@ Acl::loaddb(const YAML::Node &dbNode)
   db_loaded = true;
   Dbg(dbg_ctl, "Initialized MMDB with %s", dbloc.c_str());
   return true;
+}
+
+bool
+Acl::check_bypass(TSHttpTxn txnp) const
+{
+  if (_bypass_header.empty()) {
+    return false;
+  }
+
+  TSMBuffer mbuf;
+  TSMLoc    hdr_loc;
+  if (TS_SUCCESS != TSHttpTxnClientReqGet(txnp, &mbuf, &hdr_loc)) {
+    Dbg(dbg_ctl, "check_bypass: failed to get client request headers");
+    return false;
+  }
+
+  TSMLoc field_loc = TSMimeHdrFieldFind(mbuf, hdr_loc, _bypass_header.c_str(), static_cast<int>(_bypass_header.size()));
+  if (TS_NULL_MLOC == field_loc) {
+    TSHandleMLocRelease(mbuf, TS_NULL_MLOC, hdr_loc);
+    return false;
+  }
+
+  bool        bypassed = false;
+  int         val_len  = 0;
+  const char *val      = TSMimeHdrFieldValueStringGet(mbuf, hdr_loc, field_loc, -1, &val_len);
+  if (val != nullptr && 0 < val_len && std::string_view(val, val_len) == _bypass_header_value) {
+    Dbg(dbg_ctl, "check_bypass: bypass triggered");
+    bypassed = true;
+  } else {
+    Dbg(dbg_ctl, "check_bypass: bypass header present but value did not match");
+  }
+
+  TSHandleMLocRelease(mbuf, hdr_loc, field_loc);
+  TSHandleMLocRelease(mbuf, TS_NULL_MLOC, hdr_loc);
+  return bypassed;
 }
 
 bool
@@ -793,7 +882,7 @@ Acl::eval_country(MMDB_entry_data_s *entry_data, const std::string &url)
     Dbg(dbg_ctl, "saw url not empty: %s, %ld", url.c_str(), url.length());
     if (!allow_regex[output].empty()) {
       for (auto &i : allow_regex[output]) {
-        if (PCRE_ERROR_NOMATCH != pcre_exec(i._rex, i._extra, url.c_str(), url.length(), 0, PCRE_NOTEMPTY, nullptr, 0)) {
+        if (i._rex.exec(url, RE_NOTEMPTY)) {
           Dbg(dbg_ctl, "Got a regex allow hit on regex: %s, country: %s", i._regex_s.c_str(), output);
           ret = true;
         }
@@ -801,7 +890,7 @@ Acl::eval_country(MMDB_entry_data_s *entry_data, const std::string &url)
     }
     if (!deny_regex[output].empty()) {
       for (auto &i : deny_regex[output]) {
-        if (PCRE_ERROR_NOMATCH != pcre_exec(i._rex, i._extra, url.c_str(), url.length(), 0, PCRE_NOTEMPTY, nullptr, 0)) {
+        if (i._rex.exec(url, RE_NOTEMPTY)) {
           Dbg(dbg_ctl, "Got a regex deny hit on regex: %s, country: %s", i._regex_s.c_str(), output);
           ret = false;
         }

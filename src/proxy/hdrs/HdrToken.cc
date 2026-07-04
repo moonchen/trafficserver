@@ -43,7 +43,7 @@ DbgCtl dbg_ctl_hdr_token{"hdr_token"};
 
  You want a regexp like 'Accept' after "greedier" choices so it doesn't match 'Accept-Ranges' earlier than
  it should. The regexp are anchored (^Accept), but I dont see a way with the current system to
- match the word ONLY without making _hdrtoken_strs a real PCRE, but then that breaks the hashing
+ match the word ONLY without making _hdrtoken_strs a real PCRE2, but then that breaks the hashing
  hdrtoken_hash("^Accept$") != hdrtoken_hash("Accept")
 
  So, the current hack is to have "Accept" follow "Accept-.*", lame, I know
@@ -122,7 +122,13 @@ const char *const _hdrtoken_strs[] = {
   "Early-Data",
 
   // RFC-7932
-  "br"};
+  "br",
+
+  // RFC-8878
+  "zstd",
+
+  // RFC-9213 Targeted Cache Control
+  "CDN-Cache-Control"};
 
 HdrTokenTypeBinding _hdrtoken_strs_type_initializers[] = {
   {"file",                 HdrTokenType::SCHEME        },
@@ -264,6 +270,7 @@ HdrTokenFieldInfo _hdrtoken_strs_field_initializers[] = {
   {"Forwarded",                 MIME_SLOTID_NONE,                MIME_PRESENCE_NONE,                (HdrTokenInfoFlags::COMMAS | HdrTokenInfoFlags::MULTVALS)                              },
   {"Sec-WebSocket-Key",         MIME_SLOTID_NONE,                MIME_PRESENCE_NONE,                HdrTokenInfoFlags::NONE                                                                },
   {"Sec-WebSocket-Version",     MIME_SLOTID_NONE,                MIME_PRESENCE_NONE,                HdrTokenInfoFlags::NONE                                                                },
+  {"CDN-Cache-Control",         MIME_SLOTID_NONE,                MIME_PRESENCE_NONE,                (HdrTokenInfoFlags::COMMAS | HdrTokenInfoFlags::MULTVALS)                              },
   {nullptr,                     0,                               0,                                 HdrTokenInfoFlags::NONE                                                                },
 };
 
@@ -289,7 +296,7 @@ DFA *hdrtoken_strs_dfa = nullptr;
  *                                                                     *
  ***********************************************************************/
 
-#define HDRTOKEN_HASH_TABLE_SIZE 65536
+static constexpr size_t HDRTOKEN_HASH_TABLE_SIZE = 65536;
 
 struct HdrTokenHashBucket {
   const char *wks;
@@ -400,7 +407,7 @@ hdrtoken_init()
       heap_size                 += packed_prefix_str_len;
     }
 
-    _hdrtoken_strs_heap_f = static_cast<const char *>(ats_malloc(heap_size));
+    _hdrtoken_strs_heap_f = static_cast<const char *>(ats_calloc(1, heap_size));
     _hdrtoken_strs_heap_l = _hdrtoken_strs_heap_f + heap_size - 1;
 
     char *heap_ptr = const_cast<char *>(_hdrtoken_strs_heap_f);

@@ -18,17 +18,17 @@
 
 #pragma once
 
+#include <tsutil/Regex.h>
+
 #include "slice.h"
 #include "ObjectSizeCache.h"
 
-#ifdef HAVE_PCRE_PCRE_H
-#include <pcre/pcre.h>
-#else
-#include <pcre.h>
-#endif
-
 #include <string>
 #include <mutex>
+#include <unordered_set>
+#include <vector>
+
+struct BgBlockFetch;
 
 // Data Structures and Classes
 struct Config {
@@ -40,11 +40,10 @@ struct Config {
   std::string m_remaphost; // remap host to use for loopback slice GET
   std::string m_regexstr;  // regex string for things to slice (default all)
   enum RegexType { None, Include, Exclude };
-  RegexType   m_regex_type{None};
-  pcre       *m_regex{nullptr};
-  pcre_extra *m_regex_extra{nullptr};
-  int         m_paceerrsecs{0};   // -1 disable logging, 0 no pacing, max 60s
-  int         m_prefetchcount{0}; // 0 disables prefetching
+  RegexType m_regex_type{None};
+  Regex    *m_regex{nullptr};
+  int       m_paceerrsecs{0};   // -1 disable logging, 0 no pacing, max 60s
+  int       m_prefetchcount{0}; // 0 disables prefetching
   enum RefType { First, Relative };
   RefType  m_reftype{First};          // reference slice is relative to request
   bool     m_head_strip_range{false}; // strip range header for head requests
@@ -84,6 +83,10 @@ struct Config {
   // Did we cache this internally as a small object?
   bool isKnownLargeObj(std::string_view url);
 
+  // Prefetch dedup and freelist
+  std::pair<bool, BgBlockFetch *> prefetchAcquire(const std::string &key);
+  void                            prefetchRelease(BgBlockFetch *bg);
+
   // Metadata cache stats
   std::string stat_prefix{};
   int         stat_TP{0}, stat_TN{0}, stat_FP{0}, stat_FN{0}, stat_no_cl{0}, stat_bad_cl{0}, stat_no_url{0};
@@ -94,4 +97,9 @@ private:
   std::mutex                     m_mutex;
   std::optional<ObjectSizeCache> m_oscache;
   void                           setCacheSize(size_t entries);
+
+  std::mutex                      m_prefetch_mutex;
+  std::unordered_set<std::string> m_prefetch_active;
+  std::vector<BgBlockFetch *>     m_prefetch_freelist;
+  void                            prefetchCleanup();
 };

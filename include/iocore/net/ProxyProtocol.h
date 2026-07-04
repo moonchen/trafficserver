@@ -54,6 +54,7 @@ constexpr uint8_t PP2_SUBTYPE_SSL_CN      = 0x22;
 constexpr uint8_t PP2_SUBTYPE_SSL_CIPHER  = 0x23;
 constexpr uint8_t PP2_SUBTYPE_SSL_SIG_ALG = 0x24;
 constexpr uint8_t PP2_SUBTYPE_SSL_KEY_ALG = 0x25;
+constexpr uint8_t PP2_SUBTYPE_SSL_GROUP   = 0x26;
 constexpr uint8_t PP2_TYPE_NETNS          = 0x30;
 
 class ProxyProtocol
@@ -64,12 +65,50 @@ public:
     : version(pp_ver), ip_family(family), src_addr(src), dst_addr(dst)
   {
   }
-  ~ProxyProtocol() { ats_free(additional_data); }
+  ProxyProtocol(const ProxyProtocol &other)
+    : version(other.version), ip_family(other.ip_family), src_addr(other.src_addr), dst_addr(other.dst_addr)
+  {
+    if (!other.additional_data.empty()) {
+      set_additional_data(other.additional_data);
+    }
+  }
+  ProxyProtocol(ProxyProtocol &&other)
+    : version(other.version), ip_family(other.ip_family), src_addr(other.src_addr), dst_addr(other.dst_addr)
+  {
+    if (!other.additional_data.empty()) {
+      set_additional_data(other.additional_data);
+    }
+    other.additional_data.clear();
+    other.tlv.clear();
+  }
+  ~ProxyProtocol() = default;
+
+  /** Release owned heap and reset to the default-constructed state.
+   *
+   * Swap rather than clear() the containers: clear() retains capacity, which would be abandoned
+   * (leaked) when the slot is reused, since the NetVConnection allocators are Destruct_on_free=false
+   * and so never run ~ProxyProtocol.
+   */
+  void
+  reset()
+  {
+    std::string{}.swap(additional_data);
+    std::unordered_map<uint8_t, std::string_view>{}.swap(tlv);
+    version   = ProxyProtocolVersion::UNDEFINED;
+    ip_family = AF_UNSPEC;
+    type      = 0;
+    src_addr  = {};
+    dst_addr  = {};
+  }
+
   int  set_additional_data(std::string_view data);
   void set_ipv4_addrs(in_addr_t src_addr, uint16_t src_port, in_addr_t dst_addr, uint16_t dst_port);
   void set_ipv6_addrs(const in6_addr &src_addr, uint16_t src_port, const in6_addr &dst_addr, uint16_t dst_port);
 
   std::optional<std::string_view> get_tlv(const uint8_t tlvCode) const;
+  std::optional<std::string_view> get_tlv_ssl_version() const;
+  std::optional<std::string_view> get_tlv_ssl_cipher() const;
+  std::optional<std::string_view> get_tlv_ssl_group() const;
 
   ProxyProtocolVersion                          version   = ProxyProtocolVersion::UNDEFINED;
   uint16_t                                      ip_family = AF_UNSPEC;
@@ -78,13 +117,54 @@ public:
   IpEndpoint                                    dst_addr  = {};
   std::unordered_map<uint8_t, std::string_view> tlv;
 
+  ProxyProtocol &
+  operator=(const ProxyProtocol &other)
+  {
+    if (&other == this) {
+      return *this;
+    }
+    version   = other.version;
+    ip_family = other.ip_family;
+    src_addr  = other.src_addr;
+    dst_addr  = other.dst_addr;
+    if (!other.additional_data.empty()) {
+      set_additional_data(other.additional_data);
+    } else {
+      additional_data.clear();
+      tlv.clear();
+    }
+    return *this;
+  }
+
+  ProxyProtocol &
+  operator=(ProxyProtocol &&other)
+  {
+    version   = other.version;
+    ip_family = other.ip_family;
+    src_addr  = other.src_addr;
+    dst_addr  = other.dst_addr;
+
+    additional_data.clear();
+    tlv.clear();
+
+    if (!other.additional_data.empty()) {
+      set_additional_data(other.additional_data);
+    }
+    other.additional_data.clear();
+    other.tlv.clear();
+    return *this;
+  }
+
 private:
-  char *additional_data = nullptr;
+  std::string additional_data;
+
+  std::optional<std::string_view> _get_tlv_ssl_subtype(uint8_t subtype) const;
 };
 
 const size_t PPv1_CONNECTION_HEADER_LEN_MAX = 108;
 const size_t PPv2_CONNECTION_HEADER_LEN     = 16;
 
+extern bool                 proxy_protocol_detect(swoc::TextView tv);
 extern size_t               proxy_protocol_parse(ProxyProtocol *pp_info, swoc::TextView tv);
 extern size_t               proxy_protocol_build(uint8_t *buf, size_t max_buf_len, const ProxyProtocol &pp_info,
                                                  ProxyProtocolVersion force_version = ProxyProtocolVersion::UNDEFINED);

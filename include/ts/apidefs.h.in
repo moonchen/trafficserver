@@ -43,9 +43,14 @@
  */
 
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <tuple>
+#include <type_traits>
 
 /** Apply printf format string compile-time argument checking to a function.
  *
@@ -361,6 +366,7 @@ enum TSEvent {
   TS_EVENT_LIFECYCLE_MSG                        = 60105,
   TS_EVENT_LIFECYCLE_TASK_THREADS_READY         = 60106,
   TS_EVENT_LIFECYCLE_SHUTDOWN                   = 60107,
+  TS_EVENT_LIFECYCLE_LOG_INITIALIZED            = 60108,
 
   TS_EVENT_INTERNAL_60200    = 60200,
   TS_EVENT_INTERNAL_60201    = 60201,
@@ -578,6 +584,7 @@ enum TSLifecycleHookID {
   TS_LIFECYCLE_TASK_THREADS_READY_HOOK,
   TS_LIFECYCLE_SHUTDOWN_HOOK,
   TS_LIFECYCLE_SSL_SECRET_HOOK,
+  TS_LIFECYCLE_LOG_INITIALIZED_HOOK,
   TS_LIFECYCLE_LAST_HOOK,
 };
 
@@ -777,7 +784,6 @@ enum TSOverridableConfigKey {
   TS_CONFIG_HTTP_CHUNKING_ENABLED,
   TS_CONFIG_HTTP_NEGATIVE_CACHING_ENABLED,
   TS_CONFIG_HTTP_NEGATIVE_CACHING_LIFETIME,
-  TS_CONFIG_HTTP_NEGATIVE_CACHING_LIST,
   TS_CONFIG_HTTP_CACHE_WHEN_TO_REVALIDATE,
   TS_CONFIG_HTTP_KEEP_ALIVE_ENABLED_IN,
   TS_CONFIG_HTTP_KEEP_ALIVE_ENABLED_OUT,
@@ -819,9 +825,9 @@ enum TSOverridableConfigKey {
   TS_CONFIG_HTTP_TRANSACTION_ACTIVE_TIMEOUT_OUT,
   TS_CONFIG_HTTP_CONNECT_ATTEMPTS_MAX_RETRIES,
   TS_CONFIG_HTTP_CONNECT_ATTEMPTS_MAX_RETRIES_DOWN_SERVER,
+  TS_CONFIG_HTTP_CONNECT_ATTEMPTS_MAX_RETRIES_SUSPECT_SERVER,
   TS_CONFIG_HTTP_CONNECT_ATTEMPTS_RR_RETRIES,
   TS_CONFIG_HTTP_CONNECT_ATTEMPTS_TIMEOUT,
-  TS_CONFIG_HTTP_CONNECT_ATTEMPTS_RETRY_BACKOFF_BASE,
   TS_CONFIG_HTTP_DOWN_SERVER_CACHE_TIME,
   TS_CONFIG_HTTP_DOC_IN_CACHE_SKIP_DNS,
   TS_CONFIG_HTTP_BACKGROUND_FILL_ACTIVE_TIMEOUT,
@@ -842,7 +848,6 @@ enum TSOverridableConfigKey {
   TS_CONFIG_HTTP_RESPONSE_HEADER_MAX_SIZE,
   TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_ENABLED,
   TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIFETIME,
-  TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIST,
   TS_CONFIG_SSL_HSTS_MAX_AGE,
   TS_CONFIG_SSL_HSTS_INCLUDE_SUBDOMAINS,
   TS_CONFIG_HTTP_CACHE_OPEN_READ_RETRY_TIME,
@@ -906,8 +911,13 @@ enum TSOverridableConfigKey {
   TS_CONFIG_HTTP_NO_DNS_JUST_FORWARD_TO_PARENT,
   TS_CONFIG_HTTP_CACHE_IGNORE_QUERY,
   TS_CONFIG_HTTP_DROP_CHUNKED_TRAILERS,
-  TS_CONFIG_HTTP_CACHE_POST_METHOD,
   TS_CONFIG_HTTP_STRICT_CHUNK_PARSING,
+  TS_CONFIG_HTTP_NEGATIVE_CACHING_LIST,
+  TS_CONFIG_HTTP_CONNECT_ATTEMPTS_RETRY_BACKOFF_BASE,
+  TS_CONFIG_HTTP_NEGATIVE_REVALIDATING_LIST,
+  TS_CONFIG_HTTP_CACHE_POST_METHOD,
+  TS_CONFIG_HTTP_CACHE_TARGETED_CACHE_CONTROL_HEADERS,
+  TS_CONFIG_SSL_CLIENT_CA_CERT_PATH,
   TS_CONFIG_LAST_ENTRY,
 };
 
@@ -978,6 +988,8 @@ enum TSMilestonesType {
   TS_MILESTONE_PLUGIN_TOTAL,
   TS_MILESTONE_TLS_HANDSHAKE_START,
   TS_MILESTONE_TLS_HANDSHAKE_END,
+  TS_MILESTONE_SERVER_TLS_HANDSHAKE_START,
+  TS_MILESTONE_SERVER_TLS_HANDSHAKE_END,
   TS_MILESTONE_LAST_ENTRY,
 };
 
@@ -1045,6 +1057,72 @@ struct TSHttp2Priority {
   int32_t stream_dependency;
 };
 
+// Wrapper class that provides controlled access to client hello data
+class TSClientHello
+{
+public:
+  class TSExtensionTypeList
+  {
+  public:
+    TSExtensionTypeList(void *ch) : _ch(ch) {}
+
+    class Iterator
+    {
+    public:
+      Iterator(const void *ite);
+      Iterator &operator++();
+      bool      operator==(const Iterator &b) const;
+      int       operator*() const;
+
+    private:
+      char _real_iterator[24];
+    };
+
+    Iterator begin();
+    Iterator end();
+
+  private:
+    void *_ch;
+  };
+
+  TSClientHello(void *ch) : _client_hello(ch) {}
+
+  ~TSClientHello() = default;
+
+  explicit
+  operator bool() const
+  {
+    return _client_hello != nullptr;
+  }
+
+  bool is_available() const;
+
+  uint16_t get_version() const;
+
+  const uint8_t *get_cipher_suites() const;
+
+  size_t get_cipher_suites_len() const;
+
+  // Returns an iterable container of extension type IDs
+  // This abstracts the difference between BoringSSL (extensions buffer) and OpenSSL (extension_ids array)
+  TSExtensionTypeList
+  get_extension_types() const
+  {
+    return TSExtensionTypeList(_client_hello);
+  }
+
+  // Internal accessor for API implementation
+  void *
+  _get_internal() const
+  {
+    return _client_hello;
+  }
+
+private:
+  void *_client_hello;
+};
+static_assert(std::is_trivially_copyable_v<TSClientHello> == true);
+
 using TSFile = struct tsapi_file *;
 
 using TSMLoc          = struct tsapi_mloc *;
@@ -1083,9 +1161,11 @@ using TSRemapPluginInfo  = struct tsapi_remap_plugin_info *;
 
 using TSFetchSM = struct tsapi_fetchsm *;
 
-using TSThreadFunc        = void *(*)(void *data);
-using TSEventFunc         = int (*)(TSCont contp, TSEvent event, void *edata);
-using TSConfigDestroyFunc = void (*)(void *data);
+using TSThreadFunc           = void *(*)(void *data);
+using TSEventFunc            = int (*)(TSCont contp, TSEvent event, void *edata);
+using TSConfigDestroyFunc    = void (*)(void *data);
+using TSLogMarshalCallback   = std::function<int(TSHttpTxn, char *)>;
+using TSLogUnmarshalCallback = std::tuple<int, int> (*)(char **, char *, int);
 
 struct TSFetchEvent {
   int success_event_id;
@@ -1354,6 +1434,7 @@ extern const char *TS_HTTP_VALUE_COMPRESS;
 extern const char *TS_HTTP_VALUE_DEFLATE;
 extern const char *TS_HTTP_VALUE_GZIP;
 extern const char *TS_HTTP_VALUE_BROTLI;
+extern const char *TS_HTTP_VALUE_ZSTD;
 extern const char *TS_HTTP_VALUE_IDENTITY;
 extern const char *TS_HTTP_VALUE_KEEP_ALIVE;
 extern const char *TS_HTTP_VALUE_MAX_AGE;
@@ -1378,6 +1459,7 @@ extern int TS_HTTP_LEN_COMPRESS;
 extern int TS_HTTP_LEN_DEFLATE;
 extern int TS_HTTP_LEN_GZIP;
 extern int TS_HTTP_LEN_BROTLI;
+extern int TS_HTTP_LEN_ZSTD;
 extern int TS_HTTP_LEN_IDENTITY;
 extern int TS_HTTP_LEN_KEEP_ALIVE;
 extern int TS_HTTP_LEN_MAX_AGE;
@@ -1566,6 +1648,13 @@ struct TSResponseAction {
   bool        goDirect;
   bool        parentIsProxy;
   bool        no_cache;
+};
+
+enum TSLogType {
+  TS_LOG_TYPE_INT,
+  // DINT is omitted from the public API for now, until we decide whether we keep the type
+  TS_LOG_TYPE_STRING = 2,
+  TS_LOG_TYPE_ADDR   = 3,
 };
 
 /* --------------------------------------------------------------------------

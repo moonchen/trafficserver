@@ -110,7 +110,7 @@ struct StripeInitInfo {
 };
 
 // This is weird: the len passed to the constructor for _preserved_dirs is
-// initialized in the superclasse's constructor. This is safe because the
+// initialized in the superclass' constructor. This is safe because the
 // superclass should always be initialized first.
 StripeSM::StripeSM(CacheDisk *disk, off_t blocks, off_t dir_skip, int avg_obj_size, int fragment_size)
   : Continuation(new_ProxyMutex()),
@@ -179,7 +179,7 @@ StripeSM::init(bool clear)
   }
 
   init_info           = new StripeInitInfo();
-  int   footerlen     = ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter));
+  int   footerlen     = ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter));
   off_t footer_offset = this->dirlen() - footerlen;
   // try A
   off_t as = skip;
@@ -222,7 +222,7 @@ StripeSM::handle_dir_clear(int event, void *data)
       /* clear the header for directory B. We don't need to clear the
          whole of directory B. The header for directory B starts at
          skip + len */
-      op->aiocb.aio_nbytes = ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter));
+      op->aiocb.aio_nbytes = ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter));
       op->aiocb.aio_offset = skip + dir_len;
       ink_assert(ink_aio_write(op));
       return EVENT_DONE;
@@ -566,7 +566,7 @@ Ldone: {
     aio->thread           = AIO_CALLBACK_THREAD_ANY;
     aio->then             = (i < 2) ? &(init_info->vol_aio[i + 1]) : nullptr;
   }
-  int    footerlen = ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter));
+  int    footerlen = ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter));
   size_t dirlen    = this->dirlen();
   int    B         = directory.header->sync_serial & 1;
   off_t  ss        = skip + (B ? dirlen : 0);
@@ -628,14 +628,14 @@ new_DocEvacuator(int nbytes, StripeSM *stripe)
 int
 StripeSM::handle_header_read(int event, void *data)
 {
-  AIOCallback         *op;
-  StripteHeaderFooter *hf[4];
+  AIOCallback        *op;
+  StripeHeaderFooter *hf[4];
   switch (event) {
   case AIO_EVENT_DONE:
     op = static_cast<AIOCallback *>(data);
     for (auto &i : hf) {
       ink_assert(op != nullptr);
-      i = static_cast<StripteHeaderFooter *>(op->aiocb.aio_buf);
+      i = static_cast<StripeHeaderFooter *>(op->aiocb.aio_buf);
       if (!op->ok()) {
         Note("Header read failed: clearing cache directory %s", this->hash_text.get());
         clear_dir_aio();
@@ -709,9 +709,9 @@ StripeSM::aggWriteDone(int event, Event *e)
 {
   cancel_trigger();
 
-  // ensure we have the cacheDirSync lock if we intend to call it later
+  // ensure we have the waiting_dir_sync lock if we intend to call it later
   // retaking the current mutex recursively is a NOOP
-  CACHE_TRY_LOCK(lock, dir_sync_waiting ? cacheDirSync->mutex : mutex, mutex->thread_holding);
+  CACHE_TRY_LOCK(lock, dir_sync_waiting ? waiting_dir_sync->mutex : mutex, mutex->thread_holding);
   if (!lock.is_locked()) {
     eventProcessor.schedule_in(this, HRTIME_MSECONDS(cache_config_mutex_retry_delay));
     return EVENT_CONT;
@@ -759,7 +759,8 @@ StripeSM::aggWriteDone(int event, Event *e)
   }
   if (dir_sync_waiting) {
     dir_sync_waiting = false;
-    cacheDirSync->handleEvent(EVENT_IMMEDIATE, nullptr);
+    waiting_dir_sync->handleEvent(EVENT_IMMEDIATE, nullptr);
+    waiting_dir_sync = nullptr;
   }
   if (this->_write_buffer.get_pending_writers().head || sync.head) {
     return aggWrite(event, e);
@@ -1322,7 +1323,7 @@ StripeSM::shutdown(EThread *shutdown_thread)
   // the process is going down, do a blocking call
   // dont release the volume's lock, there could
   // be another aggWrite in progress
-  MUTEX_TAKE_LOCK(this->mutex, shutdown_thread);
+  SCOPED_MUTEX_LOCK(lock, this->mutex, shutdown_thread);
 
   if (DISK_BAD(this->disk)) {
     Dbg(dbg_ctl_cache_dir_sync, "Dir %s: ignoring -- bad disk", this->hash_text.get());

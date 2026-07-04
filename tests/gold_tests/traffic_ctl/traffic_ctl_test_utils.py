@@ -14,36 +14,43 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import atexit
 import os
+import shutil
+import tempfile
 
-# This function can(eventually) be used to have a single yaml file and read nodes from it.
-# The idea would be to avoid having multiple gold files with yaml content.
-# The only issue would be the comments, this is because how the yaml lib reads yaml,
-# comments  aren't rendered in the same way as traffic_ctl throws it, it should only
-# be used if no comments need to be compared.
-#
-# def GoldFilePathFor(node:str, main_file="gold/test_gold_file.yaml"):
-#     if node == "":
-#         raise Exception("node should not be empty")
+_gold_tmpdir = None
 
-#     yaml = ruamel.yaml.YAML()
-#     yaml.indent(sequence=4, offset=2)
-#     with open(os.path.join(Test.TestDirectory, main_file), 'r') as f:
-#         content = yaml.load(f)
 
-#     node_data = content[node]
-#     data_dirname = 'generated_gold_files'
-#     data_path = os.path.join(Test.TestDirectory, data_dirname)
-#     os.makedirs(data_path, exist_ok=True)
-#     gold_filepath = os.path.join(data_path, f'test_{TestNumber}.gold')
-#     with open(os.path.join(data_path, f'test_{TestNumber}.gold'), 'w') as gold_file:
-#         yaml.dump(node_data, gold_file)
+def _get_gold_tmpdir():
+    """Return a temporary directory for generated gold files.
 
-#     return gold_filepath
+    The directory is created on first call and registered for cleanup at
+    process exit so generated gold files never accumulate in /tmp.
+    """
+    global _gold_tmpdir
+    if _gold_tmpdir is None:
+        _gold_tmpdir = tempfile.mkdtemp(prefix='autest_gold_')
+        atexit.register(shutil.rmtree, _gold_tmpdir, True)
+    return _gold_tmpdir
 
 
 def MakeGoldFileWithText(content, dir, test_number, add_new_line=True):
-    data_path = os.path.join(dir, "gold")
+    """Write expected-output text to a temporary gold file and return its path.
+
+    The gold file is placed in a process-unique temporary directory rather than
+    the source tree so that generated files don't pollute the repository.
+
+    Args:
+        content: The expected output text.
+        dir: Unused (kept for API compatibility).
+        test_number: Numeric identifier used to name the gold file.
+        add_new_line: If True, append a trailing newline to content.
+
+    Returns:
+        Absolute path to the generated gold file.
+    """
+    data_path = os.path.join(_get_gold_tmpdir(), "gold")
     os.makedirs(data_path, exist_ok=True)
     gold_filepath = os.path.join(data_path, f'test_{test_number}.gold')
     with open(gold_filepath, 'w') as gold_file:
@@ -59,17 +66,225 @@ class Common():
         Handy class to map common traffic_ctl test options.
     """
 
-    def __init__(self, tr, finish_callback):
+    def __init__(self, tr):
         self._tr = tr
-        self._finish_callback = finish_callback
+
+    def _finish(self):
+        """
+            Sets the command to the test. Make sure this gets called after
+            validation is set. Without this call the test will fail.
+        """
+        self._tr.Processes.Default.Command = self._cmd
+
+    def exec(self):
+        """
+        If you need to just run the command with no validation, this is ok in the context of a test, but not to be
+        used in isolation (as to run traffic_ctl commands)
+        """
+        self._finish()
 
     def validate_with_exit_code(self, exit_code: int):
         """
             Sets the exit code for the test.
         """
         self._tr.Processes.Default.ReturnCode = exit_code
-        self._finish_callback(self)
+        self._finish()
         return self
+
+    def validate_with_text(self, text: str):
+        """
+        Validate command output matches expected text exactly.
+        If text is empty, validates that output is completely empty (no newline).
+
+        Example:
+            traffic_ctl.config().get("proxy.config.product_name").validate_with_text("Apache Traffic Server")
+            traffic_ctl.config().diff().validate_with_text("")  # expects empty output
+        """
+        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn, text != "")
+        self._finish()
+        return self
+
+    def validate_contains_all(self, *strings):
+        """
+        Validate command output contains all specified strings (order independent).
+        Uses Testers.IncludesExpression for each string.
+
+        Example:
+            traffic_ctl.config().reset("proxy.config.diags").validate_contains_all(
+                "Set proxy.config.diags.debug.tags",
+                "Set proxy.config.diags.debug.enabled"
+            )
+        """
+        import sys
+        # Testers and All are injected by autest into the test file's globals
+        caller_globals = sys._getframe(1).f_globals
+        _Testers = caller_globals['Testers']
+        _All = caller_globals['All']
+        testers = [_Testers.IncludesExpression(s, f"should contain: {s}") for s in strings]
+        self._tr.Processes.Default.Streams.stdout = _All(*testers)
+        self._finish()
+        return self
+
+    def validate_result_with_text(self, text: str):
+        """
+        Validate RPC result matches expected JSON exactly. Wraps text in JSON-RPC envelope.
+
+        Example:
+            traffic_ctl.rpc().invoke(handler="get_connection_tracker_info").validate_result_with_text(
+                '{"outbound": {"count": "0", "list": []}}'
+            )
+        """
+        full_text = f'{{\"jsonrpc\": \"2.0\", \"result\": {text}, \"id\": {"``"}}}'
+        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(full_text, self._dir, self._tn)
+        self._finish()
+        return self
+
+    def validate_json_contains(self, **field_checks):
+        """
+        Validate JSON output contains specific field:value pairs. Only checks specified fields.
+        Prints detailed error on failure: "FAIL: field_name = actual_value (expected expected_value)"
+        stream.all.txt will contain the actual output with the failed fields.
+
+        Example:
+            traffic_ctl.server().status().validate_json_contains(
+                initialized_done='true', is_draining='false'
+            )
+        """
+        import json
+        checks_str = ', '.join(f"'{k}': '{v}'" for k, v in field_checks.items())
+        self._cmd = (
+            f'{self._cmd} | python3 -c "'
+            f"import sys, json; "
+            f"d = json.load(sys.stdin); "
+            f"c = {{{checks_str}}}; "
+            f"failed = [(k, v, str(d.get(k))) for k, v in c.items() if str(d.get(k)) != v]; "
+            f"[print(f'FAIL: {{k}} = {{actual}} (expected {{expected}})', file=sys.stderr) "
+            f"for k, expected, actual in failed]; "
+            f"exit(0 if not failed else 1)"
+            f'"')
+        self._finish()
+        return self
+
+
+class ConfigReload(Common):
+    """
+        Handy class to map traffic_ctl config reload options.
+
+        Options (in command order):
+            --token, -t          Configuration token
+            --monitor, -m        Monitor reload progress until completion
+            --show-details, -s   Show detailed information of the reload
+            --include-logs, -l   Include logs (with --show-details)
+            --refresh-int, -r    Refresh interval in seconds (with --monitor). Accepts fractional values
+            --force, -F          Force reload even if one in progress
+            --data, -d           Inline config data (@file1 @file2, @- for stdin, or yaml string)
+            --initial-wait, -w   Initial wait before first poll (seconds). Accepts fractional values
+    """
+
+    def __init__(self, dir, tr, tn):
+        super().__init__(tr)
+        self._cmd = "traffic_ctl config reload"
+        self._tr = tr
+        self._dir = dir
+        self._tn = tn
+
+    def __finish(self):
+        """
+            Sets the command to the test. Make sure this gets called after
+            validation is set. Without this call the test will fail.
+        """
+        self._tr.Processes.Default.Command = self._cmd
+
+    # --- Options in command order ---
+
+    def token(self, token: str):
+        """Set a custom token for the reload (--token, -t)"""
+        self._cmd = f'{self._cmd} --token {token} '
+        return self
+
+    def monitor(self):
+        """Monitor reload progress until completion (--monitor, -m)"""
+        self._cmd = f'{self._cmd} --monitor '
+        return self
+
+    def show_details(self):
+        """Show detailed information of the reload (--show-details, -s)"""
+        self._cmd = f'{self._cmd} --show-details '
+        return self
+
+    def include_logs(self):
+        """Include logs in details (--include-logs, -l). Use with show_details()"""
+        self._cmd = f'{self._cmd} --include-logs '
+        return self
+
+    def refresh_int(self, seconds: float):
+        """Set refresh interval in seconds (--refresh-int, -r). Use with monitor(). Accepts fractional values (e.g. 0.5)"""
+        self._cmd = f'{self._cmd} --refresh-int {seconds} '
+        return self
+
+    def force(self):
+        """Force reload even if one in progress (--force, -F)"""
+        self._cmd = f'{self._cmd} --force '
+        return self
+
+    def data(self, data_arg: str):
+        """Set inline YAML data string (--data, -d)"""
+        self._cmd = f'{self._cmd} --data \'{data_arg}\' '
+        return self
+
+    def data_file(self, filepath: str):
+        """Set file-based inline data (--data @filepath, -d @filepath)"""
+        self._cmd = f'{self._cmd} --data @{filepath} '
+        return self
+
+    def data_files(self, filepaths: list):
+        """Set multiple file-based inline data (--data @file1 @file2 ...)"""
+        files_str = ' '.join([f'@{fp}' for fp in filepaths])
+        self._cmd = f'{self._cmd} --data {files_str} '
+        return self
+
+    def initial_wait(self, seconds: float):
+        """Set initial wait before first poll (--initial-wait, -w). Use with monitor() or show_details()"""
+        self._cmd = f'{self._cmd} --initial-wait {seconds} '
+        return self
+
+    # --- Validation ---
+
+    def validate_with_text(self, text: str):
+        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn)
+        self.__finish()
+
+
+class ConfigStatus(Common):
+    """
+        Handy class to map traffic_ctl config status.
+    """
+
+    def __init__(self, dir, tr, tn):
+        super().__init__(tr)
+        self._cmd = "traffic_ctl config status"
+        self._tr = tr
+        self._dir = dir
+        self._tn = tn
+
+    def __finish(self):
+        """
+            Sets the command to the test. Make sure this gets called after
+            validation is set. Without this call the test will fail.
+        """
+        self._tr.Processes.Default.Command = self._cmd
+
+    def token(self, token: str):
+        self._cmd = f'{self._cmd} --token {token} '
+        return self
+
+    def count(self, count: str):
+        self._cmd = f'{self._cmd} --count {count}'
+        return self
+
+    def validate_with_text(self, text: str):
+        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn)
+        self.__finish()
 
 
 class Config(Common):
@@ -78,9 +293,8 @@ class Config(Common):
     """
 
     def __init__(self, dir, tr, tn):
-        super().__init__(tr, lambda x: self.__finish())
+        super().__init__(tr)
         self._cmd = "traffic_ctl config "
-        self._tr = tr
         self._dir = dir
         self._tn = tn
 
@@ -96,9 +310,49 @@ class Config(Common):
         self._cmd = f'{self._cmd}  match {value}'
         return self
 
+    def set(self, record, value):
+        """
+        Set a configuration record to a specific value.
+
+        Args:
+            record: The record name (e.g., "proxy.config.diags.debug.enabled")
+            value: The value to set
+
+        Example:
+            traffic_ctl.config().set("proxy.config.diags.debug.enabled", "1")
+        """
+        self._cmd = f'{self._cmd} set {record} {value}'
+        return self
+
     def describe(self, value):
         self._cmd = f'{self._cmd}  describe {value}'
         return self
+
+    def reset(self, *paths):
+        """
+        Reset configuration values matching path pattern(s) to their defaults.
+
+        Args:
+            *paths: One or more path patterns (e.g., "records", "proxy.config.http",
+                   "proxy.config.diags.debug.enabled")
+
+        Example:
+            traffic_ctl.config().reset("records")
+            traffic_ctl.config().reset("proxy.config.http")
+            traffic_ctl.config().reset("proxy.config.diags.debug.enabled")
+        """
+        if not paths:
+            self._cmd = f'{self._cmd} reset records'
+        else:
+            paths_str = ' '.join(paths)
+            self._cmd = f'{self._cmd} reset {paths_str}'
+        return self
+
+    def reload(self):
+        return ConfigReload(self._dir, self._tr, self._tn)
+
+    def status(self):
+        return ConfigStatus(self._dir, self._tr, self._tn)
 
     def as_records(self):
         self._cmd = f'{self._cmd} --records'
@@ -108,20 +362,53 @@ class Config(Common):
         self._cmd = f'{self._cmd}  --default'
         return self
 
-    def __finish(self):
-        """
-            Sets the command to the test. Make sure this gets called after
-            validation is set. Without this call the test will fail.
-        """
-        self._tr.Processes.Default.Command = self._cmd
-
     def validate_with_goldfile(self, file: str):
         self._tr.Processes.Default.Streams.stdout = os.path.join("gold", file)
-        self.__finish()
+        self._finish()
 
-    def validate_with_text(self, text: str):
-        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn)
-        self.__finish()
+
+class Debug(Common):
+    """
+        Handy class to map traffic_ctl server debug options.
+    """
+
+    def __init__(self, dir, tr, tn):
+        super().__init__(tr)
+        self._cmd = "traffic_ctl server debug "
+        self._dir = dir
+        self._tn = tn
+
+    def enable(self, tags=None, append=False, client_ip=None):
+        """
+        Enable debug logging at runtime.
+
+        Args:
+            tags: Debug tags to set (e.g., "http|dns")
+            append: If True, append tags to existing tags instead of replacing
+            client_ip: Client IP filter for debug output
+
+        Example:
+            traffic_ctl.server().debug().enable(tags="http").exec()
+            traffic_ctl.server().debug().enable(tags="dns", append=True).exec()
+        """
+        self._cmd = f'{self._cmd} enable'
+        if tags:
+            self._cmd = f'{self._cmd} --tags {tags}'
+        if append:
+            self._cmd = f'{self._cmd} --append'
+        if client_ip:
+            self._cmd = f'{self._cmd} --client_ip {client_ip}'
+        return self
+
+    def disable(self):
+        """
+        Disable debug logging at runtime.
+
+        Example:
+            traffic_ctl.server().debug().disable().exec()
+        """
+        self._cmd = f'{self._cmd} disable'
+        return self
 
 
 class Server(Common):
@@ -130,9 +417,8 @@ class Server(Common):
     """
 
     def __init__(self, dir, tr, tn):
-        super().__init__(tr, lambda x: self.__finish())
+        super().__init__(tr)
         self._cmd = "traffic_ctl server "
-        self._tr = tr
         self._dir = dir
         self._tn = tn
 
@@ -146,28 +432,19 @@ class Server(Common):
             self._cmd = f'{self._cmd} --undo'
         return self
 
+    def debug(self):
+        """
+        Returns a Debug object for debug enable/disable commands.
+
+        Example:
+            traffic_ctl.server().debug().enable(tags="http").exec()
+            traffic_ctl.server().debug().disable().exec()
+        """
+        return Debug(self._dir, self._tr, self._tn)
+
     def as_json(self):
         self._cmd = f'{self._cmd} -f json'
         return self
-
-    """
-    If you need to just run the command with no validation, this is ok in the context of a test, but not to be
-    used in isolation(as to run traffic_ctl commands)
-    """
-
-    def exec(self):
-        self.__finish()
-
-    def __finish(self):
-        """
-            Sets the command to the test. Make sure this gets called after
-            validation is set. Without this call the test will fail.
-        """
-        self._tr.Processes.Default.Command = self._cmd
-
-    def validate_with_text(self, text: str):
-        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn)
-        self.__finish()
 
 
 class RPC(Common):
@@ -176,9 +453,8 @@ class RPC(Common):
     """
 
     def __init__(self, dir, tr, tn):
-        super().__init__(tr, lambda x: self.__finish())
+        super().__init__(tr)
         self._cmd = "traffic_ctl rpc "
-        self._tr = tr
         self._dir = dir
         self._tn = tn
 
@@ -189,22 +465,6 @@ class RPC(Common):
             self._cmd = f'{self._cmd}  invoke {handler} -p {str(params)} -f json'
 
         return self
-
-    def __finish(self):
-        """
-            Sets the command to the test. Make sure this gets called after
-            validation is set. Without this call the test will fail.
-        """
-        self._tr.Processes.Default.Command = self._cmd
-
-    def validate_with_text(self, text: str):
-        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(text, self._dir, self._tn)
-        self.__finish()
-
-    def validate_result_with_text(self, text: str):
-        full_text = f'{{\"jsonrpc\": \"2.0\", \"result\": {text}, \"id\": {"``"}}}'
-        self._tr.Processes.Default.Streams.stdout = MakeGoldFileWithText(full_text, self._dir, self._tn)
-        self.__finish()
 
 
 '''
@@ -234,10 +494,10 @@ class TrafficCtl(Config, Server):
         Every time a config() is called, a new test is created.
     """
 
-    def __init__(self, test, records_yaml=None):
+    def __init__(self, test, records_yaml=None, retcode=0):
         self._testNumber = 0
         self._current_test_number = self._testNumber
-
+        self._retcode = retcode
         self._Test = test
         self._ts = self._Test.MakeATSProcess(f"ts_{self._testNumber}")
         if records_yaml != None:
@@ -256,7 +516,7 @@ class TrafficCtl(Config, Server):
 
         tr.Processes.Default.Env = self._ts.Env
         tr.DelayStart = 3
-        tr.Processes.Default.ReturnCode = 0
+        tr.Processes.Default.ReturnCode = self._retcode
         tr.StillRunningAfter = self._ts
 
         self._tests.insert(self.__get_index(), tr)
@@ -275,6 +535,6 @@ class TrafficCtl(Config, Server):
         return RPC(self._Test.TestDirectory, self._tests[self.__get_index()], self._testNumber)
 
 
-def Make_traffic_ctl(test, records_yaml=None):
-    tctl = TrafficCtl(test, records_yaml)
+def Make_traffic_ctl(test, records_yaml=None, retcode=0):
+    tctl = TrafficCtl(test, records_yaml, retcode)
     return tctl

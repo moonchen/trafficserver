@@ -56,7 +56,7 @@ TEST_CASE("YamlSNIConfig sets port ranges appropriately")
     FAIL(errorstream.str());
   }
   REQUIRE(zret.is_ok());
-  REQUIRE(conf.items.size() == 10);
+  REQUIRE(conf.items.size() == 11);
 
   SECTION("If no ports were specified, port range should contain all ports.")
   {
@@ -103,6 +103,15 @@ TEST_CASE("YamlSNIConfig sets port ranges appropriately")
   {
     CHECK(conf.items[2].inbound_port_ranges.size() == 1);
   }
+
+  SECTION("Session ticket overrides are parsed.")
+  {
+    auto const &item{conf.items[10]};
+    REQUIRE(item.ssl_ticket_enabled.has_value());
+    CHECK(item.ssl_ticket_enabled.value() == 1);
+    REQUIRE(item.ssl_ticket_number.has_value());
+    CHECK(item.ssl_ticket_number.value() == 3);
+  }
 }
 
 TEST_CASE("YamlConfig handles bad ports appropriately.")
@@ -113,6 +122,8 @@ TEST_CASE("YamlConfig handles bad ports appropriately.")
 
   std::string filepath;
   swoc::bwprint(filepath, "{}/sni_conf_test_bad_port_{}.yaml", _XSTR(LIBINKNET_UNIT_TEST_DIR), port_str);
+
+  CAPTURE(port_str, filepath);
 
   swoc::Errata      zret{conf.loader(filepath)};
   std::stringstream errorstream;

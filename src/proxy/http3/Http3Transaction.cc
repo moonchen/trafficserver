@@ -353,15 +353,17 @@ HQTransaction::_close_write_complete_event(Event *e)
 }
 
 void
-HQTransaction::_signal_event(int event, Event *edata)
+HQTransaction::_signal_event(int event, Event * /* edata ATS_UNUSED */)
 {
+  // HttpSM::main_handler expects a VIO* as the event data for VC events so it
+  // can locate the vc_table entry.
   if (this->_write_vio.cont) {
     SCOPED_MUTEX_LOCK(lock, this->_write_vio.mutex, this_ethread());
-    this->_write_vio.cont->handleEvent(event, edata);
+    this->_write_vio.cont->handleEvent(event, &this->_write_vio);
   }
   if (this->_read_vio.cont && this->_read_vio.cont != this->_write_vio.cont) {
     SCOPED_MUTEX_LOCK(lock, this->_read_vio.mutex, this_ethread());
-    this->_read_vio.cont->handleEvent(event, edata);
+    this->_read_vio.cont->handleEvent(event, &this->_read_vio);
   }
 }
 
@@ -430,7 +432,7 @@ Http3Transaction::Http3Transaction(Http3Session *session, QUICStreamVCAdapter::I
   } else {
     http_type = HTTPType::REQUEST;
   }
-  this->_header_handler = new Http3HeaderVIOAdaptor(&this->_read_vio, http_type, session->remote_qpack(), stream_id);
+  this->_header_handler = new Http3HeaderVIOAdaptor(&this->_read_vio, http_type, session->remote_qpack(), stream_id, this);
   this->_data_handler   = new Http3StreamDataVIOAdaptor(&this->_read_vio);
 
   this->_frame_dispatcher.add_handler(session->get_received_frame_counter());
@@ -588,7 +590,7 @@ Http3Transaction::_process_read_vio()
   auto     error = this->_frame_dispatcher.on_read_ready(this->_info.adapter.stream().id(), Http3StreamType::UNKNOWN,
                                                          *this->_info.read_vio->get_reader(), nread);
   if (error && error->cls != Http3ErrorClass::UNDEFINED) {
-    Http3TransDebug("Error occured while processing read vio: %hu, %s", error->get_code(), error->msg);
+    Http3TransDebug("Error occurred while processing read vio: %hu, %s", error->get_code(), error->msg);
     return 0;
   }
   this->_info.read_vio->ndone += nread;
@@ -882,7 +884,7 @@ Http09Transaction::_process_write_vio()
     // NOTE: When Chunked Transfer Coding is supported, check ChunkedState of ChunkedHandler
     // is ChunkedState::READ_DONE and set FIN flag
     if (this->_write_vio.ntodo() == 0) {
-      // The size of respons to client
+      // The size of response to client
       this->_info.write_vio->done();
     }
 

@@ -139,14 +139,15 @@ IPCSocketServer::configure(YAML::Node const &params)
 std::error_code
 IPCSocketServer::init()
 {
+  std::error_code ec; // Flag possible errors.
+  _serverAddr = {};
   // Need to run some validations on the pathname to avoid issue. Normally this would not be an issue, but some tests may fail on
   // this.
   if (_conf.sockPathName.empty() || _conf.sockPathName.size() > sizeof _serverAddr.sun_path) {
-    Dbg(dbg_ctl, "Invalid unix path name, check the size.");
-    return std::make_error_code(static_cast<std::errc>(ENAMETOOLONG));
+    Dbg(dbg_ctl, "Invalid unix path name, check the size. Empty or too long.");
+    ec = InternalError::INVALID_SOCKET_PATH;
+    return ec;
   }
-
-  std::error_code ec; // Flag possible errors.
 
   if (this->create_socket(ec); ec) {
     return ec;
@@ -318,8 +319,13 @@ IPCSocketServer::bind(std::error_code &ec)
 
   mode_t mode = restricted ? 00700 : 00777;
   if (chmod(_conf.sockPathName.c_str(), mode) < 0) {
-    ec = std::make_error_code(static_cast<std::errc>(errno));
-    return;
+    // Some filesystems don't support chmod on AF_UNIX socket inodes.
+    // Keep running in that case and rely on default umask-derived permissions.
+    if (errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP) {
+      ec = std::make_error_code(static_cast<std::errc>(errno));
+      return;
+    }
+    Dbg(dbg_ctl, "chmod(%s) not supported on this filesystem: %s", _conf.sockPathName.c_str(), std::strerror(errno));
   }
 }
 

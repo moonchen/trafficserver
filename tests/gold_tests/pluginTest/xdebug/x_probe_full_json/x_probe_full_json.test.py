@@ -83,6 +83,10 @@ class XDebugProbeFullJsonTest:
         tr.Processes.Default.Streams.stdout += Testers.ContainsExpression(
             'X-Original-Content-Type: application/octet-stream',
             "X-Original-Content-Type of application/octet-stream should be present")
+        # CSP test should produce valid JSON (single quotes not escaped)
+        tr.Processes.Default.Streams.stdout += Testers.ContainsExpression(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'",
+            "CSP header with single quotes should be present in valid JSON")
 
     def _setupJqValidation(self) -> None:
         """Use curl to get the response body and pipe through jq to validate JSON.
@@ -92,7 +96,8 @@ class XDebugProbeFullJsonTest:
         tr.MakeCurlCommand(
             f'-s -H"uuid: 1" -H "Host: example.com" -H "X-Debug: probe-full-json" '
             f'http://127.0.0.1:{self._ts.Variables.port}/test | '
-            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'")
+            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'",
+            ts=self._ts)
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout = "gold/jq_escaped.gold"
 
@@ -101,7 +106,8 @@ class XDebugProbeFullJsonTest:
         tr.MakeCurlCommand(
             f'-s -H"uuid: 2" -H "Host: example.com" -H "X-Debug: probe-full-json" '
             f'http://127.0.0.1:{self._ts.Variables.port}/binary | '
-            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'")
+            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'",
+            ts=self._ts)
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout += "gold/jq_hex.gold"
 
@@ -110,7 +116,8 @@ class XDebugProbeFullJsonTest:
         tr.MakeCurlCommand(
             f'-s -H"uuid: 1" -H "Host: example.com" -H "X-Debug: probe-full-json=hex" '
             f'http://127.0.0.1:{self._ts.Variables.port}/test | '
-            "jq '.\"server-body\"'")
+            "jq '.\"server-body\"'",
+            ts=self._ts)
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout += Testers.ContainsExpression(
             '3c21444f43545950452068746d6c3e', "Should contain hex-encoded HTML content (forced hex override)")
@@ -120,7 +127,8 @@ class XDebugProbeFullJsonTest:
         tr.MakeCurlCommand(
             f'-s -H"uuid: 1" -H "Host: example.com" -H "X-Debug: probe-full-json=escape" '
             f'http://127.0.0.1:{self._ts.Variables.port}/test | '
-            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'")
+            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'",
+            ts=self._ts)
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout += "gold/jq_escaped.gold"
 
@@ -129,9 +137,25 @@ class XDebugProbeFullJsonTest:
         tr.MakeCurlCommand(
             f'-s -H"uuid: 1" -H "Host: example.com" -H "X-Debug: probe-full-json=nobody" '
             f'http://127.0.0.1:{self._ts.Variables.port}/test | '
-            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'")
+            "jq '.\"client-request\".\"uuid\",.\"server-body\",.\"proxy-response\".\"x-response\"'",
+            ts=self._ts)
         tr.Processes.Default.ReturnCode = 0
         tr.Processes.Default.Streams.stdout += "gold/jq_nobody.gold"
+
+        tr = Test.AddTestRun("CSP header with single quotes (valid JSON)")
+        self._startServersIfNeeded(tr)
+        tr.MakeCurlCommand(
+            f'-s -H"uuid: 3" -H "Host: example.com" -H "X-Debug: probe-full-json" '
+            f'http://127.0.0.1:{self._ts.Variables.port}/csp-test | '
+            "jq '.\"server-response\".\"content-security-policy\"'",
+            ts=self._ts)
+        tr.Processes.Default.ReturnCode = 0
+        # Verify jq can parse it (would fail if single quotes were escaped as \')
+        # and that the CSP header contains single quotes
+        tr.Processes.Default.Streams.stdout += Testers.ContainsExpression(
+            "'self'", "CSP header should contain single quotes (not escaped)")
+        tr.Processes.Default.Streams.stdout += Testers.ContainsExpression(
+            "'unsafe-inline'", "CSP header should contain 'unsafe-inline' directive")
 
 
 # Execute the test

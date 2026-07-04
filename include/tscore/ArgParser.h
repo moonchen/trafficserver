@@ -133,6 +133,17 @@ public:
     std::string key;           // look-up key
   };
 
+  // Mutually exclusive group structure
+  // Options in the same group cannot be used together
+  struct MutexGroup {
+    std::string              name;            // group identifier
+    std::vector<std::string> options;         // list of long option names in this group
+    bool                     required{false}; // if true, one option from group must be specified
+    std::string              description;     // optional description for help message
+
+    MutexGroup(std::string const &n, bool req = false, std::string const &desc = "") : name(n), required(req), description(desc) {}
+  };
+
   // Class for commands in a nested way
   class Command
   {
@@ -145,11 +156,32 @@ public:
     Command &operator=(Command &&)      = default;
     ~Command();
     /** Add an option to current command
-        @return The Option object.
+        @return The Command object for chaining.
     */
     Command &add_option(std::string const &long_option, std::string const &short_option, std::string const &description,
                         std::string const &envvar = "", unsigned arg_num = 0, std::string const &default_value = "",
                         std::string const &key = "");
+
+    /** Create a mutually exclusive group of options
+        @param group_name Identifier for the group
+        @return The Command object for chaining.
+    */
+    Command &add_mutex_group(std::string const &group_name, bool required = false, std::string const &description = "");
+
+    /** Add an option to a mutually exclusive group
+        @param group_name The group to add the option to
+        @return The Command object for chaining.
+    */
+    Command &add_option_to_group(std::string const &group_name, std::string const &long_option, std::string const &short_option,
+                                 std::string const &description, std::string const &envvar = "", unsigned arg_num = 0,
+                                 std::string const &default_value = "", std::string const &key = "");
+
+    /** Specify that the last added option requires another option to be present.
+        Must be called immediately after add_option() or add_option_to_group().
+        @param required_option The option that must be present (e.g., "--tags")
+        @return The Command instance for chained calls.
+    */
+    Command &with_required(std::string const &required_option);
 
     /** Two ways of adding a sub-command to current command:
         @return The new sub-command instance.
@@ -190,6 +222,12 @@ public:
     void version_message() const;
     // Helper method for parse()
     void append_option_data(Arguments &ret, AP_StrVec &args, int index);
+    // Helper method to validate mutually exclusive groups
+    void validate_mutex_groups(Arguments &ret) const;
+    // Helper method to validate option dependencies
+    void validate_dependencies(Arguments &ret) const;
+    // Helper method to apply default values for options not explicitly set
+    void apply_option_defaults(Arguments &ret) const;
     // The command name and help message
     std::string _name;
     std::string _description;
@@ -198,8 +236,8 @@ public:
     unsigned _arg_num = 0;
     // Stored Env variable
     std::string _envvar;
-    // An example usage can be added for the help message
-    std::string _example_usage;
+    // Example usages can be added for the help message
+    std::vector<std::string> _example_usages;
     // Function associated with this command
     Function _f;
     // look up key
@@ -214,6 +252,18 @@ public:
     // Map for fast searching: <short option: long option>
     std::map<std::string, std::string> _option_map;
 
+    // Mutually exclusive groups
+    // Key: group name. Value: MutexGroup object
+    std::map<std::string, MutexGroup> _mutex_groups;
+    // Map option to its mutex group (for fast lookup during validation)
+    // Key: long option name. Value: group name
+    std::map<std::string, std::string> _option_to_group;
+
+    // Option dependencies: dependent_option -> list of required options
+    std::map<std::string, std::vector<std::string>> _option_dependencies;
+    // Track the last added option for with_required() chaining
+    std::string _last_added_option;
+
     // require command / option for this parser
     bool _command_required = false;
 
@@ -226,11 +276,25 @@ public:
   ~ArgParser();
 
   /** Add an option to current command with arguments
-      @return The Option object.
+      @return The Command object for chaining.
   */
   Command &add_option(std::string const &long_option, std::string const &short_option, std::string const &description,
                       std::string const &envvar = "", unsigned arg_num = 0, std::string const &default_value = "",
                       std::string const &key = "");
+
+  /** Create a mutually exclusive group of options
+      @param group_name Identifier for the group
+      @return The Command object for chaining.
+  */
+  Command &add_mutex_group(std::string const &group_name, bool required = false, std::string const &description = "");
+
+  /** Add an option to a mutually exclusive group
+      @param group_name The group to add the option to
+      @return The Command object for chaining.
+  */
+  Command &add_option_to_group(std::string const &group_name, std::string const &long_option, std::string const &short_option,
+                               std::string const &description, std::string const &envvar = "", unsigned arg_num = 0,
+                               std::string const &default_value = "", std::string const &key = "");
 
   /** Two ways of adding command to the parser:
       @return The new command instance.
@@ -262,6 +326,14 @@ public:
   void add_description(std::string const &descr);
 
 protected:
+  // Exit handler - throws in test mode, calls exit() otherwise
+  static void do_exit(int code);
+  // Enable test mode - makes do_exit() throw instead of calling exit() for unit testing
+  static void set_test_mode(bool test = true);
+
+  // When true, do_exit() throws instead of calling exit()
+  static bool _test_mode;
+
   // Converted from 'const char **argv' for the use of parsing and help
   AP_StrVec _argv;
   // the top level command object for program use

@@ -29,6 +29,7 @@
 
  ****************************************************************************/
 
+#include "iocore/net/ReadWriteEventIO.h"
 #if defined(darwin)
 /* This is for IPV6_PKTINFO and IPV6_RECVPKTINFO */
 #define __APPLE_USE_RFC_3542
@@ -64,8 +65,8 @@
 
 using UDPNetContHandler = int (UDPNetHandler::*)(int, void *);
 
-ClassAllocator<UDPPacket> udpPacketAllocator("udpPacketAllocator");
-EventType                 ET_UDP;
+ClassAllocator<UDPPacket, false> udpPacketAllocator("udpPacketAllocator");
+EventType                        ET_UDP;
 
 namespace
 {
@@ -746,7 +747,7 @@ private:
   ink_hrtime           timeout_interval = 0;
 };
 
-ClassAllocator<UDPReadContinuation> udpReadContAllocator("udpReadContAllocator");
+ClassAllocator<UDPReadContinuation, false> udpReadContAllocator("udpReadContAllocator");
 
 UDPReadContinuation::UDPReadContinuation(Event *completionToken)
   : Continuation(nullptr),
@@ -1539,7 +1540,7 @@ UDPQueue::SendUDPPacket(UDPPacket *p)
       }
     } else {
 #endif
-      // Send segments seprately if UDP_SEGMENT is not supported
+      // Send segments separately if UDP_SEGMENT is not supported
       int offset = 0;
       while (offset < p->p.chain.get()->size()) {
         iov[0].iov_base = p->p.chain.get()->start() + offset;

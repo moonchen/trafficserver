@@ -34,6 +34,7 @@
 #include "SSLSessionCache.h"
 #include "iocore/eventsystem/ConfigProcessor.h"
 #include "iocore/net/YamlSNIConfig.h"
+#include "mgmt/config/ConfigContext.h"
 
 #include <openssl/rand.h>
 #include <atomic>
@@ -53,12 +54,6 @@ using init_ssl_ctx_func  = void (*)(void *, bool);
 using load_ssl_file_func = void (*)(const char *);
 
 struct SSLConfigParams : public ConfigInfo {
-  enum SSL_SESSION_CACHE_MODE {
-    SSL_SESSION_CACHE_MODE_OFF                 = 0,
-    SSL_SESSION_CACHE_MODE_SERVER_OPENSSL_IMPL = 1,
-    SSL_SESSION_CACHE_MODE_SERVER_ATS_IMPL     = 2
-  };
-
   SSLConfigParams();
   ~SSLConfigParams() override;
 
@@ -72,16 +67,11 @@ struct SSLConfigParams : public ConfigInfo {
   char *cipherSuite;
   char *client_cipherSuite;
   int   configExitOnLoadError;
+  int   configLoadConcurrency;
   int   clientCertLevel;
   int   verify_depth;
-  int   ssl_origin_session_cache;
-  int   ssl_origin_session_cache_size;
-  int   ssl_session_cache; // SSL_SESSION_CACHE_MODE
-  int   ssl_session_cache_size;
-  int   ssl_session_cache_num_buckets;
-  int   ssl_session_cache_skip_on_contention;
-  int   ssl_session_cache_timeout;
-  int   ssl_session_cache_auto_clear;
+  int   ssl_origin_session_cache{0};
+  int   ssl_origin_session_cache_size{0};
 
   char                   *clientCertPath;
   char                   *clientCertPathOnly;
@@ -92,13 +82,15 @@ struct SSLConfigParams : public ConfigInfo {
   int                     clientCertExitOnLoadError;
   YamlSNIConfig::Policy   verifyServerPolicy;
   YamlSNIConfig::Property verifyServerProperties;
-  bool                    tls_server_connection;
   int                     client_verify_depth;
   long                    ssl_ctx_options;
   long                    ssl_client_ctx_options;
 
   unsigned char alpn_protocols_array[MAX_ALPN_STRING];
   int           alpn_protocols_array_size = 0;
+
+  char *server_cert_compression_algorithms;
+  char *client_cert_compression_algorithms;
 
   char *server_tls13_cipher_suites;
   char *client_tls13_cipher_suites;
@@ -119,6 +111,7 @@ struct SSLConfigParams : public ConfigInfo {
 
   static int  ssl_maxrecord;
   static int  ssl_misc_max_iobuffer_size_index;
+  static int  ssl_write_buffer_water_mark;
   static bool ssl_allow_client_renegotiation;
 
   static bool  ssl_ocsp_enabled;
@@ -132,11 +125,9 @@ struct SSLConfigParams : public ConfigInfo {
 
   static int    origin_session_cache;
   static size_t origin_session_cache_size;
-  static size_t session_cache_number_buckets;
-  static size_t session_cache_max_bucket_size;
-  static bool   session_cache_skip_on_lock_contention;
 
   static swoc::IPRangeSet *proxy_protocol_ip_addrs;
+  static int               proxy_protocol_hdr_max_size;
 
   static init_ssl_ctx_func  init_ssl_ctx_cb;
   static load_ssl_file_func load_ssl_file_cb;
@@ -167,7 +158,7 @@ struct SSLConfigParams : public ConfigInfo {
 
   void cleanupCTXTable();
 
-  void initialize();
+  void initialize(ConfigContext ctx = {});
   void cleanup();
   void reset();
   void SSLConfigInit(swoc::IPRangeSet *global);
@@ -188,7 +179,7 @@ private:
 
 struct SSLConfig {
   static void             startup();
-  static void             reconfigure();
+  static void             reconfigure(ConfigContext ctx = {});
   static SSLConfigParams *acquire();
   static SSLConfigParams *load_acquire();
   static void             release(SSLConfigParams *params);
@@ -210,7 +201,7 @@ private:
 
 struct SSLCertificateConfig {
   static bool           startup();
-  static bool           reconfigure();
+  static bool           reconfigure(ConfigContext ctx = {});
   static SSLCertLookup *acquire();
   static void           release(SSLCertLookup *params);
 
@@ -224,7 +215,7 @@ struct SSLTicketParams : public ConfigInfo {
   ssl_ticket_key_block *default_global_keyblock = nullptr;
   time_t                load_time               = 0;
   char                 *ticket_key_filename     = nullptr;
-  bool                  LoadTicket(bool &nochange);
+  bool                  LoadTicket(bool &nochange, ConfigContext ctx = {});
   bool                  LoadTicketData(char *ticket_data, int ticket_data_len);
   void                  cleanup();
 
@@ -233,7 +224,7 @@ struct SSLTicketParams : public ConfigInfo {
 
 struct SSLTicketKeyConfig {
   static void startup();
-  static bool reconfigure();
+  static bool reconfigure(ConfigContext ctx = {});
   static bool reconfigure_data(char *ticket_data, int ticket_data_len);
 
   static SSLTicketParams *
@@ -256,5 +247,4 @@ private:
   static int configid;
 };
 
-extern SSLSessionCache       *session_cache;
 extern SSLOriginSessionCache *origin_sess_cache;

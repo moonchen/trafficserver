@@ -49,7 +49,13 @@ ts.addDefaultSSLFiles()
 
 ts.Disk.remap_config.AddLines(['map /httpbin/ http://127.0.0.1:{0}/'.format(httpbin.Variables.Port)])
 
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 Test.PrepareTestPlugin(
     os.path.join(Test.Variables.AtsBuildGoldTestsDir, 'pluginTest', 'tsapi', '.libs', 'test_TSHttpSsnInfo.so'), ts)
@@ -77,7 +83,7 @@ tr.TimeOut = 10
 # size which exponentially reduces the gold file processing time.
 tr.Processes.Default.Command = f"nghttp -vn --continuation 'https://localhost:{ts.Variables.ssl_port}/httpbin/post' -d 'post_body' | grep -v 'continuation-test'"
 tr.Processes.Default.ReturnCode = 0
-tr.Processes.Default.StartBefore(httpbin, ready=When.PortOpen(httpbin.Variables.Port))
+tr.Processes.Default.StartBefore(httpbin)
 tr.Processes.Default.StartBefore(Test.Processes.ts)
 tr.Processes.Default.Streams.stdout = "test_TSHttpSsnInfo_nghttp0.gold"
 tr.StillRunningAfter = httpbin

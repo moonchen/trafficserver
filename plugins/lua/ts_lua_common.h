@@ -62,6 +62,9 @@ extern "C" {
 // TLS hooks can only be global
 #define TS_LUA_FUNCTION_G_VCONN_START "do_global_vconn_start"
 
+// Lifecycle hooks
+#define TS_LUA_FUNCTION_G_SHUT_DOWN "__shutdown__"
+
 #define TS_LUA_DEBUG_TAG "ts_lua"
 
 #define TS_LUA_EVENT_COROUTINE_CONT 20000
@@ -72,7 +75,7 @@ extern "C" {
 #define TS_LUA_MAX_SHARED_DICT_COUNT       32
 #define TS_LUA_MAX_URL_LENGTH              32768
 #define TS_LUA_MAX_OVEC_SIZE               (3 * 32)
-#define TS_LUA_MAX_RESIDENT_PCRE           64
+#define TS_LUA_MAX_RESIDENT_PCRE2          64
 #define TS_LUA_MAX_STR_LENGTH              32768
 
 #define TS_LUA_MIN_ALIGN         sizeof(void *)

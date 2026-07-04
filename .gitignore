@@ -47,7 +47,7 @@ m4/lt~obsolete.m4
 /build*
 
 configs/records.yaml.default
-configs/storage.config.default
+configs/storage.yaml.default
 
 doc/_build
 doc/docbuild/
@@ -170,7 +170,8 @@ rc/trafficserver.service
 .libs/
 
 .svn/
-.vscode/
+.vscode/*
+!.vscode/settings.json
 target
 
 tsxs
@@ -201,6 +202,7 @@ cmake-build-*
 tests/env-test/
 tests/proxy-verifier
 tests/Pipfile.lock
+tests/uv.lock
 tests/gold_tests/bigobj/check_ramp
 tests/gold_tests/bigobj/push_request
 tests/gold_tests/chunked_encoding/smuggle-client
@@ -208,3 +210,18 @@ tests/gold_tests/tls/ssl-post
 
 src/iocore/cache/test_*
 src/iocore/cache/unit_tests/var/trafficserver/cache.db
+
+# LLM / AI
+.cursor/
+.claude/
+!.claude/CLAUDE.md
+.agents/
+.codex/
+!.codex/
+.codex/*
+!.codex/AGENTS.md
+
+# Extensions
+ext/
+!ext/CMakeLists.txt
+!ext/README.md

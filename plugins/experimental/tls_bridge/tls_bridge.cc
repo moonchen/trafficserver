@@ -114,7 +114,7 @@ void
 BridgeConfig::load_pair(std::string_view rxp, std::string_view service, swoc::file::path const &src, int ln)
 {
   Regex r;
-  // Unfortunately PCRE can only compile null terminated strings...
+  // Unfortunately PCRE2 can only compile null terminated strings...
   std::string pattern{rxp};
   if (r.compile(pattern.c_str(), REFlags::RE_ANCHORED)) {
     _items.emplace_back(rxp, std::move(r), service);
@@ -513,7 +513,7 @@ Bridge::update_ua_response()
     // an actual upstream connection. Otherwise, let the original connection response code
     // ride.
     if (_out_response_code != TS_HTTP_STATUS_OK && _out_response_code != TS_HTTP_STATUS_NONE) {
-      TSHttpHdrStatusSet(mbuf, hdr_loc, _out_response_code);
+      TSHttpHdrStatusSet(mbuf, hdr_loc, _out_response_code, _ua_txn, PLUGIN_NAME);
       if (!_out_response_reason.empty()) {
         TSHttpHdrReasonSet(mbuf, hdr_loc, _out_response_reason.data(), _out_response_reason.size());
       }

@@ -53,7 +53,13 @@ class DynamicCertTest:
                 "proxy.config.ssl.server.cert.path": f'{self.ts.Variables.SSLDir}',
                 "proxy.config.ssl.server.private_key.path": f'{self.ts.Variables.SSLDir}',
             })
-        self.ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+        self.ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
         self.ts.Disk.remap_config.AddLine(f"map / http://127.0.0.1:{self.server.Variables.http_port}/",)
         self.ts.Disk.plugin_config.AddLine(
             f'certifier.so -s {os.path.join(self.certPathDest, "store")} -m 1000 -c {os.path.join(self.certPathDest, "ca.cert")} -k {os.path.join(self.certPathDest, "ca.key")} -r {os.path.join(self.certPathDest, "ca-serial.txt")}'
@@ -65,11 +71,7 @@ class DynamicCertTest:
     def runHTTPSTraffic(self):
         tr = Test.AddTestRun("Test dynamic generation of certs")
         tr.AddVerifierClientProcess(
-            "client1",
-            self.httpsReplayFile,
-            http_ports=[self.ts.Variables.port],
-            https_ports=[self.ts.Variables.ssl_port],
-            other_args='--thread-limit 1')
+            "client1", self.httpsReplayFile, http_ports=[self.ts.Variables.port], https_ports=[self.ts.Variables.ssl_port])
         tr.Processes.Default.StartBefore(self.server)
         tr.Processes.Default.StartBefore(self.ts)
         tr.StillRunningAfter = self.server
@@ -132,7 +134,13 @@ class ReuseExistingCertTest:
                 "proxy.config.ssl.server.cert.path": f'{self.ts.Variables.SSLDir}',
                 "proxy.config.ssl.server.private_key.path": f'{self.ts.Variables.SSLDir}',
             })
-        self.ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+        self.ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
         self.ts.Disk.remap_config.AddLine(f"map / http://127.0.0.1:{self.server.Variables.http_port}/",)
         self.ts.Disk.plugin_config.AddLine(
             f'certifier.so -s {os.path.join(self.certPathDest, "store")} -m 1000 -c {os.path.join(self.certPathDest, "ca.cert")} -k {os.path.join(self.certPathDest, "ca.key")} -r {os.path.join(self.certPathDest, "ca-serial.txt")}'
@@ -144,11 +152,7 @@ class ReuseExistingCertTest:
     def runHTTPSTraffic(self):
         tr = Test.AddTestRun("Test dynamic generation of certs")
         tr.AddVerifierClientProcess(
-            "client2",
-            self.httpsReplayFile,
-            http_ports=[self.ts.Variables.port],
-            https_ports=[self.ts.Variables.ssl_port],
-            other_args='--thread-limit 1')
+            "client2", self.httpsReplayFile, http_ports=[self.ts.Variables.port], https_ports=[self.ts.Variables.ssl_port])
         tr.Processes.Default.StartBefore(self.server)
         tr.Processes.Default.StartBefore(self.ts)
         tr.StillRunningAfter = self.server

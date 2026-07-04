@@ -323,6 +323,35 @@ Examples
     regex_map http://x([0-9]+).z.com/ http://real-x$1.z.com/
     regex_redirect http://old.(.*).z.com http://new.$1.z.com
 
+.. _map_with_recv_port:
+
+map_with_recv_port
+==================
+
+Format::
+
+    map_with_recv_port client-URL origin-server-URL
+
+``map_with_recv_port`` supports two special URL schemes, ``http+unix`` and ``https+unix``.
+These are useful if you want to have different mapping rules or differnt plugin configuration for requests recevied via Unix Domain Socket.
+
+map_with_recv_port Examples
+---------------------------
+
+::
+
+   map_with_recv_port http://foo.example.com:8000/ http://x.example.com/
+   map_with_recv_port http://foo.example.com:8888/ http://y.example.com/
+
+Explanation: Requests received on port 8000 and 8888 are forwarded to different servers.
+
+::
+
+   map                     http://foo.example.com/ http://x.example.com/ @plugin=plugin1.so
+   map_with_recv_port http+unix://foo.example.com/ http://x.example.com/
+
+Explanation: All requests are forwarded to the same server, but plugin1 does not run for requests received via Unix Domain Socket.
+
 .. _map_with_referer:
 
 map_with_referer
@@ -425,6 +454,54 @@ Examples
 will pass "1" and "2" to plugin1.so and "3" to plugin2.so.
 
 This will pass "1" and "2" to plugin1.so and "3" to plugin2.so
+
+.. _remap-config-cache-volume-selection:
+
+Cache Volume Selection
+======================
+
+The ``@volume`` directive allows you to override the default cache volume selection
+for specific remap rules, bypassing the hostname-based volume selection configured in
+:file:`hosting.config`. This provides fine-grained control over which cache volumes
+are used for different URL patterns.
+
+Format
+------
+
+::
+
+    @volume=<volume_list>
+
+Where ``<volume_list>`` can be either:
+
+- A single volume number: ``@volume=4``
+- Multiple comma-separated volume numbers: ``@volume=3,4,5``
+
+Volume numbers must be between 1 and 255 (volume 0 is reserved and not usable).
+All specified volumes must be defined in :file:`storage.yaml`.
+
+Examples
+--------
+
+::
+
+    # Single volume for API requests (backward compatibility)
+    map https://api.example.com/ https://api-origin.example.com/ @volume=4
+
+    # Multiple volumes for load distribution across SSD volumes
+    map https://cdn.example.com/ https://cdn-origin.example.com/ @volume=2,3,4
+
+    # Single high-performance volume for critical services
+    map https://checkout.example.com/ https://checkout-origin.example.com/ @volume=1
+
+    # Everything else gets the default volume allocations (hosting.config rules)
+    map https://www.example.com/ https://origin.example.com/
+
+.. note::
+
+   When using ``@volume``, ensure that the target volumes have appropriate disk space and
+   performance characteristics for the expected traffic patterns. For multiple volumes,
+   consider the combined capacity and performance of all specified volumes.
 
 .. _remap-config-named-filters:
 

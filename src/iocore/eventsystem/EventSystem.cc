@@ -28,10 +28,13 @@
 
 ****************************************************************************/
 
-#include "P_EventSystem.h"
+#include "iocore/eventsystem/EventSystem.h"
+#include "tscore/Version.h"
 #include "tscore/hugepages.h"
 #include "records/RecCore.h"
 
+static constexpr ts::ModuleVersion EVENT_SYSTEM_MODULE_INTERNAL_VERSION{EVENT_SYSTEM_MODULE_PUBLIC_VERSION,
+                                                                        ts::ModuleVersion::PRIVATE};
 void
 ink_event_system_init(ts::ModuleVersion v)
 {
@@ -43,6 +46,9 @@ ink_event_system_init(ts::ModuleVersion v)
   RecEstablishStaticConfigInt32(thread_freelist_high_watermark, "proxy.config.allocator.thread_freelist_size");
 
   RecEstablishStaticConfigInt32(thread_freelist_low_watermark, "proxy.config.allocator.thread_freelist_low_watermark");
+
+  extern int loop_time_update_probability;
+  RecEstablishStaticConfigInt32(loop_time_update_probability, "proxy.config.exec_thread.loop_time_update_probability");
 
   int chunk_sizes[DEFAULT_BUFFER_SIZES] = {0};
   {

@@ -26,7 +26,6 @@
 
 #include "proxy/http/HttpConfig.h"
 #include "iocore/net/SSLSNIConfig.h"
-#include "../../iocore/eventsystem/P_VConnection.h"
 #include "iocore/net/NetProcessor.h"
 #include "iocore/net/PreWarm.h"
 
@@ -40,8 +39,8 @@
 #define PreWarmSMDbg(fmt, ...)  Dbg(dbg_ctl_prewarm_sm, "[%p] " fmt, this, ##__VA_ARGS__);
 #define PreWarmSMVDbg(fmt, ...) Dbg(dbg_ctl_v_prewarm_sm, "[%p] " fmt, this, ##__VA_ARGS__);
 
-ClassAllocator<PreWarmSM> preWarmSMAllocator("preWarmSMAllocator");
-PreWarmManager            prewarmManager;
+ClassAllocator<PreWarmSM, false> preWarmSMAllocator("preWarmSMAllocator");
+PreWarmManager                   prewarmManager;
 
 namespace
 {
@@ -577,6 +576,7 @@ PreWarmSM::_connect(const IpEndpoint &addr)
     opt.ssl_client_cert_name        = http_conf_params->oride.ssl_client_cert_filename;
     opt.ssl_client_private_key_name = http_conf_params->oride.ssl_client_private_key_filename;
     opt.ssl_client_ca_cert_name     = http_conf_params->oride.ssl_client_ca_cert_filename;
+    opt.ssl_client_ca_cert_path     = http_conf_params->oride.ssl_client_ca_cert_path;
 
     SCOPED_MUTEX_LOCK(lock, mutex, this_ethread());
     connect_action_handle = sslNetProcessor.connect_re(this, &addr.sa, opt);
@@ -1180,7 +1180,7 @@ PreWarmManager::_register_stats(const PreWarm::ParsedSNIConf &parsed_conf)
       } else {
         ++stats_counter;
         counters[j] = metric;
-        Dbg(dbg_ctl_v_prewarm_init, "conter stat id=%d name=%s", Metrics::Counter::lookup(name), name);
+        Dbg(dbg_ctl_v_prewarm_init, "counter stat id=%d name=%s", Metrics::Counter::lookup(name), name);
       }
     }
 

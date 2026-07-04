@@ -25,4 +25,5 @@ Testing Traffic Server
 .. toctree::
    :maxdepth: 2
 
-   blackbox-testing.en
+   autests.en
+   config-reload-ext.en

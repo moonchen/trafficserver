@@ -15,6 +15,20 @@
 #  limitations under the License.
 import os
 
+
+def update_remap_config(path: str, lines: list) -> None:
+    """Update the remap.config file.
+
+    This is used to update the config file between test runs without
+    triggering framework warnings about overriding file objects.
+
+    :param path: The path to the remap.config file.
+    :param lines: The list of lines to write to the file.
+    """
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
 Test.Summary = '''
 Test remap reloading
 '''
@@ -44,7 +58,9 @@ nameserver = Test.MakeDNServer("dns", default='127.0.0.1')
 tm.Disk.records_config.update(
     {
         'proxy.config.dns.nameservers': f"127.0.0.1:{nameserver.Variables.Port}",
-        'proxy.config.dns.resolv_conf': 'NULL'
+        'proxy.config.dns.resolv_conf': 'NULL',
+        'proxy.config.diags.debug.enabled': 1,
+        'proxy.config.diags.debug.tags': 'remap|config|file|rpc',
     })
 
 tr = Test.AddTestRun("verify load")
@@ -54,48 +70,39 @@ tr.Processes.Default.StartBefore(tm)
 tr.AddVerifierClientProcess("client", replay_file_1, http_ports=[tm.Variables.port])
 
 tr = Test.AddTestRun("Change remap.config to have only two lines")
-tr.Processes.Default.Env = tm.Env
-tr.Processes.Default.Command = 'echo "Change remap.config, two lines"'
-tr.Disk.File(remap_cfg_path).WriteOn("")
-tr.Disk.File(
-    remap_cfg_path, typename="ats:config").AddLines(
-        [
+p = tr.Processes.Default
+p.Env = tm.Env
+p.Command = 'echo "Change remap.config, two lines"'
+p.Setup.Lambda(
+    lambda: update_remap_config(
+        remap_cfg_path, [
             f"map http://alpha.ex http://alpha.ex:{pv_port}",
             f"map http://bravo.ex http://bravo.ex:{pv_port}",
-        ])
+        ]))
 
-tr = Test.AddTestRun("remap_config reload, fails")
-tr.Processes.Default.Env = tm.Env
-tr.Processes.Default.Command = 'sleep 2; traffic_ctl config reload'
+tr = Test.AddConfigReload(tm, expect="fail", expect_tasks=["remap.config"], delay_start=2, description="remap_config reload, fails")
 
 tr = Test.AddTestRun("after first reload")
-await_config_reload = tr.Processes.Process('config_reload_failed', 'sleep 30')
-await_config_reload.Ready = When.FileContains(tm.Disk.diags_log.Name, "configuration is invalid")
 tr.AddVerifierClientProcess("client_2", replay_file_2, http_ports=[tm.Variables.port])
-tr.Processes.Default.StartBefore(await_config_reload)
 
 tr = Test.AddTestRun("Change remap.config to have more than three lines")
-tr.Processes.Default.Env = tm.Env
-tr.Processes.Default.Command = 'echo "Change remap.config, more than three lines"'
-tr.Disk.File(remap_cfg_path).WriteOn("")
-tr.Disk.File(
-    remap_cfg_path, typename="ats:config").AddLines(
-        [
+p = tr.Processes.Default
+p.Env = tm.Env
+p.Command = 'echo "Change remap.config, more than three lines"'
+p.Setup.Lambda(
+    lambda: update_remap_config(
+        remap_cfg_path, [
             f"map http://echo.ex http://echo.ex:{pv_port}",
             f"map http://foxtrot.ex http://foxtrot.ex:{pv_port}",
             f"map http://golf.ex http://golf.ex:{pv_port}",
             f"map http://hotel.ex http://hotel.ex:{pv_port}",
             f"map http://india.ex http://india.ex:{pv_port}",
-        ])
+        ]))
 
-tr = Test.AddTestRun("remap_config reload, succeeds")
-tr.Processes.Default.Env = tm.Env
-tr.Processes.Default.Command = 'sleep 2; traffic_ctl config reload'
+tr = Test.AddConfigReload(
+    tm, expect="success", expect_tasks=["remap.config"], delay_start=2, description="remap_config reload, succeeds")
 
 tr = Test.AddTestRun("post update charlie")
-await_config_reload = tr.Processes.Process('config_reload_succeeded', 'sleep 30')
-await_config_reload.Ready = When.FileContains(tm.Disk.diags_log.Name, "remap.config finished loading", 2)
-tr.Processes.Default.StartBefore(await_config_reload)
 tr.AddVerifierClientProcess("client_3", replay_file_3, http_ports=[tm.Variables.port])
 
 tr = Test.AddTestRun("post update golf")

@@ -31,11 +31,13 @@
 #include <openssl/ssl.h>
 
 #include <arpa/inet.h>
+#include <getopt.h>
 #include <netinet/in.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -52,13 +54,13 @@ static void               reserve_user_arg();
 static bool               create_log_file();
 static void               register_hooks();
 static int                handle_client_hello(TSCont cont, TSEvent event, void *edata);
-static std::string        get_fingerprint(SSL *ssl);
 char                     *get_IP(sockaddr const *s_sockaddr, char res[INET6_ADDRSTRLEN]);
 static void               log_fingerprint(JA4_data const *data);
-static std::uint16_t      get_version(SSL *ssl);
-static std::string        get_first_ALPN(SSL *ssl);
-static void               add_ciphers(JA4::TLSClientHelloSummary &summary, SSL *ssl);
-static void               add_extensions(JA4::TLSClientHelloSummary &summary, SSL *ssl);
+static std::string        get_fingerprint(TSClientHello ch);
+static std::uint16_t      get_version(TSClientHello ch);
+static std::string        get_first_ALPN(TSClientHello ch);
+static void               add_ciphers(JA4::TLSClientHelloSummary &summary, TSClientHello ch);
+static void               add_extensions(JA4::TLSClientHelloSummary &summary, TSClientHello ch);
 static std::string        hash_with_SHA256(std::string_view sv);
 static int                handle_read_request_hdr(TSCont cont, TSEvent event, void *edata);
 static void               append_JA4_headers(TSCont cont, TSHttpTxn txnp, std::string const *fingerprint);
@@ -75,11 +77,39 @@ constexpr std::string_view JA4_VIA_HEADER{"x-ja4-via"};
 
 constexpr unsigned int EXT_ALPN{0x10};
 constexpr unsigned int EXT_SUPPORTED_VERSIONS{0x2b};
-constexpr int          SSL_SUCCESS{1};
 
 DbgCtl dbg_ctl{PLUGIN_NAME};
 
+int global_preserve_enabled{0};
+
 } // end anonymous namespace
+
+static bool
+read_config_option(int argc, char const *argv[], int &preserve)
+{
+  const struct option longopts[] = {
+    {"preserve", no_argument, &preserve, 1},
+    {nullptr,    0,           nullptr,   0}
+  };
+
+  optind = 0;
+  int opt{0};
+  while ((opt = getopt_long(argc, const_cast<char *const *>(argv), "", longopts, nullptr)) >= 0) {
+    switch (opt) {
+    case '?':
+      Dbg(dbg_ctl, "Unrecognized command argument.");
+    case 0:
+    case -1:
+      break;
+    default:
+      Dbg(dbg_ctl, "Unexpected options error.");
+      return false;
+    }
+  }
+
+  Dbg(dbg_ctl, "JA4 preserve is %s", (preserve == 1) ? "enabled" : "disabled");
+  return true;
+}
 
 static int *
 get_user_arg_index()
@@ -112,10 +142,14 @@ make_word(unsigned char lowbyte, unsigned char highbyte)
 }
 
 void
-TSPluginInit(int /* argc ATS_UNUSED */, char const ** /* argv ATS_UNUSED */)
+TSPluginInit(int argc, char const **argv)
 {
   if (!register_plugin()) {
     TSError("[%s] Failed to register.", PLUGIN_NAME);
+    return;
+  }
+  if (!read_config_option(argc, argv, global_preserve_enabled)) {
+    TSError("[%s] Failed to parse options.", PLUGIN_NAME);
     return;
   }
   reserve_user_arg();
@@ -163,13 +197,16 @@ handle_client_hello(TSCont /* cont ATS_UNUSED */, TSEvent event, void *edata)
     // We ignore the event, but we don't want to reject the connection.
     return TS_SUCCESS;
   }
-  TSVConn const         ssl_vc{static_cast<TSVConn>(edata)};
-  TSSslConnection const ssl{TSVConnSslConnectionGet(ssl_vc)};
-  if (nullptr == ssl) {
-    Dbg(dbg_ctl, "Could not get SSL object.");
+
+  TSVConn const ssl_vc{static_cast<TSVConn>(edata)};
+
+  TSClientHello ch = TSVConnClientHelloGet(ssl_vc);
+
+  if (!ch) {
+    Dbg(dbg_ctl, "Could not get TSClientHello object.");
   } else {
     auto data{std::make_unique<JA4_data>()};
-    data->fingerprint = get_fingerprint(reinterpret_cast<SSL *>(ssl));
+    data->fingerprint = get_fingerprint(ch);
     get_IP(TSNetVConnRemoteAddrGet(ssl_vc), data->IP_addr);
     log_fingerprint(data.get());
     // The VCONN_CLOSE handler is now responsible for freeing the resource.
@@ -180,14 +217,14 @@ handle_client_hello(TSCont /* cont ATS_UNUSED */, TSEvent event, void *edata)
 }
 
 std::string
-get_fingerprint(SSL *ssl)
+get_fingerprint(TSClientHello ch)
 {
   JA4::TLSClientHelloSummary summary{};
   summary.protocol    = JA4::Protocol::TLS;
-  summary.TLS_version = get_version(ssl);
-  summary.ALPN        = get_first_ALPN(ssl);
-  add_ciphers(summary, ssl);
-  add_extensions(summary, ssl);
+  summary.TLS_version = get_version(ch);
+  summary.ALPN        = get_first_ALPN(ch);
+  add_ciphers(summary, ch);
+  add_extensions(summary, ch);
   std::string result{JA4::make_JA4_fingerprint(summary, hash_with_SHA256)};
   return result;
 }
@@ -229,49 +266,52 @@ log_fingerprint(JA4_data const *data)
 }
 
 std::uint16_t
-get_version(SSL *ssl)
+get_version(TSClientHello ch)
 {
   unsigned char const *buf{};
   std::size_t          buflen{};
-  if (SSL_SUCCESS == SSL_client_hello_get0_ext(ssl, EXT_SUPPORTED_VERSIONS, &buf, &buflen)) {
+  if (TS_SUCCESS == TSClientHelloExtensionGet(ch, EXT_SUPPORTED_VERSIONS, &buf, &buflen)) {
     std::uint16_t max_version{0};
-    for (std::size_t i{1}; i < buflen; i += 2) {
-      std::uint16_t version{make_word(buf[i - 1], buf[i])};
-      if ((!JA4::is_GREASE(version)) && version > max_version) {
+    size_t        n_versions = buf[0];
+    for (size_t i = 1; i + 1 < buflen && i < (n_versions * 2) + 1; i += 2) {
+      std::uint16_t version = (buf[i] << 8) | buf[i + 1];
+      if (!JA4::is_GREASE(version) && version > max_version) {
         max_version = version;
       }
     }
     return max_version;
   } else {
     Dbg(dbg_ctl, "No supported_versions extension... using legacy version.");
-    return SSL_client_hello_get0_legacy_version(ssl);
+    return ch.get_version();
   }
 }
 
 std::string
-get_first_ALPN(SSL *ssl)
+get_first_ALPN(TSClientHello ch)
 {
   unsigned char const *buf{};
   std::size_t          buflen{};
   std::string          result{""};
-  if (SSL_SUCCESS == SSL_client_hello_get0_ext(ssl, EXT_ALPN, &buf, &buflen)) {
+  if (TS_SUCCESS == TSClientHelloExtensionGet(ch, EXT_ALPN, &buf, &buflen)) {
     // The first two bytes are a 16bit encoding of the total length.
     unsigned char first_ALPN_length{buf[2]};
     TSAssert(buflen > 4);
     TSAssert(0 != first_ALPN_length);
     result.assign(&buf[3], (&buf[3]) + first_ALPN_length);
   }
+
   return result;
 }
 
 void
-add_ciphers(JA4::TLSClientHelloSummary &summary, SSL *ssl)
+add_ciphers(JA4::TLSClientHelloSummary &summary, TSClientHello ch)
 {
-  unsigned char const *buf{};
-  std::size_t          buflen{SSL_client_hello_get0_ciphers(ssl, &buf)};
+  const uint8_t *buf    = ch.get_cipher_suites();
+  size_t         buflen = ch.get_cipher_suites_len();
+
   if (buflen > 0) {
-    for (std::size_t i{1}; i < buflen; i += 2) {
-      summary.add_cipher(make_word(buf[i], buf[i - 1]));
+    for (std::size_t i = 0; i + 1 < buflen; i += 2) {
+      summary.add_cipher(make_word(buf[i], buf[i + 1]));
     }
   } else {
     Dbg(dbg_ctl, "Failed to get ciphers.");
@@ -279,16 +319,11 @@ add_ciphers(JA4::TLSClientHelloSummary &summary, SSL *ssl)
 }
 
 void
-add_extensions(JA4::TLSClientHelloSummary &summary, SSL *ssl)
+add_extensions(JA4::TLSClientHelloSummary &summary, TSClientHello ch)
 {
-  int        *buf{};
-  std::size_t buflen{};
-  if (SSL_SUCCESS == SSL_client_hello_get1_extensions_present(ssl, &buf, &buflen)) {
-    for (std::size_t i{1}; i < buflen; i += 2) {
-      summary.add_extension(make_word(buf[i], buf[i - 1]));
-    }
+  for (auto ext_type : ch.get_extension_types()) {
+    summary.add_extension(ext_type);
   }
-  OPENSSL_free(buf);
 }
 
 std::string
@@ -323,9 +358,9 @@ handle_read_request_hdr(TSCont cont, TSEvent event, void *edata)
     return TS_SUCCESS;
   }
 
-  std::string *fingerprint{static_cast<std::string *>(TSUserArgGet(vconn, *get_user_arg_index()))};
-  if (fingerprint) {
-    append_JA4_headers(cont, txnp, fingerprint);
+  JA4_data *data{static_cast<JA4_data *>(TSUserArgGet(vconn, *get_user_arg_index()))};
+  if (data) {
+    append_JA4_headers(cont, txnp, &data->fingerprint);
   } else {
     Dbg(dbg_ctl, "No JA4 fingerprint attached to vconn!");
   }
@@ -334,12 +369,36 @@ handle_read_request_hdr(TSCont cont, TSEvent event, void *edata)
   return TS_SUCCESS;
 }
 
+// Check if a header field exists in the request.
+static bool
+header_exists(TSMBuffer bufp, TSMLoc hdr_loc, char const *field, int field_len)
+{
+  TSMLoc loc = TSMimeHdrFieldFind(bufp, hdr_loc, field, field_len);
+  if (loc != TS_NULL_MLOC) {
+    TSHandleMLocRelease(bufp, hdr_loc, loc);
+    return true;
+  }
+  return false;
+}
+
 void
 append_JA4_headers(TSCont /* cont ATS_UNUSED */, TSHttpTxn txnp, std::string const *fingerprint)
 {
   TSMBuffer bufp;
   TSMLoc    hdr_loc;
-  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &bufp, &hdr_loc)) {
+  if (TS_SUCCESS != TSHttpTxnClientReqGet(txnp, &bufp, &hdr_loc)) {
+    Dbg(dbg_ctl, "Failed to get headers.");
+    return;
+  }
+
+  // When preserve is enabled, check if ANY JA4 header exists. If so, skip
+  // adding ALL JA4 headers to avoid mismatched fingerprint data when requests
+  // traverse multiple proxies.
+  bool const ja4_header_exists = header_exists(bufp, hdr_loc, "ja4", 3) ||
+                                 header_exists(bufp, hdr_loc, JA4_VIA_HEADER.data(), static_cast<int>(JA4_VIA_HEADER.length()));
+  bool const skip_ja4_headers = global_preserve_enabled && ja4_header_exists;
+
+  if (!skip_ja4_headers) {
     append_to_field(bufp, hdr_loc, "ja4", 3, fingerprint->data(), fingerprint->size());
 
     TSMgmtString proxy_name = nullptr;
@@ -351,9 +410,6 @@ append_JA4_headers(TSCont /* cont ATS_UNUSED */, TSHttpTxn txnp, std::string con
     append_to_field(bufp, hdr_loc, JA4_VIA_HEADER.data(), static_cast<int>(JA4_VIA_HEADER.length()), proxy_name,
                     static_cast<int>(std::strlen(proxy_name)));
     TSfree(proxy_name);
-
-  } else {
-    Dbg(dbg_ctl, "Failed to get headers.");
   }
 
   TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
@@ -387,9 +443,8 @@ handle_vconn_close(TSCont /* cont ATS_UNUSED */, TSEvent event, void *edata)
     // We ignore the event, but we don't want to reject the connection.
     return TS_SUCCESS;
   }
-
   TSVConn const ssl_vc{static_cast<TSVConn>(edata)};
-  delete static_cast<std::string *>(TSUserArgGet(ssl_vc, *get_user_arg_index()));
+  delete static_cast<JA4_data *>(TSUserArgGet(ssl_vc, *get_user_arg_index()));
   TSUserArgSet(ssl_vc, *get_user_arg_index(), nullptr);
   TSVConnReenable(ssl_vc);
   return TS_SUCCESS;

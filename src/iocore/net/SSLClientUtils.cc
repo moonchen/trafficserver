@@ -24,9 +24,11 @@
 #include "P_SSLNetVConnection.h"
 #include "P_TLSKeyLogger.h"
 #include "SSLSessionCache.h"
+#include "TLSCertCompression.h"
 #include "iocore/net/YamlSNIConfig.h"
 #include "iocore/net/SSLDiags.h"
 #include "tscore/ink_config.h"
+#include "tscore/SimpleTokenizer.h"
 #include "tscore/Filenames.h"
 #include "tscore/X509HostnameValidator.h"
 
@@ -81,7 +83,7 @@ verify_callback(int signature_ok, X509_STORE_CTX *ctx)
       Dbg(dbg_ctl_ssl_verify, "verification error:num=%d:%s:depth=%d", err, X509_verify_cert_error_string(err), depth);
       const char *sni_name;
       char        buff[INET6_ADDRSTRLEN];
-      ats_ip_ntop(netvc->get_remote_addr(), buff, INET6_ADDRSTRLEN);
+      ats_ip_ntop(netvc->get_effective_remote_addr(), buff, INET6_ADDRSTRLEN);
       if (netvc->options.sni_servername) {
         sni_name = netvc->options.sni_servername.get();
       } else {
@@ -110,7 +112,7 @@ verify_callback(int signature_ok, X509_STORE_CTX *ctx)
       sni_name = reinterpret_cast<unsigned char *>(netvc->options.sni_servername.get());
     } else {
       sni_name = reinterpret_cast<unsigned char *>(buff);
-      ats_ip_ntop(netvc->get_remote_addr(), buff, INET6_ADDRSTRLEN);
+      ats_ip_ntop(netvc->get_effective_remote_addr(), buff, INET6_ADDRSTRLEN);
     }
     if (validate_hostname(cert, sni_name, false, &matched_name)) {
       Dbg(dbg_ctl_ssl_verify, "Hostname %s verified OK, matched %s", sni_name, matched_name);
@@ -118,7 +120,7 @@ verify_callback(int signature_ok, X509_STORE_CTX *ctx)
     } else { // Name validation failed
       // Get the server address if we did't already compute it
       if (netvc->options.sni_servername) {
-        ats_ip_ntop(netvc->get_remote_addr(), buff, INET6_ADDRSTRLEN);
+        ats_ip_ntop(netvc->get_effective_remote_addr(), buff, INET6_ADDRSTRLEN);
       }
       // If we got here the verification failed
       Warning("SNI (%s) not in certificate. Action=%s server=%s(%s)", sni_name, enforce_mode ? "Terminate" : "Continue",
@@ -141,7 +143,7 @@ verify_callback(int signature_ok, X509_STORE_CTX *ctx)
       sni_name = reinterpret_cast<unsigned char *>(netvc->options.sni_servername.get());
     } else {
       sni_name = reinterpret_cast<unsigned char *>(buff);
-      ats_ip_ntop(netvc->get_remote_addr(), buff, INET6_ADDRSTRLEN);
+      ats_ip_ntop(netvc->get_effective_remote_addr(), buff, INET6_ADDRSTRLEN);
     }
     Warning("TS_EVENT_SSL_VERIFY_SERVER plugin failed the origin certificate check for %s.  Action=%s SNI=%s",
             netvc->options.ssl_servername.get(), enforce_mode ? "Terminate" : "Continue", sni_name);
@@ -246,6 +248,18 @@ SSLInitClientContext(const SSLConfigParams *params)
     }
   }
 #endif
+
+  if (params->client_cert_compression_algorithms) {
+    std::vector<std::string> algs;
+    SimpleTokenizer          tok(params->client_cert_compression_algorithms, ',');
+    for (const char *token = tok.getNext(); token; token = tok.getNext()) {
+      algs.emplace_back(token);
+    }
+    if (register_certificate_compression_preference(client_ctx, algs) != 1) {
+      SSLError("invalid client certificate compression algorithm list in %s", ts::filename::RECORDS);
+      goto fail;
+    }
+  }
 
   SSL_CTX_set_verify_depth(client_ctx, params->client_verify_depth);
   if (SSLConfigParams::init_ssl_ctx_cb) {

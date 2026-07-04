@@ -24,6 +24,7 @@
 #include "tsutil/Assert.h"
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <variant>
 #include <vector>
 #include "tsutil/Metrics.h"
@@ -290,6 +291,34 @@ void
 Metrics::Derived::update_derived()
 {
   details::DerivativeMetrics::instance().update();
+}
+
+Metrics::StaticString &
+Metrics::StaticString::instance()
+{
+  static Metrics::StaticString i{};
+  return i;
+}
+
+void
+Metrics::StaticString::_createString(const std::string &name, const std::string_view value)
+{
+  std::lock_guard lock(_mutex);
+  _strings[name] = value;
+}
+
+std::optional<std::string_view>
+Metrics::StaticString::lookup(const std::string &name) const
+{
+  std::lock_guard                 lock(_mutex);
+  auto                            it = _strings.find(name);
+  std::optional<std::string_view> result{};
+
+  if (it != _strings.end()) {
+    result = it->second;
+  }
+
+  return result;
 }
 
 } // namespace ts

@@ -63,6 +63,7 @@ enum NextHopQualifiers {
   NEXT_HOP_NONE,
   NEXT_HOP_HOST,
   NEXT_HOP_PORT,
+  NEXT_HOP_STRATEGY,
 };
 
 // NOW data
@@ -168,8 +169,16 @@ public:
   {
     TSReleaseAssert(_initialized == false);
     initialize_hooks();
-    acquire_txn_slot();
-    acquire_txn_private_slot();
+
+    if (need_txn_slot()) {
+      _txn_slot = acquire_txn_slot();
+    }
+    if (need_ssn_slot()) {
+      _ssn_slot = acquire_ssn_slot();
+    }
+    if (need_txn_private_slot()) {
+      _txn_private_slot = acquire_txn_private_slot();
+    }
 
     _initialized = true;
   }
@@ -180,18 +189,16 @@ public:
     return _initialized;
   }
 
-  int
-  get_txn_private_slot()
-  {
-    acquire_txn_private_slot();
-    return _txn_private_slot;
-  }
-
   void
   require_resources(const ResourceIDs ids)
   {
     _rsrc = static_cast<ResourceIDs>(_rsrc | ids);
   }
+
+  static int acquire_txn_slot();
+  static int acquire_txn_private_slot();
+  static int acquire_ssn_slot();
+  static int acquire_state_slot(TSUserArgType type);
 
 protected:
   virtual void initialize_hooks();
@@ -212,14 +219,53 @@ protected:
     return false;
   }
 
+  virtual bool
+  need_ssn_slot() const
+  {
+    return false;
+  }
+
+  // Scope-aware helpers for state variable access
+  uint64_t
+  _get_state_data(TSUserArgType scope, const Resources &res) const
+  {
+    if (scope == TS_USER_ARGS_SSN) {
+      return reinterpret_cast<uint64_t>(TSUserArgGet(res.state.ssnp, _ssn_slot));
+    }
+    return reinterpret_cast<uint64_t>(TSUserArgGet(res.state.txnp, _txn_slot));
+  }
+
+  void
+  _set_state_data(TSUserArgType scope, const Resources &res, uint64_t data) const
+  {
+    if (scope == TS_USER_ARGS_SSN) {
+      TSUserArgSet(res.state.ssnp, _ssn_slot, reinterpret_cast<void *>(data));
+    } else {
+      TSUserArgSet(res.state.txnp, _txn_slot, reinterpret_cast<void *>(data));
+    }
+  }
+
+  bool
+  _check_state_handle(TSUserArgType scope, const Resources &res) const
+  {
+    if (scope == TS_USER_ARGS_SSN) {
+      return res.state.ssnp != nullptr;
+    }
+    return res.state.txnp != nullptr;
+  }
+
+  static const char *
+  _scope_label(TSUserArgType scope)
+  {
+    return (scope == TS_USER_ARGS_SSN) ? "SESSION" : "STATE";
+  }
+
   Statement *_next             = nullptr; // Linked list
   int        _txn_slot         = -1;
   int        _txn_private_slot = -1;
+  int        _ssn_slot         = -1;
 
 private:
-  void acquire_txn_slot();
-  void acquire_txn_private_slot();
-
   ResourceIDs               _rsrc = RSRC_NONE;
   TSHttpHookID              _hook = TS_HTTP_READ_RESPONSE_HDR_HOOK;
   std::vector<TSHttpHookID> _allowed_hooks;
@@ -238,8 +284,8 @@ union PrivateSlotData {
 enum { TIMEZONE_LOCAL, TIMEZONE_GMT };
 
 enum {
-  IP_SRC_PEER,  // Immediate connection
-  IP_SRC_PROXY, // PROXY protocl
+  IP_SRC_PEER,   // Immediate connection
+  IP_SRC_PROXY,  // PROXY protocl
+  IP_SRC_PLUGIN, // Plugin
   // IP_SRC_FORWARDED,  // Forwarded header field (TS core needs to support the header first. It can be done by a plugin as well.)
-  // IP_SRC_PLUGIN  // Plugin (Needs TS API to set and get a verified client IP address)
 };

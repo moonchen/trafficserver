@@ -23,6 +23,7 @@ limitations under the License.
 
 #define CATCH_CONFIG_ENABLE_BENCHMARKING
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/benchmark/catch_benchmark.hpp>
 
 #include "iocore/eventsystem/Thread.h"
 #include "tscore/Allocator.h"
@@ -51,7 +52,7 @@ struct BItem {
 } // namespace
 
 // THREAD_ALLOC/FREE requires allocators be global variables and are named after one of the defined ProxyAllocator members
-ClassAllocator<BItem> ioAllocator("io");
+ClassAllocator<BItem, false> ioAllocator("io");
 
 #define OLD_THREAD_FREE(_p, _a, _t)                                                                \
   do {                                                                                             \

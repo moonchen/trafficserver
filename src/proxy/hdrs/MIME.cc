@@ -24,11 +24,16 @@
 #include "tscore/ink_defs.h"
 #include "tscore/ink_platform.h"
 #include "tscore/ink_memory.h"
+
+#include "tsutil/StringCompare.h"
+
 #include <cassert>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <algorithm>
+#include <string_view>
 #include "proxy/hdrs/MIME.h"
 #include "proxy/hdrs/HdrHeap.h"
 #include "proxy/hdrs/HdrToken.h"
@@ -51,16 +56,60 @@ using swoc::TextView;
  *                          C O N S T A N T S                          *
  *                                                                     *
  ***********************************************************************/
-static DFA *day_names_dfa   = nullptr;
-static DFA *month_names_dfa = nullptr;
 
-static const char *day_names[] = {
+namespace
+{
+constexpr std::array<std::string_view, 7> day_names = {
   "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
 };
 
-static const char *month_names[] = {
+constexpr std::array<std::string_view, 12> month_names = {
   "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
+
+template <size_t count>
+consteval std::array<uint32_t, count>
+make_packed(const std::array<std::string_view, count> &names)
+{
+  std::array<uint32_t, count> packed{};
+
+  auto tl = [](char c) -> char { return (c >= 'A' && c <= 'Z') ? (c + 32) : c; };
+
+  for (size_t i = 0; i < count; ++i) {
+    const auto    &sv = names[i];
+    const uint32_t c0 = tl(static_cast<unsigned char>(sv[0]));
+    const uint32_t c1 = tl(static_cast<unsigned char>(sv[1]));
+    const uint32_t c2 = tl(static_cast<unsigned char>(sv[2]));
+    packed[i]         = (c0 << 16) | (c1 << 8) | c2;
+  }
+  return packed;
+}
+
+constexpr std::array<uint32_t, day_names.size()>   day_names_packed   = make_packed(day_names);
+constexpr std::array<uint32_t, month_names.size()> month_names_packed = make_packed(month_names);
+
+// Case-insensitive match of first 3 characters of input string against array of names
+// Longer strings will match if their first 3 characters match - this is intentional for
+// matching non-standard day/month names like "Thursday" or "September".
+template <size_t count>
+__attribute__((always_inline)) constexpr int
+match_3char_ci(const std::string_view s, const std::array<uint32_t, count> &names_packed)
+{
+  if (s.size() < 3) {
+    return -1;
+  }
+
+  auto           tl     = [](char c) -> char { return (c >= 'A' && c <= 'Z') ? (c + 32) : c; };
+  const uint32_t packed = (tl(s[0]) << 16) | (tl(s[1]) << 8) | tl(s[2]);
+
+  for (size_t i = 0; i < count; i++) {
+    if (packed == names_packed[i]) {
+      return i;
+    }
+  }
+  return -1;
+}
+} // namespace
 
 struct MDY {
   uint8_t  m;
@@ -164,6 +213,7 @@ c_str_view MIME_VALUE_COMPRESS;
 c_str_view MIME_VALUE_DEFLATE;
 c_str_view MIME_VALUE_GZIP;
 c_str_view MIME_VALUE_BROTLI;
+c_str_view MIME_VALUE_ZSTD;
 c_str_view MIME_VALUE_IDENTITY;
 c_str_view MIME_VALUE_KEEP_ALIVE;
 c_str_view MIME_VALUE_MAX_AGE;
@@ -422,7 +472,7 @@ mime_hdr_set_accelerators_and_presence_bits(MIMEHdrImpl *mh, MIMEField *field)
   if (slot_id != MIME_SLOTID_NONE) {
     if (mh->m_first_fblock.contains(field)) {
       slot_num = (field - &(mh->m_first_fblock.m_field_slots[0]));
-      // constains() assure that the field is in the block, and the calculated
+      // contains() assure that the field is in the block, and the calculated
       // slot_num will be between 0 and 15, which seem valid.
       // However, strangely, this function regards slot number 14 and 15 as
       // unknown for some reason that is not clear. It might be a bug.
@@ -594,11 +644,6 @@ mime_init()
     init = 0;
 
     hdrtoken_init();
-    day_names_dfa = new DFA;
-    day_names_dfa->compile(day_names, SIZEOF(day_names), RE_CASE_INSENSITIVE);
-
-    month_names_dfa = new DFA;
-    month_names_dfa->compile(month_names, SIZEOF(month_names), RE_CASE_INSENSITIVE);
 
     MIME_FIELD_ACCEPT                    = hdrtoken_string_to_wks_sv("Accept");
     MIME_FIELD_ACCEPT_CHARSET            = hdrtoken_string_to_wks_sv("Accept-Charset");
@@ -766,6 +811,7 @@ mime_init()
     MIME_VALUE_DEFLATE              = hdrtoken_string_to_wks_sv("deflate");
     MIME_VALUE_GZIP                 = hdrtoken_string_to_wks_sv("gzip");
     MIME_VALUE_BROTLI               = hdrtoken_string_to_wks_sv("br");
+    MIME_VALUE_ZSTD                 = hdrtoken_string_to_wks_sv("zstd");
     MIME_VALUE_IDENTITY             = hdrtoken_string_to_wks_sv("identity");
     MIME_VALUE_KEEP_ALIVE           = hdrtoken_string_to_wks_sv("keep-alive");
     MIME_VALUE_MAX_AGE              = hdrtoken_string_to_wks_sv("max-age");
@@ -1118,8 +1164,8 @@ _mime_hdr_field_list_search_by_string(MIMEHdrImpl *mh, std::string_view field_na
     too_far_field = &(fblock->m_field_slots[fblock->m_freetop]);
     while (field < too_far_field) {
       if (field->is_live() &&
-          strcasecmp(std::string_view{field->m_ptr_name, static_cast<std::string_view::size_type>(field->m_len_name)},
-                     field_name) == 0) {
+          ts::iequals(std::string_view{field->m_ptr_name, static_cast<std::string_view::size_type>(field->m_len_name)},
+                      field_name)) {
         return field;
       }
       ++field;
@@ -2495,8 +2541,8 @@ mime_hdr_describe(HdrHeapObjImpl *raw, bool recurse)
 void
 mime_field_block_describe(HdrHeapObjImpl *raw, bool /* recurse ATS_UNUSED */)
 {
-  unsigned int       i;
-  static const char *readiness_names[] = {"EMPTY", "DETACHED", "LIVE", "DELETED"};
+  unsigned int                 i;
+  static constexpr const char *readiness_names[] = {"EMPTY", "DETACHED", "LIVE", "DELETED"};
 
   MIMEFieldBlockImpl *obj = (MIMEFieldBlockImpl *)raw;
 
@@ -2754,7 +2800,7 @@ mime_format_int64(char *buf, int64_t val, size_t buf_len)
 void
 mime_days_since_epoch_to_mdy_slowcase(time_t days_since_jan_1_1970, int *m_return, int *d_return, int *y_return)
 {
-  static const int DAYS_OFFSET = 25508;
+  static constexpr int DAYS_OFFSET = 25508;
 
   static const char months[] = {
     2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
@@ -2770,7 +2816,7 @@ mime_days_since_epoch_to_mdy_slowcase(time_t days_since_jan_1_1970, int *m_retur
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,
     1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1};
 
-  static const int days[12] = {305, 336, -1, 30, 60, 91, 121, 152, 183, 213, 244, 274};
+  static constexpr int days[12] = {305, 336, -1, 30, 60, 91, 121, 152, 183, 213, 244, 274};
 
   time_t mday, year, month, d, dp;
 
@@ -2842,12 +2888,12 @@ int
 mime_format_date(char *buffer, time_t value)
 {
   // must be 3 characters!
-  static const char *daystrs[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static constexpr const char *daystrs[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
   // must be 3 characters!
-  static const char *monthstrs[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  static constexpr const char *monthstrs[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-  static const char *digitstrs[] = {
+  static constexpr const char *digitstrs[] = {
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
     "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39",
     "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
@@ -3123,8 +3169,7 @@ mime_parse_int64(const char *buf, const char *end)
 int
 mime_parse_rfc822_date_fastcase(const char *buf, int length, struct tm *tp)
 {
-  unsigned int     three_char_wday, three_char_mon;
-  std::string_view view{buf, size_t(length)};
+  unsigned int three_char_wday, three_char_mon;
 
   ink_assert(length >= 29);
   ink_assert(!is_ws(buf[0]));
@@ -3155,7 +3200,7 @@ mime_parse_rfc822_date_fastcase(const char *buf, int length, struct tm *tp)
     }
   }
   if (tp->tm_wday < 0) {
-    tp->tm_wday = day_names_dfa->match(view);
+    tp->tm_wday = match_3char_ci({buf, 3}, day_names_packed);
     if (tp->tm_wday < 0) {
       return 0;
     }
@@ -3208,7 +3253,7 @@ mime_parse_rfc822_date_fastcase(const char *buf, int length, struct tm *tp)
     }
   }
   if (tp->tm_mon < 0) {
-    tp->tm_mon = month_names_dfa->match(view);
+    tp->tm_mon = match_3char_ci({buf + 8, 3}, month_names_packed);
     if (tp->tm_mon < 0) {
       return 0;
     }
@@ -3239,8 +3284,8 @@ mime_parse_rfc822_date_fastcase(const char *buf, int length, struct tm *tp)
 time_t
 mime_parse_date(const char *buf, const char *end)
 {
-  static const int DAYS_OFFSET = 25508;
-  static const int days[12]    = {305, 336, -1, 30, 60, 91, 121, 152, 183, 213, 244, 274};
+  static constexpr int DAYS_OFFSET = 25508;
+  static constexpr int days[12]    = {305, 336, -1, 30, 60, 91, 121, 152, 183, 213, 244, 274};
 
   struct tm tp;
   time_t    t;
@@ -3353,7 +3398,7 @@ mime_parse_day(const char *&buf, const char *end, int *day)
     e += 1;
   }
 
-  *day = day_names_dfa->match({buf, size_t(e - buf)});
+  *day = match_3char_ci({buf, static_cast<size_t>(e - buf)}, day_names_packed);
   if (*day < 0) {
     return false;
   } else {
@@ -3376,7 +3421,7 @@ mime_parse_month(const char *&buf, const char *end, int *month)
     e += 1;
   }
 
-  *month = month_names_dfa->match({buf, size_t(e - buf)});
+  *month = match_3char_ci({buf, static_cast<size_t>(e - buf)}, month_names_packed);
   if (*month < 0) {
     return false;
   } else {
@@ -3671,7 +3716,8 @@ MIMEHdrImpl::recompute_accelerators_and_presence_bits()
 ////////////////////////////////////////////////////////
 
 void
-MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null)
+MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null, const std::string_view *targeted_headers,
+                                    size_t targeted_headers_count)
 {
   int         len, tlen;
   const char *s;
@@ -3683,13 +3729,27 @@ MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null)
 
   mime_hdr_cooked_stuff_init(this, changing_field_or_null);
 
-  //////////////////////////////////////////////////
-  // (1) cook the Cache-Control header if present //
-  //////////////////////////////////////////////////
+  /////////////////////////////////////////////////////////////////////////////
+  // (1) cook the Cache-Control header (or targeted variant) if present     //
+  /////////////////////////////////////////////////////////////////////////////
 
   // to be safe, recompute unless you know this call is for other cooked field
   if ((changing_field_or_null == nullptr) || (changing_field_or_null->m_wks_idx != MIME_WKSIDX_PRAGMA)) {
-    field = mime_hdr_field_find(this, static_cast<std::string_view>(MIME_FIELD_CACHE_CONTROL));
+    ink_assert(targeted_headers != nullptr || targeted_headers_count == 0);
+    field = nullptr;
+
+    // Check for targeted cache control headers first (in priority order).
+    for (size_t i = 0; i < targeted_headers_count; ++i) {
+      field = mime_hdr_field_find(this, targeted_headers[i]);
+      if (field) {
+        break;
+      }
+    }
+
+    // If no targeted header was found, fall back to standard Cache-Control.
+    if (!field) {
+      field = mime_hdr_field_find(this, static_cast<std::string_view>(MIME_FIELD_CACHE_CONTROL));
+    }
 
     if (field) {
       // try pathpaths first -- unlike most other fastpaths, this one
@@ -3710,6 +3770,9 @@ MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null)
 
         for (s = csv_iter.get_first(field, &len); s != nullptr; s = csv_iter.get_next(&len)) {
           e = s + len;
+          // Store set mask bits from this CSV value so we can clear them if needed.
+          uint32_t csv_value_mask = 0;
+
           for (c = s; (c < e) && (ParseRules::is_token(*c)); c++) {
             ;
           }
@@ -3724,6 +3787,7 @@ MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null)
             HdrTokenHeapPrefix *p                  = hdrtoken_wks_to_prefix(token_wks);
             mask                                   = p->wks_type_specific.u.cache_control.cc_mask;
             m_cooked_stuff.m_cache_control.m_mask |= mask;
+            csv_value_mask                        |= mask;
 
 #if TRACK_COOKING
             Dbg(dbg_ctl_http, "                        set mask 0x%0X", mask);
@@ -3732,27 +3796,72 @@ MIMEHdrImpl::recompute_cooked_stuff(MIMEField *changing_field_or_null)
             if (mask & (MIME_COOKED_MASK_CC_MAX_AGE | MIME_COOKED_MASK_CC_S_MAXAGE | MIME_COOKED_MASK_CC_MAX_STALE |
                         MIME_COOKED_MASK_CC_MIN_FRESH)) {
               int value;
+              // Per RFC 7230 Section 3.2.3, there should be no whitespace around '='.
+              const char *value_start = c;
 
-              if (mime_parse_integer(c, e, &value)) {
+              // Check if the next character is '=' (no space allowed before '=').
+              if (c < e && *c == '=') {
+                ++c; // Move past the '='
+
+                // Again: no whitespace after the '=' either. Keep in mind that values can be negative.
+                bool valid_syntax = (c < e) && (is_digit(*c) || *c == '-');
+
+                if (valid_syntax) {
+                  // Reset to value_start to let mime_parse_integer do its work.
+                  c = value_start;
+                  if (mime_parse_integer(c, e, &value)) {
 #if TRACK_COOKING
-                Dbg(dbg_ctl_http, "                        set integer value %d", value);
+                    Dbg(dbg_ctl_http, "                        set integer value %d", value);
 #endif
-                if (token_wks == MIME_VALUE_MAX_AGE.c_str()) {
-                  m_cooked_stuff.m_cache_control.m_secs_max_age = value;
-                } else if (token_wks == MIME_VALUE_MIN_FRESH.c_str()) {
-                  m_cooked_stuff.m_cache_control.m_secs_min_fresh = value;
-                } else if (token_wks == MIME_VALUE_MAX_STALE.c_str()) {
-                  m_cooked_stuff.m_cache_control.m_secs_max_stale = value;
-                } else if (token_wks == MIME_VALUE_S_MAXAGE.c_str()) {
-                  m_cooked_stuff.m_cache_control.m_secs_s_maxage = value;
+                    if (token_wks == MIME_VALUE_MAX_AGE.c_str()) {
+                      m_cooked_stuff.m_cache_control.m_secs_max_age = value;
+                    } else if (token_wks == MIME_VALUE_MIN_FRESH.c_str()) {
+                      m_cooked_stuff.m_cache_control.m_secs_min_fresh = value;
+                    } else if (token_wks == MIME_VALUE_MAX_STALE.c_str()) {
+                      m_cooked_stuff.m_cache_control.m_secs_max_stale = value;
+                    } else if (token_wks == MIME_VALUE_S_MAXAGE.c_str()) {
+                      m_cooked_stuff.m_cache_control.m_secs_s_maxage = value;
+                    }
+                  } else {
+#if TRACK_COOKING
+                    Dbg(dbg_ctl_http, "                        set integer value %d", INT_MAX);
+#endif
+                    if (token_wks == MIME_VALUE_MAX_STALE.c_str()) {
+                      m_cooked_stuff.m_cache_control.m_secs_max_stale = INT_MAX;
+                    }
+                  }
+                } else {
+                  // Syntax is malformed (e.g., whitespace after '=', quotes around value, or no value).
+                  // Treat this as unrecognized and clear the mask.
+                  csv_value_mask                         = 0;
+                  m_cooked_stuff.m_cache_control.m_mask &= ~mask;
                 }
               } else {
-#if TRACK_COOKING
-                Dbg(dbg_ctl_http, "                        set integer value %d", INT_MAX);
-#endif
-                if (token_wks == MIME_VALUE_MAX_STALE.c_str()) {
-                  m_cooked_stuff.m_cache_control.m_secs_max_stale = INT_MAX;
-                }
+                // No '=' found, or whitespace before '='. This is malformed.
+                // For directives that require values, this is an error.
+                // Clear the mask for this directive.
+                csv_value_mask                         = 0;
+                m_cooked_stuff.m_cache_control.m_mask &= ~mask;
+              }
+            }
+
+            // Detect whether there is any more non-whitespace content after the
+            // directive. This indicates an unrecognized or malformed directive.
+            // This can happen, for instance, if the host uses semicolons
+            // instead of commas as separators which is against RFC 7234 (see
+            // issue #12029). Regardless of the cause, this means we need to
+            // ignore the directive and clear any mask bits we set from it.
+            while (c < e && ParseRules::is_ws(*c)) {
+              ++c;
+            }
+            if (c < e) {
+              // There's non-whitespace content that wasn't parsed. This means
+              // that we cannot really understand what this directive is.
+              // Per RFC 7234 Section 5.2: "A cache MUST ignore unrecognized cache
+              // directives."
+              if (csv_value_mask != 0) {
+                // Reverse the mask that we set above.
+                m_cooked_stuff.m_cache_control.m_mask &= ~csv_value_mask;
               }
             }
           }

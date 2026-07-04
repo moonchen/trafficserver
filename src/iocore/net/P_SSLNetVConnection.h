@@ -31,6 +31,10 @@
  ****************************************************************************/
 #pragma once
 
+#include "iocore/eventsystem/Continuation.h"
+#include "iocore/eventsystem/IOBuffer.h"
+#include "iocore/net/AsyncSignalEventIO.h"
+#include "iocore/net/AsyncTLSEventIO.h"
 #include "ts/apidefs.h"
 
 #include "P_UnixNetVConnection.h"
@@ -43,7 +47,6 @@
 #include "iocore/net/TLSEventSupport.h"
 #include "iocore/net/TLSCertSwitchSupport.h"
 #include "P_SSLUtils.h"
-#include "P_SSLConfig.h"
 
 #include <netinet/in.h>
 #include <openssl/ssl.h>
@@ -79,14 +82,13 @@ constexpr int64_t  SSL_DEF_TLS_RECORD_BYTE_THRESHOLD = 1000000;
 constexpr int      SSL_DEF_TLS_RECORD_MSEC_THRESHOLD = 1000;
 
 struct SSLCertLookup;
+class Event;
 
 enum class SslVConnOp {
   SSL_HOOK_OP_DEFAULT,  ///< Null / initialization value. Do normal processing.
   SSL_HOOK_OP_TUNNEL,   ///< Switch to blind tunnel
   SSL_HOOK_OP_TERMINATE ///< Termination connection / transaction.
 };
-
-enum class SSLHandshakeStatus { SSL_HANDSHAKE_ONGOING, SSL_HANDSHAKE_DONE, SSL_HANDSHAKE_ERROR };
 
 //////////////////////////////////////////////////////////////////
 //
@@ -95,7 +97,7 @@ enum class SSLHandshakeStatus { SSL_HANDSHAKE_ONGOING, SSL_HANDSHAKE_DONE, SSL_H
 //  A VConnection for a network socket.
 //
 //////////////////////////////////////////////////////////////////
-class SSLNetVConnection : public UnixNetVConnection,
+class SSLNetVConnection : public NetVConnection,
                           public ALPNSupport,
                           public TLSSessionResumptionSupport,
                           public TLSSNISupport,
@@ -104,30 +106,80 @@ class SSLNetVConnection : public UnixNetVConnection,
                           public TLSCertSwitchSupport,
                           public TLSEventSupport,
                           public TLSBasicSupport
+#if TS_USE_TLS_ASYNC
+  ,
+                          public AsyncTLSEventCallback
+#endif
 {
-  using super = UnixNetVConnection; ///< Parent type.
+private:
+  // SSL state management
+  enum class SslState {
+    INIT                  = 0, // SSL object not created or initialized
+    HANDSHAKE_WANTED      = 1, // Ready to start or continue the SSL handshake
+    HANDSHAKE_IN_PROGRESS = 2, // SSL_connect or SSL_accept called, waiting for IO
+    HANDSHAKE_DONE        = 3, // Handshake complete, ready for application data
+    SHUTDOWN_WANTED       = 4, // Application requested close, SSL_shutdown needs to run
+    SHUTDOWN_IN_PROGRESS  = 5, // SSL_shutdown called, waiting for IO or peer close_notify
+    CLOSED                = 6, // Clean SSL shutdown complete (close_notify sent/received)
+    ERROR                 = 7  // An SSL error occurred (handshake, read/write, or shutdown)
+  };
+  enum SslState _sslState = SslState::INIT;
+  static bool
+  isTerminated(SslState state)
+  {
+    return state == SslState::CLOSED || state == SslState::ERROR;
+  }
+  void _trackFirstHandshake();
 
 public:
-  void clear() override;
-  void free_thread(EThread *t) override;
+  int  sslStartHandShake(int event, int &err);
+  void free_thread(EThread *t);
+  UnixNetVConnection *
+  getUnixNetVC() const
+  {
+    return _unvc;
+  }
 
   bool
   getSSLHandShakeComplete() const
   {
-    return sslHandshakeStatus != SSLHandshakeStatus::SSL_HANDSHAKE_ONGOING;
+    return _sslState == SslState::HANDSHAKE_DONE;
   }
 
-  virtual void
-  setSSLHandShakeComplete(SSLHandshakeStatus state)
-  {
-    sslHandshakeStatus = state;
-  }
+  int sslServerHandShakeEvent(int &err);
+  int sslClientHandShakeEvent(int &err);
 
-  int     sslServerHandShakeEvent(int &err);
-  int     sslClientHandShakeEvent(int &err);
-  void    net_read_io(NetHandler *nh) override;
-  int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs) override;
-  void    do_io_close(int lerrno = -1) override;
+  // NetVConnection
+  VIO       *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
+  VIO       *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
+  void       do_io_close(int lerrno = -1) override;
+  void       do_io_shutdown(ShutdownHowTo_t howto) override;
+  void       set_active_timeout(ink_hrtime timeout_in) override;
+  void       set_inactivity_timeout(ink_hrtime timeout_in) override;
+  void       set_default_inactivity_timeout(ink_hrtime timeout_in) override;
+  bool       is_default_inactivity_timeout() override;
+  void       cancel_active_timeout() override;
+  void       cancel_inactivity_timeout() override;
+  void       set_action(Continuation *c) override;
+  void       add_to_keep_alive_queue() override;
+  void       remove_from_keep_alive_queue() override;
+  bool       add_to_active_queue() override;
+  ink_hrtime get_active_timeout() override;
+  ink_hrtime get_inactivity_timeout() override;
+  void       apply_options() override;
+  void       reenable(VIO *vio) override;
+  void       reenable_re(VIO *vio) override;
+  SOCKET     get_socket() override;
+  int        set_tcp_congestion_control(tcp_congestion_control_side side) override;
+  void       set_local_addr() override;
+  void       set_remote_addr() override;
+  void       set_remote_addr(const sockaddr *addr) override;
+  void       set_mptcp_state() override;
+
+#if TS_USE_TLS_ASYNC
+  // AsyncTLSEventCallback
+  void handle_async_tls_ready() override;
+#endif
 
   ////////////////////////////////////////////////////////////
   // Instances of NetVConnection should be allocated        //
@@ -135,7 +187,8 @@ public:
   // The constructor is public just to avoid compile errors.//
   ////////////////////////////////////////////////////////////
   SSLNetVConnection();
-  ~SSLNetVConnection() override {}
+  explicit SSLNetVConnection(UnixNetVConnection *unvc);
+  ~SSLNetVConnection() override;
 
   bool
   getSSLClientRenegotiationAbort() const
@@ -173,9 +226,6 @@ public:
     allowPlain = val;
   }
 
-  // Copy up here so we overload but don't override
-  using super::reenable;
-
   int64_t read_raw_data();
 
   /** Initialize handshake buffers in which we store TLS handshake data.
@@ -201,46 +251,21 @@ public:
   void
   initialize_handshake_buffers()
   {
-    this->handShakeBuffer             = new_MIOBuffer(SSLConfigParams::ssl_misc_max_iobuffer_size_index);
-    this->handShakeReader             = this->handShakeBuffer->alloc_reader();
-    this->handShakeHolder             = this->handShakeReader->clone();
-    this->handShakeBioStored          = 0;
-    this->coalescedHandShakeBioBuffer = nullptr;
+    this->handShakeHolder    = this->_read_buf->alloc_reader();
+    this->handShakeBioStored = 0;
   }
 
   void
   free_handshake_buffers()
   {
-    if (this->handShakeReader) {
-      this->handShakeReader->dealloc();
-    }
     if (this->handShakeHolder) {
       this->handShakeHolder->dealloc();
     }
-    if (this->handShakeBuffer) {
-      free_MIOBuffer(this->handShakeBuffer);
-    }
-    if (this->coalescedHandShakeBioBuffer != nullptr) {
-      ats_free(this->coalescedHandShakeBioBuffer);
-    }
-    this->handShakeReader             = nullptr;
-    this->handShakeHolder             = nullptr;
-    this->handShakeBuffer             = nullptr;
-    this->handShakeBioStored          = 0;
-    this->coalescedHandShakeBioBuffer = nullptr;
   }
 
   int         populate_protocol(std::string_view *results, int n) const override;
   const char *protocol_contains(std::string_view tag) const override;
 
-  /**
-   * Populate the current object based on the socket information in the
-   * con parameter and the ssl object in the arg parameter
-   * This is logic is invoked when the NetVC object is created in a new thread context
-   */
-  int populate(Connection &con, Continuation *c, void *arg) override;
-
-  SSL       *ssl               = nullptr;
   ink_hrtime sslLastWriteTime  = 0;
   int64_t    sslTotalBytesSent = 0;
 
@@ -253,6 +278,8 @@ public:
   SSLNetVConnection(const SSLNetVConnection &)            = delete;
   SSLNetVConnection &operator=(const SSLNetVConnection &) = delete;
 
+  NetVConnection *migrateToCurrentThread(Continuation *cont, EThread *t) override;
+
   bool          protocol_mask_set = false;
   unsigned long protocol_mask     = 0;
 
@@ -260,9 +287,9 @@ public:
   peer_provided_cert() const override
   {
 #ifdef OPENSSL_IS_OPENSSL3
-    X509 *cert = SSL_get1_peer_certificate(this->ssl);
+    X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
 #else
-    X509 *cert = SSL_get_peer_certificate(this->ssl);
+    X509 *cert = SSL_get_peer_certificate(this->_ssl.get());
 #endif
     if (cert != nullptr) {
       X509_free(cert);
@@ -303,24 +330,21 @@ public:
 
   // TLSEventSupport
   /// Reenable the VC after a pre-accept or SNI hook is called.
-  void            reenable(int event = TS_EVENT_CONTINUE) override;
+  void            reenable_with_event(int event = TS_EVENT_CONTINUE) override;
   Continuation   *getContinuationForTLSEvents() override;
   EThread        *getThreadForTLSEvents() override;
   Ptr<ProxyMutex> getMutexForTLSEvents() override;
 
 protected:
-  // UnixNetVConnection
-  bool _isReadyToTransferData() const override;
-  void _beReadyToTransferData() override;
-
   // TLSBasicSupport
   SSL *
   _get_ssl_object() const override
   {
-    return this->ssl;
+    return this->_ssl.get();
   }
-  ssl_curve_id _get_tls_curve() const override;
-  int          _verify_certificate(X509_STORE_CTX *ctx) override;
+  ssl_curve_id     _get_tls_curve() const override;
+  std::string_view _get_tls_group() const override;
+  int              _verify_certificate(X509_STORE_CTX *ctx) override;
 
   // TLSSessionResumptionSupport
   const IpEndpoint &
@@ -350,65 +374,26 @@ protected:
 
 private:
   std::string_view map_tls_protocol_to_tag(const char *proto_string) const;
-  bool             update_rbio(bool move_to_socket);
   void             increment_ssl_version_metric(int version) const;
-  NetProcessor    *_getNetProcessor() override;
-  void            *_prepareForMigration() override;
-
-  bool _trackFirstHandshake();
-  int  _sslStartHandShake(int event, int &err);
-
-  /** Return the unconsumed bytes in @a handShakeReader in a contiguous memory buffer.
-   *
-   * If @a handShakeReader is a single IOBufferBlock, this returns the pointer
-   * to the data in that block. Otherwise, memory is allocated in @a
-   * handshakeReaderCoalesced and the bytes are copied into it. Regardless, any
-   * previously allocated memory in @a coalescedHandShakeBioBuffer is freed when
-   * this function is called.
-   *
-   * @param[in] total_chain_size The total size of the bytes in @a
-   * handShakeReader across all IOBufferBlocks.
-   *
-   * @return A pointer to all unconsumed bytes in @a handShakeReader in a single
-   * contiguous memory buffer.
-   */
-  char *_getCoalescedHandShakeBuffer(int64_t total_chain_size);
-
-  enum SSLHandshakeStatus sslHandshakeStatus          = SSLHandshakeStatus::SSL_HANDSHAKE_ONGOING;
-  bool                    sslClientRenegotiationAbort = false;
-  bool                    first_ssl_connect           = true;
-
-  /** The buffer storing the initial CLIENT_HELLO bytes. */
-  MIOBuffer *handShakeBuffer = nullptr;
-
-  /** Used to incrementally shuffle bytes read off the socket to the SSL object. */
-  IOBufferReader *handShakeHolder = nullptr;
-
-  /** If blind tunneling, this supplies the initial raw bytes of the CLIENT_HELLO. */
-  IOBufferReader *handShakeReader = nullptr;
-
-  /** A buffer for the Coalesced @a handShakeReader bytes if @a handShakeReader
-   * spans multiple IOBufferBlocks. */
-  char *coalescedHandShakeBioBuffer = nullptr;
-
-  /** The number of bytes last send to the SSL's BIO. */
-  int handShakeBioStored = 0;
-
-  /** Whether we have already checked for Proxy Protocol in the initial packet. */
-  bool haveCheckedProxyProtocol = false;
+  bool             sslClientRenegotiationAbort = false;
+  bool             first_ssl_connect           = true;
+  IOBufferReader  *handShakeHolder             = nullptr;
+  int              handShakeBioStored          = 0;
 
   bool transparentPassThrough = false;
   bool allowPlain             = false;
 
   int sent_cert = 0;
 
-  int64_t redoWriteSize = 0;
-
   // Null-terminated string, or nullptr if there is no SNI server name.
   std::unique_ptr<char[]> _ca_cert_file;
   std::unique_ptr<char[]> _ca_cert_dir;
 
-  ReadWriteEventIO async_ep{};
+  // Async TLS related
+#if TS_USE_TLS_ASYNC
+  AsyncTLSEventIO            async_ep{*this};
+  std::vector<OSSL_ASYNC_FD> async_fds{};
+#endif
 
   // early data related stuff
 #if TS_HAS_TLS_EARLY_DATA
@@ -417,12 +402,14 @@ private:
   IOBufferReader *_early_data_reader = nullptr;
 #endif
 
-private:
+  void                _trigger_ssl_read();
+  int64_t             _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
   void                _make_ssl_connection(SSL_CTX *ctx);
   void                _bindSSLObject();
-  void                _unbindSSLObject();
-  UnixNetVConnection *_migrateFromSSL();
+  UnixNetVConnection *_downgradeToPlain();
   void                _propagateHandShakeBuffer(UnixNetVConnection *target, EThread *t);
+  void                _handoffBlindTunnel();
+  void                _adoptConsumerMutex(Continuation *c);
 
   int         _ssl_read_from_net(int64_t &ret);
   ssl_error_t _ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread);
@@ -430,10 +417,100 @@ private:
   ssl_error_t _ssl_connect();
   ssl_error_t _ssl_accept();
 
-  void _in_context_tunnel() override;
-  void _out_context_tunnel() override;
+  bool _is_tunnel_endpoint{false};
+  void _in_context_tunnel();
+  void _out_context_tunnel();
+
+  // underlying TCP connection
+  UnixNetVConnection *_unvc = nullptr;
+
+  // We give these VIOs to our consumer
+  VIO _user_read_vio;
+  VIO _user_write_vio;
+
+  // The transport protocol (usually TCP) gives these to us
+  VIO *_transport_read_vio  = nullptr;
+  VIO *_transport_write_vio = nullptr;
+
+  enum class SignalSide { READ, WRITE };
+  int        _signal_user(SignalSide side, int event);
+  SignalSide _handshake_fail_side() const;
+  // Schedule the user-facing WRITE_COMPLETE to be delivered from a clean dispatch (see the
+  // definition and _write_complete_pending).
+  void _scheduleWriteComplete();
+
+  // Re-entrancy depth of _signal_user; the outermost unwind performs the deferred free of a
+  // VC that terminated while a signal was still on the stack.
+  int recursion = 0;
+
+  std::unique_ptr<SSL, decltype(&SSL_free)>                              _ssl{nullptr, &SSL_free};
+  std::unique_ptr<MIOBuffer, decltype(&free_MIOBuffer)>                  _read_buf;
+  std::unique_ptr<MIOBuffer, decltype(&free_MIOBuffer)>                  _write_buf;
+  std::unique_ptr<IOBufferReader, std::function<void(IOBufferReader *)>> _write_buf_reader;
+
+public:
+  void mark_as_tunnel_endpoint() override;
+  bool from_accept_thread{false};
+
+  // initial connect or accept event handler
+  int startEvent(int event, void *data);
+  // transport events handling function
+  int mainEvent(int event, void *data);
+
+private:
+  enum class TransportState {
+    TRANSPORT_INIT,       // Initial state, not connected
+    TRANSPORT_CONNECTING, // TCP connection requested
+    TRANSPORT_CONNECTED,  // TCP connection established
+    TRANSPORT_CLOSED,     // TCP connection received EOS or normal close initiated
+    TRANSPORT_ERROR       // TCP connection encountered an error
+  };
+  TransportState _transport_state = TransportState::TRANSPORT_INIT;
+  // True once the inbound blind-tunnel decision has been made. The handoff to a
+  // dedicated pass-through VC is deferred out of line (schedule_imm; see
+  // _trigger_ssl_read / mainEvent) so we never free this VC while a transport read
+  // handler is still on the stack.
+  bool _blind_tunnel_handoff_pending = false;
+  // True once the inbound allow-plain decision has been made (the leading bytes are not a
+  // ClientHello). Like the blind-tunnel handoff above, downgrading to a plain UnixNetVC frees
+  // this VC, so it is deferred out of line (schedule_imm; see sslServerHandShakeEvent / mainEvent).
+  bool _downgrade_to_plain_pending = false;
+  // True while an out-of-line read drive (schedule_imm) is pending so we never
+  // queue more than one. See do_io_read / _handle_transport_eos / mainEvent.
+  bool _read_drive_scheduled = false;
+  // The pending read-drive event, so it can be cancelled if this VC is freed
+  // before it fires (otherwise the stale event would run on freed memory).
+  Event *_read_drive_event = nullptr;
+  // True while do_io_close is lingering to flush buffered ciphertext (the response
+  // plus close-notify) to the transport before tearing it down. See do_io_close /
+  // _handle_transport_write_ready.
+  bool _closing = false;
+  // Set when all queued plaintext has been encrypted AND drained to the transport, to
+  // deliver the user-facing WRITE_COMPLETE from a clean scheduled dispatch instead of
+  // synchronously from inside the inner transport's net_write_io stack. The consumer
+  // usually closes/reconfigures from its WRITE_COMPLETE handler, which would reset the
+  // transport write VIO underneath the live net_write_io (use-after-free). See
+  // _handle_transport_write_ready / mainEvent.
+  bool _write_complete_pending = false;
+  static bool
+  isTerminated(TransportState state)
+  {
+    return state == TransportState::TRANSPORT_CLOSED || state == TransportState::TRANSPORT_ERROR;
+  }
+
+  // Event handlers for transport (UnixNetVConnection)
+  int _handle_transport_read_ready(VIO *vio);
+  int _handle_transport_write_ready(VIO *vio);
+  int _handle_transport_eos(VIO *vio);
+  int _handle_transport_error(VIO *vio, int err);
+  int _parse_proxy_protocol(IOBufferReader *reader);
+
+  // Release the handshake reader (handShakeHolder) once the handshake is established and no
+  // blind tunnel will adopt it, so it stops pinning _read_buf. See the definition for why a
+  // lingering second reader otherwise wedges the rbio and stalls large reads.
+  void _releaseHandshakeReader();
+
+  Action _action;
 };
 
-using SSLNetVConnHandler = int (SSLNetVConnection::*)(int, void *);
-
-extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
+extern ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator;

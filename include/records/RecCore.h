@@ -25,10 +25,13 @@
 
 #include <functional>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "tscore/Diags.h"
 
 #include "records/RecDefs.h"
+#include "mgmt/config/ConfigContext.h"
 #include "swoc/MemSpan.h"
 
 struct RecRecord;
@@ -69,9 +72,34 @@ std::string RecConfigReadConfigPath(const char *file_variable, const char *defau
 // Return a copy of the persistent stats file. This is $RUNTIMEDIR/records.snap.
 std::string RecConfigReadPersistentStatsPath();
 
-// Test whether the named configuration value is overridden by an environment variable. Return either
-// the overridden value, or the original value. Caller MUST NOT free the result.
-const char *RecConfigOverrideFromEnvironment(const char *name, const char *value);
+/// Indicates why RecConfigOverrideFromEnvironment() chose its returned value.
+enum class RecConfigOverrideSource {
+  NONE,    ///< No override — the original value was kept.
+  ENV,     ///< Overridden by a PROXY_CONFIG_* environment variable.
+  RUNROOT, ///< Overridden with the resolved Layout path because runroot manages this record.
+};
+
+/// Label for the override source (for logging).
+constexpr const char *
+RecConfigOverrideSourceName(RecConfigOverrideSource src)
+{
+  switch (src) {
+  case RecConfigOverrideSource::ENV:
+    return "environment variable";
+  case RecConfigOverrideSource::RUNROOT:
+    return "runroot";
+  case RecConfigOverrideSource::NONE:
+    return "none";
+  default:
+    return "unknown";
+  }
+}
+
+// Test whether the named configuration value is overridden by the execution
+// environment — either a PROXY_CONFIG_* environment variable or the runroot
+// mechanism.  Returns the resolved value together with the source that
+// produced it.
+std::pair<std::string, RecConfigOverrideSource> RecConfigOverrideFromEnvironment(const char *name, const char *value);
 
 //-------------------------------------------------------------------------
 // Stat Registration
@@ -83,10 +111,6 @@ RecErrT _RecRegisterStatInt(RecT rec_type, const char *name, RecInt data_default
 RecErrT _RecRegisterStatFloat(RecT rec_type, const char *name, RecFloat data_default, RecPersistT persist_type);
 #define RecRegisterStatFloat(rec_type, name, data_default, persist_type) \
   _RecRegisterStatFloat((rec_type), (name), (data_default), REC_PERSISTENCE_TYPE(persist_type))
-
-RecErrT _RecRegisterStatString(RecT rec_type, const char *name, RecStringConst data_default, RecPersistT persist_type);
-#define RecRegisterStatString(rec_type, name, data_default, persist_type) \
-  _RecRegisterStatString((rec_type), (name), (data_default), REC_PERSISTENCE_TYPE(persist_type))
 
 RecErrT _RecRegisterStatCounter(RecT rec_type, const char *name, RecCounter data_default, RecPersistT persist_type);
 #define RecRegisterStatCounter(rec_type, name, data_default, persist_type) \
@@ -161,7 +185,7 @@ void Enable_Config_Var(std::string_view const &name, RecContextCb record_cb, Rec
 
 RecErrT RecSetRecordInt(const char *name, RecInt rec_int, RecSourceT source, bool lock = true);
 RecErrT RecSetRecordFloat(const char *name, RecFloat rec_float, RecSourceT source, bool lock = true);
-RecErrT RecSetRecordString(const char *name, const RecString rec_string, RecSourceT source, bool lock = true);
+RecErrT RecSetRecordString(const char *name, RecStringConst rec_string, RecSourceT source, bool lock = true);
 RecErrT RecSetRecordCounter(const char *name, RecCounter rec_counter, RecSourceT source, bool lock = true);
 
 std::optional<RecInt>           RecGetRecordInt(const char *name, bool lock = true);
@@ -248,9 +272,17 @@ RecErrT RecGetRecordPersistenceType(const char *name, RecPersistT *persist_type,
 RecErrT RecGetRecordSource(const char *name, RecSourceT *source, bool lock = true);
 
 /// Generate a warning if any configuration name/value is not registered.
-void RecConfigWarnIfUnregistered();
+// void RecConfigWarnIfUnregistered();
+/// Generate a warning if any configuration name/value is not registered.
+void RecConfigWarnIfUnregistered(ConfigContext ctx = {});
 
 //------------------------------------------------------------------------
 // Set RecRecord attributes
 //------------------------------------------------------------------------
 RecErrT RecSetSyncRequired(const char *name, bool lock = true);
+
+/// Flush pending record config-update callbacks (those marked sync-required).
+/// This forces immediate execution of RecConfigUpdateCb callbacks for dirty records,
+/// rather than waiting for the next config_update_cont timer tick (~3s).
+/// After this call the sync-required flag on those records is cleared.
+void RecFlushConfigUpdateCbs();

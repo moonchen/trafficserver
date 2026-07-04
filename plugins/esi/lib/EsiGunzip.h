@@ -25,11 +25,12 @@
 
 #include <zlib.h>
 #include <string>
+#include <cinttypes>
 
 class EsiGunzip
 {
 public:
-  EsiGunzip();
+  EsiGunzip() = default;
 
   ~EsiGunzip();
 
@@ -44,10 +45,10 @@ public:
   bool stream_finish();
 
 private:
-  int      _downstream_length;
-  int      _total_data_length;
-  z_stream _zstrm;
+  int64_t  _downstream_length{0};
+  int64_t  _total_data_length{0};
+  z_stream _zstrm{};
 
-  bool _init;
-  bool _success;
+  bool _init{false};
+  bool _success{true};
 };

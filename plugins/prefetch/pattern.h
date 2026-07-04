@@ -23,25 +23,18 @@
 
 #pragma once
 
-#ifdef HAVE_PCRE_PCRE_H
-#include <pcre/pcre.h>
-#else
-#include <pcre.h>
-#endif
-
 #include "common.h"
+#include "tsutil/Regex.h"
 
 /**
- * @brief PCRE matching, capturing and replacing
+ * @brief PCRE2 matching, capturing and replacing
  */
 class Pattern
 {
 public:
-  static const int TOKENCOUNT = 10;             /**< @brief Capturing groups $0..$9 */
-  static const int OVECOUNT   = TOKENCOUNT * 3; /**< @brief pcre_exec() array count, handle 10 capture groups */
+  static const int TOKENCOUNT = 10; /**< @brief Capturing groups $0..$9 */
 
   Pattern();
-  virtual ~Pattern();
 
   bool init(const String &pattern, const String &replacement);
   bool init(const String &config);
@@ -54,13 +47,11 @@ public:
 private:
   bool compile();
   bool failed(const String &subject) const;
-  void pcreFree();
 
-  pcre       *_re    = nullptr; /**< @brief PCRE compiled info structure, computed during initialization */
-  pcre_extra *_extra = nullptr; /**< @brief PCRE study data block, computed during initialization */
+  Regex _regex;
 
-  String _pattern;     /**< @brief PCRE pattern string, containing PCRE patterns and capturing groups. */
-  String _replacement; /**< @brief PCRE replacement string, containing $0..$9 to be replaced with content of the capturing groups */
+  String _pattern;     /**< @brief PCRE2 pattern string, containing PCRE2 patterns and capturing groups. */
+  String _replacement; /**< @brief PCRE2 replacement string with $0..$9 placeholders for capturing groups */
 
   int _tokenCount = 0;          /**< @brief number of replacements $0..$9 found in the replacement string if not empty */
   int _tokens[TOKENCOUNT];      /**< @brief replacement index 0..9, since they can be used in the replacement string in any order */

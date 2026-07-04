@@ -34,22 +34,26 @@ class TestJA4Fingerprint:
     '''Configure a test for ja4_fingerprint.'''
 
     replay_filepath: str = 'ja4_fingerprint.replay.yaml'
+    basic_server_replay_filepath: str = 'ja4_fingerprint_basic_server.replay.yaml'
     client_counter: int = 0
     server_counter: int = 0
     ts_counter: int = 0
 
-    def __init__(self, name: str, /, autorun: bool) -> None:
+    def __init__(self, name: str, /, autorun: bool, use_preserve: bool = False) -> None:
         '''Initialize the test.
 
         :param name: The name of the test.
+        :param use_preserve: Whether to use the --preserve flag.
         '''
         self.name = name
         self.autorun = autorun
+        self.use_preserve = use_preserve
 
     def _init_run(self) -> 'TestRun':
         '''Initialize processes for the test run.'''
 
-        server_one = TestJA4Fingerprint.configure_server('yay.com')
+        replay_filepath = self.replay_filepath if self.use_preserve else self.basic_server_replay_filepath
+        server_one = TestJA4Fingerprint.configure_server('yay.com', replay_filepath=replay_filepath)
         self._configure_traffic_server(server_one)
 
         tr = Test.AddTestRun(self.name)
@@ -94,11 +98,9 @@ class TestJA4Fingerprint:
         return wrapper
 
     @staticmethod
-    def configure_server(domain: str):
+    def configure_server(domain: str, replay_filepath: str):
         server = Test.MakeVerifierServerProcess(
-            f'server{TestJA4Fingerprint.server_counter + 1}.{domain}',
-            TestJA4Fingerprint.replay_filepath,
-            other_args='--format \'{url}\'')
+            f'server{TestJA4Fingerprint.server_counter + 1}.{domain}', replay_filepath, other_args="--format '{url}'")
         TestJA4Fingerprint.server_counter += 1
 
         return server
@@ -125,9 +127,18 @@ class TestJA4Fingerprint:
 
         ts.Disk.remap_config.AddLine(f'map / http://localhost:{server_one.Variables.http_port}')
 
-        ts.Disk.ssl_multicert_config.AddLine(f'dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+        ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
-        ts.Disk.plugin_config.AddLine(f'ja4_fingerprint.so')
+        plugin_args = 'ja4_fingerprint.so'
+        if self.use_preserve:
+            plugin_args += ' --preserve'
+        ts.Disk.plugin_config.AddLine(plugin_args)
 
         log_path = os.path.join(ts.Variables.LOGDIR, "ja4_fingerprint.log")
         ts.Disk.File(log_path, id='log_file')
@@ -146,9 +157,51 @@ class TestJA4Fingerprint:
                  'then a JA4 header should be attached.')
 def test1(params: TestParams) -> None:
     client = params['tr'].Processes.Default
-    params['tr'].MakeCurlCommand('-k -v "https://localhost:{0}/resource"'.format(params['port_one']), ts=params['ts'])
+    params['tr'].MakeCurlCommand(
+        '-k -v -H "uuid: no-existing-headers" "https://localhost:{0}/resource"'.format(params['port_one']), ts=params['ts'])
 
     client.ReturnCode = 0
     client.Streams.stdout += Testers.ContainsExpression(r'Yay!', 'We should receive the expected body.')
     params['ts'].Disk.traffic_out.Content += Testers.ContainsExpression(
         r'JA4 fingerprint:', 'We should receive the expected log message.')
+
+
+@TestJA4Fingerprint.runner('With --preserve, existing JA4 headers should be preserved.', use_preserve=True)
+def test_preserve(params: TestParams) -> None:
+    '''Test that --preserve skips adding headers when JA4 headers exist.'''
+    tr = params['tr']
+    client = tr.Processes.Default
+    server = params['server_one']
+
+    # Request 1: No existing JA4 headers - should add them.
+    tr.MakeCurlCommand(
+        '-k -v -H "uuid: no-existing-headers" "https://localhost:{0}/resource"'.format(params['port_one']), ts=params['ts'])
+    client.ReturnCode = 0
+    client.Streams.stdout += Testers.ContainsExpression(r'Yay!', 'First request should succeed.')
+
+    # Request 2: With existing JA4 headers - should preserve them.
+    tr2 = Test.AddTestRun('Verify preserve skips adding JA4 headers when they exist.')
+    tr2.MakeCurlCommand(
+        '-k -v -H "uuid: existing-ja4-headers" -H "ja4: upstream-fingerprint" -H "x-ja4-via: upstream.proxy.com" '
+        '"https://localhost:{0}/resource-with-headers"'.format(params['port_one']),
+        ts=params['ts'])
+    tr2.Processes.Default.ReturnCode = 0
+    tr2.Processes.Default.Streams.stdout += Testers.ContainsExpression(r'Preserved!', 'Second request should preserve headers.')
+
+    # Request 3: With only x-ja4-via - should also trigger preserve.
+    tr3 = Test.AddTestRun('Verify preserve triggers when only x-ja4-via exists.')
+    tr3.MakeCurlCommand(
+        '-k -v -H "uuid: existing-via-only" -H "x-ja4-via: upstream.proxy.com" '
+        '"https://localhost:{0}/resource-via-only"'.format(params['port_one']),
+        ts=params['ts'])
+    tr3.Processes.Default.ReturnCode = 0
+    tr3.Processes.Default.Streams.stdout += Testers.ContainsExpression(r'Via only!', 'Third request should succeed.')
+
+    # Verify the replay file's proxy-request validations pass (checked per-request).
+    # Also verify via Proxy Verifier's validation logs.
+    server.Streams.All += Testers.ContainsExpression(
+        r'Equals Success.*"/resource-with-headers".*ja4.*upstream-fingerprint',
+        'Preserved ja4 header should match original value.',
+        reflags=re.DOTALL)
+    server.Streams.All += Testers.ContainsExpression(
+        r'Absence Success.*"/resource-via-only".*ja4', 'ja4 should be absent when only x-ja4-via exists.', reflags=re.DOTALL)

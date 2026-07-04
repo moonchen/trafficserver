@@ -29,7 +29,7 @@ request_header = {'timestamp': 100, "headers": "GET /test-1 HTTP/1.1\r\nHost: te
 response_header = {
     'timestamp': 100,
     "headers":
-        "HTTP/1.1 200 OK\r\nTest: 1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTest: 1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
     "body": "Test 1"
 }
 server.addResponse("sessionlog.json", request_header, response_header)
@@ -59,6 +59,8 @@ nameserver = Test.MakeDNServer("dns", default='127.0.0.1')
 
 ts.Disk.records_config.update(
     {
+        'proxy.config.diags.debug.enabled': 1,
+        'proxy.config.diags.debug.tags': 'http|log',
         'proxy.config.net.connections_throttle': 100,
         'proxy.config.dns.nameservers': f"127.0.0.1:{nameserver.Variables.Port}",
         'proxy.config.dns.resolv_conf': 'NULL'
@@ -71,7 +73,7 @@ ts.Disk.logging_yaml.AddLines(
 logging:
   formats:
     - name: custom
-      format: '%<{Content-Type}essh>'
+      format: 'Transfer-Encoding:%<{Transfer-Encoding}ssh> Content-Type:%<{Content-Type}essh> Request-ID:%<{X-Primary-Id}cqh??{X-Secondary-Id}cqh> Request-ID-Default:%<{X-Primary-Id}cqh??{X-Secondary-Id}cqh??"missing-id"> Request-ID-Or-IP:%<{X-Primary-Id}cqh??{X-Secondary-Id}cqh??chi> Remote-IP:%<{X-Remote-Ip}cqh??chi> Path-Fallback:%<{X-Path-Fallback}cqh??cqup[0:7]>'
   logs:
     - filename: field-test
       format: custom
@@ -81,6 +83,8 @@ logging:
 # at the end of the different test run a custom log file should exist
 # Because of this we expect the testruns to pass the real test is if the
 # customlog file exists and passes the format check
+# Note that the gold file expects Chunked, not chunked, because microserver
+# converts to Chunked. This is not an ATS issue, but a microserver issue.
 Test.Disk.File(os.path.join(ts.Variables.LOGDIR, 'field-test.log'), exists=True, content='gold/field-test.gold')
 
 # first test is a miss for default
@@ -91,19 +95,27 @@ tr.Processes.Default.StartBefore(nameserver)
 # Delay on readiness of our ssl ports
 tr.Processes.Default.StartBefore(Test.Processes.ts)
 
-tr.MakeCurlCommand('--verbose --header "Host: test-1" http://localhost:{0}/test-1'.format(ts.Variables.port), ts=ts)
+tr.MakeCurlCommand(
+    '--verbose --ipv4 --header "Host: test-1" --header "X-Primary-Id: primary-1" --header "X-Secondary-Id: secondary-1" --header "X-Remote-Ip: 203.0.113.10" http://127.0.0.1:{0}/test-1'
+    .format(ts.Variables.port),
+    ts=ts)
 tr.Processes.Default.ReturnCode = 0
 
 tr = Test.AddTestRun()
-tr.MakeCurlCommand('--verbose --header "Host: test-2" http://localhost:{0}/test-2'.format(ts.Variables.port), ts=ts)
+tr.MakeCurlCommand(
+    '--verbose --ipv4 --header "Host: test-2" --header "X-Secondary-Id: secondary-2" http://127.0.0.1:{0}/test-2'.format(
+        ts.Variables.port),
+    ts=ts)
 tr.Processes.Default.ReturnCode = 0
 
 tr = Test.AddTestRun()
-tr.MakeCurlCommand('--verbose --header "Host: test-3" http://localhost:{0}/test-3'.format(ts.Variables.port), ts=ts)
+tr.MakeCurlCommand('--verbose --ipv4 --header "Host: test-3" http://127.0.0.1:{0}/test-3'.format(ts.Variables.port), ts=ts)
 tr.Processes.Default.ReturnCode = 0
 
-# Wait for log file to appear, then wait one extra second to make sure TS is done writing it.
-test_run = Test.AddTestRun()
-test_run.Processes.Default.Command = (
-    os.path.join(Test.Variables.AtsTestToolsDir, 'condwait') + ' 60 1 -f ' + os.path.join(ts.Variables.LOGDIR, 'field-test.log'))
-test_run.Processes.Default.ReturnCode = 0
+# Wait for all expected log lines to be written.
+Test.AddAwaitFileContainsTestRun(
+    'Await field-test log lines.',
+    os.path.join(ts.Variables.LOGDIR, 'field-test.log'),
+    r'^Transfer-Encoding:',
+    3,
+)

@@ -87,7 +87,20 @@ operator_factory(const std::string &op)
     o = new OperatorSetStateInt8();
   } else if (op == "set-state-int16") {
     o = new OperatorSetStateInt16();
+  } else if (op == "set-session-flag") {
+    o = new OperatorSetStateFlag(TS_USER_ARGS_SSN);
+  } else if (op == "set-session-int8") {
+    o = new OperatorSetStateInt8(TS_USER_ARGS_SSN);
+  } else if (op == "set-session-int16") {
+    o = new OperatorSetStateInt16(TS_USER_ARGS_SSN);
+  } else if (op == "set-effective-address") {
+    o = new OperatorSetEffectiveAddress();
+  } else if (op == "set-next-hop-strategy") {
+    o = new OperatorSetNextHopStrategy();
+  } else if (op == "set-cc-alg") {
+    o = new OperatorSetCCAlgorithm();
   } else {
+    // Note that we don't support the OperatorIf() pseudo-operator here!
     TSError("[%s] Unknown operator: %s", PLUGIN_NAME, op.c_str());
     return nullptr;
   }
@@ -125,9 +138,13 @@ condition_factory(const std::string &cond)
   } else if (c_name == "HEADER") { // This condition adapts to the hook
     c = new ConditionHeader();
   } else if (c_name == "CLIENT-HEADER") {
-    c = new ConditionHeader(true);
+    c = new ConditionHeader(ConditionHeader::CLIENT);
+  } else if (c_name == "SERVER-HEADER") {
+    c = new ConditionHeader(ConditionHeader::SERVER);
   } else if (c_name == "CLIENT-URL") { // This condition adapts to the hook
     c = new ConditionUrl(ConditionUrl::CLIENT);
+  } else if (c_name == "SERVER-URL") {
+    c = new ConditionUrl(ConditionUrl::SERVER);
   } else if (c_name == "URL") {
     c = new ConditionUrl(ConditionUrl::URL);
   } else if (c_name == "FROM-URL") {
@@ -180,6 +197,12 @@ condition_factory(const std::string &cond)
     c = new ConditionStateInt8();
   } else if (c_name == "STATE-INT16") {
     c = new ConditionStateInt16();
+  } else if (c_name == "SESSION-FLAG") {
+    c = new ConditionStateFlag(TS_USER_ARGS_SSN);
+  } else if (c_name == "SESSION-INT8") {
+    c = new ConditionStateInt8(TS_USER_ARGS_SSN);
+  } else if (c_name == "SESSION-INT16") {
+    c = new ConditionStateInt16(TS_USER_ARGS_SSN);
   } else if (c_name == "LAST-CAPTURE") {
     c = new ConditionLastCapture();
   } else {

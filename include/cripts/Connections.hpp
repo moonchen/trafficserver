@@ -277,7 +277,11 @@ class ConnBase
     retrans()
     {
       initialize();
+#if defined(__FreeBSD__)
+      return (_ready ? info.__tcpi_retrans : 0);
+#else
       return (_ready ? info.tcpi_retrans : 0);
+#endif
     }
 
     struct tcp_info info;
@@ -455,10 +459,9 @@ protected:
 
   void virtual _initialize() { _initialized = true; }
 
-  cripts::Transaction   *_state  = nullptr;
-  struct sockaddr const *_socket = nullptr;
-  TSVConn                _vc     = nullptr;
-  char                   _str[INET6_ADDRSTRLEN + 1];
+  cripts::Transaction   *_state       = nullptr;
+  struct sockaddr const *_socket      = nullptr;
+  TSVConn                _vc          = nullptr;
   bool                   _initialized = false;
 
 }; // End class ConnBase

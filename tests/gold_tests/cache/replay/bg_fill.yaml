@@ -25,13 +25,9 @@ meta:
   version: '1.0'
 sessions:
 - protocol:
-  - name: http
-    version: 2
-  - name: tls
-    sni: test_sni
-  - name: tcp
-  - name: ip
-    version: 4
+    stack: http2
+    tls:
+      sni: test_sni
   transactions:
   - client-request:
       frames:
@@ -44,6 +40,7 @@ sessions:
             - [:path, /a/path]
             - [Content-Type, text/html]
             - [uuid, 1]
+            - [x-debug, x-cache]
       - RST_STREAM:
           delay: 1s
           error-code: INTERNAL_ERROR
@@ -64,13 +61,9 @@ sessions:
             size: 11
 
 - protocol:
-  - name: http
-    version: 2
-  - name: tls
-    sni: test_sni
-  - name: tcp
-  - name: ip
-    version: 4
+    stack: http2
+    tls:
+      sni: test_sni
   transactions:
   - client-request:
       delay: 3s
@@ -84,6 +77,7 @@ sessions:
             - [:path, /a/path]
             - [Content-Type, text/html]
             - [uuid, 2]
+            - [x-debug, x-cache]
 
     server-response:
       frames:

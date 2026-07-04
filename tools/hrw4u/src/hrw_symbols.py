@@ -21,55 +21,60 @@ from functools import cached_property
 import re
 
 from hrw4u.errors import SymbolResolutionError
+from hrw4u.debugging import Dbg
 from hrw4u.validation import Validator
 import hrw4u.types as types
 import hrw4u.tables as tables
 from hrw4u.states import SectionType
+from hrw4u.symbols_base import SymbolResolverBase
 
 
-class InverseSymbolResolver:
-    """
-    Reverse mapping utilities driven by the forward SymbolResolver tables.
-    Designed to produce hrw4u output that round-trips closely (including
-    naming/casing where hrw4u establishes a style).
-    """
+class InverseSymbolResolver(SymbolResolverBase):
+    """Reverse mapping utilities for hrw4u output generation."""
 
-    def __init__(self):
-        self._state_vars: dict[tuple[types.VarType, int], str] = {}
+    def __init__(self, dbg: Dbg | None = None) -> None:
+        super().__init__(debug=False, dbg=dbg)
+        self._state_vars: dict[tuple[types.VarType, int, types.VarScope], str] = {}
 
     @cached_property
     def _rev_conditions_exact(self) -> dict[str, str]:
-        """Cached reverse condition mapping for exact matches"""
+        """Cached reverse condition mapping for exact matches."""
+        if reverse_map := tables.REVERSE_RESOLUTION_MAP.get('EXACT_CONDITIONS'):
+            return reverse_map
+        # Fallback to building from condition map if not available
         result = {}
-        for ident_key, (tag, _, uppercase, *_) in tables.CONDITION_MAP.items():
+        for ident_key, params in self._condition_map.items():
             if not ident_key.endswith("."):
+                tag = params.target
                 tag_key = tag.strip().removeprefix("%{").removesuffix("}").split(":", 1)[0]
                 result[tag_key] = ident_key
         return result
 
     @cached_property
     def _rev_conditions_prefix(self) -> list[tuple[str, str, bool]]:
-        """Cached reverse condition mapping for prefix matches"""
+        """Cached reverse condition mapping for prefix matches."""
+        if reverse_map := tables.REVERSE_RESOLUTION_MAP.get('PREFIX_CONDITIONS'):
+            return reverse_map
+        # Fallback to building from condition map if not available
         result = []
-        for ident_key, (tag, _, uppercase, *_) in tables.CONDITION_MAP.items():
+        for ident_key, params in self._condition_map.items():
             if ident_key.endswith("."):
+                tag = params.target
+                uppercase = params.upper if params else False
                 result.append((tag, ident_key, uppercase))
         return result
 
     @cached_property
     def _rev_functions(self) -> dict[str, str]:
-        """Cached reverse function mapping"""
-        return {tag: fn_name for fn_name, (tag, _) in tables.FUNCTION_MAP.items()}
+        """Cached reverse function mapping."""
+        if reverse_map := tables.REVERSE_RESOLUTION_MAP.get('FUNCTIONS'):
+            return reverse_map
+        return {params.target: fn_name for fn_name, params in self._function_map.items()}
 
     @cached_property
     def _rev_sections(self) -> dict[str, str]:
-        """Cached reverse section mapping"""
+        """Cached reverse section mapping."""
         return {s.hook_name: s.value for s in SectionType}
-
-    @cached_property
-    def _url_tags(self) -> set[str]:
-        """Cached URL tags from condition map"""
-        return {tag for ident_key, (tag, *_) in tables.CONDITION_MAP.items() if ident_key.endswith(".url.") or "URL" in tag}
 
     def _section_label_for_tag(self, tag: str) -> str | None:
         try:
@@ -87,17 +92,19 @@ class InverseSymbolResolver:
     def _resolve_fallback_tag(self, tag: str, payload: str, section: SectionType | None) -> tuple[str, bool] | None:
         if (fallback_map := tables.REVERSE_RESOLUTION_MAP.get("FALLBACK_TAG_MAP")) and (tag_info := fallback_map.get(tag)):
             context_info, use_payload = tag_info
+
             if use_payload:
                 prefix = self.get_prefix_for_context(context_info, section)
                 return f"{prefix}{payload}", False
             return f"{context_info}{payload}", False
         return None
 
-    def _get_or_create_var_name(self, var_type: types.VarType, index: int) -> str:
-        key = (var_type, index)
+    def _get_or_create_var_name(self, var_type: types.VarType, index: int, scope: types.VarScope = types.VarScope.TXN) -> str:
+        key = (var_type, index, scope)
         if key not in self._state_vars:
             type_name = var_type.name.lower()
-            self._state_vars[key] = f"{type_name}_{index}"
+            prefix = "ssn_" if scope == types.VarScope.SESSION else ""
+            self._state_vars[key] = f"{prefix}{type_name}_{index}"
         return self._state_vars[key]
 
     def _resolve_from_context_map(self, context_map: dict, section: SectionType | None, default: str) -> str:
@@ -121,37 +128,46 @@ class InverseSymbolResolver:
         return "inbound.resp."
 
     def _resolve_ambiguous_exact(self, tag: str, section: SectionType | None) -> str | None:
-        if tag in tables.AMBIGUOUS_CONTEXT_TAGS and (mapping := tables.REVERSE_RESOLUTION_MAP.get(tag)):
-            outbound_sections = mapping["outbound_sections"]
-            if section in outbound_sections or (tag == "STATUS" and section == SectionType.READ_RESPONSE):
-                return mapping["outbound_result"]
-            return mapping["inbound_result"]
+        if tag == "STATUS":
+            if (mapping := tables.REVERSE_RESOLUTION_MAP.get("STATUS")):
+                outbound_sections = mapping["outbound_sections"]
+                if section in outbound_sections or section == SectionType.READ_RESPONSE:
+                    return mapping["outbound_result"]
+                return mapping["inbound_result"]
+        elif tag == "METHOD":
+            if (mapping := tables.REVERSE_RESOLUTION_MAP.get("METHOD")):
+                outbound_sections = mapping["outbound_sections"]
+                if section in outbound_sections:
+                    return mapping["outbound_result"]
+                return mapping["inbound_result"]
         elif tag == "IP":
             return None
 
-        candidates = []
-        for key, (mapped_tag, _, _, restricted, _, _) in tables.CONDITION_MAP.items():
+        for key, params in self._condition_map.items():
+            mapped_tag = params.target
             tag_part = mapped_tag.replace("%{", "").replace("}", "").split(":")[0]
+            restricted = params.sections if params else None
             if tag_part == tag:
                 if not restricted or not section or section not in restricted:
-                    candidates.append((key, restricted))
+                    pass
 
         return None
 
-    def _handle_state_tag(self, tag: str, payload: str | None) -> tuple[str, bool]:
-        state_type = tag[6:]
+    def _handle_state_tag(self, tag: str, payload: str | None, scope: types.VarScope = types.VarScope.TXN) -> tuple[str, bool]:
+        prefix_len = len(scope.cond_prefix) + 1  # "STATE-" or "SESSION-"
+        state_type = tag[prefix_len:]
         if payload is None:
             raise SymbolResolutionError(f"%{{{tag}}}", f"Missing index for {tag}")
         try:
             index = int(payload)
             for var_type in types.VarType:
                 if var_type.cond_tag == state_type:
-                    return self._get_or_create_var_name(var_type, index), False
+                    return self._get_or_create_var_name(var_type, index, scope), False
             raise SymbolResolutionError(f"%{{{tag}}}", f"Unknown state type: {state_type}")
         except ValueError:
             raise SymbolResolutionError(f"%{{{tag}}}", f"Invalid index for {tag}: {payload}")
 
-    def _handle_ip_tag(self, payload: str) -> tuple[str, bool]:
+    def _handle_ip_tag(self, payload: str) -> tuple[str | None, bool]:
         if (ip_map := tables.REVERSE_RESOLUTION_MAP.get("IP")) and (result := ip_map.get(payload)):
             return result, False
         return None, False
@@ -160,50 +176,69 @@ class InverseSymbolResolver:
         for tag_match, lhs_prefix, needs_upper in self._rev_conditions_prefix:
             if tag_match == tag:
                 suffix = payload.upper() if needs_upper else payload
-                if lhs_prefix.endswith(".url.") or tag_match in self._url_tags or tag == "NOW":
+
+                # Use existing type definitions for case handling
+                if self._should_lowercase_suffix(tag_match, lhs_prefix):
                     suffix = suffix.lower()
+
                 if tag == "HEADER":
                     return f"{self.get_prefix_for_context('header_condition', section)}{suffix}", False
-                return f"{lhs_prefix}{suffix}", False
+                else:
+                    return f"{lhs_prefix}{suffix.replace(':', '.')}", False
         return None
 
+    def _should_lowercase_suffix(self, tag_match: str, lhs_prefix: str) -> bool:
+        """Determine if suffix should be lowercase based on field type."""
+        # URL fields should be lowercase (use existing SuffixGroup)
+        if lhs_prefix.endswith(".url.") or tag_match in {"CLIENT-URL", "TO-URL", "FROM-URL", "NEXT-HOP"}:
+            return True
+        # Time fields should be lowercase
+        if tag_match == "NOW":
+            return True
+        return False
+
     def _rewrite_inline_percents(self, value: str, section: SectionType | None) -> str:
+        # Handle simple cases first
         if types.BooleanLiteral.contains(value):
             return value.lower()
-
         if value.isnumeric():
             return value
 
-        if value.startswith('%{') and value.endswith('}'):
-            m = Validator._PERCENT_RE.fullmatch(value)
-            if m:
-                try:
-                    expr, _ = self.percent_to_ident_or_func(value, section)
-                    return f'"{{{expr}}}"'
-                except SymbolResolutionError:
-                    return f'"{value}"'
+        # Handle full percent block
+        if value.startswith('%{') and value.endswith('}') and Validator._PERCENT_RE.fullmatch(value):
+            try:
+                expr, _ = self.percent_to_ident_or_func(value, section)
+                return f'"{{{expr}}}"'
+            except SymbolResolutionError:
+                return f'"{value}"'
 
+        # Handle quoted strings with embedded percent blocks
         is_quoted = value.startswith('"') and value.endswith('"')
         inner_value = value[1:-1] if is_quoted else value
 
-        def repl(match: re.Match) -> str:
-            percent_block = match.group(0)
-            try:
-                expr, _ = self.percent_to_ident_or_func(percent_block, section)
-                return "{" + expr + "}"
-            except SymbolResolutionError:
-                return percent_block
-
-        rewritten = Validator._PERCENT_PATTERN.sub(repl, inner_value)
+        rewritten = Validator._PERCENT_PATTERN.sub(self._make_percent_replacer(section), inner_value)
         return f'"{rewritten}"'
 
-    def _handle_set_rm_operation(self, cmd: str, toks: list[str], prefix: str, qualifier: str, context: str) -> str:
+    def _make_percent_replacer(self, section: SectionType | None):
+        """Create a replacement function for percent blocks in strings."""
+
+        def repl(match: re.Match) -> str:
+            try:
+                expr, _ = self.percent_to_ident_or_func(match.group(0), section)
+                return "{" + expr + "}"
+            except SymbolResolutionError:
+                return match.group(0)
+
+        return repl
+
+    def _handle_set_rm_operation(
+            self, cmd: str, toks: list[str], prefix: str, qualifier: str, section: SectionType | None = None) -> str:
         if cmd.startswith("rm-"):
             return f'{prefix}{qualifier} = ""'
         if len(toks) < 3:
             raise SymbolResolutionError(" ".join(toks), f"Missing value for {cmd}")
         value = " ".join(toks[2:])
-        value = self._rewrite_inline_percents(value, None)
+        value = self._rewrite_inline_percents(value, section)
         return f"{prefix}{qualifier} = {value}"
 
     def _handle_operator_command(
@@ -226,7 +261,7 @@ class InverseSymbolResolver:
             prefix = self.get_prefix_for_context(context_type, section)
 
             processed_qualifier = qualifier_processor(qualifier)
-            return self._handle_set_rm_operation(cmd, toks, prefix, processed_qualifier, op_context)
+            return self._handle_set_rm_operation(cmd, toks, prefix, processed_qualifier, section)
 
         if lhs_key.endswith("."):
             if len(toks) < 2:
@@ -253,18 +288,28 @@ class InverseSymbolResolver:
 
             qargs = [status_code, self._rewrite_inline_percents(f'"{url_arg}"', section)]
         elif name == "add-header" and args:
+            # Convert add-header command to += syntax for reverse mapping
             header_name = args[0]
             prefix = self.get_prefix_for_context("header_ops", section)
             prefixed_header = f"{prefix}{header_name}"
 
-            processed_args = [self._rewrite_inline_percents(arg, section) for arg in args[1:]]
-            qargs = [prefixed_header] + processed_args
+            if len(args) > 1:
+                value = self._rewrite_inline_percents(args[1], section)
+                return f"{prefixed_header} += {value}"
+            raise SymbolResolutionError("add-header", "Missing value for add-header")
+        elif name == "set-plugin-cntl" and len(args) >= 2:
+            qualifier = args[0]
+            value = args[1]
+            # Always quote the value for consistent output
+            quoted_value = f'"{value}"' if not (value.startswith('"') and value.endswith('"')) else value
+            qargs = [qualifier, quoted_value]
         else:
             qargs = [self._rewrite_inline_percents(Validator.quote_if_needed(a), section) for a in args]
 
         return f"{name}({', '.join(qargs)})" if qargs else f"{name}()"
 
     def parse_percent_block(self, pct: str) -> tuple[str, str | None]:
+        """Parse percent block into tag and payload components."""
         try:
             Validator.percent_block()(pct)
         except Exception:
@@ -276,11 +321,23 @@ class InverseSymbolResolver:
         elif inner.endswith("}"):
             inner = inner[:-1]
         if ":" in inner:
+            # Check for multi-part certificate tags first
+            if (fallback_map := tables.REVERSE_RESOLUTION_MAP.get("FALLBACK_TAG_MAP")):
+                parts = inner.split(":")
+                for i in range(len(parts) - 1, 0, -1):
+                    potential_tag = ":".join(parts[:i])
+                    if potential_tag in fallback_map:
+                        remaining_parts = parts[i:]
+                        payload = ":".join(remaining_parts) if remaining_parts else None
+                        return potential_tag, payload
+
+            # Default behavior - split on first colon
             tag, payload = inner.split(":", 1)
             return tag, payload
         return inner, None
 
     def convert_set_to_brackets(self, set_text: str) -> str:
+        """Convert set notation to bracket format."""
         try:
             Validator.set_format()(set_text)
         except Exception:
@@ -297,6 +354,7 @@ class InverseSymbolResolver:
         return set_text
 
     def format_iprange(self, iprange_text: str) -> str:
+        """Format IP range with proper spacing."""
         try:
             Validator.iprange_format()(iprange_text)
         except Exception:
@@ -308,13 +366,25 @@ class InverseSymbolResolver:
             return '{' + content + '}'
         return iprange_text
 
-    def get_var_declarations(self) -> list[str]:
-        declarations = []
-        for (var_type, _), var_name in sorted(self._state_vars.items()):
-            declarations.append(f"{var_name}: {var_type.name.lower()};")
-        return declarations
+    def get_var_declarations(self) -> tuple[list[str], list[str]]:
+        """Get variable declarations in hrw4u format, separated by scope.
+
+        Returns a tuple of (txn_declarations, session_declarations).
+        """
+        txn_decls = []
+        ssn_decls = []
+
+        for (var_type, _, scope), var_name in sorted(self._state_vars.items(), key=lambda x: (x[0][2].name, x[0][0].name, x[0][1])):
+            decl = f"{var_name}: {var_type.name.lower()};"
+            if scope == types.VarScope.SESSION:
+                ssn_decls.append(decl)
+            else:
+                txn_decls.append(decl)
+
+        return txn_decls, ssn_decls
 
     def negate_expression(self, term: str) -> str:
+        """Negate a logical expression appropriately."""
         t = term.strip()
         if ' == ""' in t:
             return t.replace(' == ""', '')
@@ -326,7 +396,9 @@ class InverseSymbolResolver:
             return t
         if " ~ " in t and " !~ " not in t:
             return t.replace(" ~ ", " !~ ", 1)
-        if any(op in t for op in (" in ", " > ", " < ")):
+        if " in " in t:
+            return t.replace(" in ", " !in ", 1)
+        if any(op in t for op in (" > ", " < ")):
             return f"!({t})"
         if t.endswith(')'):
             return f"!{t}"
@@ -335,12 +407,23 @@ class InverseSymbolResolver:
         return f"!({t})"
 
     def percent_to_ident_or_func(self, percent: str, section: SectionType | None) -> tuple[str, bool]:
+        """Convert percent block to identifier or function call."""
         match = Validator._PERCENT_RE.match(percent)
         if not match:
             raise SymbolResolutionError(percent, "Invalid %{...} reference")
 
         tag = match.group(1)
         payload = match.group(2)
+
+        # Handle multi-colon tags explicitly to ensure proper parsing
+        # Multi-colon parsing for certificate tags (CLIENT-CERT, SERVER-CERT) and query parameter tags (QUERY)
+        original_inner = percent[2:-1]
+        if ":" in original_inner:
+            if (any(cert_tag in original_inner for cert_tag in ["CLIENT-CERT", "SERVER-CERT"]) or
+                (payload and payload.startswith("QUERY:"))):
+                new_tag, new_payload = self.parse_percent_block(percent)
+                if new_tag != tag or new_payload != payload:
+                    tag, payload = new_tag, new_payload
 
         if types.BooleanLiteral.contains(tag):
             return tag, False
@@ -349,7 +432,10 @@ class InverseSymbolResolver:
             return percent, False
 
         if tag.startswith("STATE-"):
-            return self._handle_state_tag(tag, payload)
+            return self._handle_state_tag(tag, payload, types.VarScope.TXN)
+
+        if tag.startswith("SESSION-"):
+            return self._handle_state_tag(tag, payload, types.VarScope.SESSION)
 
         if tag == "IP" and payload:
             result = self._handle_ip_tag(payload)
@@ -386,6 +472,7 @@ class InverseSymbolResolver:
         raise SymbolResolutionError(percent, f"Unknown percent tag: {tag}")
 
     def op_to_hrw4u(self, cmd: str, args: list[str], section: SectionType | None, op_state: 'OperatorState') -> str:
+        """Convert HRW operation to hrw4u statement."""
         if cmd == "no-op" and op_state.last:
             return "break"
 
@@ -399,28 +486,32 @@ class InverseSymbolResolver:
         line = " ".join(toks)
 
         for var_type in types.VarType:
-            if cmd == var_type.op_tag:
-                if len(toks) < 3:
-                    raise SymbolResolutionError(line, f"Missing arguments for {cmd}")
-                try:
-                    index = int(toks[1])
-                    value = " ".join(toks[2:])
-                except ValueError:
-                    raise SymbolResolutionError(line, f"Invalid index for {cmd}: {toks[1]}")
+            for scope in types.VarScope:
+                op_tag = f"{scope.op_prefix}-{var_type.op_suffix}"
+                if cmd == op_tag:
+                    if len(toks) < 3:
+                        raise SymbolResolutionError(line, f"Missing arguments for {cmd}")
+                    try:
+                        index = int(toks[1])
+                        value = " ".join(toks[2:])
+                    except ValueError:
+                        raise SymbolResolutionError(line, f"Invalid index for {cmd}: {toks[1]}")
 
-                var_name = self._get_or_create_var_name(var_type, index)
-                if value.startswith('%{') and value.endswith('}'):
-                    rewritten_value, _ = self.percent_to_ident_or_func(value, section)
-                else:
-                    rewritten_value = self._rewrite_inline_percents(value, section)
-                return f"{var_name} = {rewritten_value}"
+                    var_name = self._get_or_create_var_name(var_type, index, scope)
+                    if value.startswith('%{') and value.endswith('}'):
+                        rewritten_value, _ = self.percent_to_ident_or_func(value, section)
+                    else:
+                        rewritten_value = self._rewrite_inline_percents(value, section)
+                    return f"{var_name} = {rewritten_value}"
 
-        for lhs_key, (commands, _, uppercase, _) in tables.OPERATOR_MAP.items():
+        for lhs_key, params in tables.OPERATOR_MAP.items():
+            commands = params.target if params else None
             if (isinstance(commands, (list, tuple)) and cmd in commands) or (cmd == commands):
+                uppercase = params.upper if params else False
                 return self._handle_operator_command(cmd, toks, lhs_key, uppercase, section)
 
-        for name, (forward_cmd, _) in tables.STATEMENT_FUNCTION_MAP.items():
-            if forward_cmd == cmd:
+        for name, params in tables.STATEMENT_FUNCTION_MAP.items():
+            if params.target == cmd:
                 return self._handle_statement_function(name, args, section, op_state)
 
         raise SymbolResolutionError(line, f"Unknown operator: {cmd}")

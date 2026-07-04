@@ -27,7 +27,13 @@ pv_server = Test.MakeVerifierServerProcess("pv_server", "http2_close_connection.
 ts = Test.MakeATSProcess('ts', select_ports=True, enable_tls=True)
 
 ts.addDefaultSSLFiles()
-ts.Disk.ssl_multicert_config.AddLine("dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key")
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 ts.Disk.records_config.update(
     {
         "proxy.config.http.server_ports": f"{ts.Variables.port} {ts.Variables.ssl_port}:ssl",
@@ -51,11 +57,7 @@ tr = Test.AddTestRun()
 tr.Processes.Default.StartBefore(pv_server)
 tr.Processes.Default.StartBefore(ts)
 tr.AddVerifierClientProcess(
-    "pv_client",
-    "http2_close_connection.yaml",
-    http_ports=[ts.Variables.port],
-    https_ports=[ts.Variables.ssl_port],
-    other_args='--thread-limit 1')
+    "pv_client", "http2_close_connection.yaml", http_ports=[ts.Variables.port], https_ports=[ts.Variables.ssl_port])
 tr.Processes.Default.ReturnCode = 0
 
 tr.Processes.Default.Streams.All += Testers.ContainsExpression(

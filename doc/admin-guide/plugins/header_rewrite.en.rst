@@ -153,9 +153,19 @@ like the following::
 Which converts any 4xx HTTP status code from the origin server to a 404. A
 response from the origin with a status of 200 would be unaffected by this rule.
 
+Advanced Conditionals
+---------------------
+
+The header_rewrite plugin supports advanced conditional logic that allows
+for more sophisticated rule construction, including branching logic, nested
+conditionals, and complex boolean expressions.
+
+else and elif Clauses
+~~~~~~~~~~~~~~~~~~~~~
+
 An optional ``else`` clause may be specified, which will be executed if the
-conditions are not met. The ``else`` clause is specified by starting a new line
-with the word ``else``. The following example illustrates this::
+conditions are not met. The ``else`` clause is specified by starting a new
+line with the word ``else``. The following example illustrates this::
 
     cond %{STATUS} >399 [AND]
     cond %{STATUS} <500
@@ -164,10 +174,12 @@ with the word ``else``. The following example illustrates this::
       set-status 503
 
 The ``else`` clause is not a condition, and does not take any flags, it is
-of course optional, but when specified must be followed by at least one operator.
+of course optional, but when specified must be followed by at least one
+operator.
 
-You can also do an ``elif`` (else if) clause, which is specified by starting a new line
-with the word ``elif``. The following example illustrates this::
+You can also do an ``elif`` (else if) clause, which is specified by
+starting a new line with the word ``elif``. The following example
+illustrates this::
 
     cond %{STATUS} >399 [AND]
     cond %{STATUS} <500
@@ -178,13 +190,104 @@ with the word ``elif``. The following example illustrates this::
     else
       set-status 503
 
-Keep in mind that nesting the ``else`` and ``elif`` clauses is not allowed, but any
-number of ``elif`` clauses can be specified. We can consider these clauses are more
-powerful and flexible ``switch`` statement. In an ``if-elif-else`` rule, only one
-will evaluate its operators.
+Any number of ``elif`` clauses can be specified. We can consider these
+clauses are more powerful and flexible ``switch`` statement. In an
+``if-elif-else`` rule, only one will evaluate its operators.
+
+Note that while ``else`` and ``elif`` themselves cannot be directly nested,
+you can use ``if``/``endif`` blocks within ``else`` or ``elif`` operator
+sections to achieve nested conditional logic (see `Nested Conditionals with
+if/endif`_).
 
 Similarly, each ``else`` and ``elif`` have the same implied
 :ref:`Hook Condition <hook_conditions>` as the initial condition.
+
+Nested Conditionals with if/endif
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For more complex logic requiring nested conditionals, the ``if`` and
+``endif`` pseudo-operators can be used. While ``else`` and ``elif``
+themselves cannot be directly nested, you can use ``if``/``endif`` blocks
+within any operator section (including inside ``else`` or ``elif`` blocks)
+to achieve arbitrary nesting depth.
+
+The ``if`` operator starts a new conditional block, and ``endif`` closes
+it. Each ``if`` must have a matching ``endif``. Here's an example::
+
+    cond %{READ_RESPONSE_HDR_HOOK} [AND]
+    cond %{STATUS} >399
+      if
+        cond %{HEADER:X-Custom-Error} ="true"
+          set-header X-Error-Handled "yes"
+        else
+          set-header X-Error-Handled "no"
+      endif
+      set-status 500
+
+In this example, the nested ``if``/``endif`` block is only evaluated when
+the status is greater than 399. The nested block itself can contain
+``else`` or ``elif`` clauses, and you can nest multiple levels deep::
+
+    cond %{READ_RESPONSE_HDR_HOOK}
+      if
+        cond %{STATUS} =404
+          if
+            cond %{CLIENT-HEADER:User-Agent} /mobile/
+              set-header X-Error-Type "mobile-404"
+            else
+              set-header X-Error-Type "desktop-404"
+          endif
+      elif
+        cond %{STATUS} =500
+          set-header X-Error-Type "server-error"
+      endif
+
+GROUP Conditions in Advanced Conditionals
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `GROUP`_ condition can be combined with advanced conditionals to
+create very sophisticated boolean expressions. ``GROUP`` conditions act as
+parentheses in your conditional logic, allowing you to mix AND, OR, and NOT
+operators in complex ways.
+
+Here's an example combining ``GROUP`` with ``if``/``endif``::
+
+    cond %{READ_RESPONSE_HDR_HOOK} [AND]
+    cond %{STATUS} >399
+      if
+        cond %{GROUP} [OR]
+          cond %{CLIENT-HEADER:X-Retry} ="true" [AND]
+          cond %{METHOD} =GET
+        cond %{GROUP:END}
+        cond %{CLIENT-HEADER:X-Force-Cache} ="" [NOT]
+          set-header X-Can-Retry "yes"
+      else
+        set-header X-Can-Retry "no"
+      endif
+      set-status 500
+
+This creates the logic: if error status, then set retry header when
+``((X-Retry=true AND METHOD=GET) OR X-Force-Cache header exists)``.
+The GROUP is necessary here to properly combine the two conditions with OR.
+
+You can also use ``GROUP`` with ``else`` and ``elif`` inside nested conditionals::
+
+    cond %{SEND_RESPONSE_HDR_HOOK} [AND]
+    cond %{STATUS} >399
+      if
+        cond %{GROUP} [OR]
+          cond %{HEADER:X-Custom} ="retry" [AND]
+          cond %{METHOD} =POST
+        cond %{GROUP:END}
+        cond %{HEADER:Content-Type} /json/
+          set-header X-Error-Handler "json-retry"
+        elif
+          cond %{METHOD} =GET
+            set-header X-Error-Handler "get-error"
+        else
+          set-header X-Error-Handler "standard"
+      endif
+      set-status 500
 
 State variables
 ---------------
@@ -266,6 +369,25 @@ header operated on by this condition will be a comma separated string of the
 values from every occurrence of the header. More details are provided in
 `Repeated Headers`_ below.
 
+SERVER-HEADER
+~~~~~~~~~~~~~
+::
+
+    cond %{SERVER-HEADER:<name>} <operand>
+
+Value of the header ``<name>`` from the request sent to the origin server
+(regardless of the hook context in which the rule is being evaluated). This is
+useful when you need to check headers that have been modified or added during
+the request processing before being sent to the origin. Note that some headers
+may appear in an HTTP message more than once. In these cases, the value of the
+header operated on by this condition will be a comma separated string of the
+values from every occurrence of the header. More details are provided in
+`Repeated Headers`_ below.
+
+Note that the server request headers are only available after the
+``SEND_REQUEST_HDR_HOOK`` has been reached. Using this condition in earlier
+hooks will result in an empty value.
+
 CLIENT-URL
 ~~~~~~~~~~
 ::
@@ -281,6 +403,20 @@ Note that the HOST ``<part>`` of the CLIENT-URL might not be set until the remap
 phase of the transaction.  This happens when there is no host in the incoming URL
 and only set as a host header.  During the remap phase the host header is copied
 to the CLIENT-URL.  Use CLIENT-HEADER:Host if you are going to match the host.
+
+SERVER-URL
+~~~~~~~~~~
+::
+
+    cond %{SERVER-URL:<part>} <operand>
+
+The URL of the request being sent to the origin server. This is the URL after
+any remapping and modifications have been applied. The ``<part>`` may be
+specified according to the options documented in `URL Parts`_.
+
+Note that the server request URL is only available after the
+``SEND_REQUEST_HDR_HOOK`` has been reached. Using this condition in earlier
+hooks will result in an empty value.
 
 CIDR
 ~~~~
@@ -647,6 +783,7 @@ are supported::
 
     %{NEXT-HOP:HOST} Name of the current selected parent.
     %{NEXT-HOP:PORT} Port of the current selected parent.
+    %{NEXT-HOP:STRATEGY} Name of the current strategy (can be "" if not using a strategy)
 
 Note that the ``<part>`` of NEXT-HOP will likely not be available unless
 an origin server connection is attempted at which point it will available
@@ -724,6 +861,41 @@ This condition allows you to check the state of an 16-bit unsigned integer.
 There's only one such integer, and its value is returned from this condition.
 As such, the index, ``0``, is optional here. The initialized value of this
 state variable is ``0``.
+
+SESSION-FLAG
+~~~~~~~~~~~~
+::
+
+      cond %{SESSION-FLAG:<n>}
+
+This condition allows you to check the state of a session-scoped flag. The
+``<n>`` is the number of the flag, from 0 to 15. Unlike ``STATE-FLAG`` which
+is scoped to the current transaction, session flags persist across all
+transactions on the same client connection (session). The default value of all
+flags are ``false``.
+
+SESSION-INT8
+~~~~~~~~~~~~
+::
+
+      cond %{SESSION-INT8:<n>}
+
+This condition allows you to check the state of a session-scoped 8-bit unsigned
+integer. The ``<n>`` is the number of the integer, from 0 to 3. The current
+value is returned, and all 4 integers are initialized to 0. Session integers
+persist across all transactions on the same client connection.
+
+SESSION-INT16
+~~~~~~~~~~~~~
+::
+
+      cond %{SESSION-INT16:<0>}
+
+This condition allows you to check the state of a session-scoped 16-bit unsigned
+integer. There's only one such integer, and its value is returned from this
+condition. As such, the index, ``0``, is optional here. The initialized value
+is ``0``. Session integers persist across all transactions on the same client
+connection.
 
 STATUS
 ~~~~~~
@@ -839,23 +1011,26 @@ The condition flags are optional, and you can combine more than one into
 a comma-separated list of flags. Note that whitespaces are not allowed inside
 the brackets:
 
-====== ========================================================================
-Flag   Description
-====== ========================================================================
-AND    Indicates that both the current condition and the next must be true.
-       This is the default behavior for all conditions when no flags are
-       provided.
-NOT    Inverts the condition.
-OR     Indicates that either the current condition or the next one must be
-       true, as contrasted with the default behavior from ``[AND]``.
-NOCASE Indicates that the string comparison, or regular expression, should be
-       case-insensitive. The default is to be case-sensitive.
-PRE    Make a prefix match on a string comparison.
-SUF    Make a suffix match on a string comparison.
-MID    Make a substring match on a string comparison.
-EXT    The substring match only applies to the file extension following a dot.
-       This is generally mostly useful for the ``URL:PATH`` part.
-====== ========================================================================
+.. table:: Condition Flags
+   :widths: 15 85
+
+   ====== ========================================================================
+   Flag   Description
+   ====== ========================================================================
+   AND    Indicates that both the current condition and the next must be true.
+          This is the default behavior for all conditions when no flags are
+          provided.
+   NOT    Inverts the condition.
+   OR     Indicates that either the current condition or the next one must be
+          true, as contrasted with the default behavior from ``[AND]``.
+   NOCASE Indicates that the string comparison, or regular expression, should be
+          case-insensitive. The default is to be case-sensitive.
+   PRE    Make a prefix match on a string comparison.
+   SUF    Make a suffix match on a string comparison.
+   MID    Make a substring match on a string comparison.
+   EXT    The substring match only applies to the file extension following a dot.
+          This is generally mostly useful for the ``URL:PATH`` part.
+   ====== ========================================================================
 
 .. note::
     At most, one of ``[PRE]``, ``[SUF]``, ``[MID]``, or ``[EXT]`` may be
@@ -921,6 +1096,29 @@ Counters can only increment by 1 each time this operator is invoked. There is
 no facility to increment by other amounts, nor is it possible to initialize the
 counter with any value other than ``0``. Additionally, the counter will reset
 whenever |TS| is restarted.
+
+if
+~~
+::
+
+  if
+    <conditions>
+    <operators>
+  endif
+
+This is a pseudo-operator that enables nested conditional blocks within
+the operator section of a rule. While ``else`` and ``elif`` themselves
+cannot be directly nested, you can use ``if``/``endif`` blocks within any
+operator section (including inside ``else`` or ``elif`` blocks) to create
+arbitrary nesting depth for complex conditional logic.
+
+The ``if`` operator must be preceded by conditions and followed by at
+least one condition or operator. Each ``if`` must have a matching
+``endif`` to close the block. Within an ``if``/``endif`` block, you can
+use regular conditions, operators, and even ``else`` and ``elif`` clauses.
+
+For detailed usage and examples, see `Nested Conditionals with if/endif`_
+in the `Advanced Conditionals`_ section.
 
 no-op
 ~~~~~
@@ -1083,6 +1281,18 @@ if necessary.
 The header's ``<value>`` may be a literal string, or take advantage of
 `String concatenations`_ to calculate a dynamic value for the header.
 
+set-next-hop-strategy
+~~~~~~~~~~~~~~~~~~~~~
+::
+
+  set-next-hop-strategy <name>
+
+Replaces/Sets the current next hop parent selection strategy with
+the matching strategy specified in `strategies.yaml`
+
+Setting to "null" removes the current strategy which will fall back
+to other methods (ie: parent.config or remap to url).
+
 set-redirect
 ~~~~~~~~~~~~
 ::
@@ -1128,6 +1338,42 @@ This operator allows you to set the state of a 16-bit unsigned integer.
 The ``<value>`` is an unsigned 16-bit integer as well, 0-65535. It can also
 be a condition, in which case thevalue of the condition is used. The index,
 0, is always required eventhough there is only one 16-bit integer state variable.
+
+set-session-flag
+~~~~~~~~~~~~~~~~
+::
+
+  set-session-flag <n> <value>
+
+This operator allows you to set the state of a session-scoped flag. The ``<n>``
+is the number of the flag, from 0 to 15. The ``<value>`` is either ``true`` or
+``false``, turning the flag on or off. Unlike ``set-state-flag``, session flags
+persist across all transactions on the same client connection.
+
+set-session-int8
+~~~~~~~~~~~~~~~~
+::
+
+   set-session-int8 <n> <value>
+
+This operator allows you to set the state of a session-scoped 8-bit unsigned
+integer. The ``<n>`` is the number of the integer, from 0 to 3. The ``<value>``
+is an unsigned 8-bit integer, 0-255. It can also be a condition, in which case
+the value of the condition is used. Session integers persist across all
+transactions on the same client connection.
+
+set-session-int16
+~~~~~~~~~~~~~~~~~
+::
+
+   set-session-int16 0 <value>
+
+This operator allows you to set the state of a session-scoped 16-bit unsigned
+integer. The ``<value>`` is an unsigned 16-bit integer, 0-65535. It can also
+be a condition, in which case the value of the condition is used. The index,
+0, is always required even though there is only one 16-bit session integer
+state variable. Session integers persist across all transactions on the same
+client connection.
 
 set-status
 ~~~~~~~~~~
@@ -1208,6 +1454,8 @@ TXN_DEBUG        Enable transaction debugging (default: ``off``)
 SKIP_REMAP       Don't require a remap match for the transaction (default: ``off``)
 ================ ====================================================================
 
+.. _admin-plugins-header-rewrite-plugin-cntl:
+
 set-plugin-cntl
 ~~~~~~~~~~~~~~~
 ::
@@ -1238,6 +1486,32 @@ If ``PROXY`` is set, and PROXY protocol is used, the source IP address provided 
 
 .. note::
     The conditions return an empty string if the source is set to ``PROXY`` but PROXY protocol header does not present.
+
+set-effective-address
+~~~~~~~~~~~~~~~~~~~~~
+::
+
+  set-effective-address <address>
+
+This operator allows you to set client's effective address for a transaction. The address will be used on other conditions and
+operators that use client's IP address.
+
+.. note::
+    This operator also changes `INBOUND_IP_SOURCE` to `PLUGIN` to make the address available for other conditions and operators.
+    See `set-plugin-cntl`_ for the detail.
+
+set-cc-alg
+~~~~~~~~~~
+::
+
+  set-cc-alg <value>
+
+This operator lets you set the congestion control algorithm for a particular transaction.
+This will only work if your os supports TCP_CONGESTION at the protocol level IPPROTO_TCP.
+Supported algorithms are operating system dependent. Common algorithms include reno and cubic.
+
+
+.......
 
 Operator Flags
 --------------
@@ -1297,37 +1571,80 @@ parameters by writing it as::
 
 The URL part names which may be used for these conditions and actions are:
 
-.. code-block::
+.. graphviz::
+   :alt: URL Parts Diagram
+   :align: center
 
-  ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-  │                                          URL                                            │
-  ├─────────────────────────────────────────────────────────────────────────────────────────┤
-  │  https://docs.trafficserver.apache.org:443/en/latest/search.html?q=header_rewrite&...   │
-  │  ┬────   ┬──────────────────────────── ┬── ─┬─────────────────── ┬───────────────────   │
-  │  │       │                             │    │                    │                      │
-  │  SCHEME  HOST                          PORT PATH                 QUERY                  │
-  └─────────────────────────────────────────────────────────────────────────────────────────┘
+   digraph url_parts {
+     node [shape=none, fontname="Courier"];
 
-======== ======================================================================
-Part     Description and value for ``https://docs.trafficserver.apache.org/en/latest/search.html?q=header_rewrite``
-======== ======================================================================
-SCHEME   URL scheme in use (e.g. ``http`` and ``https``). ``Value`` = `https`
+     url_diagram [label=<
+       <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0">
+         <TR><TD COLSPAN="9" ALIGN="CENTER" BGCOLOR="lightgray"><B>URL</B></TD></TR>
+         <TR>
+           <TD BORDER="0" BGCOLOR="lightyellow">https</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">://</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">docs.trafficserver.apache.org</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">:</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">443</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">/en/latest/search.html</TD>
+           <TD BORDER="0" BGCOLOR="lightyellow">?p=hrw&amp;v=1</TD>
+         </TR>
+         <TR>
+           <TD ALIGN="CENTER"><FONT POINT-SIZE="8">│</FONT></TD>
+           <TD BORDER="0"></TD>
+           <TD ALIGN="CENTER"><FONT POINT-SIZE="8">│</FONT></TD>
+           <TD BORDER="0"></TD>
+           <TD ALIGN="CENTER"><FONT POINT-SIZE="8">│</FONT></TD>
+           <TD ALIGN="CENTER"><FONT POINT-SIZE="8">│</FONT></TD>
+           <TD ALIGN="CENTER"><FONT POINT-SIZE="8">│</FONT></TD>
+         </TR>
+         <TR>
+           <TD ALIGN="CENTER" BGCOLOR="lightblue">SCHEME</TD>
+           <TD BORDER="0"></TD>
+           <TD ALIGN="CENTER" BGCOLOR="palegreen">HOST</TD>
+           <TD BORDER="0"></TD>
+           <TD ALIGN="CENTER" BGCOLOR="lightcyan">PORT</TD>
+           <TD ALIGN="CENTER" BGCOLOR="wheat">PATH</TD>
+           <TD ALIGN="CENTER" BGCOLOR="lavender">QUERY</TD>
+         </TR>
+       </TABLE>
+     >];
+   }
 
-HOST     Full hostname. ``Value`` = `docs.trafficserver.apache.org`
+.. table:: URL Part Descriptions
+   :widths: 10 90
 
-PORT     Port number. (Regardless if directly specified in the URL). ``Value`` = `443`
+   ========== ======================================================================
+   Part       Description and value for the URL above
+   ========== ======================================================================
+   SCHEME     URL scheme in use (e.g. ``http`` and ``https``). ``Value`` = `https`
 
-PATH     URL substring beginning with (but not including) the first ``/`` after
-         the hostname up to, but not including, the query string. **Note**: previous
-         versions of ATS had a `%{PATH}` directive, this will no longer work. Instead,
-         you want to use `%{CLIENT-URL:PATH}`. ``Value`` = `en/latest/search.html`
+   HOST       Full hostname. ``Value`` = `docs.trafficserver.apache.org`
 
-QUERY    URL substring from the ``?``, signifying the beginning of the query
-         parameters, until the end of the URL. Empty string if there were no
-         query parameters. ``Value`` = `  `
+   PORT       Port number. (Regardless if directly specified in the URL). ``Value`` = `443`
 
-URL      The complete URL.  ``Value`` = `https://docs.trafficserver.apache.org/en/latest/search.html?q=header_rewrite`
-======== ======================================================================
+   PATH       URL substring beginning with (but not including) the first ``/`` after
+              the hostname up to, but not including, the query string. **Note**: previous
+              versions of ATS had a `%{PATH}` directive, this will no longer work. Instead,
+              you want to use `%{CLIENT-URL:PATH}`. ``Value`` = `en/latest/search.html`
+
+   QUERY      URL substring from the ``?``, signifying the beginning of the query
+              parameters, until the end of the URL. Empty string if there were no
+              query parameters. ``Value`` = `p=hrw&v=1`
+
+              A specific query parameter value can be extracted using the sub-key
+              syntax ``QUERY:<param_name>``. For example, ``%{CLIENT-URL:QUERY:p}``
+              would return ``hrw`` for the URL above. If there are duplicate query
+              parameter names, the first value listed wins.
+
+              .. note::
+                 Query parameter names and values are matched as-is without URL
+                 decoding. For example, ``%{CLIENT-URL:QUERY:my%20param}`` matches
+                 the literal parameter name ``my%20param``, not ``my param``.
+
+   URL        The complete URL.  ``Value`` = `https://docs.trafficserver.apache.org/...`
+   ========== ======================================================================
 
 As another example, a remap rule might use the `set-destination`_ operator to
 change just the hostname via::
@@ -1660,9 +1977,11 @@ already set to some value, and the status code is a 2xx::
 Add a response header for certain status codes
 ----------------------------------------------
 
+This rule will set a header ``X-Redirect-Status`` but only for a set of status codes::
+
    cond %{SEND_RESPONSE_HDR_HOOK} [AND]
    cond %{STATUS} (301,302,307,308)
-   set-header X-Redirect-Status %{STATUS}
+      set-header X-Redirect-Status %{STATUS}
 
 Add HSTS
 --------
@@ -1795,3 +2114,17 @@ Those will pick the address provided by PROXY protocol, instead of the peer's ad
 
    cond %{SEND_RESPONSE_HDR_HOOK}
       set-header real-ip %{INBOUND:REMOTE-ADDR}
+
+Route Based on Query Parameter Value
+------------------------------------
+
+This rule extracts a specific query parameter value and uses it to set a custom
+header or make routing decisions. The ``QUERY:<param_name>`` sub-key syntax
+allows extracting individual query parameter values::
+
+   cond %{REMAP_PSEUDO_HOOK} [AND]
+   cond %{CLIENT-URL:QUERY:version} ="v2"
+      set-destination HOST api-v2.example.com
+
+   cond %{SEND_RESPONSE_HDR_HOOK}
+      set-header X-API-Version %{CLIENT-URL:QUERY:version}

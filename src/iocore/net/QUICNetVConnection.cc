@@ -50,7 +50,7 @@ DbgCtl dbg_ctl_v_quic_net{"v_quic_net"};
 #define QUICConDebug(fmt, ...)  Dbg(dbg_ctl_quic_net, "[%s] " fmt, this->cids().data(), ##__VA_ARGS__)
 #define QUICConVDebug(fmt, ...) Dbg(dbg_ctl_v_quic_net, "[%s] " fmt, this->cids().data(), ##__VA_ARGS__)
 
-ClassAllocator<QUICNetVConnection> quicNetVCAllocator("quicNetVCAllocator");
+ClassAllocator<QUICNetVConnection, false> quicNetVCAllocator("quicNetVCAllocator");
 
 QUICNetVConnection::QUICNetVConnection()
 {
@@ -533,7 +533,7 @@ QUICNetVConnection::net_read_io(NetHandler * /* nh ATS_UNUSED */)
 
 int64_t
 QUICNetVConnection::load_buffer_and_write(int64_t /* towrite ATS_UNUSED */, MIOBufferAccessor & /* buf ATS_UNUSED */,
-                                          int64_t & /* total_written ATS_UNUSED */, int & /* needs ATS_UNUSED */)
+                                          int64_t & /* total_written ATS_UNUSED */)
 {
   return 0;
 }
@@ -766,7 +766,7 @@ QUICNetVConnection::get_quic_connection()
 }
 
 void
-QUICNetVConnection::reenable(int event)
+QUICNetVConnection::reenable_with_event(int event)
 {
   this->_is_verifying_cert = false;
 
@@ -808,10 +808,26 @@ QUICNetVConnection::_get_ssl_object() const
 ssl_curve_id
 QUICNetVConnection::_get_tls_curve() const
 {
-  if (getSSLSessionCacheHit()) {
+  // For resumed server side session caching, we have to retrieve the curve/group
+  // from our stored data. For non-resumed sessions or from ticket based resumption,
+  // simply query the SSL object.
+  if (getIsResumedFromSessionCache()) {
     return getSSLCurveNID();
   } else {
     return SSLGetCurveNID(this->_ssl);
+  }
+}
+
+std::string_view
+QUICNetVConnection::_get_tls_group() const
+{
+  // For resumed server side session caching, we have to retrieve the curve/group
+  // from our stored data. For non-resumed sessions or from ticket based resumption,
+  // simply query the SSL object.
+  if (getIsResumedFromSessionCache()) {
+    return getSSLGroupName();
+  } else {
+    return SSLGetGroupName(this->_ssl);
   }
 }
 

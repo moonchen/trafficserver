@@ -34,6 +34,7 @@
 #include "proxy/logging/RolledLogDeleter.h"
 #include "swoc/MemSpan.h"
 #include "tsutil/Metrics.h"
+#include "mgmt/config/ReloadCoordinator.h"
 
 using ts::Metrics;
 
@@ -48,6 +49,7 @@ struct LogsStatsBlock {
   Metrics::Counter::AtomicType *event_log_access_aggr;
   Metrics::Counter::AtomicType *event_log_access_full;
   Metrics::Counter::AtomicType *event_log_access_fail;
+  Metrics::Counter::AtomicType *marshalled_bytes;
   Metrics::Counter::AtomicType *num_sent_to_network;
   Metrics::Counter::AtomicType *num_lost_before_sent_to_network;
   Metrics::Counter::AtomicType *num_received_from_network;
@@ -103,10 +105,13 @@ public:
   void display(FILE *fd = stdout);
   void setup_log_objects();
 
-  static int reconfigure(const char *name, RecDataT data_type, RecData data, void *cookie);
+  // static int reconfigure(const char *name, RecDataT data_type, RecData data, void *cookie);
+  static void reconfigure(ConfigContext ctx = {}); // ConfigRegistry reload handler
 
   static void register_config_callbacks();
   static void register_stat_callbacks();
+
+  ConfigContext reload_ctx; ///< Tracks reload status;
 
   bool space_to_write(int64_t bytes_to_write) const;
 
@@ -163,8 +168,8 @@ public:
   bool    reconfiguration_needed  = false;
   bool    logging_space_exhausted = false;
   int64_t m_space_used            = 0;
-  int64_t m_partition_space_left;
-  bool    roll_log_files_now; // signal that files must be rolled
+  int64_t m_partition_space_left  = static_cast<int64_t>(UINT_MAX);
+  bool    roll_log_files_now      = false; // signal that files must be rolled
 
   LogObjectManager log_object_manager;
 

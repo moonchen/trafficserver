@@ -478,7 +478,7 @@ Http2ConnectionState::rcv_headers_frame(const Http2Frame &frame)
                                                          this->acknowledged_local_settings.get(HTTP2_SETTINGS_HEADER_TABLE_SIZE));
 
     // If this was an outbound connection and the state was already closed, just clear the
-    // headers after processing.  We just processed the heaer blocks to keep the dynamic table in
+    // headers after processing.  We just processed the header blocks to keep the dynamic table in
     // sync with peer to avoid future HPACK compression errors
     if (reset_header_after_decoding) {
       stream->reset_receive_headers();
@@ -496,6 +496,9 @@ Http2ConnectionState::rcv_headers_frame(const Http2Frame &frame)
         return Http2Error(Http2ErrorClass::HTTP2_ERROR_CLASS_CONNECTION, Http2ErrorCode::HTTP2_ERROR_ENHANCE_YOUR_CALM,
                           "recv headers enhance your calm");
       } else {
+        if (!stream->trailing_header_is_possible() && !stream->is_outbound_connection()) {
+          stream->log_non_http_sm_access(stream->get_receive_header(), "http/2");
+        }
         return Http2Error(Http2ErrorClass::HTTP2_ERROR_CLASS_STREAM, Http2ErrorCode::HTTP2_ERROR_PROTOCOL_ERROR,
                           "recv headers malformed request");
       }
@@ -1108,6 +1111,9 @@ Http2ConnectionState::rcv_continuation_frame(const Http2Frame &frame)
         return Http2Error(Http2ErrorClass::HTTP2_ERROR_CLASS_CONNECTION, Http2ErrorCode::HTTP2_ERROR_ENHANCE_YOUR_CALM,
                           "continuation enhance your calm");
       } else {
+        if (!stream->trailing_header_is_possible() && !stream->is_outbound_connection()) {
+          stream->log_non_http_sm_access(stream->get_receive_header(), "http/2");
+        }
         return Http2Error(Http2ErrorClass::HTTP2_ERROR_CLASS_CONNECTION, Http2ErrorCode::HTTP2_ERROR_PROTOCOL_ERROR,
                           "continuation malformed request");
       }
@@ -1300,7 +1306,7 @@ Http2ConnectionState::init(Http2CommonSession *ssn)
 
   // Generally speaking, before enforcing h2 settings we wait upon the client to
   // acknowledge the settings via a SETTINGS ACK. This is important for things
-  // like correctly handling windows. Howerver, the RFC default values for
+  // like correctly handling windows. However, the RFC default values for
   // MAX_CONCURRENT_STREAMS and MAX_HEADER_SIZE are infinite, which is not
   // practical and a client can run ATS out of resources by simply opening up
   // more streams than is reasonable. We enforce our configured defaults before
@@ -1369,10 +1375,7 @@ Http2ConnectionState::send_connection_preface()
   configured_settings.set(HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, _adjust_concurrent_stream());
 
   uint32_t const configured_initial_window_size = this->_get_configured_receive_session_window_size();
-  if (this->_has_dynamic_stream_window()) {
-    // Since this is the beginning of the connection and there are no streams
-    // yet, we can just set the stream window size to fill the entire session
-    // window size.
+  if (configured_initial_window_size > HTTP2_INITIAL_WINDOW_SIZE) {
     configured_settings.set(HTTP2_SETTINGS_INITIAL_WINDOW_SIZE, configured_initial_window_size);
   }
 
@@ -1696,7 +1699,7 @@ Http2ConnectionState::create_initiating_stream(Http2Error &error)
   // If this is an outbound client stream, must check against the peer's max_concurrent
   if (session->is_outbound()) {
     check_max_concurrent_limit = peer_settings.get(HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
-  } else { // Inbound client streamm check against our own max_connecurent limits
+  } else { // Inbound client stream check against our own max_connecurent limits
     check_max_concurrent_limit = local_settings.get(HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
   }
   ink_release_assert(check_max_concurrent_limit != 0);
@@ -1878,7 +1881,7 @@ Http2ConnectionState::create_stream(Http2StreamId new_id, Http2Error &error)
 
   // Set incomplete header timeout
   //   Client should send END_HEADERS flag within the http2.incomplete_header_timeout_in.
-  //   The active timeout of this stream will be reset by HttpSM with http.transction_active_timeout_in when a HTTP TXN is started
+  //   The active timeout of this stream will be reset by HttpSM with http.transaction_active_timeout_in when a HTTP TXN is started
   new_stream->set_active_timeout(HRTIME_SECONDS(Http2::incomplete_header_timeout_in));
 
   // Clear the session timeout.  Let the transaction timeouts reign

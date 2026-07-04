@@ -28,6 +28,9 @@
 #include "iocore/eventsystem/Continuation.h"
 #include "iocore/aio/AIO.h"
 #include "tscore/Version.h"
+#include "tscore/hugepages.h"
+
+#include <ts/ats_probe.h>
 
 #include <cstdint>
 #include <ctime>
@@ -246,13 +249,28 @@ struct CacheSync : public Continuation {
   AIOCallback io;
   Event      *trigger    = nullptr;
   ink_hrtime  start_time = 0;
-  int         mainEvent(int event, Event *e);
-  void        aio_write(int fd, char *b, int n, off_t o);
+
+  std::vector<int> stripe_indices;
+  int              current_index{0};
+
+  int  mainEvent(int event, Event *e);
+  void aio_write(int fd, char *b, int n, off_t o);
 
   CacheSync() : Continuation(new_ProxyMutex()) { SET_HANDLER(&CacheSync::mainEvent); }
+
+  ~CacheSync()
+  {
+    if (buf) {
+      if (buf_huge) {
+        ats_free_hugepage(buf, buflen);
+      } else {
+        ats_free(buf);
+      }
+    }
+  }
 };
 
-struct StripteHeaderFooter {
+struct StripeHeaderFooter {
   unsigned int      magic;
   ts::VersionNumber version;
   time_t            create_time;
@@ -270,13 +288,17 @@ struct StripteHeaderFooter {
   uint16_t          freelist[1];
 };
 
-struct Directory {
-  char                *raw_dir{nullptr};
-  Dir                 *dir{};
-  StripteHeaderFooter *header{};
-  StripteHeaderFooter *footer{};
-  int                  segments{};
-  off_t                buckets{};
+class Directory
+{
+public:
+  char               *raw_dir{nullptr};
+  Dir                *dir{};
+  StripeHeaderFooter *header{};
+  StripeHeaderFooter *footer{};
+  int                 segments{};
+  off_t               buckets{};
+  size_t              raw_dir_size{0};     // size of raw_dir allocation (for freeing hugepages)
+  bool                raw_dir_huge{false}; // true if raw_dir was allocated with hugepages
 
   /* Total number of dir entries.
    */
@@ -292,25 +314,19 @@ struct Directory {
   int      remove(const CacheKey *key, StripeSM *stripe, Dir *del);
   void     free_entry(Dir *e, int s);
   int      check();
-  void     cleanup(Stripe *stripe);
-  void     clear_range(off_t start, off_t end, Stripe *stripe);
+  void     cleanup(StripeSM *stripe);
+  void     clear_range(off_t start, off_t end, StripeSM *stripe);
   uint64_t entries_used();
   int      bucket_length(Dir *b, int s);
   int      freelist_length(int s);
-  void     clean_segment(int s, Stripe *stripe);
+  void     clean_segment(int s, StripeSM *stripe);
+  void     init_segment(int s);
+  int      bucket_loop_fix(Dir *start_dir, int s);
+  Dir     *delete_entry(Dir *e, Dir *p, int s);
+
+private:
+  void unlink_from_freelist(Dir *e, int s);
 };
-
-inline int
-Directory::entries() const
-{
-  return this->buckets * DIR_DEPTH * this->segments;
-}
-
-inline Dir *
-Directory::get_segment(int s) const
-{
-  return reinterpret_cast<Dir *>((reinterpret_cast<char *>(this->dir)) + (s * this->buckets) * DIR_DEPTH * SIZEOF_DIR);
-}
 
 // Global Functions
 
@@ -375,4 +391,65 @@ inline Dir *
 dir_bucket_row(Dir *b, int64_t i)
 {
   return dir_in_seg(b, i);
+}
+
+inline int
+Directory::entries() const
+{
+  return this->buckets * DIR_DEPTH * this->segments;
+}
+
+inline Dir *
+Directory::get_segment(int s) const
+{
+  return reinterpret_cast<Dir *>((reinterpret_cast<char *>(this->dir)) + (s * this->buckets) * DIR_DEPTH * SIZEOF_DIR);
+}
+
+inline void
+Directory::unlink_from_freelist(Dir *e, int s)
+{
+  Dir *seg = this->get_segment(s);
+  Dir *p   = dir_from_offset(dir_prev(e), seg);
+  if (p) {
+    dir_set_next(p, dir_next(e));
+  } else {
+    this->header->freelist[s] = dir_next(e);
+  }
+  Dir *n = dir_from_offset(dir_next(e), seg);
+  if (n) {
+    dir_set_prev(n, dir_prev(e));
+  }
+}
+
+inline Dir *
+Directory::delete_entry(Dir *e, Dir *p, int s)
+{
+  Dir *seg            = this->get_segment(s);
+  int  no             = dir_next(e);
+  this->header->dirty = 1;
+  if (p) {
+    unsigned int fo = this->header->freelist[s];
+    unsigned int eo = dir_to_offset(e, seg);
+    dir_clear(e);
+    dir_set_next(p, no);
+    dir_set_next(e, fo);
+    if (fo) {
+      dir_set_prev(dir_from_offset(fo, seg), eo);
+    }
+    this->header->freelist[s] = eo;
+  } else {
+    Dir *n = next_dir(e, seg);
+    if (n) {
+      // "Shuffle" here means that we're copying the second entry's data to the head entry's location, and removing the second entry
+      // - because the head entry can't be moved.
+      ATS_PROBE3(cache_dir_shuffle, s, dir_to_offset(e, seg), dir_to_offset(n, seg));
+      dir_assign(e, n);
+      this->delete_entry(n, e, s);
+      return e;
+    } else {
+      dir_clear(e);
+      return nullptr;
+    }
+  }
+  return dir_from_offset(no, seg);
 }

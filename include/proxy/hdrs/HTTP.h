@@ -162,6 +162,7 @@ enum class SquidLogCode {
   ERR_FUTURE_1              = 'I',
   ERR_CLIENT_READ_ERROR     = 'J', // Client side abort logging
   ERR_LOOP_DETECTED         = 'K', // Loop or cycle detected, request came back to this server
+  ERR_TUN_ACTIVE_TIMEOUT    = 'T', // Tunnel (CONNECT) active timeout
   ERR_UNKNOWN               = 'Z'
 };
 
@@ -368,6 +369,7 @@ extern c_str_view HTTP_VALUE_COMPRESS;
 extern c_str_view HTTP_VALUE_DEFLATE;
 extern c_str_view HTTP_VALUE_GZIP;
 extern c_str_view HTTP_VALUE_BROTLI;
+extern c_str_view HTTP_VALUE_ZSTD;
 extern c_str_view HTTP_VALUE_IDENTITY;
 extern c_str_view HTTP_VALUE_KEEP_ALIVE;
 extern c_str_view HTTP_VALUE_MAX_AGE;
@@ -420,7 +422,15 @@ ParseResult http_parser_parse_req(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl
                                   bool must_copy_strings, bool eof, int strict_uri_parsing, size_t max_request_line_size,
                                   size_t max_hdr_field_size);
 ParseResult validate_hdr_request_target(int method_wks_idx, URLImpl *url);
+
+// This calls http_parse_host_header internally to parse the Host field value
+// when present, so it enforces the same syntax rules and also validates the
+// port number when specified.
 ParseResult validate_hdr_host(HTTPHdrImpl *hh);
+
+// This parses and validates the Host field value.
+bool http_parse_host_header(std::string_view value, std::string_view &host, int &port, bool &has_port);
+
 ParseResult validate_hdr_content_length(HdrHeap *heap, HTTPHdrImpl *hh);
 ParseResult http_parser_parse_resp(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl *hh, const char **start, const char *end,
                                    bool must_copy_strings, bool eof);
@@ -443,13 +453,22 @@ bool is_http1_hdr_version_supported(const HTTPVersion &http_version);
 
 class IOBufferReader;
 
+/** HTTP Header class.
+ *
+ * @warning Changing the size of this class (adding/removing fields) will change
+ * the on-disk cache format and cause cache incompatibility. The HTTPCacheAlt
+ * structure contains embedded HTTPHdr objects, and the cache marshalling code
+ * uses sizeof(HTTPCacheAlt) to read/write cache entries. Any size change will
+ * cause "vector inconsistency" errors when reading cache entries written by a
+ * different version.
+ */
 class HTTPHdr : public MIMEHdr
 {
 public:
   HTTPHdrImpl       *m_http = nullptr;
   mutable URL        m_url_cached;
   mutable MIMEField *m_host_mime             = nullptr;
-  mutable int        m_host_length           = 0;     ///< Length of hostname.
+  mutable int        m_host_length           = 0;     ///< Length of hostname (parsed, excludes port).
   mutable int        m_port                  = 0;     ///< Target port.
   mutable bool       m_target_cached         = false; ///< Whether host name and port are cached.
   mutable bool       m_target_in_url         = false; ///< Whether host name and port are in the URL.
@@ -731,8 +750,34 @@ HTTPHdr::print(char *buf, int bufsize, int *bufindex, int *dumpoffset) const
 inline void
 HTTPHdr::_test_and_fill_target_cache() const
 {
-  if (!m_target_cached)
+  if (!m_target_cached) {
     this->_fill_target_cache();
+    return;
+  }
+
+  // If host came from the Host header (not URL), check for staleness by verifying
+  // the current Host header value length matches what we expect from cached values.
+  if (!m_target_in_url && m_host_mime != nullptr) {
+    int expected_len = m_host_length;
+    if (m_port_in_header && m_port > 0) {
+      // Account for ":port" suffix in the raw Host header value.
+      expected_len += 1; // colon
+      if (m_port < 10) {
+        expected_len += 1;
+      } else if (m_port < 100) {
+        expected_len += 2;
+      } else if (m_port < 1000) {
+        expected_len += 3;
+      } else if (m_port < 10000) {
+        expected_len += 4;
+      } else {
+        expected_len += 5;
+      }
+    }
+    if (m_host_mime->m_len_value != expected_len) {
+      this->_fill_target_cache();
+    }
+  }
 }
 
 /*-------------------------------------------------------------------------

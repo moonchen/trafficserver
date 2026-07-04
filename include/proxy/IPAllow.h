@@ -40,8 +40,6 @@
 #include "swoc/swoc_ip.h"
 #include "swoc/Errata.h"
 
-// forward declare in name only so it can be a friend.
-struct IpAllowUpdate;
 namespace YAML
 {
 class Node;
@@ -147,7 +145,7 @@ public:
 
   static constexpr const char *MODULE_NAME = "IPAllow";
 
-  enum Subject { PEER, PROXY, MAX_SUBJECTS };
+  enum Subject { PEER, PROXY, PLUGIN, MAX_SUBJECTS };
 
   /** An access control record and support data.
    * The primary point of this is to hold the backing configuration in memory while the ACL
@@ -206,7 +204,7 @@ public:
   static ACL match(sockaddr const *sa, match_key_t key);
 
   static void startup();
-  static void reconfigure();
+  static void reconfigure(ConfigContext ctx = {});
   /// @return The global instance.
   static IpAllow *acquire();
   /// Release the configuration.

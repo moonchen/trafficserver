@@ -145,7 +145,7 @@ NextHopRoundRobin::findNextHop(TSHttpTxn txnp, void * /* ih ATS_UNUSED */, time_
                sm_id, cur_host->hostname.c_str(), (intmax_t)cur_host->failedAt, cur_host->failCount.load(), fail_threshold);
         parentUp = true;
       }
-    } else { // if not available, check to see if it can be retried.  If so, set the retry flag and temporairly mark it as
+    } else { // if not available, check to see if it can be retried.  If so, set the retry flag and temporarily mark it as
              // available.
       _now == 0 ? _now = time(nullptr) : _now = now;
       if (((result->wrap_around) || (cur_host->failedAt + retry_time) < _now) && host_stat == TS_HOST_STATUS_UP) {
@@ -170,7 +170,6 @@ NextHopRoundRobin::findNextHop(TSHttpTxn txnp, void * /* ih ATS_UNUSED */, time_
       result->last_parent = cur_hst_index;
       result->last_group  = cur_grp_index;
       result->retry       = parentRetry;
-      setHostHeader(txnp, result->hostname);
       ink_assert(result->hostname != nullptr);
       ink_assert(result->port != 0);
       NH_Dbg(NH_DBG_CTL, "[%" PRIu64 "] Chosen parent = %s.%d", sm_id, result->hostname, result->port);

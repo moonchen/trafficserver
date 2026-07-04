@@ -23,12 +23,16 @@
 
 #pragma once
 #include "iocore/cache/CacheDefs.h"
+#include "mgmt/config/ConfigContext.h"
 #include "records/RecCore.h"
 #include "tscore/MatcherUtils.h"
 #include "tscore/HostLookup.h"
 #include "tsutil/Bravo.h"
+#include "tscore/Filenames.h"
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #define CACHE_MEM_FREE_TIMEOUT HRTIME_SECONDS(1)
 
@@ -62,7 +66,9 @@ struct CacheHostRecord {
   CacheHostRecord() {}
 };
 
-void build_vol_hash_table(CacheHostRecord *cp);
+void             build_vol_hash_table(CacheHostRecord *cp);
+CacheHostRecord *createCacheHostRecord(const char *volume_str, char *errbuf, size_t errbufsize);
+void             destroyCacheHostRecord(CacheHostRecord *rec);
 
 struct CacheHostResult {
   CacheHostRecord *record = nullptr;
@@ -220,104 +226,143 @@ class CacheHostTable
 public:
   // Parameter name must not be deallocated before this
   //  object is
-  CacheHostTable(Cache *c, CacheType typ);
+  CacheHostTable(Cache *c, CacheType typ, ConfigContext ctx = {});
   ~CacheHostTable();
 
-  int BuildTable(const char *config_file_path);
-  int BuildTableFromString(const char *config_file_path, char *str);
+  int BuildTable(const char *config_file_path, ConfigContext ctx = {});
+  int BuildTableFromString(const char *config_file_path, char *str, ConfigContext ctx = {});
 
   void Match(std::string_view rdata, CacheHostResult *result) const;
   void Print() const;
 
+  // Getters for Cache::key_to_stripe access
+  const CacheHostRecord *
+  getGenHostRec() const
+  {
+    return &gen_host_rec;
+  }
+
   int
-  getEntryCount() const
+  getNumEntries() const
   {
     return m_numEntries;
   }
+
+  int
+  getGenHostRecCacheVols() const
+  {
+    return gen_host_rec.num_cachevols;
+  }
+
   CacheHostMatcher *
   getHostMatcher() const
   {
     return hostMatch.get();
   }
 
-  static int config_callback(const char *, RecDataT, RecData, void *);
-
-  void
-  register_config_callback(ReplaceablePtr<CacheHostTable> *p)
+  CacheType
+  getType() const
   {
-    RecRegisterConfigUpdateCb("proxy.config.cache.hosting_filename", CacheHostTable::config_callback, (void *)p);
+    return type;
   }
 
-  CacheType       type         = CacheType::HTTP;
-  Cache          *cache        = nullptr;
-  int             m_numEntries = 0;
-  CacheHostRecord gen_host_rec;
+  Cache *
+  getCache() const
+  {
+    return cache;
+  }
 
 private:
+  static int config_callback(const char *, RecDataT, RecData, void *);
+
+  CacheType                         type         = CacheType::HTTP;
+  Cache                            *cache        = nullptr;
+  int                               m_numEntries = 0;
+  CacheHostRecord                   gen_host_rec;
   std::unique_ptr<CacheHostMatcher> hostMatch    = nullptr;
   const matcher_tags                config_tags  = {"hostname", "domain", nullptr, nullptr, nullptr, nullptr, false};
   const char                       *matcher_name = "unknown"; // Used for Debug/Warning/Error messages
 };
 
-struct CacheHostTableConfig;
-using CacheHostTabHandler = int (CacheHostTableConfig::*)(int, void *);
-struct CacheHostTableConfig : public Continuation {
-  CacheHostTableConfig(ReplaceablePtr<CacheHostTable> *appt) : Continuation(nullptr), ppt(appt)
-  {
-    SET_HANDLER(&CacheHostTableConfig::mainEvent);
-  }
-
-  ~CacheHostTableConfig() {}
-
-  int
-  mainEvent(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
-  {
-    CacheType type  = CacheType::HTTP;
-    Cache    *cache = nullptr;
-    {
-      ReplaceablePtr<CacheHostTable>::ScopedReader hosttable(ppt);
-      type  = hosttable->type;
-      cache = hosttable->cache;
-    }
-    ppt->reset(new CacheHostTable(cache, type));
-    delete this;
-    return EVENT_DONE;
-  }
-
-private:
-  ReplaceablePtr<CacheHostTable> *ppt;
-};
-
-/* list of volumes in the volume.config file */
+/**
+  List of volumes in the storage.yaml
+ */
 struct ConfigVol {
-  int       number;
-  CacheType scheme;
-  off_t     size;
-  bool      in_percent;
-  bool      ramcache_enabled;
-  int       percent;
-  int       avg_obj_size;
-  int       fragment_size;
-  CacheVol *cachep;
+  struct Size {
+    int64_t absolute_value = 0;
+    bool    in_percent     = false;
+    int     percent        = 0;
+
+    bool is_empty() const;
+  };
+
+  struct Span {
+    std::string use{};
+    Size        size{};
+  };
+  using Spans = std::vector<Span>;
+
+  int       number           = 0;
+  CacheType scheme           = CacheType::NONE;
+  bool      ramcache_enabled = true;
+  Size      size{};
+  Spans     spans{};
+
+  int     avg_obj_size     = -1;
+  int     fragment_size    = -1;
+  int64_t ram_cache_size   = -1; // Per-volume RAM cache size (-1 = use shared allocation)
+  int64_t ram_cache_cutoff = -1; // Per-volume RAM cache cutoff (-1 = use global cutoff)
+
+  CacheVol *cachep = nullptr;
   LINK(ConfigVol, link);
 };
 
 struct ConfigVolumes {
-  int              num_volumes;
-  int              num_http_volumes;
-  Queue<ConfigVol> cp_queue;
-  void             read_config_file();
-  void             BuildListFromString(char *config_file_path, char *file_buf);
+  ConfigVolumes() = default;
+  ~ConfigVolumes() { clear_all(); }
 
+  // Move constructor
+  ConfigVolumes(ConfigVolumes &&other) noexcept : num_volumes(other.num_volumes), cp_queue(std::move(other.cp_queue))
+  {
+    // Reset the source object to prevent double deletion
+    other.num_volumes = 0;
+    other.cp_queue.clear();
+  }
+
+  // Move assignment operator
+  ConfigVolumes &
+  operator=(ConfigVolumes &&other) noexcept
+  {
+    if (this != &other) {
+      // Clear current contents
+      clear_all();
+      // Move from other
+      num_volumes = other.num_volumes;
+      cp_queue    = std::move(other.cp_queue);
+      // Reset the source object to prevent double deletion
+      other.num_volumes = 0;
+      other.cp_queue.clear();
+    }
+    return *this;
+  }
+
+  // Delete copy constructor and copy assignment to prevent accidental copying
+  ConfigVolumes(const ConfigVolumes &)            = delete;
+  ConfigVolumes &operator=(const ConfigVolumes &) = delete;
+
+  int              num_volumes = 0;
+  Queue<ConfigVol> cp_queue{};
+
+  void complement();
   void
   clear_all()
   {
     // remove all the volumes from the queue
     for (int i = 0; i < num_volumes; i++) {
-      cp_queue.pop();
+      ConfigVol *v = cp_queue.pop();
+      delete v;
     }
     // reset count variables
-    num_volumes      = 0;
-    num_http_volumes = 0;
+    num_volumes = 0;
   }
 };

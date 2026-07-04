@@ -1,6 +1,6 @@
 /** @file
 
-  Transforms content using gzip, deflate or brotli
+  Transforms content using gzip, deflate, brotli or zstd
 
   @section license License
 
@@ -22,28 +22,27 @@
  */
 
 #include <cstring>
-#include <zlib.h>
+#include <cinttypes>
 
 #include "ts/apidefs.h"
 #include "tscore/ink_config.h"
 
 #include <tsutil/PostScript.h>
 
-#if HAVE_BROTLI_ENCODE_H
-#include <brotli/encode.h>
-#endif
-
 #include "ts/ts.h"
 #include "tscore/ink_defs.h"
 
 #include "debug_macros.h"
+#include "compress_common.h"
 #include "misc.h"
 #include "configuration.h"
+#include "gzip_compress.h"
+#include "brotli_compress.h"
+#include "zstd_compress.h"
 #include "ts/remap.h"
 #include "ts/remap_version.h"
 
 using namespace std;
-using namespace Gzip;
 
 // FIXME: custom dictionaries would be nice. configurable/content-type?
 // a GPRS device might benefit from a higher compression ratio, whereas a desktop w. high bandwidth
@@ -62,14 +61,10 @@ namespace compress_ns
 DbgCtl dbg_ctl{TAG};
 }
 
-const int   ZLIB_COMPRESSION_LEVEL = 6;
-const char *dictionary             = nullptr;
+namespace Compress
+{
 
-// brotli compression quality 1-11. Testing proved level '6'
-#if HAVE_BROTLI_ENCODE_H
-const int BROTLI_COMPRESSION_LEVEL = 6;
-const int BROTLI_LGW               = 16;
-#endif
+const char *dictionary = nullptr;
 
 static const char *global_hidden_header_name = nullptr;
 
@@ -81,68 +76,66 @@ Configuration *prev_config = nullptr;
 
 namespace
 {
-/**
-  If client request has both of Range and Accept-Encoding header, follow range-request config.
- */
-void
-handle_range_request(TSMBuffer req_buf, TSMLoc req_loc, HostConfiguration *hc)
-{
-  TSMLoc accept_encoding_hdr_field =
-    TSMimeHdrFieldFind(req_buf, req_loc, TS_MIME_FIELD_ACCEPT_ENCODING, TS_MIME_LEN_ACCEPT_ENCODING);
-  ts::PostScript accept_encoding_defer([&]() -> void { TSHandleMLocRelease(req_buf, req_loc, accept_encoding_hdr_field); });
-  if (accept_encoding_hdr_field == TS_NULL_MLOC) {
-    return;
-  }
-
-  TSMLoc         range_hdr_field = TSMimeHdrFieldFind(req_buf, req_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE);
-  ts::PostScript range_defer([&]() -> void { TSHandleMLocRelease(req_buf, req_loc, range_hdr_field); });
-  if (range_hdr_field == TS_NULL_MLOC) {
-    return;
-  }
-
-  debug("Both of Accept-Encoding and Range header are found in the request");
-
-  switch (hc->range_request_ctl()) {
-  case RangeRequestCtrl::REMOVE_RANGE: {
-    debug("Remove the Range header by remove-range config");
-    while (range_hdr_field) {
-      TSMLoc next_dup = TSMimeHdrFieldNextDup(req_buf, req_loc, range_hdr_field);
-      TSMimeHdrFieldDestroy(req_buf, req_loc, range_hdr_field);
-      TSHandleMLocRelease(req_buf, req_loc, range_hdr_field);
-      range_hdr_field = next_dup;
+  /**
+    If client request has both of Range and Accept-Encoding header, follow range-request config.
+    */
+  void
+  handle_range_request(TSMBuffer req_buf, TSMLoc req_loc, HostConfiguration *hc)
+  {
+    TSMLoc accept_encoding_hdr_field =
+      TSMimeHdrFieldFind(req_buf, req_loc, TS_MIME_FIELD_ACCEPT_ENCODING, TS_MIME_LEN_ACCEPT_ENCODING);
+    ts::PostScript accept_encoding_defer([&]() -> void { TSHandleMLocRelease(req_buf, req_loc, accept_encoding_hdr_field); });
+    if (accept_encoding_hdr_field == TS_NULL_MLOC) {
+      return;
     }
-    break;
-  }
-  case RangeRequestCtrl::REMOVE_ACCEPT_ENCODING: {
-    debug("Remove the Accept-Encoding header by remove-accept-encoding config");
-    while (accept_encoding_hdr_field) {
-      TSMLoc next_dup = TSMimeHdrFieldNextDup(req_buf, req_loc, accept_encoding_hdr_field);
-      TSMimeHdrFieldDestroy(req_buf, req_loc, accept_encoding_hdr_field);
-      TSHandleMLocRelease(req_buf, req_loc, accept_encoding_hdr_field);
-      accept_encoding_hdr_field = next_dup;
+
+    TSMLoc         range_hdr_field = TSMimeHdrFieldFind(req_buf, req_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE);
+    ts::PostScript range_defer([&]() -> void { TSHandleMLocRelease(req_buf, req_loc, range_hdr_field); });
+    if (range_hdr_field == TS_NULL_MLOC) {
+      return;
     }
-    break;
+
+    debug("Both of Accept-Encoding and Range header are found in the request");
+
+    switch (hc->range_request_ctl()) {
+    case RangeRequestCtrl::REMOVE_RANGE: {
+      debug("Remove the Range header by remove-range config");
+      while (range_hdr_field) {
+        TSMLoc next_dup = TSMimeHdrFieldNextDup(req_buf, req_loc, range_hdr_field);
+        TSMimeHdrFieldDestroy(req_buf, req_loc, range_hdr_field);
+        TSHandleMLocRelease(req_buf, req_loc, range_hdr_field);
+        range_hdr_field = next_dup;
+      }
+      break;
+    }
+    case RangeRequestCtrl::REMOVE_ACCEPT_ENCODING: {
+      debug("Remove the Accept-Encoding header by remove-accept-encoding config");
+      while (accept_encoding_hdr_field) {
+        TSMLoc next_dup = TSMimeHdrFieldNextDup(req_buf, req_loc, accept_encoding_hdr_field);
+        TSMimeHdrFieldDestroy(req_buf, req_loc, accept_encoding_hdr_field);
+        TSHandleMLocRelease(req_buf, req_loc, accept_encoding_hdr_field);
+        accept_encoding_hdr_field = next_dup;
+      }
+      break;
+    }
+    case RangeRequestCtrl::NO_COMPRESSION:
+      // Do NOT touch header - this config is referred by `transformable()` function
+      debug("no header modification by no-compression config");
+      break;
+    case RangeRequestCtrl::NONE:
+      [[fallthrough]];
+    default:
+      debug("Do nothing by none config");
+      break;
+    }
   }
-  case RangeRequestCtrl::NO_COMPRESSION:
-    // Do NOT touch header - this config is referred by `transformable()` function
-    debug("no header modification by no-compression config");
-    break;
-  case RangeRequestCtrl::NONE:
-    [[fallthrough]];
-  default:
-    debug("Do nothing by none config");
-    break;
-  }
-}
 } // namespace
 
 static Data *
-data_alloc(int compression_type, int compression_algorithms)
+data_alloc(int compression_type, int compression_algorithms, HostConfiguration *hc)
 {
-  Data *data;
-  int   err;
+  Data *data = static_cast<Data *>(TSmalloc(sizeof(Data)));
 
-  data                         = static_cast<Data *>(TSmalloc(sizeof(Data)));
   data->downstream_vio         = nullptr;
   data->downstream_buffer      = nullptr;
   data->downstream_reader      = nullptr;
@@ -150,52 +143,25 @@ data_alloc(int compression_type, int compression_algorithms)
   data->state                  = transform_state_initialized;
   data->compression_type       = compression_type;
   data->compression_algorithms = compression_algorithms;
-  data->zstrm.next_in          = Z_NULL;
-  data->zstrm.avail_in         = 0;
-  data->zstrm.total_in         = 0;
-  data->zstrm.next_out         = Z_NULL;
-  data->zstrm.avail_out        = 0;
-  data->zstrm.total_out        = 0;
-  data->zstrm.zalloc           = gzip_alloc;
-  data->zstrm.zfree            = gzip_free;
-  data->zstrm.opaque           = (voidpf) nullptr;
-  data->zstrm.data_type        = Z_ASCII;
+  data->hc                     = hc;
 
-  int window_bits = WINDOW_BITS_GZIP;
-  if (compression_type & COMPRESSION_TYPE_DEFLATE) {
-    window_bits = WINDOW_BITS_DEFLATE;
+  // Initialize algorithm-specific compression contexts
+  if ((compression_type & (COMPRESSION_TYPE_GZIP | COMPRESSION_TYPE_DEFLATE)) &&
+      (compression_algorithms & (ALGORITHM_GZIP | ALGORITHM_DEFLATE))) {
+    Gzip::data_alloc(data);
   }
 
-  err = deflateInit2(&data->zstrm, ZLIB_COMPRESSION_LEVEL, Z_DEFLATED, window_bits, ZLIB_MEMLEVEL, Z_DEFAULT_STRATEGY);
-
-  if (err != Z_OK) {
-    fatal("gzip-transform: ERROR: deflateInit (%d)!", err);
-  }
-
-  if (dictionary) {
-    err = deflateSetDictionary(&data->zstrm, reinterpret_cast<const Bytef *>(dictionary), strlen(dictionary));
-    if (err != Z_OK) {
-      fatal("gzip-transform: ERROR: deflateSetDictionary (%d)!", err);
-    }
-  }
 #if HAVE_BROTLI_ENCODE_H
-  data->bstrm.br = nullptr;
-  if (compression_type & COMPRESSION_TYPE_BROTLI) {
-    debug("brotli compression. Create Brotli Encoder Instance.");
-    data->bstrm.br = BrotliEncoderCreateInstance(nullptr, nullptr, nullptr);
-    if (!data->bstrm.br) {
-      fatal("Brotli Encoder Instance Failed");
-    }
-    BrotliEncoderSetParameter(data->bstrm.br, BROTLI_PARAM_QUALITY, BROTLI_COMPRESSION_LEVEL);
-    BrotliEncoderSetParameter(data->bstrm.br, BROTLI_PARAM_LGWIN, BROTLI_LGW);
-    data->bstrm.next_in   = nullptr;
-    data->bstrm.avail_in  = 0;
-    data->bstrm.total_in  = 0;
-    data->bstrm.next_out  = nullptr;
-    data->bstrm.avail_out = 0;
-    data->bstrm.total_out = 0;
+  if (compression_type & COMPRESSION_TYPE_BROTLI && compression_algorithms & ALGORITHM_BROTLI) {
+    Brotli::data_alloc(data);
   }
 #endif
+#if HAVE_ZSTD_H
+  if ((compression_type & COMPRESSION_TYPE_ZSTD) && (compression_algorithms & ALGORITHM_ZSTD)) {
+    Zstd::data_alloc(data);
+  }
+#endif
+
   return data;
 }
 
@@ -204,17 +170,25 @@ data_destroy(Data *data)
 {
   TSReleaseAssert(data);
 
-  // deflateEnd return value ignore is intentional
-  // it would spew log on every client abort
-  deflateEnd(&data->zstrm);
-
   if (data->downstream_buffer) {
     TSIOBufferDestroy(data->downstream_buffer);
   }
 
-// brotlidestory
+  // Destroy algorithm-specific compression contexts
+  if ((data->compression_type & (COMPRESSION_TYPE_GZIP | COMPRESSION_TYPE_DEFLATE)) &&
+      (data->compression_algorithms & (ALGORITHM_GZIP | ALGORITHM_DEFLATE))) {
+    Gzip::data_destroy(data);
+  }
+
 #if HAVE_BROTLI_ENCODE_H
-  BrotliEncoderDestroyInstance(data->bstrm.br);
+  if (data->compression_type & COMPRESSION_TYPE_BROTLI && data->compression_algorithms & ALGORITHM_BROTLI) {
+    Brotli::data_destroy(data);
+  }
+#endif
+#if HAVE_ZSTD_H
+  if (data->compression_type & COMPRESSION_TYPE_ZSTD && data->compression_algorithms & ALGORITHM_ZSTD) {
+    Zstd::data_destroy(data);
+  }
 #endif
 
   TSfree(data);
@@ -228,7 +202,10 @@ content_encoding_header(TSMBuffer bufp, TSMLoc hdr_loc, const int compression_ty
   const char  *value     = nullptr;
   int          value_len = 0;
   // Delete Content-Encoding if present???
-  if (compression_type & COMPRESSION_TYPE_BROTLI && (algorithm & ALGORITHM_BROTLI)) {
+  if (compression_type & COMPRESSION_TYPE_ZSTD && (algorithm & ALGORITHM_ZSTD)) {
+    value     = TS_HTTP_VALUE_ZSTD;
+    value_len = TS_HTTP_LEN_ZSTD;
+  } else if (compression_type & COMPRESSION_TYPE_BROTLI && (algorithm & ALGORITHM_BROTLI)) {
     value     = TS_HTTP_VALUE_BROTLI;
     value_len = TS_HTTP_LEN_BROTLI;
   } else if (compression_type & COMPRESSION_TYPE_GZIP && (algorithm & ALGORITHM_GZIP)) {
@@ -240,7 +217,6 @@ content_encoding_header(TSMBuffer bufp, TSMLoc hdr_loc, const int compression_ty
   }
 
   if (value_len == 0) {
-    error("no need to add Content-Encoding header");
     return TS_SUCCESS;
   }
 
@@ -354,117 +330,24 @@ compress_transform_init(TSCont contp, Data *data)
   }
 
   if (content_encoding_header(bufp, hdr_loc, data->compression_type, data->compression_algorithms) == TS_SUCCESS &&
-      vary_header(bufp, hdr_loc) == TS_SUCCESS && etag_header(bufp, hdr_loc) == TS_SUCCESS) {
+      etag_header(bufp, hdr_loc) == TS_SUCCESS) {
     downstream_conn         = TSTransformOutputVConnGet(contp);
     data->downstream_buffer = TSIOBufferCreate();
     data->downstream_reader = TSIOBufferReaderAlloc(data->downstream_buffer);
     data->downstream_vio    = TSVConnWrite(downstream_conn, contp, data->downstream_reader, INT64_MAX);
   }
 
+#if HAVE_ZSTD_H
+  if (data->compression_type & COMPRESSION_TYPE_ZSTD && (data->compression_algorithms & ALGORITHM_ZSTD)) {
+    if (!Zstd::transform_init(data)) {
+      error("Failed to configure Zstandard compression context");
+      return;
+    }
+  }
+#endif
+
   TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
 }
-
-static void
-gzip_transform_one(Data *data, const char *upstream_buffer, int64_t upstream_length)
-{
-  TSIOBufferBlock downstream_blkp;
-  int64_t         downstream_length;
-  int             err;
-  data->zstrm.next_in  = (unsigned char *)upstream_buffer;
-  data->zstrm.avail_in = upstream_length;
-
-  while (data->zstrm.avail_in > 0) {
-    downstream_blkp         = TSIOBufferStart(data->downstream_buffer);
-    char *downstream_buffer = TSIOBufferBlockWriteStart(downstream_blkp, &downstream_length);
-
-    data->zstrm.next_out  = reinterpret_cast<unsigned char *>(downstream_buffer);
-    data->zstrm.avail_out = downstream_length;
-
-    if (!data->hc->flush()) {
-      err = deflate(&data->zstrm, Z_NO_FLUSH);
-    } else {
-      err = deflate(&data->zstrm, Z_SYNC_FLUSH);
-    }
-
-    if (err != Z_OK) {
-      warning("deflate() call failed: %d", err);
-    }
-
-    if (downstream_length > data->zstrm.avail_out) {
-      TSIOBufferProduce(data->downstream_buffer, downstream_length - data->zstrm.avail_out);
-      data->downstream_length += (downstream_length - data->zstrm.avail_out);
-    }
-
-    if (data->zstrm.avail_out > 0) {
-      if (data->zstrm.avail_in != 0) {
-        error("gzip-transform: avail_in is (%d): should be 0", data->zstrm.avail_in);
-      }
-    }
-  }
-}
-
-#if HAVE_BROTLI_ENCODE_H
-static bool
-brotli_compress_operation(Data *data, const char *upstream_buffer, int64_t upstream_length, BrotliEncoderOperation op)
-{
-  TSIOBufferBlock downstream_blkp;
-  int64_t         downstream_length;
-
-  data->bstrm.next_in  = (uint8_t *)upstream_buffer;
-  data->bstrm.avail_in = upstream_length;
-
-  bool ok = true;
-  while (ok) {
-    downstream_blkp         = TSIOBufferStart(data->downstream_buffer);
-    char *downstream_buffer = TSIOBufferBlockWriteStart(downstream_blkp, &downstream_length);
-
-    data->bstrm.next_out  = reinterpret_cast<unsigned char *>(downstream_buffer);
-    data->bstrm.avail_out = downstream_length;
-    data->bstrm.total_out = 0;
-
-    ok =
-      !!BrotliEncoderCompressStream(data->bstrm.br, op, &data->bstrm.avail_in, &const_cast<const uint8_t *&>(data->bstrm.next_in),
-                                    &data->bstrm.avail_out, &data->bstrm.next_out, &data->bstrm.total_out);
-
-    if (!ok) {
-      error("BrotliEncoderCompressStream(%d) call failed", op);
-      return false;
-    }
-
-    TSIOBufferProduce(data->downstream_buffer, downstream_length - data->bstrm.avail_out);
-    data->downstream_length += (downstream_length - data->bstrm.avail_out);
-    if (data->bstrm.avail_in || BrotliEncoderHasMoreOutput(data->bstrm.br)) {
-      continue;
-    }
-
-    break;
-  }
-
-  return ok;
-}
-
-static void
-brotli_transform_one(Data *data, const char *upstream_buffer, int64_t upstream_length)
-{
-  bool ok = brotli_compress_operation(data, upstream_buffer, upstream_length, BROTLI_OPERATION_PROCESS);
-  if (!ok) {
-    error("BrotliEncoderCompressStream(PROCESS) call failed");
-    return;
-  }
-
-  data->bstrm.total_in += upstream_length;
-
-  if (!data->hc->flush()) {
-    return;
-  }
-
-  ok = brotli_compress_operation(data, nullptr, 0, BROTLI_OPERATION_FLUSH);
-  if (!ok) {
-    error("BrotliEncoderCompressStream(FLUSH) call failed");
-    return;
-  }
-}
-#endif
 
 static void
 compress_transform_one(Data *data, TSIOBufferReader upstream_reader, int amount)
@@ -488,16 +371,27 @@ compress_transform_one(Data *data, TSIOBufferReader upstream_reader, int amount)
       upstream_length = amount;
     }
 
+#if HAVE_ZSTD_H
+    if (data->compression_type & COMPRESSION_TYPE_ZSTD && (data->compression_algorithms & ALGORITHM_ZSTD)) {
+      Zstd::transform_one(data, upstream_buffer, upstream_length);
+    } else
+#endif
 #if HAVE_BROTLI_ENCODE_H
-    if (data->compression_type & COMPRESSION_TYPE_BROTLI && (data->compression_algorithms & ALGORITHM_BROTLI)) {
-      brotli_transform_one(data, upstream_buffer, upstream_length);
+      if (data->compression_type & COMPRESSION_TYPE_BROTLI && (data->compression_algorithms & ALGORITHM_BROTLI)) {
+      Brotli::transform_one(data, upstream_buffer, upstream_length);
     } else
 #endif
       if ((data->compression_type & (COMPRESSION_TYPE_GZIP | COMPRESSION_TYPE_DEFLATE)) &&
           (data->compression_algorithms & (ALGORITHM_GZIP | ALGORITHM_DEFLATE))) {
-      gzip_transform_one(data, upstream_buffer, upstream_length);
+      Gzip::transform_one(data, upstream_buffer, upstream_length);
     } else {
-      warning("No compression supported. Shouldn't come here.");
+      warning("No compression supported. Passing data through without transformation.");
+      int64_t written = TSIOBufferWrite(data->downstream_buffer, upstream_buffer, upstream_length);
+      if (written == TS_ERROR || written != upstream_length) {
+        error("Failed to copy upstream data to downstream buffer");
+        return;
+      }
+      data->downstream_length += written;
     }
 
     TSIOBufferReaderConsume(upstream_reader, upstream_length);
@@ -506,87 +400,26 @@ compress_transform_one(Data *data, TSIOBufferReader upstream_reader, int amount)
 }
 
 static void
-gzip_transform_finish(Data *data)
-{
-  if (data->state == transform_state_output) {
-    TSIOBufferBlock downstream_blkp;
-    int64_t         downstream_length;
-
-    data->state = transform_state_finished;
-
-    for (;;) {
-      downstream_blkp = TSIOBufferStart(data->downstream_buffer);
-
-      char *downstream_buffer = TSIOBufferBlockWriteStart(downstream_blkp, &downstream_length);
-      data->zstrm.next_out    = reinterpret_cast<unsigned char *>(downstream_buffer);
-      data->zstrm.avail_out   = downstream_length;
-
-      int err = deflate(&data->zstrm, Z_FINISH);
-
-      if (downstream_length > static_cast<int64_t>(data->zstrm.avail_out)) {
-        TSIOBufferProduce(data->downstream_buffer, downstream_length - data->zstrm.avail_out);
-        data->downstream_length += (downstream_length - data->zstrm.avail_out);
-      }
-
-      if (err == Z_OK) { /* some more data to encode */
-        continue;
-      }
-
-      if (err != Z_STREAM_END) {
-        warning("deflate should report Z_STREAM_END");
-      }
-      break;
-    }
-
-    if (data->downstream_length != static_cast<int64_t>(data->zstrm.total_out)) {
-      error("gzip-transform: output lengths don't match (%d, %ld)", data->downstream_length, data->zstrm.total_out);
-    }
-
-    debug("gzip-transform: Finished gzip");
-    log_compression_ratio(data->zstrm.total_in, data->downstream_length);
-  }
-}
-
-#if HAVE_BROTLI_ENCODE_H
-static void
-brotli_transform_finish(Data *data)
-{
-  if (data->state != transform_state_output) {
-    return;
-  }
-
-  data->state = transform_state_finished;
-
-  bool ok = brotli_compress_operation(data, nullptr, 0, BROTLI_OPERATION_FINISH);
-  if (!ok) {
-    error("BrotliEncoderCompressStream(PROCESS) call failed");
-    return;
-  }
-
-  if (data->downstream_length != static_cast<int64_t>(data->bstrm.total_out)) {
-    error("brotli-transform: output lengths don't match (%d, %ld)", data->downstream_length, data->bstrm.total_out);
-  }
-
-  debug("brotli-transform: Finished brotli");
-  log_compression_ratio(data->bstrm.total_in, data->downstream_length);
-}
-#endif
-
-static void
 compress_transform_finish(Data *data)
 {
+#if HAVE_ZSTD_H
+  if (data->compression_type & COMPRESSION_TYPE_ZSTD && data->compression_algorithms & ALGORITHM_ZSTD) {
+    Zstd::transform_finish(data);
+    debug("compress_transform_finish: zstd compression finish");
+  } else
+#endif
 #if HAVE_BROTLI_ENCODE_H
-  if (data->compression_type & COMPRESSION_TYPE_BROTLI && data->compression_algorithms & ALGORITHM_BROTLI) {
-    brotli_transform_finish(data);
+    if (data->compression_type & COMPRESSION_TYPE_BROTLI && data->compression_algorithms & ALGORITHM_BROTLI) {
+    Brotli::transform_finish(data);
     debug("compress_transform_finish: brotli compression finish");
   } else
 #endif
     if ((data->compression_type & (COMPRESSION_TYPE_GZIP | COMPRESSION_TYPE_DEFLATE)) &&
         (data->compression_algorithms & (ALGORITHM_GZIP | ALGORITHM_DEFLATE))) {
-    gzip_transform_finish(data);
+    Gzip::transform_finish(data);
     debug("compress_transform_finish: gzip compression finish");
   } else {
-    error("No Compression matched, shouldn't come here");
+    debug("compress_transform_finish: no compression active, passthrough mode");
   }
 }
 
@@ -685,7 +518,7 @@ compress_transform(TSCont contp, TSEvent event, void * /* edata ATS_UNUSED */)
 }
 
 static int
-transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration, int *compress_type, int *algorithms)
+is_content_compressible(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration)
 {
   /* Server response header */
   TSMBuffer bufp;
@@ -695,7 +528,6 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
   /* Client request header */
   TSMBuffer cbuf;
   TSMLoc    chdr;
-  TSMLoc    cfield;
 
   const char  *value;
   int          len;
@@ -737,6 +569,100 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
     return 0;
   }
 
+  // the only compressible method is currently GET or POST.
+  int         method_length;
+  const char *method = TSHttpHdrMethodGet(cbuf, chdr, &method_length);
+
+  if (!((method_length == TS_HTTP_LEN_GET && memcmp(method, TS_HTTP_METHOD_GET, TS_HTTP_LEN_GET) == 0) ||
+        (method_length == TS_HTTP_LEN_POST && memcmp(method, TS_HTTP_METHOD_POST, TS_HTTP_LEN_POST) == 0))) {
+    debug("method is not GET or POST, not compressible");
+    TSHandleMLocRelease(cbuf, TS_NULL_MLOC, chdr);
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+    return 0;
+  }
+
+  TSHandleMLocRelease(cbuf, TS_NULL_MLOC, chdr);
+
+  /* If there already exists a content encoding then we don't want
+     to do anything. */
+  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_ENCODING, -1);
+  if (field_loc) {
+    info("response is already content encoded, not compressible");
+    TSHandleMLocRelease(bufp, hdr_loc, field_loc);
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+    return 0;
+  }
+
+  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH);
+  if (field_loc != TS_NULL_MLOC) {
+    unsigned int hdr_value = TSMimeHdrFieldValueUintGet(bufp, hdr_loc, field_loc, -1);
+    TSHandleMLocRelease(bufp, hdr_loc, field_loc);
+    if (hdr_value == 0) {
+      info("response is 0-length, not compressible");
+      TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+      return 0;
+    }
+
+    if (hdr_value < host_configuration->minimum_content_length()) {
+      info("response is smaller than minimum content length, not compressing");
+      TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+      return 0;
+    }
+  }
+
+  // Check if content type is compressible based on configuration.
+  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_TYPE, -1);
+  if (!field_loc) {
+    info("no content type header found, not compressible");
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+    return 0;
+  }
+
+  value = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, field_loc, -1, &len);
+
+  int rv = host_configuration->is_content_type_compressible(value, len);
+
+  if (!rv) {
+    info("content-type [%.*s] not compressible", len, value);
+  }
+
+  TSHandleMLocRelease(bufp, hdr_loc, field_loc);
+  TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+
+  return rv;
+}
+
+static int
+client_accepts_compression(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration, int *compress_type, int *algorithms)
+{
+  /* Server response header */
+  TSMBuffer bufp;
+  TSMLoc    hdr_loc;
+
+  /* Client request header */
+  TSMBuffer cbuf;
+  TSMLoc    chdr;
+  TSMLoc    cfield;
+
+  const char *value;
+  int         len;
+
+  if (server) {
+    if (TS_SUCCESS != TSHttpTxnServerRespGet(txnp, &bufp, &hdr_loc)) {
+      return 0;
+    }
+  } else {
+    if (TS_SUCCESS != TSHttpTxnCachedRespGet(txnp, &bufp, &hdr_loc)) {
+      return 0;
+    }
+  }
+
+  if (TS_SUCCESS != TSHttpTxnClientReqGet(txnp, &cbuf, &chdr)) {
+    info("cound not get client request");
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+    return 0;
+  }
+
   // check Partial Object is transformable
   if (host_configuration->range_request_ctl() == RangeRequestCtrl::NO_COMPRESSION) {
     // check Range header in client request
@@ -759,21 +685,6 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
       TSHandleMLocRelease(cbuf, TS_NULL_MLOC, chdr);
       return 0;
     }
-
-    TSHandleMLocRelease(bufp, hdr_loc, content_range_hdr_field);
-    TSHandleMLocRelease(cbuf, chdr, range_hdr_field);
-  }
-
-  // the only compressible method is currently GET.
-  int         method_length;
-  const char *method = TSHttpHdrMethodGet(cbuf, chdr, &method_length);
-
-  if (!((method_length == TS_HTTP_LEN_GET && memcmp(method, TS_HTTP_METHOD_GET, TS_HTTP_LEN_GET) == 0) ||
-        (method_length == TS_HTTP_LEN_POST && memcmp(method, TS_HTTP_METHOD_POST, TS_HTTP_LEN_POST) == 0))) {
-    debug("method is not GET or POST, not compressible");
-    TSHandleMLocRelease(cbuf, TS_NULL_MLOC, chdr);
-    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
-    return 0;
   }
 
   *algorithms = host_configuration->compression_algorithms();
@@ -787,7 +698,14 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
         continue;
       }
 
-      if (strncasecmp(value, "br", sizeof("br") - 1) == 0) {
+      debug("Accept-Encoding value [%.*s]", len, value);
+
+      if (strncasecmp(value, "zstd", sizeof("zstd") - 1) == 0) {
+        if (*algorithms & ALGORITHM_ZSTD) {
+          compression_acceptable = 1;
+        }
+        *compress_type |= COMPRESSION_TYPE_ZSTD;
+      } else if (strncasecmp(value, "br", sizeof("br") - 1) == 0) {
         if (*algorithms & ALGORITHM_BROTLI) {
           compression_acceptable = 1;
         }
@@ -807,10 +725,10 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
 
     TSHandleMLocRelease(cbuf, chdr, cfield);
     TSHandleMLocRelease(cbuf, TS_NULL_MLOC, chdr);
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
 
     if (!compression_acceptable) {
       info("no acceptable encoding match found in request header, not compressible");
-      TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
       return 0;
     }
   } else {
@@ -821,52 +739,48 @@ transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration
     return 0;
   }
 
-  /* If there already exists a content encoding then we don't want
-     to do anything. */
-  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_ENCODING, -1);
-  if (field_loc) {
-    info("response is already content encoded, not compressible");
-    TSHandleMLocRelease(bufp, hdr_loc, field_loc);
-    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+  return 1;
+}
+
+static int
+transformable(TSHttpTxn txnp, bool server, HostConfiguration *host_configuration, int *compress_type, int *algorithms,
+              bool *content_is_compressible)
+{
+  // First check if content could be compressible
+  *content_is_compressible = is_content_compressible(txnp, server, host_configuration);
+  if (!*content_is_compressible) {
     return 0;
   }
 
-  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH);
-  if (field_loc != TS_NULL_MLOC) {
-    unsigned int hdr_value = TSMimeHdrFieldValueUintGet(bufp, hdr_loc, field_loc, -1);
-    TSHandleMLocRelease(bufp, hdr_loc, field_loc);
-    if (hdr_value == 0) {
-      info("response is 0-length, not compressible");
-      return 0;
+  // Then check if client accepts compression
+  return client_accepts_compression(txnp, server, host_configuration, compress_type, algorithms);
+}
+
+static void
+add_vary_header_for_compressible_content(TSHttpTxn txnp, bool server, HostConfiguration * /* hc ATS_UNUSED */)
+{
+  TSMBuffer resp_buf;
+  TSMLoc    resp_loc;
+
+  // Get the response headers
+  if (server) {
+    if (TS_SUCCESS != TSHttpTxnServerRespGet(txnp, &resp_buf, &resp_loc)) {
+      return;
     }
-
-    if (hdr_value < host_configuration->minimum_content_length()) {
-      info("response is smaller than minimum content length, not compressing");
-      return 0;
+  } else {
+    if (TS_SUCCESS != TSHttpTxnCachedRespGet(txnp, &resp_buf, &resp_loc)) {
+      return;
     }
   }
 
-  /* We only want to do gzip compression on documents that have a
-     content type of "text/" or "application/x-javascript". */
-  field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_TYPE, -1);
-  if (!field_loc) {
-    info("no content type header found, not compressible");
-    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
-    return 0;
+  // Add Vary: Accept-Encoding header
+  if (vary_header(resp_buf, resp_loc) != TS_SUCCESS) {
+    error("failed to add Vary header for compressible content");
+    TSHandleMLocRelease(resp_buf, TS_NULL_MLOC, resp_loc);
+    return;
   }
 
-  value = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, field_loc, -1, &len);
-
-  int rv = host_configuration->is_content_type_compressible(value, len);
-
-  if (!rv) {
-    info("content-type [%.*s] not compressible", len, value);
-  }
-
-  TSHandleMLocRelease(bufp, hdr_loc, field_loc);
-  TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
-
-  return rv;
+  TSHandleMLocRelease(resp_buf, TS_NULL_MLOC, resp_loc);
 }
 
 static void
@@ -887,12 +801,26 @@ compress_transform_add(TSHttpTxn txnp, HostConfiguration *hc, int compress_type,
   }
 
   connp     = TSTransformCreate(compress_transform, txnp);
-  data      = data_alloc(compress_type, algorithms);
+  data      = data_alloc(compress_type, algorithms, hc);
   data->txn = txnp;
-  data->hc  = hc;
 
   TSContDataSet(connp, data);
   TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+}
+
+static void
+handle_compression_and_vary(TSHttpTxn txnp, bool server, HostConfiguration *hc, int *compress_type, int *algorithms)
+{
+  // Check if content is compressible and add compression if client accepts it
+  bool content_is_compressible;
+  if (transformable(txnp, server, hc, compress_type, algorithms, &content_is_compressible)) {
+    compress_transform_add(txnp, hc, *compress_type, *algorithms);
+  }
+
+  // Add Vary: Accept-Encoding for all compressible content to ensure proper HTTP caching
+  if (content_is_compressible) {
+    add_vary_header_for_compressible_content(txnp, server, hc);
+  }
 }
 
 HostConfiguration *
@@ -939,9 +867,7 @@ transform_plugin(TSCont contp, TSEvent event, void *edata)
         }
       }
 
-      if (transformable(txnp, true, hc, &compress_type, &algorithms)) {
-        compress_transform_add(txnp, hc, compress_type, algorithms);
-      }
+      handle_compression_and_vary(txnp, true, hc, &compress_type, &algorithms);
     }
     break;
 
@@ -967,9 +893,7 @@ transform_plugin(TSCont contp, TSEvent event, void *edata)
     if (TS_ERROR != TSHttpTxnCacheLookupStatusGet(txnp, &obj_status) && (TS_CACHE_LOOKUP_HIT_FRESH == obj_status)) {
       if (hc != nullptr) {
         info("handling compression of cached object");
-        if (transformable(txnp, false, hc, &compress_type, &algorithms)) {
-          compress_transform_add(txnp, hc, compress_type, algorithms);
-        }
+        handle_compression_and_vary(txnp, false, hc, &compress_type, &algorithms);
       }
     } else {
       // Prepare for going to origin
@@ -1090,12 +1014,13 @@ management_update(TSCont contp, TSEvent event, void * /* edata ATS_UNUSED */)
 
   return 0;
 }
+} // namespace Compress
 
 void
 TSPluginInit(int argc, const char *argv[])
 {
-  const char *config_path = nullptr;
-  compress_config_mutex   = TSMutexCreate();
+  const char *config_path         = nullptr;
+  Compress::compress_config_mutex = TSMutexCreate();
 
   if (argc > 2) {
     fatal("the compress plugin does not accept more than 1 plugin argument");
@@ -1109,19 +1034,19 @@ TSPluginInit(int argc, const char *argv[])
 
   info("TSPluginInit %s", argv[0]);
 
-  if (!global_hidden_header_name) {
-    global_hidden_header_name = init_hidden_header_name();
+  if (!Compress::global_hidden_header_name) {
+    Compress::global_hidden_header_name = init_hidden_header_name();
   }
 
-  TSCont management_contp = TSContCreate(management_update, nullptr);
+  TSCont management_contp = TSContCreate(Compress::management_update, nullptr);
 
   // Make sure the global configuration is properly loaded and reloaded on changes
   TSContDataSet(management_contp, (void *)config_path);
   TSMgmtUpdateRegister(management_contp, TAG);
-  load_global_configuration(management_contp);
+  Compress::load_global_configuration(management_contp);
 
   // Setup the global hook, main entry point for kicking off the plugin
-  TSCont transform_global_contp = TSContCreate(transform_global_plugin, nullptr);
+  TSCont transform_global_contp = TSContCreate(Compress::transform_global_plugin, nullptr);
 
   TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, transform_global_contp);
   info("loaded");
@@ -1151,12 +1076,12 @@ TSRemapNewInstance(int argc, char *argv[], void **instance, char * /* errbuf ATS
   } else {
     config_path = TSstrdup(3 == argc ? argv[2] : "");
   }
-  if (!global_hidden_header_name) {
-    global_hidden_header_name = init_hidden_header_name();
+  if (!Compress::global_hidden_header_name) {
+    Compress::global_hidden_header_name = init_hidden_header_name();
   }
 
-  Configuration *config = Configuration::Parse(config_path);
-  *instance             = config;
+  Compress::Configuration *config = Compress::Configuration::Parse(config_path);
+  *instance                       = config;
 
   free((void *)config_path);
   info("Configuration loaded");
@@ -1167,7 +1092,7 @@ void
 TSRemapDeleteInstance(void *instance)
 {
   debug("Cleanup configs read from remap");
-  auto c = static_cast<Configuration *>(instance);
+  auto c = static_cast<Compress::Configuration *>(instance);
   delete c;
 }
 
@@ -1178,7 +1103,7 @@ TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo * /* rri ATS_U
     info("No Rules configured, falling back to default");
   } else {
     info("Remap Rules configured for compress");
-    Configuration *config = static_cast<Configuration *>(instance);
+    Compress::Configuration *config = static_cast<Compress::Configuration *>(instance);
     // Handle compress request and use the configs populated from remap instance
     handle_request(txnp, config);
   }

@@ -30,11 +30,11 @@ cd "$SCRIPT_DIR"
 
 ./prepare_proxy_verifier.sh || fail "Failed to install Proxy Verifier."
 export PYTHONPATH=$(pwd):$PYTHONPATH
-export PYTHONPATH=$(pwd)/gold_tests/remap:$PYTHONPATH
+export PYTHONPATH=$(pwd)/gold_tests/remap:$(pwd)/gold_tests/remap_yaml:$PYTHONPATH
 ./test-env-check.sh || fail "Failed Python environment checks."
 hash nc 2>/dev/null || fail "Netcat is not installed."
 # this is for rhel or centos systems
 echo "Environment config finished. Running AuTest..."
-exec pipenv run env \
+exec uv run env \
     HTTP_PROXY= HTTPS_PROXY= NO_PROXY= http_proxy= https_proxy= no_proxy= \
     autest -D gold_tests "$@"

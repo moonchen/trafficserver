@@ -32,6 +32,7 @@
 
 #include "iocore/aio/AIO.h"
 #include "iocore/cache/Store.h"
+#include "iocore/eventsystem/Watchdog.h"
 #include "tscore/TSSystemState.h"
 #include "tscore/Version.h"
 #include "tscore/ink_platform.h"
@@ -48,10 +49,12 @@
 
 #include "ts/ts.h" // This is sadly needed because of us using TSThreadInit() for some reason.
 #include "swoc/swoc_file.h"
+#include "tsutil/Metrics.h"
 
 #include <syslog.h>
 #include <algorithm>
 #include <atomic>
+#include <filesystem>
 #include <list>
 #include <string>
 
@@ -73,7 +76,6 @@ extern "C" int plock(int);
 
 #include "Crash.h"
 #include "tscore/signals.h"
-#include "../iocore/eventsystem/P_EventSystem.h"
 #include "../iocore/net/P_Net.h"
 #if TS_HAS_QUICHE
 #include "../iocore/net/P_QUICNetProcessor.h"
@@ -83,6 +85,7 @@ extern "C" int plock(int);
 #include "../iocore/net/P_SSLUtils.h"
 #include "../iocore/dns/P_SplitDNSProcessor.h"
 #include "../iocore/hostdb/P_HostDB.h"
+#include "../iocore/cache/P_CacheDir.h"
 #include "../records/P_RecCore.h"
 #include "tscore/Layout.h"
 #include "iocore/utils/Machine.h"
@@ -90,6 +93,8 @@ extern "C" int plock(int);
 #include "iocore/eventsystem/RecProcess.h"
 #include "proxy/Transform.h"
 #include "iocore/eventsystem/ConfigProcessor.h"
+#include "mgmt/config/ConfigContextDiags.h"
+#include "mgmt/config/ConfigRegistry.h"
 #include "proxy/http/HttpProxyServerMain.h"
 #include "proxy/http/HttpBodyFactory.h"
 #include "proxy/ProxySession.h"
@@ -136,8 +141,6 @@ extern "C" int plock(int);
 extern void load_config_file_callback(const char *parent_file, const char *remap_file);
 
 extern HttpBodyFactory *body_factory;
-
-extern void initializeRegistry();
 
 extern void Initialize_Errata_Settings();
 
@@ -213,6 +216,8 @@ int cmd_block = 0;
 // -1: cache is already initialized, don't delay.
 int delay_listen_for_cache = 0;
 
+std::unique_ptr<Watchdog::Monitor> watchdog = nullptr;
+
 ArgumentDescription argument_descriptions[] = {
   {"net_threads",       'n', "Number of Net Threads",                                                                 "I",     &num_of_net_threads,             "PROXY_NET_THREADS",       nullptr                    },
   {"udp_threads",       'U', "Number of UDP Threads",                                                                 "I",     &num_of_udp_threads,             "PROXY_UDP_THREADS",       nullptr                    },
@@ -261,11 +266,14 @@ DbgCtl dbg_ctl_diags{"diags"};
 DbgCtl dbg_ctl_hugepages{"hugepages"};
 DbgCtl dbg_ctl_rpc_init{"rpc.init"};
 DbgCtl dbg_ctl_statsproc{"statsproc"};
-
+DbgCtl dbg_ctl_conf_reload{"confreload"};
 struct AutoStopCont : public Continuation {
   int
   mainEvent(int /* event */, Event * /* e */)
   {
+    // Stop the watchdog before shutting threads down
+    watchdog.reset();
+
     TSSystemState::stop_ssl_handshaking();
 
     APIHook *hook = g_lifecycle_hooks->get(TS_LIFECYCLE_SHUTDOWN_HOOK);
@@ -280,7 +288,20 @@ struct AutoStopCont : public Continuation {
       jsonrpcServer->stop_thread();
     }
 
+    // Flush the in-memory cache directory to disk
+    if (cacheProcessor.IsCacheEnabled() == CacheInitState::INITIALIZED) {
+      sync_cache_dir_on_shutdown();
+    }
+
+    // Push buffered log entries into the preproc queue before shutdown.
+    Log::flush_all_objects();
+
     TSSystemState::shut_down_event_system();
+
+    // Wake preproc threads to drain remaining log buffers before exit.
+    for (int i = 0; i < Log::preproc_threads; i++) {
+      Log::preproc_notify[i].signal();
+    }
     delete this;
     return EVENT_CONT;
   }
@@ -457,7 +478,6 @@ class MemoryLimit : public Continuation
 public:
   MemoryLimit() : Continuation(new_ProxyMutex())
   {
-    memset(&_usage, 0, sizeof(_usage));
     SET_HANDLER(&MemoryLimit::periodic);
     memory_rss = Metrics::Gauge::createPtr("proxy.process.traffic_server.memory.rss");
   }
@@ -474,45 +494,48 @@ public:
       return EVENT_DONE;
     }
 
-    // "reload" the setting, we don't do this often so not expensive
+    // "reload" the setting, we don't do this often so not expensive.
+    // proxy.config.memory.max_usage is in bytes; 0 (the default) disables the
+    // feature. We only schedule this continuation when it is enabled, but
+    // re-check here defensively and stop monitoring if it is ever cleared.
     _memory_limit = RecGetRecordInt("proxy.config.memory.max_usage").value_or(0);
-    _memory_limit = _memory_limit >> 10; // divide by 1024
+    if (_memory_limit <= 0) {
+      Dbg(dbg_ctl_server, "limiting connections based on memory usage has been disabled");
+      e->cancel();
+      delete this;
+      return EVENT_DONE;
+    }
 
-    if (getrusage(RUSAGE_SELF, &_usage) == 0) {
-      ts::Metrics::Gauge::store(memory_rss, _usage.ru_maxrss << 10); // * 1024
-      Dbg(dbg_ctl_server, "memory usage - ru_maxrss: %ld memory limit: %" PRId64, _usage.ru_maxrss, _memory_limit);
-      if (_memory_limit > 0) {
-        if (_usage.ru_maxrss > _memory_limit) {
-          if (net_memory_throttle == false) {
-            net_memory_throttle = true;
-            Dbg(dbg_ctl_server, "memory usage exceeded limit - ru_maxrss: %ld memory limit: %" PRId64, _usage.ru_maxrss,
-                _memory_limit);
-          }
-        } else {
-          if (net_memory_throttle == true) {
-            net_memory_throttle = false;
-            Dbg(dbg_ctl_server, "memory usage under limit - ru_maxrss: %ld memory limit: %" PRId64, _usage.ru_maxrss,
-                _memory_limit);
-          }
-        }
-      } else {
-        // this feature has not been enabled
-        Dbg(dbg_ctl_server, "limiting connections based on memory usage has been disabled");
-        e->cancel();
-        delete this;
-        return EVENT_DONE;
+    // Sample and publish the *current* RSS only while the feature is enabled,
+    // so we incur the cost of reading RSS only when it is needed.
+    // ink_get_current_rss() reports current (not peak) RSS in bytes, portably,
+    // so the gauge can both rise and fall and the throttle releases correctly.
+    uint64_t rss = ink_get_current_rss();
+    ts::Metrics::Gauge::store(memory_rss, static_cast<int64_t>(rss));
+    Dbg(dbg_ctl_server, "memory usage - current rss: %" PRIu64 " bytes memory limit: %" PRId64 " bytes", rss, _memory_limit);
+
+    // net_memory_throttle is read on accept threads, so use relaxed atomics.
+    if (rss > static_cast<uint64_t>(_memory_limit)) {
+      if (net_memory_throttle.load(std::memory_order_relaxed) == false) {
+        net_memory_throttle.store(true, std::memory_order_relaxed);
+        Dbg(dbg_ctl_server, "memory usage exceeded limit - current rss: %" PRIu64 " memory limit: %" PRId64, rss, _memory_limit);
+      }
+    } else {
+      if (net_memory_throttle.load(std::memory_order_relaxed) == true) {
+        net_memory_throttle.store(false, std::memory_order_relaxed);
+        Dbg(dbg_ctl_server, "memory usage under limit - current rss: %" PRIu64 " memory limit: %" PRId64, rss, _memory_limit);
       }
     }
+
     return EVENT_CONT;
   }
 
 private:
   int64_t                     _memory_limit = 0;
-  struct rusage               _usage;
   Metrics::Gauge::AtomicType *memory_rss;
 };
 
-/** Gate the emission of the "Traffic Server is fuly initialized" log message.
+/** Gate the emission of the "Traffic Server is fully initialized" log message.
  *
  * This message is intended to be helpful to users who want to know that
  * Traffic Server is not just running but has become fully initialized and is
@@ -712,19 +735,67 @@ initialize_records()
   // Define version info records
   //
   auto &version = AppVersionInfo::get_version();
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.short", version.version(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.long", version.full_version(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.build_number", version.build_number(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.build_time", version.build_time(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.build_date", version.build_date(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.build_machine", version.build_machine(), RECP_NON_PERSISTENT);
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.build_person", version.build_person(), RECP_NON_PERSISTENT);
+  ts::Metrics::StaticString::createString("proxy.process.version.server.short", version.version());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.long", version.full_version());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.build_number", version.build_number());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.build_time", version.build_time());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.build_date", version.build_date());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.build_machine", version.build_machine());
+  ts::Metrics::StaticString::createString("proxy.process.version.server.build_person", version.build_person());
 }
 
+// register_config_files
+//
+// Registration point for records.yaml and static (non-reloadable) config files.
+//
+// Most reloadable config files (ip_allow, sni, logging, etc.) register
+// themselves via ConfigRegistry::register_config() in their own modules
+// (IPAllow.cc, SSLClientCoordinator.cc, LogConfig.cc, etc.).
+//
+// records.yaml is special:
+//   - It is first read at startup inside RecCoreInit() (src/records/RecCore.cc),
+//     which is called through RecProcessInit() → initialize_records() well before
+//     this function.
+//   - On reload (file change detected by FileManager), process_config_update() in
+//     FileManager.cc delegates to ConfigRegistry::execute_reload("records"), which
+//     invokes the handler below.
+//   - The handler calls RecReadYamlConfigFile() (src/records/P_RecCore.cc), the same
+//     function used at startup, to re-parse the file.
+//
+// Static/non-reloadable files (storage.config, socks.config, volume.config,
+// plugin.config, jsonrpc.yaml) are registered via register_static_file() for
+// inventory purposes (filemanager.get_files_registry RPC endpoint and future work).
+//
 void
-initialize_file_manager()
+register_config_files()
 {
-  initializeRegistry();
+  using namespace config;
+  auto &reg = ConfigRegistry::Get_Instance();
+
+  // records.yaml — reloadable.
+  // First read happens at startup in RecCoreInit() (src/records/RecCore.cc:244).
+  // This handler is only invoked on runtime reload via ConfigRegistry::execute_reload("records").
+  reg.register_config(
+    "records", ts::filename::RECORDS, ts::filename::RECORDS,
+    [](ConfigContext ctx) {
+      if (auto zret = RecReadYamlConfigFile(); zret) {
+        RecConfigWarnIfUnregistered(ctx);
+      } else {
+        ctx.log("{}", zret);
+        if (zret.severity() >= ERRATA_ERROR) {
+          CfgLoadFail(ctx, "Failed to reload %s", ts::filename::RECORDS);
+          return;
+        }
+      }
+      CfgLoadComplete(ctx, "%s finished loading", ts::filename::RECORDS);
+    },
+    ConfigSource::FileOnly);
+
+  // Static (non-reloadable) files only.
+  reg.register_static_file("storage", ts::filename::STORAGE, {}, true);
+  reg.register_static_file("socks", ts::filename::SOCKS, "proxy.config.socks.socks_config_file");
+  reg.register_static_file("plugin", ts::filename::PLUGIN);
+  reg.register_static_file("jsonrpc", ts::filename::JSONRPC, "proxy.config.jsonrpc.filename");
 }
 
 std::tuple<bool, std::string>
@@ -749,7 +820,7 @@ initialize_jsonrpc_server()
     // jsonrpcServer object.
     ink_assert(jsonrpcServer == nullptr);
     std::string msg;
-    return {false, swoc::bwprint(msg, "Server failed: '{}'", ex.what())};
+    return {false, swoc::bwprint(msg, "Error: '{}'", ex.what())};
   }
   // Register admin handlers.
   rpc::admin::register_admin_jsonrpc_handlers();
@@ -824,6 +895,10 @@ CB_After_Cache_Init()
 
   start = ink_atomic_swap(&delay_listen_for_cache, -1);
   emit_fully_initialized_message();
+
+  // Initialize volume_host_rec for any remap rules with @volume= directives
+  // that were deferred during startup because cache wasn't ready yet
+  init_remap_volume_host_records();
 
   if (1 == start) {
     // The delay_listen_for_cache value was 1, therefore the main function
@@ -950,11 +1025,11 @@ cmd_verify(char * /* cmd ATS_UNUSED */)
   }
 
   api_init();
-  if (!plugin_init(true)) {
+  if (!plugin_yaml_init(true)) {
     exitStatus |= (1 << 2);
-    fprintf(stderr, "ERROR: Failed to load %s, exitStatus %d\n\n", ts::filename::PLUGIN, exitStatus);
+    fprintf(stderr, "ERROR: Failed to load plugins, exitStatus %d\n\n", exitStatus);
   } else {
-    fprintf(stderr, "INFO: Successfully loaded %s\n\n", ts::filename::PLUGIN);
+    fprintf(stderr, "INFO: Successfully loaded plugins\n\n");
   }
 
   if (!urlRewriteVerify()) {
@@ -1698,6 +1773,83 @@ change_uid_gid(const char *user)
 #endif
 }
 
+#if !TS_USE_POSIX_CAP
+/**
+ * Recursively chown a directory and all its contents to the given uid/gid.
+ * Uses lchown() to avoid following symlinks.
+ */
+static void
+chown_dir_recursive(const char *dir, uid_t uid, gid_t gid)
+{
+  if (lchown(dir, uid, gid) != 0) {
+    Warning("chown_dir_recursive: failed to chown '%s': %s", dir, strerror(errno));
+  }
+
+  std::error_code ec;
+
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+    if (lchown(entry.path().c_str(), uid, gid) != 0) {
+      Warning("chown_dir_recursive: failed to chown '%s': %s", entry.path().c_str(), strerror(errno));
+    }
+  }
+
+  if (ec) {
+    Warning("chown_dir_recursive: error iterating '%s': %s", dir, ec.message().c_str());
+  }
+}
+
+/**
+ * On systems without POSIX capabilities, privilege is dropped late — after
+ * initialization has already created files and directories as root. This
+ * causes runtime operations (plugin reloads, log rotation) to fail because
+ * the now-unprivileged process can't write to root-owned paths. Fix this by
+ * chowning affected directories to the target user before dropping privileges.
+ */
+static void
+chown_owned_dirs(const char *user)
+{
+  if (getuid() != 0 && geteuid() != 0) {
+    return;
+  }
+
+  struct passwd *pwd;
+  struct passwd  pbuf;
+  unsigned       pw_bufsize = 4096;
+#if defined(_SC_GETPW_R_SIZE_MAX)
+  long pw_size = sysconf(_SC_GETPW_R_SIZE_MAX);
+
+  if (pw_size > 0) {
+    pw_bufsize = static_cast<unsigned>(pw_size);
+  }
+#endif
+  char buf[pw_bufsize];
+
+  if (*user == '#') {
+    uid_t uid = static_cast<uid_t>(atoi(&user[1]));
+    if (getpwuid_r(uid, &pbuf, buf, sizeof(buf), &pwd) != 0 || pwd == nullptr) {
+      Warning("chown_owned_dirs: cannot resolve uid %ld", static_cast<long>(uid));
+      return;
+    }
+  } else {
+    if (getpwnam_r(user, &pbuf, buf, sizeof(buf), &pwd) != 0 || pwd == nullptr) {
+      Warning("chown_owned_dirs: cannot resolve user '%s'", user);
+      return;
+    }
+  }
+
+  std::string rundir(RecConfigReadRuntimeDir());
+  std::string logdir(RecConfigReadLogDir());
+
+  if (!rundir.empty()) {
+    chown_dir_recursive(rundir.c_str(), pwd->pw_uid, pwd->pw_gid);
+  }
+
+  if (!logdir.empty()) {
+    chown_dir_recursive(logdir.c_str(), pwd->pw_uid, pwd->pw_gid);
+  }
+}
+#endif // !TS_USE_POSIX_CAP
+
 /*
  * Binds stdout and stderr to files specified by the parameters
  *
@@ -1858,8 +2010,8 @@ main(int /* argc ATS_UNUSED */, const char **argv)
   // Records init
   initialize_records();
 
-  // Initialize file manager for TS.
-  initialize_file_manager();
+  // Register  non reloadable config files and records.yaml.
+  register_config_files();
 
   // Set the core limit for the process
   init_core_size();
@@ -1879,7 +2031,7 @@ main(int /* argc ATS_UNUSED */, const char **argv)
   metrics[id].store(time(nullptr));
   id = Metrics::Gauge::create("proxy.process.proxy.start_time");
   metrics[id].store(time(nullptr));
-  // These all gets initialied to 0
+  // These all gets initialized to 0
   Metrics::Gauge::create("proxy.process.proxy.reconfigure_required");
   Metrics::Gauge::create("proxy.process.proxy.restart_required");
   Metrics::Gauge::create("proxy.process.proxy.draining");
@@ -1989,7 +2141,10 @@ main(int /* argc ATS_UNUSED */, const char **argv)
   if (!command_flag) { // No need if we are going into command mode.
     // JSONRPC server and handlers
     if (auto &&[ok, msg] = initialize_jsonrpc_server(); !ok) {
-      Warning("JSONRPC server could not be started.\n  Why?: '%s' ... Continuing without it.", msg.c_str());
+      fprintf(stderr,
+              "[ERROR] JSONRPC server could not be started because: '%s', ATS will start without it, but traffic_ctl will not be "
+              "available.\n",
+              msg.c_str());
     }
   }
 
@@ -2030,8 +2185,7 @@ main(int /* argc ATS_UNUSED */, const char **argv)
     Machine::init(hostname, &machine_addr.sa);
   }
 
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.uuid", (char *)Machine::instance()->process_uuid.getString(),
-                        RECP_NON_PERSISTENT);
+  ts::Metrics::StaticString::createString("proxy.process.version.server.uuid", Machine::instance()->process_uuid.getString());
 
   res_track_memory = RecGetRecordInt("proxy.config.res_track_memory").value_or(0);
 
@@ -2127,9 +2281,23 @@ main(int /* argc ATS_UNUSED */, const char **argv)
 
   eventProcessor.schedule_every(new SignalContinuation, HRTIME_MSECOND * 500, ET_CALL);
   eventProcessor.schedule_every(new DiagsLogContinuation, HRTIME_SECOND, ET_TASK);
-  eventProcessor.schedule_every(new MemoryLimit, HRTIME_SECOND * 10, ET_TASK);
+  // Only monitor RSS and enforce the memory limit when the feature is enabled.
+  // proxy.config.memory.max_usage requires a restart to change, so this gate is
+  // stable for the life of the process. This also avoids reading RSS and
+  // publishing the memory.rss gauge when the feature is off.
+  if (RecGetRecordInt("proxy.config.memory.max_usage").value_or(0) > 0) {
+    eventProcessor.schedule_every(new MemoryLimit, HRTIME_SECOND * 10, ET_TASK);
+  }
   RecRegisterConfigUpdateCb("proxy.config.dump_mem_info_frequency", init_memory_tracker, nullptr);
   init_memory_tracker(nullptr, RECD_NULL, RecData(), nullptr);
+
+  // Start the watchdog
+  int watchdog_timeout_ms = RecGetRecordInt("proxy.config.exec_thread.watchdog.timeout_ms").value_or(0);
+  if (watchdog_timeout_ms > 0) {
+    watchdog = std::make_unique<Watchdog::Monitor>(eventProcessor.thread_group[ET_NET]._thread,
+                                                   static_cast<size_t>(eventProcessor.thread_group[ET_NET]._count),
+                                                   std::chrono::milliseconds{watchdog_timeout_ms});
+  }
 
   {
     auto s{RecGetRecordStringAlloc("proxy.config.diags.debug.client_ip")};
@@ -2203,7 +2371,9 @@ main(int /* argc ATS_UNUSED */, const char **argv)
 
     // Init plugins as soon as logging is ready.
     api_init();
-    (void)plugin_init(); // plugin.config
+    if (!plugin_yaml_init()) {
+      Warning("plugin initialization failed");
+    }
 
     {
       std::unique_lock<std::mutex> lock(pluginInitMutex);
@@ -2211,6 +2381,16 @@ main(int /* argc ATS_UNUSED */, const char **argv)
       lock.unlock();
       pluginInitCheck.notify_one();
     }
+
+    // Give plugins a chance to customize log fields
+    APIHook *hook = g_lifecycle_hooks->get(TS_LIFECYCLE_LOG_INITIALIZED_HOOK);
+    while (hook) {
+      hook->invoke(TS_EVENT_LIFECYCLE_LOG_INITIALIZED, nullptr);
+      hook = hook->next();
+    }
+
+    // Log config needs to be loaded after the custom field registration
+    Log::load_config();
 
     if (IpAllow::has_no_rules()) {
       Error("No ip_allow.yaml entries found.  All requests will be denied!");
@@ -2222,7 +2402,7 @@ main(int /* argc ATS_UNUSED */, const char **argv)
 #if TS_USE_QUIC == 1
     quic_NetProcessor.start(-1, stacksize);
 #endif
-    FileManager::instance().registerConfigPluginCallbacks(global_config_cbs);
+    FileManager::instance().registerConfigPluginCallbacks([&]() { global_config_cbs->invoke(); });
     cacheProcessor.afterInitCallbackSet(&CB_After_Cache_Init);
     cacheProcessor.start();
 
@@ -2321,6 +2501,7 @@ main(int /* argc ATS_UNUSED */, const char **argv)
 
 #if !TS_USE_POSIX_CAP
   if (admin_user_p) {
+    chown_owned_dirs(user);
     change_uid_gid(user);
   }
 #endif

@@ -57,7 +57,7 @@ DbgCtl dbg_ctl_http{"http"};
 void
 obj_describe(HdrHeapObjImpl *obj, bool recurse)
 {
-  static const char *obj_names[] = {"EMPTY", "RAW", "URL", "HTTP_HEADER", "MIME_HEADER", "FIELD_BLOCK"};
+  static constexpr const char *obj_names[] = {"EMPTY", "RAW", "URL", "HTTP_HEADER", "MIME_HEADER", "FIELD_BLOCK"};
 
   Dbg(dbg_ctl_http, "%s %p: [T: %d, L: %4d, OBJFLAGS: %X]  ", obj_names[obj->m_type], obj, obj->m_type, obj->m_length,
       obj->m_obj_flags);
@@ -119,7 +119,7 @@ new_HdrHeap(int size)
   HdrHeap *h;
   if (size <= HdrHeap::DEFAULT_SIZE) {
     size = HdrHeap::DEFAULT_SIZE;
-    h    = static_cast<HdrHeap *>(THREAD_ALLOC(hdrHeapAllocator, this_ethread()));
+    h    = static_cast<HdrHeap *>(thread_alloc(::hdrHeapAllocator, this_ethread()->hdrHeapAllocator));
   } else {
     h = static_cast<HdrHeap *>(ats_malloc(size));
   }
@@ -1029,7 +1029,7 @@ HdrHeap::attach_str_heap(char const *h_start, int h_len, RefCountObj *h_ref_obj,
   return true;
 }
 
-// void HdrHeap::inhertit_string_heaps(const HdrHeap* inherit_from)
+// void HdrHeap::inherit_string_heaps(const HdrHeap* inherit_from)
 //
 //    Inherits all of inherit_from's string heaps as read-only
 //     string heaps

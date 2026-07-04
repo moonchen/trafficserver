@@ -52,7 +52,13 @@ ts.Disk.records_config.update(
         'proxy.config.diags.debug.tags': 'ssl',
     })
 
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 # Just map everything through to origin.  This test is concentrating on the user-agent side
 ts.Disk.remap_config.AddLine('map / http://127.0.0.1:{0}/'.format(server.Variables.Port))
@@ -181,10 +187,12 @@ tr.MakeCurlCommand(
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.All = Testers.ExcludesExpression("Access Denied", "Check response")
 
-# Wait for the error.log to appaer.
-test_run = Test.AddTestRun()
-test_run.Processes.Default.Command = (
-    os.path.join(Test.Variables.AtsTestToolsDir, 'condwait') + ' 60 1 -f ' + os.path.join(ts.Variables.LOGDIR, 'error.log'))
+# Wait for the error.log entry to be written.
+test_run = Test.AddAwaitFileContainsTestRun(
+    'Await SNI mismatch error log entry.',
+    os.path.join(ts.Variables.LOGDIR, 'error.log'),
+    "SNI/hostname mismatch: connecting to .* for host='bob' sni='dave', returning a 403",
+)
 
 ts.Disk.diags_log.Content += Testers.ContainsExpression(
     "WARNING: SNI/hostname mismatch sni=dave host=bob action=terminate", "Should have warning on mismatch")

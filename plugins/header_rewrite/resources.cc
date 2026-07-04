@@ -33,11 +33,6 @@ void
 Resources::gather(const ResourceIDs ids, TSHttpHookID hook)
 {
   Dbg(pi_dbg_ctl, "Building resources, hook=%s", TSHttpHookNameLookup(hook));
-
-  // Clear the capture groups just in case
-  ovector_count = 0;
-  ovector_ptr   = nullptr;
-
   Dbg(pi_dbg_ctl, "Gathering resources for hook %s with IDs %d", TSHttpHookNameLookup(hook), ids);
 
   // If we need the client request headers, make sure it's also available in the client vars.
@@ -49,30 +44,42 @@ Resources::gather(const ResourceIDs ids, TSHttpHookID hook)
     }
   }
 
+  if (ids & RSRC_SERVER_REQUEST_HEADERS) {
+    Dbg(pi_dbg_ctl, "\tAdding TXN server request header buffers");
+    if (TSHttpTxnServerReqGet(state.txnp, &server_bufp, &server_hdr_loc) != TS_SUCCESS) {
+      Dbg(pi_dbg_ctl, "could not gather bufp/hdr_loc for server request");
+      // Not a fatal error - server request may not be available in all hooks
+    }
+  }
+
   switch (hook) {
   case TS_HTTP_READ_RESPONSE_HDR_HOOK:
     // Read response headers from server
-    if (ids & RSRC_SERVER_RESPONSE_HEADERS) {
+    if ((ids & RSRC_SERVER_RESPONSE_HEADERS) || (ids & RSRC_RESPONSE_STATUS)) {
       Dbg(pi_dbg_ctl, "\tAdding TXN server response header buffers");
       if (TSHttpTxnServerRespGet(state.txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
         Dbg(pi_dbg_ctl, "could not gather bufp/hdr_loc for response");
         return;
       }
-    }
-    if (ids & RSRC_RESPONSE_STATUS) {
-      Dbg(pi_dbg_ctl, "\tAdding TXN server response status resource");
-      resp_status = TSHttpHdrStatusGet(bufp, hdr_loc);
+      if (ids & RSRC_RESPONSE_STATUS) {
+        Dbg(pi_dbg_ctl, "\tAdding TXN server response status resource");
+        resp_status = TSHttpHdrStatusGet(bufp, hdr_loc);
+      }
     }
     break;
 
   case TS_HTTP_SEND_REQUEST_HDR_HOOK:
     Dbg(pi_dbg_ctl, "Processing TS_HTTP_SEND_REQUEST_HDR_HOOK");
-    // Read request headers to server
     if (ids & RSRC_SERVER_REQUEST_HEADERS) {
-      Dbg(pi_dbg_ctl, "\tAdding TXN server request header buffers");
-      if (!TSHttpTxnServerReqGet(state.txnp, &bufp, &hdr_loc)) {
-        Dbg(pi_dbg_ctl, "could not gather bufp/hdr_loc for request");
-        return;
+      if (server_bufp && server_hdr_loc) {
+        bufp    = server_bufp;
+        hdr_loc = server_hdr_loc;
+      } else {
+        Dbg(pi_dbg_ctl, "\tAdding TXN server request header buffers");
+        if (TSHttpTxnServerReqGet(state.txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
+          Dbg(pi_dbg_ctl, "could not gather bufp/hdr_loc for request");
+          return;
+        }
       }
     }
     break;
@@ -176,6 +183,12 @@ Resources::destroy()
     }
   }
 
+  if (server_bufp && (server_bufp != bufp) && (server_bufp != client_bufp)) {
+    if (server_hdr_loc && (server_hdr_loc != hdr_loc) && (server_hdr_loc != client_hdr_loc)) {
+      TSHandleMLocRelease(server_bufp, TS_NULL_MLOC, server_hdr_loc);
+    }
+  }
+
 #if TS_HAS_CRIPTS
   delete client_conn;
   delete server_conn;
@@ -184,4 +197,36 @@ Resources::destroy()
 #endif
 
   _ready = false;
+}
+
+swoc::TextView
+Resources::get_query_param(const std::string &name, const char *query_str, int query_len) const
+{
+  // Note: Query parameter names and values are matched as-is without URL decoding.
+  // For example, searching for "my%20param" matches the literal string, not "my param".
+  if (!_extended_info.query_parsed) {
+    if (query_str && query_len > 0) {
+      swoc::TextView query_view(query_str, query_len);
+
+      while (!query_view.empty()) {
+        swoc::TextView param       = query_view.take_prefix_at('&');
+        swoc::TextView param_name  = param.take_prefix_at('=');
+        swoc::TextView param_value = param;
+
+        if (!param_name.empty()) {
+          // We only allow caching / using the first instance of a query param
+          _extended_info.query_params[param_name] = param_value;
+        }
+      }
+    }
+    _extended_info.query_parsed = true;
+  }
+
+  auto it = _extended_info.query_params.find(swoc::TextView(name));
+
+  if (it != _extended_info.query_params.end()) {
+    return it->second;
+  }
+
+  return swoc::TextView();
 }

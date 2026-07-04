@@ -61,12 +61,28 @@ struct EvacuationBlock;
 
 #define VC_LOCK_RETRY_EVENT()                                                                                         \
   do {                                                                                                                \
+    ts::Metrics::Counter::increment(cache_rsb.stripe_lock_contention);                                                \
+    if (stripe && stripe->cache_vol) {                                                                                \
+      ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.stripe_lock_contention);                             \
+    }                                                                                                                 \
     trigger = mutex->thread_holding->schedule_in_local(this, HRTIME_MSECONDS(cache_config_mutex_retry_delay), event); \
     return EVENT_CONT;                                                                                                \
   } while (0)
 
 #define VC_SCHED_LOCK_RETRY()                                                                                  \
   do {                                                                                                         \
+    ts::Metrics::Counter::increment(cache_rsb.stripe_lock_contention);                                         \
+    if (stripe && stripe->cache_vol) {                                                                         \
+      ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.stripe_lock_contention);                      \
+    }                                                                                                          \
+    trigger = mutex->thread_holding->schedule_in_local(this, HRTIME_MSECONDS(cache_config_mutex_retry_delay)); \
+    return EVENT_CONT;                                                                                         \
+  } while (0)
+
+// Variant for writer lock contention (write_vc->mutex during read aggregation)
+#define VC_SCHED_WRITER_LOCK_RETRY()                                                                           \
+  do {                                                                                                         \
+    ts::Metrics::Counter::increment(cache_rsb.writer_lock_contention);                                         \
     trigger = mutex->thread_holding->schedule_in_local(this, HRTIME_MSECONDS(cache_config_mutex_retry_delay)); \
     return EVENT_CONT;                                                                                         \
   } while (0)
@@ -92,10 +108,14 @@ struct EvacuationBlock;
 
 extern CacheStatsBlock cache_rsb;
 
+// Global default volumes host record (initialized from proxy.config.cache.default_volumes)
+extern CacheHostRecord *default_volumes_host_rec;
+
 // Configuration
 extern int cache_config_dir_sync_frequency;
 extern int cache_config_dir_sync_delay;
 extern int cache_config_dir_sync_max_write;
+extern int cache_config_dir_sync_parallel_tasks;
 extern int cache_config_http_max_alts;
 extern int cache_config_log_alternate_eviction;
 extern int cache_config_permit_pinning;
@@ -138,9 +158,8 @@ struct CacheRemoveCont : public Continuation {
 };
 
 // Global Data
-extern ClassAllocator<CacheVC>            cacheVConnectionAllocator;
-extern ClassAllocator<CacheEvacuateDocVC> cacheEvacuateDocVConnectionAllocator;
-extern CacheSync                         *cacheDirSync;
+extern ClassAllocator<CacheVC, false>            cacheVConnectionAllocator;
+extern ClassAllocator<CacheEvacuateDocVC, false> cacheEvacuateDocVConnectionAllocator;
 // Function Prototypes
 int                 cache_write(CacheVC *, CacheHTTPInfoVector *);
 int                 get_alternate_index(CacheHTTPInfoVector *cache_vector, CacheKey key);
@@ -330,6 +349,10 @@ CacheVC::handleWriteLock(int /* event ATS_UNUSED */, Event *e)
   {
     CACHE_TRY_LOCK(lock, stripe->mutex, mutex->thread_holding);
     if (!lock.is_locked()) {
+      ts::Metrics::Counter::increment(cache_rsb.stripe_lock_contention);
+      if (stripe && stripe->cache_vol) {
+        ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.stripe_lock_contention);
+      }
       set_agg_write_in_progress();
       trigger = mutex->thread_holding->schedule_in_local(this, HRTIME_MSECONDS(cache_config_mutex_retry_delay));
       return EVENT_CONT;
@@ -411,7 +434,7 @@ next_rand(unsigned int *p)
   return seed;
 }
 
-extern ClassAllocator<CacheRemoveCont> cacheRemoveContAllocator;
+extern ClassAllocator<CacheRemoveCont, false> cacheRemoveContAllocator;
 
 inline CacheRemoveCont *
 new_CacheRemoveCont()
@@ -465,9 +488,11 @@ struct Cache {
   Action *scan(Continuation *cont, std::string_view hostname = std::string_view{}, int KB_per_second = 2500) const;
 
   Action     *open_read(Continuation *cont, const CacheKey *key, CacheHTTPHdr *request, const HttpConfigAccessor *params,
-                        CacheFragType type, std::string_view hostname = std::string_view{}) const;
+                        CacheFragType type, std::string_view hostname = std::string_view{},
+                        const CacheHostRecord *volume_host_rec = nullptr) const;
   Action     *open_write(Continuation *cont, const CacheKey *key, CacheHTTPInfo *old_info, time_t pin_in_cache = 0,
-                         CacheFragType type = CACHE_FRAG_TYPE_HTTP, std::string_view hostname = std::string_view{}) const;
+                         CacheFragType type = CACHE_FRAG_TYPE_HTTP, std::string_view hostname = std::string_view{},
+                         const CacheHostRecord *volume_host_rec = nullptr) const;
   static void generate_key(CryptoHash *hash, CacheURL *url);
   static void generate_key(HttpCacheKey *hash, CacheURL *url, bool ignore_query = false, cache_generation_t generation = -1);
 
@@ -480,7 +505,7 @@ struct Cache {
 
   int open_done();
 
-  StripeSM *key_to_stripe(const CacheKey *key, std::string_view hostname) const;
+  StripeSM *key_to_stripe(const CacheKey *key, std::string_view hostname, const CacheHostRecord *volume_host_rec = nullptr) const;
 
   Cache() {}
 };
@@ -497,9 +522,7 @@ Cache::generate_key(CryptoHash *hash, CacheURL *url)
 inline void
 Cache::generate_key(HttpCacheKey *key, CacheURL *url, bool ignore_query, cache_generation_t generation)
 {
-  auto host{url->host_get()};
-  key->hostname = host.data();
-  key->hostlen  = static_cast<int>(host.length());
+  key->hostname = url->host_get();
   url->hash_get(&key->hash, ignore_query, generation);
 }
 
@@ -512,9 +535,7 @@ Cache::generate_key92(CryptoHash *hash, CacheURL *url)
 inline void
 Cache::generate_key92(HttpCacheKey *key, CacheURL *url, bool ignore_query, cache_generation_t generation)
 {
-  auto host{url->host_get()};
-  key->hostname = host.data();
-  key->hostlen  = static_cast<int>(host.length());
+  key->hostname = url->host_get();
   url->hash_get92(&key->hash, ignore_query, generation);
 }
 

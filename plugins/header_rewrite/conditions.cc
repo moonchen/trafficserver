@@ -25,9 +25,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cctype>
+#include <cinttypes>
 #include <sstream>
 #include <array>
 #include <atomic>
+
+#include "swoc/TextView.h"
 
 #include "ts/ts.h"
 
@@ -221,12 +224,20 @@ ConditionHeader::append_value(std::string &s, const Resources &res)
   TSMLoc    hdr_loc;
   int       len;
 
-  if (_client) {
+  switch (_type) {
+  case CLIENT:
     bufp    = res.client_bufp;
     hdr_loc = res.client_hdr_loc;
-  } else {
+    break;
+  case SERVER:
+    bufp    = res.server_bufp;
+    hdr_loc = res.server_hdr_loc;
+    break;
+  case HEADER:
+  default:
     bufp    = res.bufp;
     hdr_loc = res.hdr_loc;
+    break;
   }
 
   if (bufp && hdr_loc) {
@@ -269,8 +280,13 @@ ConditionUrl::initialize(Parser &p)
   Condition::initialize(p);
 
   auto match = std::make_unique<MatcherType>(_cond_op);
+
   match->set(p.get_arg(), mods());
   _matcher = std::move(match);
+
+  if (_type == SERVER) {
+    require_resources(RSRC_SERVER_REQUEST_HEADERS);
+  }
 }
 
 void
@@ -279,7 +295,27 @@ ConditionUrl::set_qualifier(const std::string &q)
   Condition::set_qualifier(q);
 
   Dbg(pi_dbg_ctl, "\tParsing %%{URL:%s}", q.c_str());
-  _url_qual = parse_url_qualifier(q);
+
+  std::string::size_type pos = q.find(':');
+
+  if (pos != std::string::npos) {
+    std::string qual_part = q.substr(0, pos);
+    std::string sub_qual  = q.substr(pos + 1);
+
+    _url_qual = parse_url_qualifier(qual_part);
+
+    if (_url_qual == URL_QUAL_QUERY) {
+      if (!sub_qual.empty()) {
+        _query_param = std::move(sub_qual);
+        Dbg(pi_dbg_ctl, "\tQuery parameter sub-key: %s", _query_param.c_str());
+      }
+    } else {
+      TSError("[%s] Sub-qualifier syntax (component:subkey) is only supported for QUERY component, got: %s", PLUGIN_NAME,
+              qual_part.c_str());
+    }
+  } else {
+    _url_qual = parse_url_qualifier(q);
+  }
 }
 
 void
@@ -293,6 +329,18 @@ ConditionUrl::append_value(std::string &s, const Resources &res)
     Dbg(pi_dbg_ctl, "   Using the pristine url");
     if (TSHttpTxnPristineUrlGet(res.state.txnp, &bufp, &url) != TS_SUCCESS) {
       TSError("[%s] Error getting the pristine URL", PLUGIN_NAME);
+      return;
+    }
+  } else if (_type == SERVER) {
+    Dbg(pi_dbg_ctl, "   Using the server request url");
+    bufp = res.server_bufp;
+    if (bufp && res.server_hdr_loc) {
+      if (TSHttpHdrUrlGet(bufp, res.server_hdr_loc, &url) != TS_SUCCESS) {
+        TSError("[%s] Error getting the server request URL", PLUGIN_NAME);
+        return;
+      }
+    } else {
+      Dbg(pi_dbg_ctl, "   Server request not available");
       return;
     }
   } else if (res._rri != nullptr) {
@@ -346,8 +394,19 @@ ConditionUrl::append_value(std::string &s, const Resources &res)
     break;
   case URL_QUAL_QUERY:
     q_str = TSUrlHttpQueryGet(bufp, url, &i);
-    s.append(q_str, i);
-    Dbg(pi_dbg_ctl, "   Query parameters to match is: %.*s", i, q_str);
+    if (_query_param.empty()) {
+      s.append(q_str, i);
+      Dbg(pi_dbg_ctl, "   Query parameters to match is: %.*s", i, q_str);
+    } else {
+      swoc::TextView value = res.get_query_param(_query_param, q_str, i);
+
+      if (value.data() != nullptr && value.size() > 0) {
+        s.append(value.data(), value.size());
+        Dbg(pi_dbg_ctl, "   Query parameter %s value is: %.*s", _query_param.c_str(), static_cast<int>(value.size()), value.data());
+      } else {
+        Dbg(pi_dbg_ctl, "   Query parameter %s is empty or not present", _query_param.c_str());
+      }
+    }
     break;
   case URL_QUAL_SCHEME:
     q_str = TSUrlSchemeGet(bufp, url, &i);
@@ -772,14 +831,14 @@ ConditionNow::eval(const Resources &res)
 }
 
 std::string
-ConditionGeo::get_geo_string(const sockaddr * /* addr ATS_UNUSED */) const
+ConditionGeo::get_geo_string(const sockaddr * /* addr ATS_UNUSED */, void * /* geo_handle ATS_UNUSED */) const
 {
   TSError("[%s] No Geo library available!", PLUGIN_NAME);
   return "";
 }
 
 int64_t
-ConditionGeo::get_geo_int(const sockaddr * /* addr ATS_UNUSED */) const
+ConditionGeo::get_geo_int(const sockaddr * /* addr ATS_UNUSED */, void * /* geo_handle ATS_UNUSED */) const
 {
   TSError("[%s] No Geo library available!", PLUGIN_NAME);
   return 0;
@@ -832,9 +891,9 @@ void
 ConditionGeo::append_value(std::string &s, const Resources &res)
 {
   if (is_int_type()) {
-    s += std::to_string(get_geo_int(getClientAddr(res.state.txnp, _txn_private_slot)));
+    s += std::to_string(get_geo_int(getClientAddr(res.state.txnp, _txn_private_slot), res.geo_handle));
   } else {
-    s += get_geo_string(getClientAddr(res.state.txnp, _txn_private_slot));
+    s += get_geo_string(getClientAddr(res.state.txnp, _txn_private_slot), res.geo_handle);
   }
   Dbg(pi_dbg_ctl, "Appending GEO() to evaluation value -> %s", s.c_str());
 }
@@ -846,7 +905,7 @@ ConditionGeo::eval(const Resources &res)
 
   Dbg(pi_dbg_ctl, "Evaluating GEO()");
   if (is_int_type()) {
-    int64_t geo = get_geo_int(getClientAddr(res.state.txnp, _txn_private_slot));
+    int64_t geo = get_geo_int(getClientAddr(res.state.txnp, _txn_private_slot), res.geo_handle);
 
     ret = static_cast<const Matchers<int64_t> *>(_matcher.get())->test(geo, res);
   } else {
@@ -1538,6 +1597,15 @@ ConditionNextHop::append_value(std::string &s, const Resources &res)
     Dbg(pi_dbg_ctl, "Appending '%d' to evaluation value", port);
     s.append(std::to_string(port));
   } break;
+  case NEXT_HOP_STRATEGY: {
+    char const *const name = TSHttpNextHopStrategyNameGet(res.state.txnp);
+    if (nullptr != name) {
+      Dbg(pi_dbg_ctl, "Appending '%s' to evaluation value", name);
+      s.append(name);
+    } else {
+      Dbg(pi_dbg_ctl, "NextHopStrategyName is empty");
+    }
+  } break;
   default:
     TSReleaseAssert(!"All cases should have been handled");
     break;
@@ -1586,9 +1654,9 @@ ConditionStateFlag::set_qualifier(const std::string &q)
 
   _flag_ix = strtol(q.c_str(), nullptr, 10);
   if (_flag_ix < 0 || _flag_ix >= NUM_STATE_FLAGS) {
-    TSError("[%s] STATE-FLAG index out of range: %s", PLUGIN_NAME, q.c_str());
+    TSError("[%s] %s-FLAG index out of range: %s", PLUGIN_NAME, _scope_label(_scope), q.c_str());
   } else {
-    Dbg(pi_dbg_ctl, "\tParsing %%{STATE-FLAG:%s}", q.c_str());
+    Dbg(pi_dbg_ctl, "\tParsing %%{%s-FLAG:%s}", _scope_label(_scope), q.c_str());
     _mask = 1ULL << _flag_ix;
   }
 }
@@ -1597,15 +1665,15 @@ void
 ConditionStateFlag::append_value(std::string &s, const Resources &res)
 {
   s += eval(res) ? "TRUE" : "FALSE";
-  Dbg(pi_dbg_ctl, "Evaluating STATE-FLAG(%d)", _flag_ix);
+  Dbg(pi_dbg_ctl, "Evaluating %s-FLAG(%d)", _scope_label(_scope), _flag_ix);
 }
 
 bool
 ConditionStateFlag::eval(const Resources &res)
 {
-  auto data = reinterpret_cast<uint64_t>(TSUserArgGet(res.state.txnp, _txn_slot));
+  auto data = _get_state_data(_scope, res);
 
-  Dbg(pi_dbg_ctl, "Evaluating STATE-FLAG()");
+  Dbg(pi_dbg_ctl, "Evaluating %s-FLAG()", _scope_label(_scope));
 
   return (data & _mask) == _mask;
 }
@@ -1628,9 +1696,9 @@ ConditionStateInt8::set_qualifier(const std::string &q)
 
   _byte_ix = strtol(q.c_str(), nullptr, 10);
   if (_byte_ix < 0 || _byte_ix >= NUM_STATE_INT8S) {
-    TSError("[%s] STATE-INT8 index out of range: %s", PLUGIN_NAME, q.c_str());
+    TSError("[%s] %s-INT8 index out of range: %s", PLUGIN_NAME, _scope_label(_scope), q.c_str());
   } else {
-    Dbg(pi_dbg_ctl, "\tParsing %%{STATE-INT8:%s}", q.c_str());
+    Dbg(pi_dbg_ctl, "\tParsing %%{%s-INT8:%s}", _scope_label(_scope), q.c_str());
   }
 }
 
@@ -1641,7 +1709,7 @@ ConditionStateInt8::append_value(std::string &s, const Resources &res)
 
   s += std::to_string(data);
 
-  Dbg(pi_dbg_ctl, "Appending STATE-INT8(%d) to evaluation value -> %s", data, s.c_str());
+  Dbg(pi_dbg_ctl, "Appending %s-INT8(%d) to evaluation value -> %s", _scope_label(_scope), data, s.c_str());
 }
 
 bool
@@ -1649,7 +1717,7 @@ ConditionStateInt8::eval(const Resources &res)
 {
   uint8_t data = _get_data(res);
 
-  Dbg(pi_dbg_ctl, "Evaluating STATE-INT8()");
+  Dbg(pi_dbg_ctl, "Evaluating %s-INT8()", _scope_label(_scope));
 
   return static_cast<const MatcherType *>(_matcher.get())->test(data, res);
 }
@@ -1674,9 +1742,9 @@ ConditionStateInt16::set_qualifier(const std::string &q)
     long ix = strtol(q.c_str(), nullptr, 10);
 
     if (ix != 0) {
-      TSError("[%s] STATE-INT16 index out of range: %s", PLUGIN_NAME, q.c_str());
+      TSError("[%s] %s-INT16 index out of range: %s", PLUGIN_NAME, _scope_label(_scope), q.c_str());
     } else {
-      Dbg(pi_dbg_ctl, "\tParsing %%{STATE-INT16:%s}", q.c_str());
+      Dbg(pi_dbg_ctl, "\tParsing %%{%s-INT16:%s}", _scope_label(_scope), q.c_str());
     }
   }
 }
@@ -1687,7 +1755,7 @@ ConditionStateInt16::append_value(std::string &s, const Resources &res)
   uint16_t data = _get_data(res);
 
   s += std::to_string(data);
-  Dbg(pi_dbg_ctl, "Appending STATE-INT16(%d) to evaluation value -> %s", data, s.c_str());
+  Dbg(pi_dbg_ctl, "Appending %s-INT16(%d) to evaluation value -> %s", _scope_label(_scope), data, s.c_str());
 }
 
 bool
@@ -1695,7 +1763,7 @@ ConditionStateInt16::eval(const Resources &res)
 {
   uint16_t data = _get_data(res);
 
-  Dbg(pi_dbg_ctl, "Evaluating STATE-INT8()");
+  Dbg(pi_dbg_ctl, "Evaluating %s-INT16()", _scope_label(_scope));
 
   return static_cast<const MatcherType *>(_matcher.get())->test(data, res);
 }
@@ -1722,11 +1790,8 @@ ConditionLastCapture::set_qualifier(const std::string &q)
 void
 ConditionLastCapture::append_value(std::string &s, const Resources &res)
 {
-  if (res.ovector_ptr && res.ovector_count > _ix) {
-    int start = res.ovector[_ix * 2];
-    int end   = res.ovector[_ix * 2 + 1];
-
-    s.append(std::string_view(res.ovector_ptr).substr(start, (end - start)));
+  if (res.matches().size() > _ix) {
+    s.append(res.matches()[_ix]);
     Dbg(pi_dbg_ctl, "Evaluating LAST-CAPTURE(%d)", _ix);
   }
 }
@@ -1758,8 +1823,11 @@ getClientAddr(TSHttpTxn txnp, int txn_private_slot)
     TSVConnPPInfoGet(TSHttpSsnClientVConnGet(TSHttpTxnSsnGet(txnp)), TS_PP_INFO_SRC_ADDR, reinterpret_cast<const char **>(&addr),
                      &addr_len);
     break;
+  case IP_SRC_PLUGIN:
+    TSHttpTxnVerifiedAddrGet(txnp, &addr);
+    break;
   default:
-    Dbg(pi_dbg_ctl, "Unknown IP source (%d) was specified", private_data.ip_source);
+    Dbg(pi_dbg_ctl, "Unknown IP source (%" PRIu64 ") was specified", static_cast<uint64_t>(private_data.ip_source));
     addr = TSHttpTxnClientAddrGet(txnp);
     break;
   }

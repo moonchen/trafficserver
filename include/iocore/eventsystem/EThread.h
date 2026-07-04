@@ -33,6 +33,7 @@
 #include "iocore/eventsystem/PriorityEventQueue.h"
 #include "iocore/eventsystem/ProtectedQueue.h"
 #include "tsutil/Histogram.h"
+#include "iocore/eventsystem/Watchdog.h"
 
 #if TS_USE_HWLOC
 struct hwloc_obj;
@@ -46,7 +47,6 @@ using hwloc_obj_t = hwloc_obj *;
 // instead.
 #define MUTEX_RETRY_DELAY HRTIME_MSECONDS(20)
 
-class DiskHandler;
 struct EventIO;
 
 class ServerSessionPool;
@@ -327,12 +327,6 @@ public:
   /** Block of memory to allocate thread specific data e.g. stat system arrays. */
   char thread_private[PER_THREAD_DATA];
 
-  /** Private Data for the Disk Processor. */
-  DiskHandler *diskHandler = nullptr;
-
-  /** Private Data for AIO. */
-  Que(Continuation, link) aio_ops;
-
   ProtectedQueue     EventQueueExternal;
   PriorityEventQueue EventQueue;
 
@@ -352,8 +346,8 @@ public:
 
   void             execute() override;
   void             execute_regular();
-  void             process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_count);
-  void             process_event(Event *e, int calling_code);
+  ink_hrtime       process_queue(Que(Event, link) * NegativeQueue, int *ev_count, int *nq_count, ink_hrtime event_time);
+  ink_hrtime       process_event(Event *e, int calling_code, ink_hrtime event_time);
   void             free_event(Event *e);
   LoopTailHandler *tail_cb = &DEFAULT_TAIL_HANDLER;
 
@@ -584,6 +578,8 @@ public:
 
   Metrics metrics;
 
+  Watchdog::Heartbeat heartbeat_state;
+
 private:
   void cons_common();
 };
@@ -707,6 +703,29 @@ operator new(size_t, ink_dummy_for_new *p)
 }
 #define ETHREAD_GET_PTR(thread, offset) ((void *)((char *)(thread) + (offset)))
 
-extern EThread *this_ethread();
+inline EThread *
+this_ethread()
+{
+  return EThread::this_ethread_ptr;
+}
+
+inline EThread *
+this_event_thread()
+{
+  EThread *ethread = this_ethread();
+  if (ethread != nullptr && ethread->tt == REGULAR) {
+    return ethread;
+  } else {
+    return nullptr;
+  }
+}
+
+inline void
+EThread::free_event(Event *e)
+{
+  ink_assert(!e->in_the_priority_queue && !e->in_the_prot_queue);
+  e->mutex = nullptr;
+  EVENT_FREE(e, eventAllocator, this);
+}
 
 extern int thread_max_heartbeat_mseconds;

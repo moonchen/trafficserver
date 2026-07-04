@@ -16,6 +16,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from __future__ import annotations
+
 import sys
 import argparse
 from pathlib import Path
@@ -24,10 +26,38 @@ from hrw4u.hrw4uLexer import hrw4uLexer
 from hrw4u.hrw4uParser import hrw4uParser
 from hrw4u.visitor import HRW4UVisitor
 
-KNOWN_MARKS = {"hooks", "conds", "ops", "vars", "examples", "invalid"}
+KNOWN_MARKS = {"hooks", "conds", "ops", "vars", "examples", "invalid", "procedures"}
 
 
-def parse_tree(input_text):
+def load_exceptions(test_dir: Path) -> dict[str, str]:
+    exceptions_file = test_dir / "exceptions.txt"
+    exceptions = {}
+
+    if not exceptions_file.exists():
+        return exceptions
+
+    for line in exceptions_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        parts = line.split(':', 1)
+        if len(parts) == 2:
+            test_name = parts[0].strip()
+            direction = parts[1].strip()
+            exceptions[test_name] = direction
+
+    return exceptions
+
+
+def _proc_search_paths(input_path: Path) -> list[Path] | None:
+    procs_dir = input_path.parent / 'procs'
+    if procs_dir.is_dir():
+        return [procs_dir]
+    return None
+
+
+def parse_tree(input_text: str) -> tuple[hrw4uParser, hrw4uParser.ProgramContext]:
     stream = InputStream(input_text)
     lexer = hrw4uLexer(stream)
     tokens = CommonTokenStream(lexer)
@@ -36,18 +66,36 @@ def parse_tree(input_text):
     return parser, tree
 
 
-def process_file(input_path, update_ast=False, update_output=False, update_error=False):
+def process_file(
+        input_path: Path,
+        update_ast: bool = False,
+        update_output: bool = False,
+        update_error: bool = False,
+        exceptions: dict[str, str] = None) -> bool:
     base = input_path.with_suffix('')
     ast_path = base.with_suffix('.ast.txt')
     output_path = base.with_suffix('.output.txt')
     error_path = base.with_suffix('.error.txt')
+
+    # Check if this test has a direction exception
+    if exceptions is None:
+        exceptions = load_exceptions(input_path.parent)
+
+    test_filename = input_path.name.replace('.input.txt', '.input')
+    if test_filename in exceptions:
+        exception_direction = exceptions[test_filename]
+        # Skip updating for hrw4u if test is u4wrh-only (and vice versa)
+        # Since this script runs hrw4u, skip if marked as u4wrh
+        if exception_direction == 'u4wrh':
+            # This test is reverse-only, skip updating
+            return True
 
     input_text = input_path.read_text()
 
     if input_path.name.endswith(".fail.input.txt"):
         try:
             parser, tree = parse_tree(input_text)
-            visitor = HRW4UVisitor(filename=str(input_path))
+            visitor = HRW4UVisitor(filename=str(input_path), proc_search_paths=_proc_search_paths(input_path))
             visitor.visit(tree)
             print(f"Unexpected success: {input_path}")
             return False
@@ -64,7 +112,8 @@ def process_file(input_path, update_ast=False, update_output=False, update_error
         try:
             parser, tree = parse_tree(input_text)
             ast_text = tree.toStringTree(recog=parser).strip()
-            output_text = "\n".join(HRW4UVisitor(filename=str(input_path)).visit(tree)).strip()
+            output_text = "\n".join(
+                HRW4UVisitor(filename=str(input_path), proc_search_paths=_proc_search_paths(input_path)).visit(tree)).strip()
 
             if update_ast:
                 ast_path.write_text(ast_text + "\n")
@@ -79,7 +128,7 @@ def process_file(input_path, update_ast=False, update_output=False, update_error
             return False
 
 
-def run_batch(group=None, update_ast=False, update_output=False, update_error=False):
+def run_batch(group: str | None = None, update_ast: bool = False, update_output: bool = False, update_error: bool = False) -> None:
     base_dir = Path("tests/data")
     pattern = "**/*.input.txt" if group is None else f"{group}/**/*.input.txt"
     input_files = sorted(base_dir.glob(pattern))
@@ -88,20 +137,38 @@ def run_batch(group=None, update_ast=False, update_output=False, update_error=Fa
         print(f"No test files found for pattern: {base_dir}/{pattern}")
         sys.exit(1)
 
+    # Group files by directory to load exceptions once per directory
+    files_by_dir = {}
+    for f in input_files:
+        if f.parent not in files_by_dir:
+            files_by_dir[f.parent] = []
+        files_by_dir[f.parent].append(f)
+
     total = len(input_files)
     failed = 0
+    skipped = 0
 
-    for f in input_files:
-        ok = process_file(f, update_ast=update_ast, update_output=update_output, update_error=update_error)
-        if not ok:
-            failed += 1
+    for test_dir, files in sorted(files_by_dir.items()):
+        exceptions = load_exceptions(test_dir)
 
-    print(f"\nUpdated: {total - failed}, Failed: {failed}")
+        for f in files:
+            # Check if this test should be skipped
+            test_filename = f.name.replace('.input.txt', '.input')
+            if test_filename in exceptions and exceptions[test_filename] == 'u4wrh':
+                skipped += 1
+                continue
+
+            ok = process_file(
+                f, update_ast=update_ast, update_output=update_output, update_error=update_error, exceptions=exceptions)
+            if not ok:
+                failed += 1
+
+    print(f"\nUpdated: {total - failed - skipped}, Skipped: {skipped}, Failed: {failed}")
     if failed:
         sys.exit(1)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run, update, or show ANTLR test outputs.")
     parser.add_argument("input_file", type=Path, nargs="?", help="Optional single input file")
     parser.add_argument("-g", "--group", help="Test group to run (e.g. 'hooks')")

@@ -611,7 +611,7 @@ StateUnauthorized(AuthRequestContext *auth, void *)
 {
   static const char msg[] = "authorization denied\n";
 
-  TSHttpTxnStatusSet(auth->txn, TS_HTTP_STATUS_FORBIDDEN);
+  TSHttpTxnStatusSet(auth->txn, TS_HTTP_STATUS_FORBIDDEN, "authproxy");
   TSHttpTxnErrorBodySet(auth->txn, TSstrdup(msg), sizeof(msg) - 1, TSstrdup("text/plain"));
 
   TSHttpTxnReenable(auth->txn, TS_EVENT_HTTP_ERROR);
@@ -661,6 +661,8 @@ StateAuthorized(AuthRequestContext *auth, void *)
       TSHandleMLocRelease(auth->rheader.buffer, auth->rheader.header, field_loc);
       field_loc = next_field_loc;
     }
+
+    TSHandleMLocRelease(request_bufp, TS_NULL_MLOC, request_hdr);
   }
 
   // Proceed with the modified request

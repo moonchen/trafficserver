@@ -37,6 +37,7 @@
 #include "tscore/BaseLogFile.h"
 #include "tsutil/PostScript.h"
 
+#include <filesystem>
 #include <fstream>
 #include <memory>
 
@@ -122,6 +123,49 @@ SCENARIO("Parsing ACL named filters", "[proxy][remap]")
   }
 }
 
+std::string
+make_regex_remap_with_substitutions(int n_substitutions)
+{
+  std::string substitutions;
+
+  substitutions.reserve(n_substitutions * 2);
+  for (int i = 0; i < n_substitutions; ++i) {
+    substitutions += "$0";
+  }
+
+  return "regex_map http://([^.]+)\\.example\\.com/ http://" + substitutions + ".origin.example.com/\n";
+}
+
+SCENARIO("Parsing regex remap substitutions", "[proxy][remap]")
+{
+  GIVEN("A regex remap target with the maximum number of substitution markers")
+  {
+    std::unique_ptr<UrlRewrite> urlrw = std::make_unique<UrlRewrite>();
+
+    auto cpath = write_test_remap(make_regex_remap_with_substitutions(UrlRewrite::MAX_REGEX_SUBS), "max-regex-substitutions");
+    ts::PostScript file_cleanup([&]() -> void { std::filesystem::remove(cpath.c_str()); });
+
+    THEN("the remap parse succeeds")
+    {
+      REQUIRE(urlrw->BuildTable(cpath.c_str()) == TS_SUCCESS);
+    }
+  }
+
+  GIVEN("A regex remap target with too many substitution markers")
+  {
+    std::unique_ptr<UrlRewrite> urlrw = std::make_unique<UrlRewrite>();
+
+    auto cpath =
+      write_test_remap(make_regex_remap_with_substitutions(UrlRewrite::MAX_REGEX_SUBS + 1), "too-many-regex-substitutions");
+    ts::PostScript file_cleanup([&]() -> void { std::filesystem::remove(cpath.c_str()); });
+
+    THEN("the remap parse fails")
+    {
+      REQUIRE(urlrw->BuildTable(cpath.c_str()) != TS_SUCCESS);
+    }
+  }
+}
+
 struct EasyURL {
   URL      url;
   HdrHeap *heap;
@@ -166,6 +210,62 @@ map https://h1.example.com \
       REQUIRE(urlmap.getMapping()->filter->src_ip_cnt == 1);
       REQUIRE(urlmap.getMapping()->filter->src_ip_valid);
       REQUIRE(urlmap.getMapping()->filter->src_ip_array[0].match_all_addresses);
+    }
+  }
+  GIVEN("map_with_recv_port keyword with a special URL scheme for Unix Domain Socket")
+  {
+    std::unique_ptr<UrlRewrite> urlrw = std::make_unique<UrlRewrite>();
+
+    std::string config = R"RMCFG(
+map_with_recv_port http+unix://front.example.com \
+    http://origin.example.com
+  )RMCFG";
+
+    auto cpath = write_test_remap(config, "unix-scheme");
+    printf("wrote config to path: %s\n", cpath.c_str());
+    int         rc = urlrw->BuildTable(cpath.c_str());
+    EasyURL     url("http+unix://front.example.com");
+    const char *host = "front.example.com";
+
+    THEN("only requests via unix domain socket matches")
+    {
+      // Checck if the rule is loaded
+      REQUIRE(rc == TS_SUCCESS);
+      REQUIRE(urlrw->rule_count() == 1);
+      UrlMappingContainer urlmap;
+
+      // The rule must not match if a port number is available (the request is made on IP interface)
+      REQUIRE(urlrw->forwardMappingWithRecvPortLookup(&url.url, 80, host, strlen(host), urlmap) == false);
+      // The rule must match if a port number is unavailable (the request is made on Unix Domain Socket)
+      REQUIRE(urlrw->forwardMappingWithRecvPortLookup(&url.url, 0, host, strlen(host), urlmap) == true);
+    }
+  }
+  GIVEN("map_with_recv_port keyword with a regular URL scheme")
+  {
+    std::unique_ptr<UrlRewrite> urlrw = std::make_unique<UrlRewrite>();
+
+    std::string config = R"RMCFG(
+map_with_recv_port http://front.example.com \
+    http://origin.example.com
+  )RMCFG";
+
+    auto cpath = write_test_remap(config, "regular-scheme");
+    printf("wrote config to path: %s\n", cpath.c_str());
+    int         rc = urlrw->BuildTable(cpath.c_str());
+    EasyURL     url("http://front.example.com");
+    const char *host = "front.example.com";
+
+    THEN("only request via IP interface matches")
+    {
+      // Checck if the rule is loaded
+      REQUIRE(rc == TS_SUCCESS);
+      REQUIRE(urlrw->rule_count() == 1);
+      UrlMappingContainer urlmap;
+
+      // The rule must match if a port number is available (the request is made on IP interface)
+      REQUIRE(urlrw->forwardMappingWithRecvPortLookup(&url.url, 80, host, strlen(host), urlmap) == true);
+      // The rule must not match if a port number is unavailable (the request is made on Unix Domain Socket)
+      REQUIRE(urlrw->forwardMappingWithRecvPortLookup(&url.url, 0, host, strlen(host), urlmap) == false);
     }
   }
 }

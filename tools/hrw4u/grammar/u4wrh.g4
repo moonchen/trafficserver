@@ -21,10 +21,10 @@ grammar u4wrh;
 // Lexer Rules
 // -----------------------------
 COND          : 'cond';
-IF            : 'if';
+IF_OP         : 'if';
+ENDIF_OP      : 'endif';
 ELIF          : 'elif';
 ELSE          : 'else';
-IN            : 'in';
 AND_MOD       : 'AND';
 OR_MOD        : 'OR';
 NOT_MOD       : 'NOT';
@@ -50,28 +50,24 @@ fragment HEXDIGIT : [0-9a-fA-F];
 // Percent blocks - treat entire %{...} as one token
 PERCENT_BLOCK : '%{' ~[}\r\n]* '}' '}'?;
 
-IDENT         : [@a-zA-Z_][a-zA-Z0-9_@.-]* ;
-COMPLEX_STRING : (~[ \t\r\n[\]{}(),=!><~%])+;
-NUMBER        : [0-9]+ ;
-LPAREN        : '(';
-RPAREN        : ')';
-LBRACE        : '{';
-RBRACE        : '}';
-LBRACKET      : '[';
-RBRACKET      : ']';
-EQUALS        : '=';
-NEQ           : '!=';
-GT            : '>';
-LT            : '<';
-TILDE         : '~';
-NOT_TILDE     : '!~';
-COLON         : ':';
-COMMA         : ',';
-SEMICOLON     : ';';
+IDENT          : [@a-zA-Z_][a-zA-Z0-9_@.-]* ;
+COMPLEX_STRING : (~[ \t\r\n[\]{}(),=!><~%#])+;
+NUMBER         : [0-9]+ ;
+LPAREN         : '(';
+RPAREN         : ')';
+LBRACE         : '{';
+RBRACE         : '}';
+LBRACKET       : '[';
+RBRACKET       : ']';
+EQUALS         : '=';
+NEQ            : '!=';
+GT             : '>';
+LT             : '<';
+COMMA          : ',';
 
-EOL           : '\r'? '\n';
-COMMENT       : '#' ~[\r\n]* -> skip ;
-WS            : [ \t]+ -> skip ;
+EOL            : '\r'? '\n';
+COMMENT        : '#'~[\r\n]*;
+WS             : [ \t]+ -> skip ;
 
 // -----------------------------
 // Parser Rules
@@ -84,13 +80,24 @@ program
 line
     : condLine EOL
     | opLine EOL
+    | ifLine EOL
+    | endifLine EOL
     | elifLine EOL
     | elseLine EOL
+    | commentLine EOL
     | EOL                     // blank line
     ;
 
 condLine
     : COND condBody modList?
+    ;
+
+ifLine
+    : IF_OP
+    ;
+
+endifLine
+    : ENDIF_OP
     ;
 
 elifLine
@@ -112,15 +119,16 @@ bareRef
     : percentRef
     ;
 
-// Comparison forms including implicit regex "~"
+// Comparison forms including implicit regex "~" and implicit equality "="
 comparison
     : lhs ( cmpOp rhs
-          | regexOp regex
-          | regex                // implicit "~" when operator omitted
-          | inOp set_
-          | inOp iprange
+          | regex
           | set_                 // implicit "in" when set follows directly
           | iprange              // implicit "in" when iprange follows directly
+          | STRING               // implicit "=" when string follows directly
+          | NUMBER               // implicit "=" when number follows directly
+          | IDENT                // implicit "=" when identifier follows directly
+          | COMPLEX_STRING       // implicit "=" when complex string follows directly
           )
     ;
 
@@ -137,15 +145,6 @@ cmpOp
 
 rhs
     : value
-    ;
-
-regexOp
-    : TILDE
-    | NOT_TILDE
-    ;
-
-inOp
-    : IN
     ;
 
 // %{...} used as a function-like condition (same token shape)
@@ -245,4 +244,8 @@ opTail
 opFlag
     : IDENT
     | 'QSA'
+    ;
+
+commentLine
+    : COMMENT
     ;

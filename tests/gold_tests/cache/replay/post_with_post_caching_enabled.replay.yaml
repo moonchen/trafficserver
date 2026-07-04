@@ -17,6 +17,34 @@
 meta:
   version: "1.0"
 
+# Configuration section for autest integration
+autest:
+  dns:
+    name: 'dns-post_with_post_caching_enabled'
+  dns:
+    name: 'dns-post_with_post_caching_enabled'
+  description: 'Verify correct POST response handling when caching POST responses is enabled'
+
+  server:
+    name: 'server-post-enabled'
+
+  client:
+    name: 'client-post-enabled'
+
+  ats:
+    name: 'ts-cache-post'
+    process_config:
+      enable_cache: true
+
+    records_config:
+      proxy.config.diags.debug.enabled: 1
+      proxy.config.diags.debug.tags: 'http.*|cache.*'
+      proxy.config.http.insert_age_in_response: 0
+      proxy.config.http.cache.post_method: 1
+
+    remap_config:
+      - from: "http://example.com/"
+        to: "http://backend.example.com:{SERVER_HTTP_PORT}/"
 
 sessions:
 - transactions:
@@ -65,6 +93,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The request should not go to the server, so this 500 response should not
     # be served.
@@ -130,6 +161,9 @@ sessions:
       # transaction.
       delay: 500ms
 
+    proxy-request:
+      expect: absent
+
     # The request should be served out of cache, so this 403 should not be
     # received.
     server-response:
@@ -187,6 +221,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The earlier response to the POST request should be returned, not this 403.
     server-response:
@@ -306,6 +343,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The response should be served out of cache, not via this server response.
     server-response:

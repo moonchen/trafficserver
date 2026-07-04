@@ -17,6 +17,31 @@
 meta:
   version: "1.0"
 
+# Configuration section for autest integration
+autest:
+  dns:
+    name: 'dns-head_with_get_cached'
+  description: 'Verify correct HEAD response handling with cached GET response'
+
+  server:
+    name: 'server-head'
+
+  client:
+    name: 'client-head'
+
+  ats:
+    name: 'ts-cache-head'
+    process_config:
+      enable_cache: true
+
+    records_config:
+      proxy.config.diags.debug.enabled: 1
+      proxy.config.diags.debug.tags: 'http.*|cache.*'
+      proxy.config.http.insert_age_in_response: 0
+
+    remap_config:
+      - from: "http://example.com/"
+        to: "http://backend.example.com:{SERVER_HTTP_PORT}/"
 
 sessions:
 - transactions:
@@ -57,6 +82,9 @@ sessions:
       # transaction.
       delay: 100ms
 
+    proxy-request:
+      expect: absent
+
     # The request should be served out of cache, so this 403 should not be
     # received.
     server-response:
@@ -86,6 +114,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The request should be served out of cache, so this 403 should not be
     # received.
@@ -117,6 +148,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The server should not receive this request because ATS should reply out
     # of the cache.
@@ -207,8 +241,8 @@ sessions:
       # transaction.
       delay: 100ms
 
-    # The server should not receive this request because ATS should reply out
-    # of the cache.
+    # The HEAD responses above should not populate cache, so this GET must go
+    # to origin and establish the cached GET entry for later requests.
     server-response:
       status: 200
       reason: OK
@@ -237,6 +271,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The request should be served out of cache, so this 403 should not be
     # received.
@@ -267,6 +304,9 @@ sessions:
       # Add a delay so ATS has time to finish any caching IO for the previous
       # transaction.
       delay: 100ms
+
+    proxy-request:
+      expect: absent
 
     # The request should be served out of cache, so this 403 should not be
     # received.

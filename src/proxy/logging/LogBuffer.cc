@@ -32,7 +32,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "../../iocore/eventsystem/P_EventSystem.h"
 #include "proxy/logging/LogField.h"
 #include "proxy/logging/LogFilter.h"
 #include "proxy/logging/LogFormat.h"
@@ -126,6 +125,8 @@ LogBuffer::LogBuffer(const LogConfig *cfg, LogObject *owner, size_t size, size_t
     m_unaligned_buffer           = static_cast<char *>(ats_malloc(alloc_size));
   }
   m_buffer = static_cast<char *>(align_pointer_forward(m_unaligned_buffer, buf_align));
+
+  memset(m_buffer, 0, size);
 
   // add the header
   hdr_size = _add_buffer_header(cfg);

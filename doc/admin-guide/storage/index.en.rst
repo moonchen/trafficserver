@@ -15,6 +15,8 @@
    specific language governing permissions and limitations
    under the License.
 
+.. include:: ../../common.defs
+
 .. _admin-cache-storage:
 
 Cache Storage
@@ -141,8 +143,8 @@ Disabling the RAM Cache
 -----------------------
 
 It is possible to disable the RAM cache. If you have configured your
-storage using the :file:`volume.config` you can add an optional directive
-of ``ramcache=false`` to whichever volumes you wish to have it disabled on.
+storage using the :file:`storage.yaml` you can add an optional directive
+of ``ram_cache: false`` to whichever volumes you wish to have it disabled on.
 This may be desirable for volumes composed of storage like RAM disks where
 you may want to avoid double RAM caching.
 
@@ -164,7 +166,7 @@ existing disks, or to add new disks to a Traffic Server node:
 
 #. Add hardware, if necessary.
 
-#. Edit :file:`storage.config` to increase the amount of disk space allocated
+#. Edit :file:`storage.yaml` to increase the amount of disk space allocated
    to the cache on existing disks or describe the new hardware you are adding.
 
 #. Restart Traffic Server.
@@ -179,12 +181,12 @@ existing disk, or to remove disks from a Traffic Server node:
 
 #. Remove hardware, if necessary.
 
-#. Edit :file:`storage.config` to reduce the amount of disk space allocated
+#. Edit :file:`storage.yaml` to reduce the amount of disk space allocated
    to the cache on existing disks or delete the reference to the hardware you're removing.
 
 #. Restart Traffic Server.
 
-.. important:: In :file:`storage.config`, a formatted or raw disk must be at least 128 MB.
+.. important:: In :file:`storage.yaml`, a formatted or raw disk must be at least 128 MB.
 
 .. _partitioning-the-cache:
 
@@ -311,6 +313,27 @@ cache. While the object remains on disk, Traffic Server will no longer able to f
 the object. The next request for that object will result in a fresh copy of the
 object fetched. Users may still see the old (removed) content if it was cached by
 intermediary caches or by the end-users' web browser.
+
+Conditional Cache Invalidation on DELETE Requests
+=================================================
+
+In compliance with :rfc:`9111` Section 4.4 "Invalidating Stored Responses", |TS|
+automatically invalidates cached responses when it receives a **successful**
+(non-error, i.e., 2xx or 3xx status code) response to a ``DELETE`` request for the same URL.
+This behavior ensures cache consistency when resources are deleted at the origin server.
+
+This means:
+
+- If a ``DELETE`` request to the origin server returns a success response
+  (e.g., ``200 OK``, ``204 No Content``), the cached object for that URL is invalidated.
+- If the ``DELETE`` request returns an error response (e.g., ``404 Not Found``,
+  ``405 Method Not Allowed``), the cached object remains unchanged.
+
+.. note::
+
+    This automatic invalidation differs from the ``PURGE`` method, which is a |TS| specific
+    mechanism for explicit cache removal. The ``DELETE`` method invalidation follows standard
+    HTTP semantics and requires the request to be forwarded to the origin server.
 
 Pushing an Object into the Cache
 ================================

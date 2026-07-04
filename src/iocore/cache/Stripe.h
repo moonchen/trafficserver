@@ -58,6 +58,8 @@ struct CacheVol {
   int          avg_obj_size     = -1; // Defer to the records.config if not overriden
   int          fragment_size    = -1; // Defer to the records.config if not overriden
   bool         ramcache_enabled = true;
+  int64_t      ram_cache_size   = -1; // Per-volume RAM cache size (-1 = use shared allocation)
+  int64_t      ram_cache_cutoff = -1; // Per-volume RAM cache cutoff (-1 = use global cutoff)
   StripeSM   **stripes          = nullptr;
   DiskStripe **disk_stripes     = nullptr;
   LINK(CacheVol, link);
@@ -95,6 +97,7 @@ public:
    * @see START_POS
    */
   Stripe(CacheDisk *disk, off_t blocks, off_t dir_skip, int avg_obj_size = -1, int fragment_size = -1);
+  virtual ~Stripe();
 
   int dir_check();
 
@@ -166,7 +169,7 @@ Stripe::round_to_approx_size(uint32_t l) const
 inline int
 Stripe::headerlen() const
 {
-  return ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter) + sizeof(uint16_t) * (this->directory.segments - 1));
+  return ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter) + sizeof(uint16_t) * (this->directory.segments - 1));
 }
 
 inline size_t
@@ -174,7 +177,7 @@ Stripe::dirlen() const
 {
   return this->headerlen() +
          ROUND_TO_STORE_BLOCK(((size_t)this->directory.buckets) * DIR_DEPTH * this->directory.segments * SIZEOF_DIR) +
-         ROUND_TO_STORE_BLOCK(sizeof(StripteHeaderFooter));
+         ROUND_TO_STORE_BLOCK(sizeof(StripeHeaderFooter));
 }
 
 /**

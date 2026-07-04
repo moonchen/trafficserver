@@ -26,9 +26,9 @@
 
 
  ***************************************************************************/
+#include "iocore/eventsystem/Freer.h"
 #include "tscore/ink_platform.h"
 #include "tscore/CryptoHash.h"
-#include "../../iocore/eventsystem/P_EventSystem.h"
 #include "proxy/logging/LogUtils.h"
 #include "proxy/logging/LogField.h"
 #include "proxy/logging/LogObject.h"
@@ -677,6 +677,8 @@ LogObject::log(LogAccess *lad, std::string_view text_entry)
   } else if (lad) {
     bytes_used = m_format->m_field_list.marshal(lad, &(*buffer)[offset]);
     ink_assert(bytes_needed >= bytes_used);
+    // Count only entries that were successfully checked out and marshalled, not dropped ones.
+    Metrics::Counter::increment(log_rsb.marshalled_bytes, bytes_needed);
   } else if (!text_entry.empty()) {
     char *dst = &(*buffer)[offset];
     memcpy(dst, text_entry.data(), text_entry.size());
@@ -892,7 +894,7 @@ TextLogObject::write(const char *format, ...)
 
   This routine will take a format string and va_list and write it as a
   single entry (line) in the text file.  If timestamps are on, then the
-  entry will be preceeded by a timestamp.
+  entry will be preceded by a timestamp.
 
   Returns ReturnCodeFlags.
   -------------------------------------------------------------------------*/

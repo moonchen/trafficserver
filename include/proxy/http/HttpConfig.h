@@ -37,9 +37,12 @@
 #include <cstdio>
 #include <bitset>
 #include <map>
+#include <unordered_map>
 #include <cctype>
 #include <string_view>
 #include <chrono>
+#include <functional>
+#include <variant>
 
 #include "iocore/eventsystem/IOBuffer.h"
 #include "swoc/swoc_ip.h"
@@ -54,8 +57,10 @@
 #include "iocore/net/ConnectionTracker.h"
 #include "iocore/net/SessionSharingAPIEnums.h"
 #include "records/RecProcess.h"
+#include "tsutil/Bravo.h"
 #include "tsutil/ts_ip.h"
 #include "tsutil/Metrics.h"
+#include "ts/apidefs.h"
 
 using ts::Metrics;
 
@@ -85,6 +90,46 @@ public:
 private:
   // TODO: change container to std::unordered_set or something
   HttpStatusBitset _data;
+};
+
+/**
+ * Pre-parsed list of targeted cache control header names (RFC 9213).
+ *
+ * Instead of parsing a comma-separated string on each request, this class
+ * stores the header names as an array of string_views into a stable backing
+ * string. The Converter ensures the string is parsed once at config load time
+ * and whenever the per-transaction override is set.
+ */
+class TargetedCacheControlHeaders
+{
+public:
+  static const MgmtConverter Conv;
+  // Must remain copy/move-capable: instances are stored in ParsedValue's
+  // std::variant and then kept inside ParsedConfigCache containers.
+
+  /// Maximum number of targeted headers supported.
+  static constexpr size_t MAX_HEADERS = 8;
+
+  char            *conf_value{nullptr};
+  std::string_view headers[MAX_HEADERS];
+  size_t           count{0};
+
+  /// Parse a comma-separated header list into the headers array.
+  void parse(std::string_view src);
+
+  /// Return a pointer to the parsed headers array.
+  const std::string_view *
+  get_headers() const
+  {
+    return headers;
+  }
+
+  /// Return the number of parsed headers.
+  size_t
+  get_count() const
+  {
+    return count;
+  }
 };
 
 struct HttpStatsBlock {
@@ -203,6 +248,7 @@ struct HttpStatsBlock {
   Metrics::Counter::AtomicType *pushed_document_total_size;
   Metrics::Counter::AtomicType *pushed_response_header_total_size;
   Metrics::Counter::AtomicType *put_requests;
+  Metrics::Counter::AtomicType *response_status_000_count;
   Metrics::Counter::AtomicType *response_status_100_count;
   Metrics::Counter::AtomicType *response_status_101_count;
   Metrics::Counter::AtomicType *response_status_1xx_count;
@@ -240,6 +286,7 @@ struct HttpStatsBlock {
   Metrics::Counter::AtomicType *response_status_414_count;
   Metrics::Counter::AtomicType *response_status_415_count;
   Metrics::Counter::AtomicType *response_status_416_count;
+  Metrics::Counter::AtomicType *response_status_429_count;
   Metrics::Counter::AtomicType *response_status_4xx_count;
   Metrics::Counter::AtomicType *response_status_500_count;
   Metrics::Counter::AtomicType *response_status_501_count;
@@ -366,6 +413,7 @@ enum class CacheOpenWriteFailAction_t {
   ERROR_ON_MISS_STALE_ON_REVALIDATE = 0x03,
   ERROR_ON_MISS_OR_REVALIDATE       = 0x04,
   READ_RETRY                        = 0x05,
+  READ_RETRY_STALE_ON_REVALIDATE    = 0x06,
   TOTAL_TYPES
 };
 
@@ -545,6 +593,8 @@ struct OverridableHttpConfigParams {
   MgmtByte cache_range_write              = 0;
   MgmtByte allow_multi_range              = 0;
 
+  TargetedCacheControlHeaders targeted_cache_control_headers;
+
   MgmtByte ignore_accept_mismatch          = 0;
   MgmtByte ignore_accept_language_mismatch = 0;
   MgmtByte ignore_accept_encoding_mismatch = 0;
@@ -656,11 +706,11 @@ struct OverridableHttpConfigParams {
   ////////////////////////////////////
   // origin server connect attempts //
   ////////////////////////////////////
-  MgmtInt connect_attempts_max_retries             = 0;
-  MgmtInt connect_attempts_max_retries_down_server = 3;
-  MgmtInt connect_attempts_rr_retries              = 3;
-  MgmtInt connect_attempts_timeout                 = 30;
-  MgmtInt connect_attempts_retry_backoff_base      = 0;
+  MgmtInt connect_attempts_max_retries                = 0;
+  MgmtInt connect_attempts_max_retries_suspect_server = 1;
+  MgmtInt connect_attempts_rr_retries                 = 3;
+  MgmtInt connect_attempts_timeout                    = 30;
+  MgmtInt connect_attempts_retry_backoff_base         = 0;
 
   MgmtInt connect_down_policy = 2;
 
@@ -723,6 +773,7 @@ struct OverridableHttpConfigParams {
   char *ssl_client_cert_filename        = nullptr;
   char *ssl_client_private_key_filename = nullptr;
   char *ssl_client_ca_cert_filename     = nullptr;
+  char *ssl_client_ca_cert_path         = nullptr;
   char *ssl_client_alpn_protocols       = nullptr;
 
   // Host Resolution order
@@ -838,6 +889,7 @@ public:
 
   MgmtInt http_request_line_max_size = 65535;
   MgmtInt http_hdr_field_max_size    = 131070;
+  MgmtInt pp_hdr_max_size            = 109;
 
   MgmtByte http_host_sni_policy         = 0;
   MgmtByte scheme_proto_mismatch_policy = 2;
@@ -850,6 +902,82 @@ public:
   /////////////////////////////////////
   HttpConfigParams(const HttpConfigParams &)            = delete;
   HttpConfigParams &operator=(const HttpConfigParams &) = delete;
+};
+
+/////////////////////////////////////////////////////////////
+//
+// class ParsedConfigCache
+//
+/////////////////////////////////////////////////////////////
+
+/** Cache for pre-parsed string config values.
+ *
+ * Some overridable STRING configs require parsing (e.g., status code lists,
+ * host resolution preferences). Parsing can be non-trivial. This cache stores
+ * parsed results so repeated calls to TSHttpTxnConfigStringSet() with the same
+ * value don't re-parse.
+ *
+ * The static lookup() method handles everything: check cache, parse if needed,
+ * store in cache, and return the result.
+ */
+class ParsedConfigCache
+{
+public:
+  /** Pre-parsed representations for configs that need special parsing.
+   *
+   * Uses std::variant since each cache entry only stores one type of parsed
+   * result. The conf_value_storage string is always present as it owns the
+   * string data that the parsed structures may reference.
+   */
+  struct ParsedValue {
+    std::string conf_value_storage{}; // Owns the string data.
+    std::variant<std::monostate, HostResData, HttpStatusCodeList, HttpForwarded::OptionBitSet, MgmtByte,
+                 TargetedCacheControlHeaders>
+      parsed{};
+
+    ParsedValue()                               = default;
+    ParsedValue(const ParsedValue &)            = delete;
+    ParsedValue &operator=(const ParsedValue &) = delete;
+    ParsedValue(ParsedValue &&)                 = delete;
+    ParsedValue &operator=(ParsedValue &&)      = delete;
+  };
+
+  /** Return the parsed value for the configuration.
+   *
+   * On first call for a given (key, value) pair, parses the value and caches it.
+   * Subsequent calls return the cached result.
+   *
+   * @param key The config key being referenced.
+   * @param value The string value to parse.
+   * @return Reference to the cached parsed value.
+   */
+  static const ParsedValue &lookup(TSOverridableConfigKey key, std::string_view value);
+
+private:
+  ParsedConfigCache() = default;
+
+  // Enforce singleton pattern.
+  ParsedConfigCache(const ParsedConfigCache &)            = delete;
+  ParsedConfigCache &operator=(const ParsedConfigCache &) = delete;
+  ParsedConfigCache(ParsedConfigCache &&)                 = delete;
+  ParsedConfigCache &operator=(ParsedConfigCache &&)      = delete;
+
+  static ParsedConfigCache &instance();
+
+  const ParsedValue &lookup_impl(TSOverridableConfigKey key, std::string_view value);
+  void               parse_into(ParsedValue &result, TSOverridableConfigKey key, std::string_view value);
+
+  // Custom hash for the cache key.
+  struct CacheKeyHash {
+    std::size_t
+    operator()(const std::pair<TSOverridableConfigKey, std::string> &k) const
+    {
+      return std::hash<int>()(static_cast<int>(k.first)) ^ (std::hash<std::string>()(k.second) << 1);
+    }
+  };
+
+  std::unordered_map<std::pair<TSOverridableConfigKey, std::string>, ParsedValue, CacheKeyHash> _cache;
+  ts::bravo::shared_mutex                                                                       _mutex;
 };
 
 /////////////////////////////////////////////////////////////
@@ -904,6 +1032,7 @@ inline HttpConfigParams::~HttpConfigParams()
   ats_free(oride.ssl_client_cert_filename);
   ats_free(oride.ssl_client_private_key_filename);
   ats_free(oride.ssl_client_ca_cert_filename);
+  ats_free(oride.ssl_client_ca_cert_path);
   ats_free(connect_ports_string);
   ats_free(reverse_proxy_no_host_redirect);
   ats_free(redirect_actions_string);
@@ -912,6 +1041,7 @@ inline HttpConfigParams::~HttpConfigParams()
   ats_free(oride.host_res_data.conf_value);
   ats_free(oride.negative_caching_list.conf_value);
   ats_free(oride.negative_revalidating_list.conf_value);
+  ats_free(oride.targeted_cache_control_headers.conf_value);
 
   delete connect_ports;
   delete redirect_actions_map;

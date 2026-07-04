@@ -22,6 +22,7 @@
   limitations under the License.
  */
 
+#include "P_SSLUtils.h"
 #include "SSLStats.h"
 #include "iocore/net/TLSBasicSupport.h"
 #if defined(OPENSSL_IS_BORINGSSL)
@@ -69,8 +70,42 @@ TLSBasicSupport::unbind(SSL *ssl)
 void
 TLSBasicSupport::clear()
 {
-  this->_tls_handshake_begin_time = 0;
-  this->_tls_handshake_end_time   = 0;
+  this->_tls_handshake_begin_time     = 0;
+  this->_tls_handshake_end_time       = 0;
+  this->_tls_handshake_bytes_measured = false;
+  this->_tls_handshake_bytes_in       = 0;
+  this->_tls_handshake_bytes_out      = 0;
+}
+
+// Returns true only on the first call that reads from the BIOs, so callers
+// can distinguish fresh values (for metrics) from cached ones.
+bool
+TLSBasicSupport::get_tls_handshake_bytes(uint64_t &bytes_in, uint64_t &bytes_out) const
+{
+  if (_tls_handshake_bytes_measured) {
+    bytes_in  = _tls_handshake_bytes_in;
+    bytes_out = _tls_handshake_bytes_out;
+    return false;
+  }
+
+  SSL *ssl = this->_get_ssl_object();
+  if (ssl == nullptr) {
+    bytes_in  = 0;
+    bytes_out = 0;
+    return false;
+  }
+
+  BIO *rbio = SSL_get_rbio(ssl);
+  BIO *wbio = SSL_get_wbio(ssl);
+
+  uint64_t bio_in  = rbio ? BIO_number_read(rbio) : 0;
+  uint64_t bio_out = wbio ? BIO_number_written(wbio) : 0;
+
+  bytes_in = _tls_handshake_bytes_in = bio_in;
+  bytes_out = _tls_handshake_bytes_out = bio_out;
+  _tls_handshake_bytes_measured        = true;
+
+  return true;
 }
 
 TLSHandle
@@ -123,25 +158,16 @@ TLSBasicSupport::get_tls_curve() const
 #endif
 }
 
-const char *
+std::string_view
 TLSBasicSupport::get_tls_group() const
 {
   auto ssl = this->_get_ssl_object();
 
   if (!ssl) {
-    return nullptr;
+    return "";
   }
-#if HAVE_SSL_GET0_GROUP_NAME // OpenSSL
-  return SSL_get0_group_name(ssl);
-#elif HAVE_SSL_GET_GROUP_ID && HAVE_SSL_GET_GROUP_NAME // BoringSSL
-  uint16_t const group_id = SSL_get_group_id(ssl);
-  if (group_id == 0) {
-    return nullptr;
-  }
-  return SSL_get_group_name(group_id);
-#else
-  return nullptr;
-#endif // HAVE_SSL_GET0_GROUP_NAME
+
+  return this->_get_tls_group();
 }
 
 ink_hrtime
@@ -247,6 +273,45 @@ TLSBasicSupport::_record_tls_handshake_end_time()
 
   Dbg(dbg_ctl_ssl, "ssl handshake time:%" PRId64, ssl_handshake_time);
   Metrics::Counter::increment(ssl_rsb.total_handshake_time, ssl_handshake_time);
+
+  // Record per-group handshake time
+#if defined(OPENSSL_IS_BORINGSSL)
+  SSL     *ssl      = this->_get_ssl_object();
+  uint16_t group_id = SSL_get_group_id(ssl);
+  if (group_id != 0) {
+    const char *group_name = SSL_get_group_name(group_id);
+    if (auto it = tls_group_handshake_time_map.find(group_name); it != tls_group_handshake_time_map.end()) {
+      Metrics::Counter::increment(it->second, ssl_handshake_time);
+    }
+  }
+#elif HAVE_SSL_CTX_GET0_IMPLEMENTED_GROUPS
+  SSL             *ssl        = this->_get_ssl_object();
+  std::string_view group_name = SSLGetGroupName(ssl);
+  if (!group_name.empty()) {
+    std::string group_str(group_name);
+    if (auto it = tls_group_handshake_time_map.find(group_str); it != tls_group_handshake_time_map.end()) {
+      Metrics::Counter::increment(it->second, ssl_handshake_time);
+    } else {
+      auto other = tls_group_handshake_time_map.find("OTHER");
+      if (other != tls_group_handshake_time_map.end()) {
+        Metrics::Counter::increment(other->second, ssl_handshake_time);
+      }
+    }
+  }
+#elif HAVE_SSL_GET_NEGOTIATED_GROUP
+  SSL *ssl = this->_get_ssl_object();
+  int  nid = SSL_get_negotiated_group(const_cast<SSL *>(ssl));
+  if (nid != NID_undef) {
+    if (auto it = tls_group_handshake_time_map.find(nid); it != tls_group_handshake_time_map.end()) {
+      Metrics::Counter::increment(it->second, ssl_handshake_time);
+    } else {
+      auto other = tls_group_handshake_time_map.find(SSL_GROUP_STAT_OTHER_KEY);
+      if (other != tls_group_handshake_time_map.end()) {
+        Metrics::Counter::increment(other->second, ssl_handshake_time);
+      }
+    }
+  }
+#endif
 }
 
 void
@@ -265,7 +330,21 @@ TLSBasicSupport::_update_end_of_handshake_stats()
       Warning("Unknown TLS Group");
     }
   }
-#elif defined(SSL_get_negotiated_group)
+#elif HAVE_SSL_CTX_GET0_IMPLEMENTED_GROUPS
+  SSL             *ssl        = this->_get_ssl_object();
+  std::string_view group_name = SSLGetGroupName(ssl);
+  if (!group_name.empty()) {
+    std::string group_str(group_name);
+    if (auto it = tls_group_map.find(group_str); it != tls_group_map.end()) {
+      Metrics::Counter::increment(it->second);
+    } else {
+      auto other = tls_group_map.find("OTHER");
+      if (other != tls_group_map.end()) {
+        Metrics::Counter::increment(other->second);
+      }
+    }
+  }
+#elif HAVE_SSL_GET_NEGOTIATED_GROUP
   SSL *ssl = this->_get_ssl_object();
   int  nid = SSL_get_negotiated_group(const_cast<SSL *>(ssl));
   if (nid != NID_undef) {
@@ -276,5 +355,5 @@ TLSBasicSupport::_update_end_of_handshake_stats()
       Metrics::Counter::increment(other->second);
     }
   }
-#endif // OPENSSL_IS_BORINGSSL or SSL_get_negotiated_group
+#endif // OPENSSL_IS_BORINGSSL or HAVE_SSL_CTX_GET0_IMPLEMENTED_GROUPS or HAVE_SSL_GET_NEGOTIATED_GROUP
 }

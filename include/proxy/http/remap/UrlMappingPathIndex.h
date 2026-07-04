@@ -40,6 +40,19 @@ public:
   void         Print() const;
   std::string  PrintUrlMappingPathIndex() const;
 
+  // Apply a function to each url_mapping in this index.
+  // Note: Trie only exposes const_iterator, so const_cast is required.
+  template <typename Func>
+  void
+  foreach_mapping(Func &&f)
+  {
+    for (auto &trie_pair : m_tries) {
+      for (auto const &mapping : *trie_pair.second) {
+        f(const_cast<url_mapping &>(mapping));
+      }
+    }
+  }
+
 private:
   using UrlMappingTrie = Trie<url_mapping>;
 
@@ -76,7 +89,7 @@ private:
     idx = url->scheme_get_wksidx();
     // If the scheme is empty (e.g. because of a CONNECT method), guess it
     // based on port
-    if (idx == -1) {
+    if (idx == -1 && url->scheme_get().empty()) {
       if (port == 80) {
         idx = URL_WKSIDX_HTTP;
       } else {

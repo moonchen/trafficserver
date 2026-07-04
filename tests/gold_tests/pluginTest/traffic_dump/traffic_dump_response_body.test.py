@@ -52,7 +52,13 @@ ts.Disk.records_config.update(
         'proxy.config.ssl.client.verify.server.policy': 'PERMISSIVE',
     })
 
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 ts.Disk.remap_config.AddLines([
     f'map / http://127.0.0.1:{server.Variables.http_port}',
@@ -83,8 +89,7 @@ tr.AddVerifierClientProcess(
     http_ports=[ts.Variables.port],
     https_ports=[ts.Variables.ssl_port],
     ssl_cert="ssl/server_combined.pem",
-    ca_cert="ssl/signer.pem",
-    other_args='--thread-limit 1')
+    ca_cert="ssl/signer.pem")
 
 tr.Processes.Default.StartBefore(server)
 tr.Processes.Default.StartBefore(ts)

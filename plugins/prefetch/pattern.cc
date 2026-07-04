@@ -23,6 +23,7 @@
  */
 
 #include "pattern.h"
+#include "tsutil/Regex.h"
 
 static void
 replaceString(String &str, const String &from, const String &to)
@@ -41,16 +42,14 @@ replaceString(String &str, const String &from, const String &to)
 Pattern::Pattern() : _pattern(""), _replacement("") {}
 
 /**
- * @brief Initializes PCRE pattern by providing the subject and replacement strings.
- * @param pattern PCRE pattern, a string containing PCRE patterns, capturing groups.
- * @param replacement PCRE replacement, a string where $0 ... $9 will be replaced with the corresponding capturing groups
+ * @brief Initializes PCRE2 pattern by providing the subject and replacement strings.
+ * @param pattern PCRE2 pattern, a string containing PCRE2 patterns, capturing groups.
+ * @param replacement PCRE2 replacement, a string where $0 ... $9 will be replaced with the corresponding capturing groups
  * @return true if successful, false if failure
  */
 bool
 Pattern::init(const String &pattern, const String &replacement)
 {
-  pcreFree();
-
   _pattern.assign(pattern);
   _replacement.assign(replacement);
 
@@ -58,7 +57,6 @@ Pattern::init(const String &pattern, const String &replacement)
 
   if (!compile()) {
     PrefetchDebug("failed to initialize pattern:'%s', replacement:'%s'", pattern.c_str(), replacement.c_str());
-    pcreFree();
     return false;
   }
 
@@ -66,9 +64,9 @@ Pattern::init(const String &pattern, const String &replacement)
 }
 
 /**
- * @brief Initializes PCRE pattern by providing the pattern only or pattern+replacement in a single configuration string.
+ * @brief Initializes PCRE2 pattern by providing the pattern only or pattern+replacement in a single configuration string.
  * @see init()
- * @param config PCRE pattern <pattern> or PCRE pattern + replacement in format /<pattern>/<replacement>/
+ * @param config PCRE2 pattern <pattern> or PCRE2 pattern + replacement in format /<pattern>/<replacement>/
  * @return true if successful, false if failure
  */
 bool
@@ -129,39 +127,14 @@ Pattern::init(const String &config)
 bool
 Pattern::empty() const
 {
-  return _pattern.empty() || nullptr == _re;
-}
-
-/**
- * @brief Frees PCRE library related resources.
- */
-void
-Pattern::pcreFree()
-{
-  if (_re) {
-    pcre_free(_re);
-    _re = nullptr;
-  }
-
-  if (_extra) {
-    pcre_free(_extra);
-    _extra = nullptr;
-  }
-}
-
-/**
- * @brief Destructor, frees PCRE related resources.
- */
-Pattern::~Pattern()
-{
-  pcreFree();
+  return _pattern.empty() || _regex.empty();
 }
 
 /**
  * @brief Capture or capture-and-replace depending on whether a replacement string is specified.
  * @see replace()
  * @see capture()
- * @param subject PCRE subject string
+ * @param subject PCRE2 subject string
  * @param result vector of strings where the result of captures or the replacements will be returned.
  * @return true if there was a match and capture or replacement succeeded, false if failure.
  */
@@ -197,23 +170,23 @@ Pattern::process(const String &subject, StringVector &result)
 }
 
 /**
- * @brief PCRE matches a subject string against the regex pattern.
- * @param subject PCRE subject
+ * @brief PCRE2 matches a subject string against the regex pattern.
+ * @param subject PCRE2 subject
  * @return true - matched, false - did not.
  */
 bool
 Pattern::match(const String &subject)
 {
-  int matchCount;
   PrefetchDebug("matching '%s' to '%s'", _pattern.c_str(), subject.c_str());
 
-  if (!_re) {
+  if (_regex.empty()) {
     return false;
   }
 
-  matchCount = pcre_exec(_re, _extra, subject.c_str(), subject.length(), 0, PCRE_NOTEMPTY, nullptr, 0);
+  RegexMatches matches;
+  int          matchCount = _regex.exec(subject, matches, RE_NOTEMPTY);
   if (matchCount < 0) {
-    if (matchCount != PCRE_ERROR_NOMATCH) {
+    if (matchCount != RE_ERROR_NOMATCH) {
       PrefetchError("matching error %d", matchCount);
     }
     return false;
@@ -223,64 +196,58 @@ Pattern::match(const String &subject)
 }
 
 /**
- * @brief Return all PCRE capture groups that matched in the subject string
- * @param subject PCRE subject string
+ * @brief Return all PCRE2 capture groups that matched in the subject string
+ * @param subject PCRE2 subject string
  * @param result reference to vector of strings containing all capture groups
  */
 bool
 Pattern::capture(const String &subject, StringVector &result)
 {
-  int matchCount;
-  int ovector[OVECOUNT];
-
   PrefetchDebug("matching '%s' to '%s'", _pattern.c_str(), subject.c_str());
 
-  if (!_re) {
+  if (_regex.empty()) {
     return false;
   }
 
-  matchCount = pcre_exec(_re, nullptr, subject.c_str(), subject.length(), 0, PCRE_NOTEMPTY, ovector, OVECOUNT);
-  if (matchCount < 0) {
-    if (matchCount != PCRE_ERROR_NOMATCH) {
+  RegexMatches matches;
+  int          matchCount = _regex.exec(subject, matches, RE_NOTEMPTY);
+
+  if (matchCount <= 0) {
+    if (matchCount != RE_ERROR_NOMATCH) {
       PrefetchError("matching error %d", matchCount);
     }
     return false;
   }
 
   for (int i = 0; i < matchCount; i++) {
-    int start  = ovector[2 * i];
-    int length = ovector[2 * i + 1] - ovector[2 * i];
-
-    String dst(subject, start, length);
-
-    PrefetchDebug("capturing '%s' %d[%d,%d]", dst.c_str(), i, ovector[2 * i], ovector[2 * i + 1]);
-    result.push_back(dst);
+    std::string_view match = matches[i];
+    result.emplace_back(match.data(), match.length());
+    PrefetchDebug("capturing '%s' %d", result.back().c_str(), i);
   }
 
   return true;
 }
 
 /**
- * @brief Replaces all replacements found in the replacement string with what matched in the PCRE capturing groups.
- * @param subject PCRE subject string
+ * @brief Replaces all replacements found in the replacement string with what matched in the PCRE2 capturing groups.
+ * @param subject PCRE2 subject string
  * @param result reference to A string where the result of the replacement will be stored
  * @return true - success, false - nothing matched or failure.
  */
 bool
 Pattern::replace(const String &subject, String &result)
 {
-  int matchCount;
-  int ovector[OVECOUNT];
-
   PrefetchDebug("matching '%s' to '%s'", _pattern.c_str(), subject.c_str());
 
-  if (!_re) {
+  if (_regex.empty()) {
     return false;
   }
 
-  matchCount = pcre_exec(_re, nullptr, subject.c_str(), subject.length(), 0, PCRE_NOTEMPTY, ovector, OVECOUNT);
-  if (matchCount < 0) {
-    if (matchCount != PCRE_ERROR_NOMATCH) {
+  RegexMatches matches;
+  int          matchCount = _regex.exec(subject, matches, RE_NOTEMPTY);
+
+  if (matchCount <= 0) {
+    if (matchCount != RE_ERROR_NOMATCH) {
       PrefetchError("matching error %d", matchCount);
     }
     return false;
@@ -296,17 +263,15 @@ Pattern::replace(const String &subject, String &result)
 
   int previous = 0;
   for (int i = 0; i < _tokenCount; i++) {
-    int replIndex = _tokens[i];
-    int start     = ovector[2 * replIndex];
-    int length    = ovector[2 * replIndex + 1] - ovector[2 * replIndex];
+    int              replIndex = _tokens[i];
+    std::string_view dst       = matches[replIndex];
 
     String src(_replacement, _tokenOffset[i], 2);
-    String dst(subject, start, length);
 
-    PrefetchDebug("replacing '%s' with '%s'", src.c_str(), dst.c_str());
+    PrefetchDebug("replacing '%s' with '%.*s'", src.c_str(), static_cast<int>(dst.length()), dst.data());
 
     result.append(_replacement, previous, _tokenOffset[i] - previous);
-    result.append(dst);
+    result.append(dst.data(), dst.length());
 
     previous = _tokenOffset[i] + 2; /* 2 is the size of $0 or $1 or $2, ... or $9 */
   }
@@ -319,36 +284,18 @@ Pattern::replace(const String &subject, String &result)
 }
 
 /**
- * @brief PCRE compiles the regex, called only during initialization.
+ * @brief PCRE2 compiles the regex, called only during initialization.
  * @return true if successful, false if not.
  */
 bool
 Pattern::compile()
 {
-  const char *errPtr;    /* PCRE error */
-  int         errOffset; /* PCRE error offset */
-
   PrefetchDebug("compiling pattern:'%s', replacement:'%s'", _pattern.c_str(), _replacement.c_str());
 
-  _re = pcre_compile(_pattern.c_str(), /* the pattern */
-                     0,                /* options */
-                     &errPtr,          /* for error message */
-                     &errOffset,       /* for error offset */
-                     nullptr);         /* use default character tables */
-
-  if (nullptr == _re) {
-    PrefetchError("compile of regex '%s' at char %d: %s", _pattern.c_str(), errOffset, errPtr);
-
-    return false;
-  }
-
-  _extra = pcre_study(_re, 0, &errPtr);
-
-  if ((nullptr == _extra) && (nullptr != errPtr) && (0 != *errPtr)) {
-    PrefetchError("failed to study regex '%s': %s", _pattern.c_str(), errPtr);
-
-    pcre_free(_re);
-    _re = nullptr;
+  std::string error;
+  int         erroffset;
+  if (!_regex.compile(_pattern, error, erroffset)) {
+    PrefetchError("compile of regex '%s' at char %d: %s", _pattern.c_str(), erroffset, error.c_str());
     return false;
   }
 
@@ -382,10 +329,6 @@ Pattern::compile()
         i++;
       }
     }
-  }
-
-  if (!success) {
-    pcreFree();
   }
 
   return success;

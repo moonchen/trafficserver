@@ -41,8 +41,8 @@ add_library(ts::proxy ALIAS proxy)
 
 target_link_libraries(
   proxy
-  PUBLIC ts::inkcache ts::inkevent ts::tsutil ts::tscore ts::inknet
-  PRIVATE ts::rpcpublichandlers ts::jsonrpc_protocol ts::inkutils ts::tsapibackend
+  PUBLIC ts::inkcache ts::inkevent ts::tsutil ts::tscore ts::inknet ts::http
+  PRIVATE ts::http ts::rpcpublichandlers ts::jsonrpc_protocol ts::inkutils ts::tsapibackend ts::configmanager
 )
 
 add_subdirectory(hdrs)
@@ -53,6 +53,10 @@ add_subdirectory(logging)
 
 if(TS_USE_QUIC)
   add_subdirectory(http3)
+endif()
+
+if(BUILD_TESTING)
+  add_subdirectory(unit_tests)
 endif()
 
 clang_tidy_check(proxy)

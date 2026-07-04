@@ -1,6 +1,6 @@
 /** @file
 
-  Transforms content using gzip, deflate or brotli
+  Transforms content using gzip, deflate, brotli or zstd
 
   @section license License
 
@@ -29,8 +29,9 @@
 
 #include "ts/ts.h"
 #include "tscpp/api/noncopyable.h"
+#include "swoc/TextView.h"
 
-namespace Gzip
+namespace Compress
 {
 using StringContainer = std::vector<std::string>;
 
@@ -38,7 +39,8 @@ enum CompressionAlgorithm {
   ALGORITHM_DEFAULT = 0,
   ALGORITHM_DEFLATE = 1,
   ALGORITHM_GZIP    = 2,
-  ALGORITHM_BROTLI  = 4 // For bit manipulations
+  ALGORITHM_BROTLI  = 4,
+  ALGORITHM_ZSTD    = 8
 };
 
 enum class RangeRequestCtrl : int {
@@ -51,18 +53,34 @@ enum class RangeRequestCtrl : int {
 class HostConfiguration : private atscppapi::noncopyable
 {
 public:
-  explicit HostConfiguration(const std::string &host)
+  explicit HostConfiguration(swoc::TextView host)
     : host_(host),
       enabled_(true),
       cache_(true),
       remove_accept_encoding_(false),
       flush_(false),
       compression_algorithms_(ALGORITHM_GZIP),
-      minimum_content_length_(1024)
+      minimum_content_length_(1024),
+      zlib_compression_level_(6),
+      brotli_compression_level_(6),
+      brotli_lgw_size_(16),
+      zstd_compression_level_(12),
+      content_type_ignore_parameters_(false)
   {
   }
 
-  bool
+  [[nodiscard]] bool
+  content_type_ignore_parameters() const
+  {
+    return content_type_ignore_parameters_;
+  }
+  void
+  set_content_type_ignore_parameters(bool x)
+  {
+    content_type_ignore_parameters_ = x;
+  }
+
+  [[nodiscard]] bool
   enabled()
   {
     return enabled_;
@@ -72,12 +90,12 @@ public:
   {
     enabled_ = x;
   }
-  RangeRequestCtrl
+  [[nodiscard]] RangeRequestCtrl
   range_request_ctl()
   {
     return range_request_ctl_;
   }
-  bool
+  [[nodiscard]] bool
   cache()
   {
     return cache_;
@@ -87,7 +105,7 @@ public:
   {
     cache_ = x;
   }
-  bool
+  [[nodiscard]] bool
   flush()
   {
     return flush_;
@@ -97,7 +115,7 @@ public:
   {
     flush_ = x;
   }
-  bool
+  [[nodiscard]] bool
   remove_accept_encoding()
   {
     return remove_accept_encoding_;
@@ -107,18 +125,18 @@ public:
   {
     remove_accept_encoding_ = x;
   }
-  std::string
+  [[nodiscard]] std::string
   host()
   {
     return host_;
   }
 
-  bool
+  [[nodiscard]] bool
   has_allows() const
   {
     return !allows_.empty();
   }
-  unsigned int
+  [[nodiscard]] unsigned int
   minimum_content_length() const
   {
     return minimum_content_length_;
@@ -129,16 +147,61 @@ public:
     minimum_content_length_ = x;
   }
 
-  void update_defaults();
-  void add_allow(const std::string &allow);
-  void add_compressible_content_type(const std::string &content_type);
-  void add_compressible_status_codes(std::string &status_codes);
-  bool is_url_allowed(const char *url, int url_len);
-  bool is_content_type_compressible(const char *content_type, int content_type_length);
-  bool is_status_code_compressible(const TSHttpStatus status_code) const;
-  void add_compression_algorithms(std::string &algorithms);
-  int  compression_algorithms();
-  void set_range_request(const std::string &token);
+  [[nodiscard]] unsigned int
+  zlib_compression_level() const
+  {
+    return zlib_compression_level_;
+  }
+
+  void
+  set_gzip_compression_level(int level)
+  {
+    zlib_compression_level_ = level;
+  }
+
+  [[nodiscard]] unsigned int
+  brotli_compression_level() const
+  {
+    return brotli_compression_level_;
+  }
+  void
+  set_brotli_compression_level(int level)
+  {
+    brotli_compression_level_ = level;
+  }
+
+  [[nodiscard]] unsigned int
+  brotli_lgw_size() const
+  {
+    return brotli_lgw_size_;
+  }
+  void
+  set_brotli_lgw_size(unsigned int lgw)
+  {
+    brotli_lgw_size_ = lgw;
+  }
+
+  [[nodiscard]] int
+  zstd_compression_level() const
+  {
+    return zstd_compression_level_;
+  }
+  void
+  set_zstd_compression_level(int level)
+  {
+    zstd_compression_level_ = level;
+  }
+
+  void               update_defaults();
+  void               add_allow(swoc::TextView allow);
+  void               add_compressible_content_type(swoc::TextView content_type);
+  void               add_compressible_status_codes(swoc::TextView &status_codes);
+  [[nodiscard]] bool is_url_allowed(const char *url, int url_len);
+  [[nodiscard]] bool is_content_type_compressible(const char *content_type, int content_type_length);
+  [[nodiscard]] bool is_status_code_compressible(const TSHttpStatus status_code) const;
+  void               add_compression_algorithms(swoc::TextView &algorithms);
+  [[nodiscard]] int  compression_algorithms();
+  void               set_range_request(swoc::TextView token);
 
 private:
   std::string  host_;
@@ -148,6 +211,11 @@ private:
   bool         flush_;
   int          compression_algorithms_;
   unsigned int minimum_content_length_;
+  unsigned int zlib_compression_level_;
+  unsigned int brotli_compression_level_;
+  unsigned int brotli_lgw_size_;
+  int          zstd_compression_level_;
+  bool         content_type_ignore_parameters_;
 
   RangeRequestCtrl range_request_ctl_ = RangeRequestCtrl::NO_COMPRESSION;
   StringContainer  compressible_content_types_;
@@ -164,8 +232,8 @@ class Configuration : private atscppapi::noncopyable
   friend class HostConfiguration;
 
 public:
-  static Configuration *Parse(const char *path);
-  HostConfiguration    *find(const char *host, int host_length);
+  [[nodiscard]] static Configuration *Parse(const char *path);
+  [[nodiscard]] HostConfiguration    *find(const char *host, int host_length);
 
 private:
   explicit Configuration() {}
@@ -175,4 +243,4 @@ private:
 
 }; // class Configuration
 
-} // namespace Gzip
+} // namespace Compress

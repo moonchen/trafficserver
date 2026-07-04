@@ -305,9 +305,9 @@ VerifyClient::SNIAction(SSL &ssl, const Context & /* ctx ATS_UNUSED */) const
 
   const char *servername = snis->get_sni_server_name();
   Dbg(dbg_ctl_ssl_sni, "action verify param %d, fqdn [%s]", this->mode, servername);
-  setClientCertLevel(ssl_vc->ssl, this->mode);
+  setClientCertLevel(ssl_vc->get_tls_handle(), this->mode);
   ssl_vc->set_ca_cert_file(ca_file, ca_dir);
-  setClientCertCACerts(ssl_vc->ssl, ssl_vc->get_ca_cert_file(), ssl_vc->get_ca_cert_dir());
+  setClientCertCACerts(ssl_vc->get_tls_handle(), ssl_vc->get_ca_cert_file(), ssl_vc->get_ca_cert_dir());
 
   return SSL_TLSEXT_ERR_OK;
 }
@@ -417,7 +417,7 @@ SNI_IpAllow::SNIAction(SSL &ssl, ActionItem::Context const & /* ctx ATS_UNUSED *
   const sockaddr *client_ip = nullptr;
   for (int i = 0; i < IpAllow::Subject::MAX_SUBJECTS; ++i) {
     if (IpAllow::Subject::PEER == IpAllow::subjects[i]) {
-      client_ip = ssl_vc->get_remote_addr();
+      client_ip = ssl_vc->get_effective_remote_addr();
       break;
     } else if (IpAllow::Subject::PROXY == IpAllow::subjects[i] &&
                ssl_vc->get_proxy_protocol_version() != ProxyProtocolVersion::UNDEFINED) {
@@ -471,6 +471,40 @@ ServerMaxEarlyData::SNIAction([[maybe_unused]] SSL &ssl, const Context & /* ctx 
   const uint32_t server_recv_max_early_data =
     server_max_early_data > 0 ? std::max(server_max_early_data, TLSEarlyDataSupport::DEFAULT_MAX_EARLY_DATA_SIZE) : 0;
   eds->update_early_data_config(&ssl, server_max_early_data, server_recv_max_early_data);
+#endif
+  return SSL_TLSEXT_ERR_OK;
+}
+
+int
+ServerSessionTicketEnabled::SNIAction(SSL &ssl, const Context & /* ctx ATS_UNUSED */) const
+{
+#if TS_HAS_TLS_SESSION_TICKET
+  if (auto snis = TLSSNISupport::getInstance(&ssl)) {
+    const char *servername = snis->get_sni_server_name();
+    Dbg(dbg_ctl_ssl_sni, "Setting session ticket support from sni.yaml to %d for fqdn [%s]", session_ticket_enabled, servername);
+    snis->hints_from_sni.ssl_ticket_enabled = session_ticket_enabled;
+  }
+
+  // Apply the ticket enable/disable flag immediately so the current handshake
+  // sees the per-SNI override before TLS session ticket processing kicks in.
+  if (session_ticket_enabled != 0) {
+    SSL_clear_options(&ssl, SSL_OP_NO_TICKET);
+  } else {
+    SSL_set_options(&ssl, SSL_OP_NO_TICKET);
+  }
+#endif
+  return SSL_TLSEXT_ERR_OK;
+}
+
+int
+ServerSessionTicketNumber::SNIAction(SSL &ssl, const Context & /* ctx ATS_UNUSED */) const
+{
+#if TS_HAS_TLS_SESSION_TICKET
+  if (auto snis = TLSSNISupport::getInstance(&ssl)) {
+    const char *servername = snis->get_sni_server_name();
+    Dbg(dbg_ctl_ssl_sni, "Setting session ticket count from sni.yaml to %d for fqdn [%s]", session_ticket_number, servername);
+    snis->hints_from_sni.ssl_ticket_number = session_ticket_number;
+  }
 #endif
   return SSL_TLSEXT_ERR_OK;
 }

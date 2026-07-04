@@ -42,6 +42,7 @@ add_library(
   handlers/common/ErrorUtils.cc
   handlers/common/RecordsUtils.cc
   handlers/config/Configuration.cc
+  handlers/hostdb/HostDB.cc
   handlers/records/Records.cc
   handlers/storage/Storage.cc
   handlers/server/Server.cc
@@ -67,8 +68,16 @@ if(BUILD_TESTING)
   add_executable(
     test_jsonrpcserver server/unit_tests/test_rpcserver.cc ${CMAKE_SOURCE_DIR}/src/shared/rpc/IPCSocketClient.cc
   )
-  target_link_libraries(test_jsonrpcserver Catch2::Catch2WithMain ts::jsonrpc_server ts::inkevent libswoc::libswoc)
+  target_link_libraries(
+    test_jsonrpcserver Catch2::Catch2WithMain ts::jsonrpc_server ts::inkevent libswoc::libswoc configmanager
+  )
   add_catch2_test(NAME test_jsonrpcserver COMMAND test_jsonrpcserver)
+
+  add_executable(test_record_yaml handlers/common/unit_tests/test_record_yaml.cc)
+  target_link_libraries(
+    test_record_yaml PRIVATE Catch2::Catch2WithMain ts::rpcpublichandlers ts::tscore yaml-cpp::yaml-cpp
+  )
+  add_catch2_test(NAME test_record_yaml COMMAND test_record_yaml)
 endif()
 
 clang_tidy_check(jsonrpc_protocol)

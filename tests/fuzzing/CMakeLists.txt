@@ -28,7 +28,10 @@ add_executable(fuzz_json fuzz_json.cc)
 add_executable(fuzz_proxy_protocol fuzz_proxy_protocol.cc)
 add_executable(fuzz_rec_http fuzz_rec_http.cc)
 add_executable(fuzz_yamlcpp fuzz_yamlcpp.cc)
-add_executable(fuzz_http3frame fuzz_http3frame.cc)
+if(TARGET ts::quic)
+  add_executable(fuzz_http3frame fuzz_http3frame.cc)
+endif()
+add_executable(fuzz_bio_miobuffer fuzz_bio_miobuffer.cc)
 
 #  Need to rewrite the ESI Parser to remove dependencies on TS API
 #target_link_libraries(fuzz_esi PRIVATE esi-common esicore tscore tsapi inkevent http)
@@ -45,8 +48,13 @@ target_link_libraries(fuzz_rec_http PRIVATE records tscore libswoc::libswoc)
 target_link_options(fuzz_rec_http PRIVATE "-fuse-ld=lld")
 target_link_libraries(fuzz_yamlcpp PRIVATE yaml-cpp)
 target_link_options(fuzz_yamlcpp PRIVATE "-fuse-ld=lld")
-target_link_libraries(fuzz_http3frame PRIVATE ts::tscore ts::quic)
-target_link_options(fuzz_http3frame PRIVATE "-fuse-ld=lld")
+if(TARGET ts::quic)
+  target_link_libraries(fuzz_http3frame PRIVATE ts::tscore ts::quic)
+  target_link_options(fuzz_http3frame PRIVATE "-fuse-ld=lld")
+endif()
+target_link_libraries(fuzz_bio_miobuffer PRIVATE inknet inkevent tscore OpenSSL::SSL OpenSSL::Crypto)
+target_link_options(fuzz_bio_miobuffer PRIVATE "-fuse-ld=lld")
+target_include_directories(fuzz_bio_miobuffer PRIVATE ${CMAKE_SOURCE_DIR}/src/iocore/net)
 
 target_sources(
   fuzz_hpack PRIVATE ${CMAKE_SOURCE_DIR}/src/proxy/http2/HTTP2.cc ${CMAKE_SOURCE_DIR}/src/proxy/http2/Http2Frame.cc

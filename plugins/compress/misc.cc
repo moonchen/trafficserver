@@ -1,6 +1,6 @@
 /** @file
 
-  Transforms content using gzip, deflate or brotli
+  Transforms content using gzip, deflate, brotli or zstd
 
   @section license License
 
@@ -29,18 +29,6 @@
 #include <cstring>
 #include <cinttypes>
 #include "debug_macros.h"
-
-voidpf
-gzip_alloc(voidpf /* opaque ATS_UNUSED */, uInt items, uInt size)
-{
-  return static_cast<voidpf>(TSmalloc(items * size));
-}
-
-void
-gzip_free(voidpf /* opaque ATS_UNUSED */, voidpf address)
-{
-  TSfree(address);
-}
 
 namespace
 {
@@ -84,8 +72,9 @@ normalize_accept_encoding(TSHttpTxn /* txnp ATS_UNUSED */, TSMBuffer reqp, TSMLo
   bool   deflate = false;
   bool   gzip    = false;
   bool   br      = false;
+  bool   zstd    = false;
   // remove the accept encoding field(s),
-  // while finding out if gzip or deflate is supported.
+  // while finding out if gzip, brotli, deflate, or zstandard are supported.
   while (field) {
     int         val_len;
     const char *values_ = TSMimeHdrFieldValueStringGet(reqp, hdr_loc, field, -1, &val_len);
@@ -100,6 +89,8 @@ normalize_accept_encoding(TSHttpTxn /* txnp ATS_UNUSED */, TSMBuffer reqp, TSMLo
           br = true;
         } else if (strcasecmp("deflate", next) == 0) {
           deflate = true;
+        } else if (strcasecmp("zstd", next) == 0) {
+          zstd = true;
         }
       }
     }
@@ -111,9 +102,13 @@ normalize_accept_encoding(TSHttpTxn /* txnp ATS_UNUSED */, TSMBuffer reqp, TSMLo
   }
 
   // append a new accept-encoding field in the header
-  if (deflate || gzip || br) {
+  if (deflate || gzip || br || zstd) {
     TSMimeHdrFieldCreate(reqp, hdr_loc, &field);
     TSMimeHdrFieldNameSet(reqp, hdr_loc, field, TS_MIME_FIELD_ACCEPT_ENCODING, TS_MIME_LEN_ACCEPT_ENCODING);
+    if (zstd) {
+      TSMimeHdrFieldValueStringInsert(reqp, hdr_loc, field, -1, "zstd", strlen("zstd"));
+      info("normalized accept encoding to zstd");
+    }
     if (br) {
       TSMimeHdrFieldValueStringInsert(reqp, hdr_loc, field, -1, "br", strlen("br"));
       info("normalized accept encoding to br");
@@ -189,14 +184,4 @@ register_plugin()
     return 0;
   }
   return 1;
-}
-
-void
-log_compression_ratio(int64_t in, int64_t out)
-{
-  if (in) {
-    info("Compressed size %" PRId64 " (bytes), Original size %" PRId64 ", ratio: %f", out, in, ((float)(in - out) / in));
-  } else {
-    debug("Compressed size %" PRId64 " (bytes), Original size %" PRId64 ", ratio: %f", out, in, 0.0F);
-  }
 }

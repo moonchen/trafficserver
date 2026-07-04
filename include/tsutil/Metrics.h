@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <optional>
 
 #include "swoc/MemSpan.h"
 
@@ -534,6 +535,48 @@ public:
     }
 
   }; // class Counter
+
+  /**
+   * Static string metrics storage.
+   *
+   * All methods are thread-safe.
+   */
+  class StaticString
+  {
+  public:
+    using StringStorage = std::unordered_map<std::string, std::string>;
+
+    static void
+    createString(const std::string &name, const std::string_view value)
+    {
+      auto &instance = Metrics::StaticString::instance();
+      return instance._createString(name, value);
+    }
+
+    static StaticString &instance();
+
+    /**
+     * Thread-safe iteration over all string metrics.
+     * The callback is invoked for each metric while holding the mutex.
+     */
+    template <typename Func>
+    void
+    for_each(Func &&func) const
+    {
+      std::lock_guard lock(_mutex);
+      for (const auto &[name, value] : _strings) {
+        func(name, value);
+      }
+    }
+
+    std::optional<std::string_view> lookup(const std::string &name) const;
+
+  private:
+    void _createString(const std::string &name, const std::string_view value);
+
+    StringStorage      _strings;
+    mutable std::mutex _mutex;
+  };
 
   /**
    * Derive metrics by summing a set of other metrics.

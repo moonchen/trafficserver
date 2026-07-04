@@ -81,13 +81,15 @@ class JA3FingerprintTest:
         self._server.Streams.All += Testers.ContainsExpression("https-request", "Verify the HTTPS request was received.")
         self._server.Streams.All += Testers.ContainsExpression("http2-request", "Verify the HTTP/2 request was received.")
         if not self._test_remap:
-            # Verify --preserve worked.
-            self._server.Streams.All += Testers.ContainsExpression("x-ja3-raw: .*,", "Verify the new raw header was added.")
+            # The first request has no existing JA3 headers, so headers are added.
             self._server.Streams.All += Testers.ContainsExpression(
-                "x-ja3-raw: first-signature", "Verify the already-existing raw header was preserved.")
-            self._server.Streams.All += Testers.ExcludesExpression(
-                "x-ja3-raw: first-signature;", "Verify no extra values were added due to preserve.")
+                "x-ja3-raw: .*,", "Verify the new raw header was added.", reflags=re.IGNORECASE)
             self._server.Streams.All += Testers.ContainsExpression("x-ja3-via: test.proxy.com", "The x-ja3-via string was added.")
+            # The second request has existing JA3 headers. With --preserve,
+            # no new JA3 headers are added (including x-ja3-sig). The replay
+            # file verifies x-ja3-sig is absent for the http2 transaction.
+            self._server.Streams.All += Testers.ContainsExpression(
+                "x-ja3-raw: first-signature", "Verify the already-existing raw header was preserved.", reflags=re.IGNORECASE)
 
     def _configure_trafficserver(self) -> None:
         """Configure Traffic Server to be used in the test."""
@@ -96,7 +98,13 @@ class JA3FingerprintTest:
         self._ts = Test.MakeATSProcess(name, enable_cache=False, enable_tls=True)
         JA3FingerprintTest._ts_counter += 1
         self._ts.addDefaultSSLFiles()
-        self._ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+        self._ts.Disk.ssl_multicert_yaml.AddLines(
+            """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
         server_port = self._server.Variables.https_port
         self._ts.Disk.remap_config.AddLine(f'map https://https.server.com https://https.backend.com:{server_port}')
 
@@ -143,11 +151,7 @@ class JA3FingerprintTest:
         """
         name = f'client{self._client_counter}'
         p = tr.AddVerifierClientProcess(
-            name,
-            self._replay_file,
-            http_ports=[self._ts.Variables.port],
-            https_ports=[self._ts.Variables.ssl_port],
-            other_args='--thread-limit 1')
+            name, self._replay_file, http_ports=[self._ts.Variables.port], https_ports=[self._ts.Variables.ssl_port])
         JA3FingerprintTest._client_counter += 1
 
         p.StartBefore(self._dns)
@@ -193,8 +197,10 @@ class JA3FingerprintTest:
 
         if self._modify_incoming:
             p.Streams.All += "modify-incoming-proxy.gold"
+        elif self._test_remap:
+            p.Streams.All += "modify-sent-proxy-remap.gold"
         else:
-            p.Streams.All += "modify-sent-proxy.gold"
+            p.Streams.All += "modify-sent-proxy-global.gold"
 
 
 JA3FingerprintTest(test_remap=False, modify_incoming=False)

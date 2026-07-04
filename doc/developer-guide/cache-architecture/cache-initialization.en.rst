@@ -23,7 +23,7 @@ Cache Initialization
 ********************
 
 Initialization starts with an instance of :cpp:class:`Store` reading the storage
-configuration file, by default :file:`storage.config`. For each valid element in
+configuration file, by default :file:`storage.yaml`. For each valid element in
 the file an instance of :cpp:class:`Span` is created. These are of basically
 four types:
 
@@ -77,7 +77,7 @@ stripe assignment and is called for each :class:`CacheHostRecord` and the generi
 stripes to be assigned are in :member:`CacheHostRecord::vols`.
 
 .. figure:: images/cache-init-cachehostrecord.png
-   :align: left
+   :align: center
 
    :member:`CacheHostRecord::vols` is the union of all the stripes in the :class:`CacheVol` instances in :member:`CacheHostRecord::cp`.
 

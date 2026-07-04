@@ -31,7 +31,11 @@
 #include "proxy/ProxyTransaction.h"
 #include "records/RecHttp.h"
 #include "iocore/net/TLSBasicSupport.h"
+#include "iocore/net/TLSEarlyDataSupport.h"
 #include "iocore/net/TLSSessionResumptionSupport.h"
+#include "tscore/ink_assert.h"
+
+#include <string>
 
 struct ClientTransactionInfo {
   int id{-1};
@@ -43,14 +47,20 @@ struct ClientConnectionInfo {
   bool tcp_reused{false};
   bool ssl_reused{false};
   bool connection_is_ssl{false};
+  int  ssl_resumption_type{0}; // 0=no resumption, 1=session cache, 2=session ticket
 
   char const *protocol{"-"};
   char const *sec_protocol{"-"};
   char const *cipher_suite{"-"};
   char const *curve{"-"};
-  char const *security_group{"-"};
+  std::string security_group{"-"};
 
   int alpn_id{SessionProtocolNameRegistry::INVALID};
+
+  // TLS handshake bytes (rx = received from client, tx = sent to client)
+  uint64_t tls_handshake_bytes_rx{0};
+  uint64_t tls_handshake_bytes_tx{0};
+  size_t   tls_early_data_len{0};
 };
 
 class HttpUserAgent
@@ -77,6 +87,8 @@ public:
 
   bool get_client_ssl_reused() const;
 
+  int get_client_ssl_resumption_type() const;
+
   bool get_client_connection_is_ssl() const;
 
   char const *get_client_protocol() const;
@@ -90,6 +102,12 @@ public:
   char const *get_client_security_group() const;
 
   int get_client_alpn_id() const;
+
+  uint64_t get_client_tls_handshake_bytes_rx() const;
+
+  uint64_t get_client_tls_handshake_bytes_tx() const;
+
+  size_t get_client_tls_early_data_len() const;
 
 private:
   HttpVCTableEntry *m_entry{nullptr};
@@ -169,10 +187,10 @@ HttpUserAgent::set_txn(ProxyTransaction *txn, TransactionMilestones &milestones)
       m_conn_info.curve = "-";
     }
 
-    if (auto group{tbs->get_tls_group()}; group) {
+    if (auto group{tbs->get_tls_group()}; !group.empty()) {
       m_conn_info.security_group = group;
     } else {
-      m_conn_info.security_group = "-";
+      m_conn_info.security_group = '-';
     }
 
     if (!m_conn_info.tcp_reused) {
@@ -180,6 +198,11 @@ HttpUserAgent::set_txn(ProxyTransaction *txn, TransactionMilestones &milestones)
       milestones[TS_MILESTONE_TLS_HANDSHAKE_START] = tbs->get_tls_handshake_begin_time();
       milestones[TS_MILESTONE_TLS_HANDSHAKE_END]   = tbs->get_tls_handshake_end_time();
     }
+    tbs->get_tls_handshake_bytes(m_conn_info.tls_handshake_bytes_rx, m_conn_info.tls_handshake_bytes_tx);
+  }
+
+  if (auto eds = netvc->get_service<TLSEarlyDataSupport>()) {
+    m_conn_info.tls_early_data_len = eds->get_early_data_len();
   }
 
   if (auto as = netvc->get_service<ALPNSupport>()) {
@@ -187,7 +210,21 @@ HttpUserAgent::set_txn(ProxyTransaction *txn, TransactionMilestones &milestones)
   }
 
   if (auto tsrs = netvc->get_service<TLSSessionResumptionSupport>()) {
-    m_conn_info.ssl_reused = tsrs->getSSLSessionCacheHit();
+    m_conn_info.ssl_reused = tsrs->getIsResumedSSLSession();
+
+    if (m_conn_info.ssl_reused) {
+      if (tsrs->getIsResumedFromSessionCache()) {
+        m_conn_info.ssl_resumption_type = 1;
+      } else if (tsrs->getIsResumedFromSessionTicket()) {
+        m_conn_info.ssl_resumption_type = 2;
+      } else {
+        // This should not happen if ssl_reused is true.
+        ink_assert(!"ssl_resumption_type should be set for an SSL reused session");
+        m_conn_info.ssl_resumption_type = 0;
+      }
+    } else {
+      m_conn_info.ssl_resumption_type = 0;
+    }
   }
 
   if (auto protocol_str{txn->get_protocol_string()}; protocol_str) {
@@ -233,6 +270,12 @@ HttpUserAgent::get_client_ssl_reused() const
   return m_conn_info.ssl_reused;
 }
 
+inline int
+HttpUserAgent::get_client_ssl_resumption_type() const
+{
+  return m_conn_info.ssl_resumption_type;
+}
+
 inline bool
 HttpUserAgent::get_client_connection_is_ssl() const
 {
@@ -266,13 +309,31 @@ HttpUserAgent::get_client_curve() const
 inline char const *
 HttpUserAgent::get_client_security_group() const
 {
-  return m_conn_info.security_group;
+  return m_conn_info.security_group.c_str();
 }
 
 inline int
 HttpUserAgent::get_client_alpn_id() const
 {
   return m_conn_info.alpn_id;
+}
+
+inline uint64_t
+HttpUserAgent::get_client_tls_handshake_bytes_rx() const
+{
+  return m_conn_info.tls_handshake_bytes_rx;
+}
+
+inline uint64_t
+HttpUserAgent::get_client_tls_handshake_bytes_tx() const
+{
+  return m_conn_info.tls_handshake_bytes_tx;
+}
+
+inline size_t
+HttpUserAgent::get_client_tls_early_data_len() const
+{
+  return m_conn_info.tls_early_data_len;
 }
 
 inline void

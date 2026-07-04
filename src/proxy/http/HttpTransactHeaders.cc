@@ -39,6 +39,8 @@
 #include "proxy/hdrs/HTTP.h"
 
 #include "iocore/utils/Machine.h"
+#include "tsutil/DbgCtl.h"
+#include "tsutil/StringCompare.h"
 
 using namespace std::literals;
 
@@ -423,6 +425,8 @@ HttpTransactHeaders::downgrade_request(bool *origin_server_keep_alive, HTTPHdr *
 void
 HttpTransactHeaders::generate_and_set_squid_codes(HTTPHdr *header, char *via_string, HttpTransact::SquidLogInfo *squid_codes)
 {
+  Dbg(dbg_ctl_http_transact_headers, "via_string=%s", via_string);
+
   SquidLogCode       log_code      = SquidLogCode::EMPTY;
   SquidHierarchyCode hier_code     = SquidHierarchyCode::EMPTY;
   SquidHitMissCode   hit_miss_code = SQUID_HIT_RESERVED;
@@ -479,6 +483,8 @@ HttpTransactHeaders::generate_and_set_squid_codes(HTTPHdr *header, char *via_str
       } else {
         if (via_string[VIA_CACHE_RESULT] == VIA_IN_CACHE_STALE && via_string[VIA_SERVER_RESULT] == VIA_SERVER_NOT_MODIFIED) {
           log_code = SquidLogCode::TCP_REFRESH_HIT;
+        } else if (via_string[VIA_CACHE_RESULT] == VIA_IN_CACHE_STALE && via_string[VIA_SERVER_RESULT] == VIA_SERVER_ERROR) {
+          log_code = SquidLogCode::TCP_REF_FAIL_HIT;
         } else {
           log_code = SquidLogCode::TCP_IMS_MISS;
         }
@@ -893,7 +899,7 @@ HttpTransactHeaders::remove_100_continue_headers(HttpTransact::State *s, HTTPHdr
 {
   auto expect{s->hdr_info.client_request.value_get(static_cast<std::string_view>(MIME_FIELD_EXPECT))};
 
-  if (strcasecmp(expect, static_cast<std::string_view>(HTTP_VALUE_100_CONTINUE)) == 0) {
+  if (ts::iequals(expect, static_cast<std::string_view>(HTTP_VALUE_100_CONTINUE))) {
     outgoing->field_delete(static_cast<std::string_view>(MIME_FIELD_EXPECT));
   }
 }
@@ -1240,6 +1246,53 @@ HttpTransactHeaders::normalize_accept_encoding(const OverridableHttpConfigParams
         } else {
           header->field_delete(ae_field);
           Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] removed non-br non-gzip Accept-Encoding");
+        }
+      } else if (normalize_ae == 4) {
+        // Force Accept-Encoding header to zstd or fallback to br/gzip or no header.
+        if (HttpTransactCache::match_content_encoding(ae_field, "zstd")) {
+          header->field_value_set(ae_field, "zstd"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to zstd");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "br")) {
+          header->field_value_set(ae_field, "br"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to br");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "gzip")) {
+          header->field_value_set(ae_field, "gzip"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to gzip");
+        } else {
+          header->field_delete(ae_field);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] removed non-zstd non-br non-gzip Accept-Encoding");
+        }
+      } else if (normalize_ae == 5) {
+        // Force Accept-Encoding header to zstd,br,gzip combinations or individual algorithms or no header.
+        if (HttpTransactCache::match_content_encoding(ae_field, "zstd") &&
+            HttpTransactCache::match_content_encoding(ae_field, "br") &&
+            HttpTransactCache::match_content_encoding(ae_field, "gzip")) {
+          header->field_value_set(ae_field, "zstd, br, gzip"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to zstd, br, gzip");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "zstd") &&
+                   HttpTransactCache::match_content_encoding(ae_field, "br")) {
+          header->field_value_set(ae_field, "zstd, br"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to zstd, br");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "zstd") &&
+                   HttpTransactCache::match_content_encoding(ae_field, "gzip")) {
+          header->field_value_set(ae_field, "zstd, gzip"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to zstd, gzip");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "zstd")) {
+          header->field_value_set(ae_field, "zstd"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to zstd");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "br") &&
+                   HttpTransactCache::match_content_encoding(ae_field, "gzip")) {
+          header->field_value_set(ae_field, "br, gzip"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to br, gzip");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "br")) {
+          header->field_value_set(ae_field, "br"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to br");
+        } else if (HttpTransactCache::match_content_encoding(ae_field, "gzip")) {
+          header->field_value_set(ae_field, "gzip"sv);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] normalized Accept-Encoding to gzip");
+        } else {
+          header->field_delete(ae_field);
+          Dbg(dbg_ctl_http_trans, "[Headers::normalize_accept_encoding] removed non-zstd non-br non-gzip Accept-Encoding");
         }
       } else {
         static bool logged = false;

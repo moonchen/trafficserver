@@ -49,6 +49,7 @@ duplicate bugs is encouraged, but not required.
    plugins/index.en
    cripts/index.en
    config-vars.en
+   config-reload-framework.en
    api/index.en
    continuous-integration/index.en
    documentation/index.en
@@ -57,6 +58,7 @@ duplicate bugs is encouraged, but not required.
    vconnection-implementers-guide.en
    netvconnection-implementers-guide.en
    netvconnection-invariants.en
+   tls-vconnection-architecture.en
    core-architecture/index.en
    design-documents/index.en
    layout/index.en

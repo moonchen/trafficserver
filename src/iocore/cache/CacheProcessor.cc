@@ -35,8 +35,7 @@
 #include "iocore/eventsystem/Action.h"
 #include "iocore/eventsystem/Continuation.h"
 
-#include "../../records/P_RecProcess.h"
-
+#include "iocore/eventsystem/Freer.h"
 #include "tscore/Diags.h"
 #include "tscore/Filenames.h"
 #include "tscore/ink_assert.h"
@@ -200,8 +199,6 @@ CacheProcessor::start_internal(int flags)
   gndisks = 0;
   ink_aio_set_err_callback(new AIO_failure_handler());
 
-  config_volumes.read_config_file();
-
   /*
    create CacheDisk objects for each span in the configuration file and store in gdisks
    */
@@ -280,7 +277,28 @@ CacheProcessor::start_internal(int flags)
         if (check) {
           cache_disk->read_only_p = true;
         }
-        cache_disk->forced_volume_num = span->forced_volume_num;
+
+        cache_disk->span_name = ats_strdup(span->name);
+
+        // Find exclusive span
+        // A span is exclusive when ConfigVolumes::complement() has assigned 100% of it to a
+        // single volume (either because the legacy storage.config used "volume=N" on that span,
+        // or because the storage.yaml volumes[].spans[] entry carries size=100%).  Exclusive
+        // spans are tracked via forced_volume_num so the allocator can skip them from the
+        // shared pool calculation.
+        for (ConfigVol *vol_config = config_volumes.cp_queue.head; vol_config; vol_config = vol_config->link.next) {
+          for (auto &span_config : vol_config->spans) {
+            if (strcmp(span->name, span_config.use.c_str()) == 0 && span_config.size.in_percent &&
+                span_config.size.percent == 100) {
+              cache_disk->forced_volume_num = vol_config->number;
+              Dbg(dbg_ctl_cache_init, "cache disk span_name=%s forced volume num=%d", cache_disk->span_name.get(),
+                  vol_config->number);
+
+              break;
+            }
+          }
+        }
+
         if (span->hash_base_string) {
           cache_disk->hash_base_string = ats_strdup(span->hash_base_string);
         }
@@ -407,24 +425,21 @@ CacheProcessor::scan(Continuation *cont, std::string_view hostname, int KB_per_s
 Action *
 CacheProcessor::lookup(Continuation *cont, const HttpCacheKey *key, CacheFragType frag_type)
 {
-  return lookup(cont, &key->hash, frag_type,
-                std::string_view{key->hostname, static_cast<std::string_view::size_type>(key->hostlen)});
+  return lookup(cont, &key->hash, frag_type, key->hostname);
 }
 
 Action *
 CacheProcessor::open_read(Continuation *cont, const HttpCacheKey *key, CacheHTTPHdr *request, const HttpConfigAccessor *params,
-                          CacheFragType type)
+                          CacheFragType frag_type, const CacheHostRecord *volume_host_rec)
 {
-  return caches[type]->open_read(cont, &key->hash, request, params, type,
-                                 std::string_view{key->hostname, static_cast<std::string_view::size_type>(key->hostlen)});
+  return caches[frag_type]->open_read(cont, &key->hash, request, params, frag_type, key->hostname, volume_host_rec);
 }
 
 Action *
 CacheProcessor::open_write(Continuation *cont, const HttpCacheKey *key, CacheHTTPInfo *old_info, time_t pin_in_cache,
-                           CacheFragType type)
+                           CacheFragType frag_type, const CacheHostRecord *volume_host_rec)
 {
-  return caches[type]->open_write(cont, &key->hash, old_info, pin_in_cache, type,
-                                  std::string_view{key->hostname, static_cast<std::string_view::size_type>(key->hostlen)});
+  return caches[frag_type]->open_write(cont, &key->hash, old_info, pin_in_cache, frag_type, key->hostname, volume_host_rec);
 }
 
 //----------------------------------------------------------------------------
@@ -433,8 +448,7 @@ CacheProcessor::open_write(Continuation *cont, const HttpCacheKey *key, CacheHTT
 Action *
 CacheProcessor::remove(Continuation *cont, const HttpCacheKey *key, CacheFragType frag_type)
 {
-  return caches[frag_type]->remove(cont, &key->hash, frag_type,
-                                   std::string_view{key->hostname, static_cast<std::string_view::size_type>(key->hostlen)});
+  return caches[frag_type]->remove(cont, &key->hash, frag_type, key->hostname);
 }
 
 /** Set the state of a disk programmatically.
@@ -488,7 +502,7 @@ CacheProcessor::mark_storage_offline(CacheDisk *d, ///< Target disk
   } else { // check cache types specifically
     if (theCache) {
       ReplaceablePtr<CacheHostTable>::ScopedReader hosttable(&theCache->hosttable);
-      if (!hosttable->gen_host_rec.vol_hash_table) {
+      if (!hosttable->getGenHostRec()->vol_hash_table) {
         unsigned int caches_ready    = 0;
         caches_ready                 = caches_ready | (1 << CACHE_FRAG_TYPE_HTTP);
         caches_ready                 = caches_ready | (1 << CACHE_FRAG_TYPE_NONE);
@@ -511,8 +525,8 @@ void
 rebuild_host_table(Cache *cache)
 {
   ReplaceablePtr<CacheHostTable>::ScopedWriter hosttable(&cache->hosttable);
-  build_vol_hash_table(&hosttable->gen_host_rec);
-  if (hosttable->m_numEntries != 0) {
+  build_vol_hash_table(const_cast<CacheHostRecord *>(hosttable->getGenHostRec()));
+  if (hosttable->getNumEntries() != 0) {
     CacheHostMatcher *hm        = hosttable->getHostMatcher();
     CacheHostRecord  *h_rec     = hm->getDataArray();
     int               h_rec_len = hm->getNumElements();
@@ -807,7 +821,7 @@ CacheProcessor::diskInitialized()
     theCache->open(clear, fix);
     return;
   }
-  if (config_volumes.num_http_volumes != 0) {
+  if (config_volumes.num_volumes != 0) {
     theCache         = new Cache();
     theCache->scheme = CacheType::HTTP;
     theCache->open(clear, fix);
@@ -817,11 +831,6 @@ CacheProcessor::diskInitialized()
 int
 cplist_reconfigure()
 {
-  int64_t    size;
-  int        volume_number;
-  off_t      size_in_blocks;
-  ConfigVol *config_vol;
-
   gnstripes = 0;
   if (config_volumes.num_volumes == 0) {
     /* only the http cache */
@@ -878,13 +887,32 @@ cplist_reconfigure()
       // in such a way forced volumes will not impact volume percentage calculations.
       if (-1 == gdisks[i]->forced_volume_num) {
         tot_space_in_blks += (gdisks[i]->num_usable_blocks / blocks_per_vol) * blocks_per_vol;
+      } else {
+        // exclusive span
+        for (ConfigVol *config_vol = config_volumes.cp_queue.head; config_vol; config_vol = config_vol->link.next) {
+          for (auto &vol_span_config : config_vol->spans) {
+            // Convert relative exclusive span size into absolute size
+            if (strlen(gdisks[i]->span_name) == vol_span_config.use.size() &&
+                strncmp(gdisks[i]->span_name, vol_span_config.use.c_str(), vol_span_config.use.size()) == 0 &&
+                vol_span_config.size.in_percent) {
+              int64_t space_in_blks =
+                (gdisks[i]->num_usable_blocks / blocks_per_vol) * blocks_per_vol * vol_span_config.size.percent / 100;
+
+              space_in_blks = space_in_blks >> (20 - STORE_BLOCK_SHIFT);
+              // round down to 128 megabyte multiple
+              space_in_blks                       = (space_in_blks >> 7) << 7;
+              vol_span_config.size.absolute_value = space_in_blks;
+            }
+          }
+        }
       }
     }
 
+    // Convert relative volume size into absolute size
     double percent_remaining = 100.00;
-    for (config_vol = config_volumes.cp_queue.head; config_vol; config_vol = config_vol->link.next) {
-      if (config_vol->in_percent) {
-        if (config_vol->percent > percent_remaining) {
+    for (ConfigVol *config_vol = config_volumes.cp_queue.head; config_vol; config_vol = config_vol->link.next) {
+      if (config_vol->size.in_percent) {
+        if (config_vol->size.percent > percent_remaining) {
           Warning("total volume sizes added up to more than 100%%!");
           Warning("no volumes created");
           return -1;
@@ -903,7 +931,7 @@ cplist_reconfigure()
         int64_t space_in_blks = 0;
         if (0 == tot_forced_space_in_blks) {
           // Calculate the space as percentage of total space in blocks.
-          space_in_blks = static_cast<int64_t>(((config_vol->percent / percent_remaining)) * tot_space_in_blks);
+          space_in_blks = static_cast<int64_t>(((config_vol->size.percent / percent_remaining)) * tot_space_in_blks);
         } else {
           // Forced volumes take all disk space, so no percentage calculations here.
           space_in_blks = tot_forced_space_in_blks;
@@ -911,34 +939,56 @@ cplist_reconfigure()
 
         space_in_blks = space_in_blks >> (20 - STORE_BLOCK_SHIFT);
         /* round down to 128 megabyte multiple */
-        space_in_blks    = (space_in_blks >> 7) << 7;
-        config_vol->size = space_in_blks;
+        space_in_blks                   = (space_in_blks >> 7) << 7;
+        config_vol->size.absolute_value = space_in_blks;
 
         if (0 == tot_forced_space_in_blks) {
           tot_space_in_blks -= space_in_blks << (20 - STORE_BLOCK_SHIFT);
-          percent_remaining -= (config_vol->size < 128) ? 0 : config_vol->percent;
+          percent_remaining -= (config_vol->size.absolute_value < 128) ? 0 : config_vol->size.percent;
         }
       }
-      if (config_vol->size < 128) {
+
+      if (!config_vol->size.is_empty() && config_vol->size.absolute_value < 128) {
         Warning("the size of volume %d (%" PRId64 ") is less than the minimum required volume size %d", config_vol->number,
-                static_cast<int64_t>(config_vol->size), 128);
+                static_cast<int64_t>(config_vol->size.absolute_value), 128);
         Warning("volume %d is not created", config_vol->number);
       }
-      Dbg(dbg_ctl_cache_hosting, "Volume: %d Size: %" PRId64 " Ramcache: %d", config_vol->number,
-          static_cast<int64_t>(config_vol->size), config_vol->ramcache_enabled);
+
+      if (dbg_ctl_cache_hosting.on()) {
+        Dbg(dbg_ctl_cache_hosting, "volume: %d ramcache: %d", config_vol->number, config_vol->ramcache_enabled);
+
+        if (config_vol->size.absolute_value) {
+          Dbg(dbg_ctl_cache_hosting, "  size: %" PRId64, config_vol->size.absolute_value);
+        } else {
+          for (const auto &config_span : config_vol->spans) {
+            Dbg(dbg_ctl_cache_hosting, "  using span: %s size: %" PRId64, config_span.use.c_str(), config_span.size.absolute_value);
+          }
+        }
+      }
     }
     cplist_update();
 
     /* go through volume config and grow and create volumes */
-    for (config_vol = config_volumes.cp_queue.head; config_vol; config_vol = config_vol->link.next) {
-      size = config_vol->size;
+    for (ConfigVol *config_vol = config_volumes.cp_queue.head; config_vol; config_vol = config_vol->link.next) {
+      Dbg(dbg_ctl_cache_init, "volume id=%d", config_vol->number);
+
+      int64_t size = 0;
+
+      if (!config_vol->size.is_empty()) {
+        size = config_vol->size.absolute_value;
+      } else {
+        for (const auto &config_span : config_vol->spans) {
+          size += config_span.size.absolute_value;
+        }
+      }
+
       if (size < 128) {
         continue;
       }
 
-      volume_number = config_vol->number;
+      int volume_number = config_vol->number;
 
-      size_in_blocks = (static_cast<off_t>(size) * 1024 * 1024) / STORE_BLOCK_SIZE;
+      off_t size_in_blocks = (static_cast<off_t>(size) * 1024 * 1024) / STORE_BLOCK_SIZE;
 
       if (config_vol->cachep && config_vol->cachep->num_vols > 0) {
         gnstripes += config_vol->cachep->num_vols;
@@ -1120,38 +1170,43 @@ register_cache_stats(CacheStatsBlock *rsb, const std::string &prefix)
   rsb->fragment_document_count[2] = ts::Metrics::Counter::createPtr(prefix + ".frags_per_doc.3+");
 
   // And then everything else
-  rsb->bytes_used            = ts::Metrics::Gauge::createPtr(prefix + ".bytes_used");
-  rsb->bytes_total           = ts::Metrics::Gauge::createPtr(prefix + ".bytes_total");
-  rsb->stripes               = ts::Metrics::Gauge::createPtr(prefix + ".stripes");
-  rsb->ram_cache_bytes_total = ts::Metrics::Gauge::createPtr(prefix + ".ram_cache.total_bytes");
-  rsb->ram_cache_bytes       = ts::Metrics::Gauge::createPtr(prefix + ".ram_cache.bytes_used");
-  rsb->ram_cache_hits        = ts::Metrics::Counter::createPtr(prefix + ".ram_cache.hits");
-  rsb->ram_cache_misses      = ts::Metrics::Counter::createPtr(prefix + ".ram_cache.misses");
-  rsb->pread_count           = ts::Metrics::Counter::createPtr(prefix + ".pread_count");
-  rsb->percent_full          = ts::Metrics::Gauge::createPtr(prefix + ".percent_full");
-  rsb->read_seek_fail        = ts::Metrics::Counter::createPtr(prefix + ".read.seek.failure");
-  rsb->read_invalid          = ts::Metrics::Counter::createPtr(prefix + ".read.invalid");
-  rsb->write_backlog_failure = ts::Metrics::Counter::createPtr(prefix + ".write.backlog.failure");
-  rsb->direntries_total      = ts::Metrics::Gauge::createPtr(prefix + ".direntries.total");
-  rsb->direntries_used       = ts::Metrics::Gauge::createPtr(prefix + ".direntries.used");
-  rsb->directory_collision   = ts::Metrics::Counter::createPtr(prefix + ".directory_collision");
-  rsb->read_busy_success     = ts::Metrics::Counter::createPtr(prefix + ".read_busy.success");
-  rsb->read_busy_failure     = ts::Metrics::Counter::createPtr(prefix + ".read_busy.failure");
-  rsb->write_bytes           = ts::Metrics::Counter::createPtr(prefix + ".write_bytes_stat");
-  rsb->hdr_vector_marshal    = ts::Metrics::Counter::createPtr(prefix + ".vector_marshals");
-  rsb->hdr_marshal           = ts::Metrics::Counter::createPtr(prefix + ".hdr_marshals");
-  rsb->hdr_marshal_bytes     = ts::Metrics::Counter::createPtr(prefix + ".hdr_marshal_bytes");
-  rsb->gc_bytes_evacuated    = ts::Metrics::Counter::createPtr(prefix + ".gc_bytes_evacuated");
-  rsb->gc_frags_evacuated    = ts::Metrics::Counter::createPtr(prefix + ".gc_frags_evacuated");
-  rsb->directory_wrap        = ts::Metrics::Counter::createPtr(prefix + ".wrap_count");
-  rsb->directory_sync_count  = ts::Metrics::Counter::createPtr(prefix + ".sync.count");
-  rsb->directory_sync_bytes  = ts::Metrics::Counter::createPtr(prefix + ".sync.bytes");
-  rsb->directory_sync_time   = ts::Metrics::Counter::createPtr(prefix + ".sync.time");
-  rsb->span_errors_read      = ts::Metrics::Counter::createPtr(prefix + ".span.errors.read");
-  rsb->span_errors_write     = ts::Metrics::Counter::createPtr(prefix + ".span.errors.write");
-  rsb->span_failing          = ts::Metrics::Gauge::createPtr(prefix + ".span.failing");
-  rsb->span_offline          = ts::Metrics::Gauge::createPtr(prefix + ".span.offline");
-  rsb->span_online           = ts::Metrics::Gauge::createPtr(prefix + ".span.online");
+  rsb->bytes_used             = ts::Metrics::Gauge::createPtr(prefix + ".bytes_used");
+  rsb->bytes_total            = ts::Metrics::Gauge::createPtr(prefix + ".bytes_total");
+  rsb->stripes                = ts::Metrics::Gauge::createPtr(prefix + ".stripes");
+  rsb->ram_cache_bytes_total  = ts::Metrics::Gauge::createPtr(prefix + ".ram_cache.total_bytes");
+  rsb->ram_cache_bytes        = ts::Metrics::Gauge::createPtr(prefix + ".ram_cache.bytes_used");
+  rsb->ram_cache_hits         = ts::Metrics::Counter::createPtr(prefix + ".ram_cache.hits");
+  rsb->last_open_read_hits    = ts::Metrics::Counter::createPtr(prefix + ".last_open_read.hits");
+  rsb->agg_buffer_hits        = ts::Metrics::Counter::createPtr(prefix + ".aggregation_buffer.hits");
+  rsb->ram_cache_misses       = ts::Metrics::Counter::createPtr(prefix + ".ram_cache.misses");
+  rsb->all_mem_misses         = ts::Metrics::Counter::createPtr(prefix + ".all_memory_caches.misses");
+  rsb->pread_count            = ts::Metrics::Counter::createPtr(prefix + ".pread_count");
+  rsb->percent_full           = ts::Metrics::Gauge::createPtr(prefix + ".percent_full");
+  rsb->read_seek_fail         = ts::Metrics::Counter::createPtr(prefix + ".read.seek.failure");
+  rsb->read_invalid           = ts::Metrics::Counter::createPtr(prefix + ".read.invalid");
+  rsb->write_backlog_failure  = ts::Metrics::Counter::createPtr(prefix + ".write.backlog.failure");
+  rsb->direntries_total       = ts::Metrics::Gauge::createPtr(prefix + ".direntries.total");
+  rsb->direntries_used        = ts::Metrics::Gauge::createPtr(prefix + ".direntries.used");
+  rsb->directory_collision    = ts::Metrics::Counter::createPtr(prefix + ".directory_collision");
+  rsb->read_busy_success      = ts::Metrics::Counter::createPtr(prefix + ".read_busy.success");
+  rsb->read_busy_failure      = ts::Metrics::Counter::createPtr(prefix + ".read_busy.failure");
+  rsb->write_bytes            = ts::Metrics::Counter::createPtr(prefix + ".write_bytes_stat");
+  rsb->hdr_vector_marshal     = ts::Metrics::Counter::createPtr(prefix + ".vector_marshals");
+  rsb->hdr_marshal            = ts::Metrics::Counter::createPtr(prefix + ".hdr_marshals");
+  rsb->hdr_marshal_bytes      = ts::Metrics::Counter::createPtr(prefix + ".hdr_marshal_bytes");
+  rsb->gc_bytes_evacuated     = ts::Metrics::Counter::createPtr(prefix + ".gc_bytes_evacuated");
+  rsb->gc_frags_evacuated     = ts::Metrics::Counter::createPtr(prefix + ".gc_frags_evacuated");
+  rsb->directory_wrap         = ts::Metrics::Counter::createPtr(prefix + ".wrap_count");
+  rsb->directory_sync_count   = ts::Metrics::Counter::createPtr(prefix + ".sync.count");
+  rsb->directory_sync_bytes   = ts::Metrics::Counter::createPtr(prefix + ".sync.bytes");
+  rsb->directory_sync_time    = ts::Metrics::Counter::createPtr(prefix + ".sync.time");
+  rsb->span_errors_read       = ts::Metrics::Counter::createPtr(prefix + ".span.errors.read");
+  rsb->span_errors_write      = ts::Metrics::Counter::createPtr(prefix + ".span.errors.write");
+  rsb->span_failing           = ts::Metrics::Gauge::createPtr(prefix + ".span.failing");
+  rsb->span_offline           = ts::Metrics::Gauge::createPtr(prefix + ".span.offline");
+  rsb->span_online            = ts::Metrics::Gauge::createPtr(prefix + ".span.online");
+  rsb->stripe_lock_contention = ts::Metrics::Counter::createPtr(prefix + ".stripe.lock_contention");
+  rsb->writer_lock_contention = ts::Metrics::Counter::createPtr(prefix + ".writer.lock_contention");
 }
 
 void
@@ -1168,6 +1223,8 @@ cplist_update()
           cp->ramcache_enabled = config_vol->ramcache_enabled;
           cp->avg_obj_size     = config_vol->avg_obj_size;
           cp->fragment_size    = config_vol->fragment_size;
+          cp->ram_cache_size   = config_vol->ram_cache_size;
+          cp->ram_cache_cutoff = config_vol->ram_cache_cutoff;
           config_vol->cachep   = cp;
         } else {
           /* delete this volume from all the disks */
@@ -1239,6 +1296,7 @@ cplist_update()
             config_vol->cachep = new_cp;
             fillExclusiveDisks(config_vol->cachep);
             cp_list.enqueue(new_cp);
+            cp_list_len++;
           } else {
             delete new_cp;
           }
@@ -1440,9 +1498,32 @@ CacheProcessor::cacheInitialized()
         }
       }
 
+      // Calculate total private RAM allocations from per-volume configurations
       int64_t http_ram_cache_size = 0;
+      int64_t total_private_ram   = 0;
 
-      // let us calculate the Size
+      if (cache_config_ram_cache_size != AUTO_SIZE_RAM_CACHE) {
+        CacheVol *cp = cp_list.head;
+
+        for (; cp; cp = cp->link.next) {
+          if (cp->ram_cache_size > 0 && !cp->ramcache_enabled) {
+            Warning("Volume %d has ram_cache_size=%" PRId64 " but ramcache=false, ignoring ram_cache_size", cp->vol_number,
+                    cp->ram_cache_size);
+            cp->ram_cache_size = -1;
+          }
+          if (cp->ram_cache_size > 0) {
+            total_private_ram += cp->ram_cache_size;
+            Dbg(dbg_ctl_cache_init, "Volume %d has private RAM allocation: %" PRId64 " bytes (%" PRId64 " MB)", cp->vol_number,
+                cp->ram_cache_size, cp->ram_cache_size / (1024 * 1024));
+          }
+        }
+
+        if (total_private_ram > 0) {
+          Dbg(dbg_ctl_cache_init, "Total private RAM allocations: %" PRId64 " bytes (%" PRId64 " MB)", total_private_ram,
+              total_private_ram / (1024 * 1024));
+        }
+      }
+
       if (cache_config_ram_cache_size == AUTO_SIZE_RAM_CACHE) {
         Dbg(dbg_ctl_cache_init, "cache_config_ram_cache_size == AUTO_SIZE_RAM_CACHE");
       } else {
@@ -1450,12 +1531,24 @@ CacheProcessor::cacheInitialized()
         // TODO, should we check the available system memories, or you will
         //   OOM or swapout, that is not a good situation for the server
         Dbg(dbg_ctl_cache_init, "%" PRId64 " != AUTO_SIZE_RAM_CACHE", cache_config_ram_cache_size);
-        http_ram_cache_size =
-          static_cast<int64_t>((static_cast<double>(theCache->cache_size) / total_size) * cache_config_ram_cache_size);
+
+        // Calculate shared pool: global RAM cache size minus private allocations
+        int64_t shared_pool = cache_config_ram_cache_size - total_private_ram;
+
+        if (shared_pool < 0) {
+          Fatal("Total private RAM cache allocations (%" PRId64 " bytes) exceed global ram_cache.size (%" PRId64 " bytes). "
+                "Increase proxy.config.cache.ram_cache.size or reduce per-volume ram_cache_size allocations.",
+                total_private_ram, cache_config_ram_cache_size);
+        } else if (total_private_ram > 0) {
+          Dbg(dbg_ctl_cache_init, "Shared RAM cache pool (after private allocations): %" PRId64 " bytes (%" PRId64 " MB)",
+              shared_pool, shared_pool / (1024 * 1024));
+        }
+
+        http_ram_cache_size = static_cast<int64_t>((static_cast<double>(theCache->cache_size) / total_size) * shared_pool);
 
         Dbg(dbg_ctl_cache_init, "http_ram_cache_size = %" PRId64 " = %" PRId64 "Mb", http_ram_cache_size,
             http_ram_cache_size / (1024 * 1024));
-        int64_t stream_ram_cache_size = cache_config_ram_cache_size - http_ram_cache_size;
+        int64_t stream_ram_cache_size = shared_pool - http_ram_cache_size;
 
         Dbg(dbg_ctl_cache_init, "stream_ram_cache_size = %" PRId64 " = %" PRId64 "Mb", stream_ram_cache_size,
             stream_ram_cache_size / (1024 * 1024));
@@ -1468,23 +1561,55 @@ CacheProcessor::cacheInitialized()
       uint64_t total_cache_bytes     = 0; // bytes that can used in total_size
       uint64_t total_direntries      = 0; // all the direntries in the cache
       uint64_t used_direntries       = 0; //   and used
-      uint64_t total_ram_cache_bytes = 0;
+      uint64_t total_ram_cache_bytes = 0; // Total RAM cache size across all volumes
+      uint64_t shared_cache_size     = 0; // Total cache size of volumes without explicit RAM allocations
+
+      // Calculate total cache size of volumes without explicit RAM allocations
+      if (http_ram_cache_size > 0) {
+        for (int i = 0; i < gnstripes; i++) {
+          if (gstripes[i]->cache_vol->ram_cache_size <= 0) {
+            shared_cache_size += (gstripes[i]->len >> STORE_BLOCK_SHIFT);
+          }
+        }
+        Dbg(dbg_ctl_cache_init, "Shared cache size (for RAM pool distribution): %" PRId64 " blocks", shared_cache_size);
+      }
 
       for (int i = 0; i < gnstripes; i++) {
         StripeSM *stripe          = gstripes[i];
         int64_t   ram_cache_bytes = 0;
 
-        if (stripe->cache_vol->ramcache_enabled) {
-          if (http_ram_cache_size == 0) {
+        // If RAM cache enabled, check if this volume has a private RAM cache allocation
+        if (stripe->cache_vol->ramcache_enabled && stripe->cache_vol->ram_cache_size != 0) {
+          if (stripe->cache_vol->ram_cache_size > 0) {
+            int64_t volume_stripe_count = 0;
+
+            for (int j = 0; j < gnstripes; j++) {
+              if (gstripes[j]->cache_vol == stripe->cache_vol) {
+                volume_stripe_count++;
+              }
+            }
+
+            if (volume_stripe_count > 0) {
+              ram_cache_bytes = stripe->cache_vol->ram_cache_size / volume_stripe_count;
+              Dbg(dbg_ctl_cache_init, "Volume %d stripe %d using private RAM allocation: %" PRId64 " bytes (%" PRId64 " MB)",
+                  stripe->cache_vol->vol_number, i, ram_cache_bytes, ram_cache_bytes / (1024 * 1024));
+            }
+          } else if (http_ram_cache_size == 0) {
             // AUTO_SIZE_RAM_CACHE
             ram_cache_bytes = stripe->dirlen() * DEFAULT_RAM_CACHE_MULTIPLIER;
           } else {
-            ink_assert(stripe->cache != nullptr);
+            // Use shared pool allocation - distribute only among volumes without explicit allocations
+            if (shared_cache_size > 0) {
+              ink_assert(stripe->cache != nullptr);
+              double factor = static_cast<double>(static_cast<int64_t>(stripe->len >> STORE_BLOCK_SHIFT)) / shared_cache_size;
 
-            double factor = static_cast<double>(static_cast<int64_t>(stripe->len >> STORE_BLOCK_SHIFT)) / theCache->cache_size;
-            Dbg(dbg_ctl_cache_init, "factor = %f", factor);
-
-            ram_cache_bytes = static_cast<int64_t>(http_ram_cache_size * factor);
+              Dbg(dbg_ctl_cache_init, "factor = %f (divisor = %" PRId64 ")", factor, shared_cache_size);
+              ram_cache_bytes = static_cast<int64_t>(http_ram_cache_size * factor);
+            } else {
+              ram_cache_bytes = 0;
+              Dbg(dbg_ctl_cache_init, "Volume %d stripe has no explicit RAM allocation, but shared pool is empty",
+                  stripe->cache_vol->vol_number);
+            }
           }
 
           stripe->ram_cache->init(ram_cache_bytes, stripe);
@@ -1495,19 +1620,19 @@ CacheProcessor::cacheInitialized()
               ram_cache_bytes, ram_cache_bytes / (1024 * 1024));
         }
 
-        uint64_t vol_total_cache_bytes  = stripe->len - stripe->dirlen();
-        total_cache_bytes              += vol_total_cache_bytes;
+        uint64_t vol_total_cache_bytes = stripe->len - stripe->dirlen();
+        uint64_t vol_total_direntries  = stripe->directory.entries();
+        uint64_t vol_used_direntries   = stripe->directory.entries_used();
+
+        total_cache_bytes += vol_total_cache_bytes;
         ts::Metrics::Gauge::increment(stripe->cache_vol->vol_rsb.bytes_total, vol_total_cache_bytes);
         ts::Metrics::Gauge::increment(stripe->cache_vol->vol_rsb.stripes);
 
         Dbg(dbg_ctl_cache_init, "total_cache_bytes = %" PRId64 " = %" PRId64 "Mb", total_cache_bytes,
             total_cache_bytes / (1024 * 1024));
 
-        uint64_t vol_total_direntries  = stripe->directory.entries();
-        total_direntries              += vol_total_direntries;
+        total_direntries += vol_total_direntries;
         ts::Metrics::Gauge::increment(stripe->cache_vol->vol_rsb.direntries_total, vol_total_direntries);
-
-        uint64_t vol_used_direntries = stripe->directory.entries_used();
         ts::Metrics::Gauge::increment(stripe->cache_vol->vol_rsb.direntries_used, vol_used_direntries);
         used_direntries += vol_used_direntries;
       }

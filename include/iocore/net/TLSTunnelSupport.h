@@ -55,6 +55,13 @@ public:
   static constexpr bool PORT_IS_DYNAMIC = true;
   void                  set_tunnel_destination(const std::string_view &destination, SNIRoutingType type, bool port_is_dynamic,
                                                YamlSNIConfig::TunnelPreWarm prewarm);
+
+  /** Copy the tunnel route, type, and prewarm configuration from another instance.
+   *
+   * Used when a terminating connection hands its blind-tunnel route off to a
+   * dedicated pass-through VConnection: the route was resolved on the original
+   * (e.g. TLS) VC during the SNI callback, and must travel with the new VC. */
+  void                         copy_tunnel_destination_from(const TLSTunnelSupport &src);
   YamlSNIConfig::TunnelPreWarm get_tunnel_prewarm_configuration() const;
 
   PreWarm::SPtrConstDst create_dst(int pid) const;

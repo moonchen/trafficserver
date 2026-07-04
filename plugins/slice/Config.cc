@@ -33,16 +33,10 @@ constexpr std::string_view DefaultCrrIdentHeader  = {"X-Crr-Ident"};
 
 Config::~Config()
 {
-  if (nullptr != m_regex_extra) {
-#ifndef PCRE_STUDY_JIT_COMPILE
-    pcre_free(m_regex_extra);
-#else
-    pcre_free_study(m_regex_extra);
-#endif
-  }
   if (nullptr != m_regex) {
-    pcre_free(m_regex);
+    delete m_regex;
   }
+  prefetchCleanup();
 }
 
 int64_t
@@ -159,16 +153,16 @@ Config::fromArgs(int const argc, char const *const argv[])
         break;
       }
 
-      const char *errptr;
+      std::string err;
       int         erroffset;
       m_regexstr = optarg;
-      m_regex    = pcre_compile(m_regexstr.c_str(), 0, &errptr, &erroffset, nullptr);
-      if (nullptr == m_regex) {
-        ERROR_LOG("Invalid regex: '%s'", m_regexstr.c_str());
-      } else {
-        m_regex_type  = Exclude;
-        m_regex_extra = pcre_study(m_regex, 0, &errptr);
+      m_regex    = new Regex();
+
+      if (m_regex->compile(m_regexstr, err, erroffset)) {
+        m_regex_type = Exclude;
         DEBUG_LOG("Using regex for url exclude: '%s'", m_regexstr.c_str());
+      } else {
+        ERROR_LOG("Invalid regex: '%s' - %s at column %d", m_regexstr.c_str(), err.c_str(), erroffset);
       }
     } break;
     case 'g': {
@@ -180,17 +174,16 @@ Config::fromArgs(int const argc, char const *const argv[])
         ERROR_LOG("Regex already specified!");
         break;
       }
-
-      const char *errptr;
+      std::string err;
       int         erroffset;
       m_regexstr = optarg;
-      m_regex    = pcre_compile(m_regexstr.c_str(), 0, &errptr, &erroffset, nullptr);
-      if (nullptr == m_regex) {
-        ERROR_LOG("Invalid regex: '%s'", m_regexstr.c_str());
-      } else {
-        m_regex_type  = Include;
-        m_regex_extra = pcre_study(m_regex, 0, &errptr);
+      m_regex    = new Regex();
+
+      if (m_regex->compile(m_regexstr, err, erroffset)) {
+        m_regex_type = Include;
         DEBUG_LOG("Using regex for url include: '%s'", m_regexstr.c_str());
+      } else {
+        ERROR_LOG("Invalid regex: '%s' - %s at column %d", m_regexstr.c_str(), err.c_str(), erroffset);
       }
     } break;
     case 'l': {
@@ -330,12 +323,14 @@ Config::matchesRegex(char const *const url, int const urllen) const
 
   switch (m_regex_type) {
   case Exclude: {
-    if (0 <= pcre_exec(m_regex, m_regex_extra, url, urllen, 0, 0, nullptr, 0)) {
+    // Exclude means if the regex matches, it doesn't match
+    if (m_regex->exec({url, static_cast<size_t>(urllen)})) {
       matches = false;
     }
   } break;
   case Include: {
-    if (pcre_exec(m_regex, m_regex_extra, url, urllen, 0, 0, nullptr, 0) < 0) {
+    // Include means if the regex matches, it matches
+    if (!m_regex->exec({url, static_cast<size_t>(urllen)})) {
       matches = false;
     }
   } break;
@@ -393,3 +388,36 @@ Config::sizeCacheRemove(std::string_view url)
     m_oscache->remove(url);
   }
 }
+
+std::pair<bool, BgBlockFetch *>
+Config::prefetchAcquire(const std::string &key)
+{
+  std::lock_guard<std::mutex> const guard(m_prefetch_mutex);
+  auto [it, inserted] = m_prefetch_active.insert(key);
+
+  if (!inserted) {
+    return {false, nullptr};
+  }
+
+  BgBlockFetch *bg = nullptr;
+
+  if (!m_prefetch_freelist.empty()) {
+    bg = m_prefetch_freelist.back();
+    m_prefetch_freelist.pop_back();
+  }
+
+  return {true, bg};
+}
+
+#if defined(UNITTEST)
+// Stubs for unit tests that don't link prefetch.cc
+void
+Config::prefetchRelease(BgBlockFetch *)
+{
+}
+
+void
+Config::prefetchCleanup()
+{
+}
+#endif

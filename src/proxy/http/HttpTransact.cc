@@ -128,14 +128,45 @@ extern HttpBodyFactory *body_factory;
 inline static bool
 bypass_ok(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
   if (s->response_action.handled) {
     return s->response_action.action.goDirect;
-  } else if (mp && mp->strategy) {
+  } else if (nullptr != s->next_hop_strategy) {
     // remap strategies do not support the TSHttpTxnParentProxySet API.
-    return mp->strategy->go_direct;
-  } else if (s->parent_params) {
+    return s->next_hop_strategy->go_direct;
+  } else if (nullptr != s->parent_params) {
     return s->parent_result.bypass_ok();
+  }
+  return false;
+}
+
+// wrapper to choose between a remap next hop strategy or use parent.config
+// remap next hop strategy is preferred
+inline static bool
+host_override(HttpTransact::State *s)
+{
+  if (s->response_action.handled) { // should be handled by the plugin
+    return false;
+  } else if (nullptr != s->next_hop_strategy) {
+    // remap strategies do not support the TSHttpTxnParentProxySet API.
+    return s->next_hop_strategy->host_override;
+  } else if (nullptr != s->parent_params) {
+    return s->parent_result.host_override();
+  }
+  return false;
+}
+
+// wrapper to choose between a remap next hop strategy or use parent.config
+// remap next hop strategy is preferred
+inline static bool
+is_some(HttpTransact::State *s)
+{
+  if (s->response_action.handled) {
+    return true;
+  } else if (nullptr != s->next_hop_strategy) {
+    // remap strategies do not support the TSHttpTxnParentProxySet API.
+    return s->parent_result.result == ParentResultType::SPECIFIED;
+  } else if (nullptr != s->parent_params) {
+    return s->parent_result.is_some();
   }
   return false;
 }
@@ -145,16 +176,14 @@ bypass_ok(HttpTransact::State *s)
 inline static bool
 is_api_result(HttpTransact::State *s)
 {
-  bool         r  = false;
-  url_mapping *mp = s->url_map.getMapping();
-
-  if (mp && mp->strategy) {
+  bool res = false;
+  if (nullptr != s->next_hop_strategy) {
     // remap strategies do not support the TSHttpTxnParentProxySet API.
-    r = false;
-  } else if (s->parent_params) {
-    r = s->parent_result.is_api_result();
+    res = false;
+  } else if (nullptr != s->parent_params) {
+    res = s->parent_result.is_api_result();
   }
-  return r;
+  return res;
 }
 
 // wrapper to get the max_retries.
@@ -184,12 +213,11 @@ numParents(HttpTransact::State *s)
 inline static bool
 parent_is_proxy(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
   if (s->response_action.handled) {
     return s->response_action.action.parentIsProxy;
-  } else if (mp && mp->strategy) {
-    return mp->strategy->parent_is_proxy;
-  } else if (s->parent_params) {
+  } else if (nullptr != s->next_hop_strategy) {
+    return s->next_hop_strategy->parent_is_proxy;
+  } else if (nullptr != s->parent_params) {
     return s->parent_result.parent_is_proxy();
   }
   return false;
@@ -211,7 +239,8 @@ retry_type(HttpTransact::State *s)
 inline static void
 findParent(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
+  TxnDbg(dbg_ctl_http_trans, "findParent");
+
   Metrics::Counter::increment(http_rsb.parent_count);
   if (s->response_action.handled) {
     s->parent_result.hostname = s->response_action.action.hostname;
@@ -224,9 +253,9 @@ findParent(HttpTransact::State *s)
     } else {
       s->parent_result.result = ParentResultType::FAIL;
     }
-  } else if (mp && mp->strategy) {
-    mp->strategy->findNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine));
-  } else if (s->parent_params) {
+  } else if (nullptr != s->next_hop_strategy) {
+    s->next_hop_strategy->findNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine));
+  } else if (nullptr != s->parent_params) {
     s->parent_params->findParent(&s->request_data, &s->parent_result, s->txn_conf->parent_fail_threshold,
                                  s->txn_conf->parent_retry_time);
   }
@@ -237,8 +266,6 @@ findParent(HttpTransact::State *s)
 inline static void
 markParentDown(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
-
   TxnDbg(dbg_ctl_http_trans, "enable_parent_timeout_markdowns: %d, disable_parent_markdowns: %d",
          s->txn_conf->enable_parent_timeout_markdowns, s->txn_conf->disable_parent_markdowns);
 
@@ -258,10 +285,10 @@ markParentDown(HttpTransact::State *s)
 
   if (s->response_action.handled) {
     // Do nothing. If a plugin handled the response, let it handle markdown.
-  } else if (mp && mp->strategy) {
-    mp->strategy->markNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine), s->parent_result.hostname, s->parent_result.port,
-                              NHCmd::MARK_DOWN);
-  } else if (s->parent_params) {
+  } else if (nullptr != s->next_hop_strategy) {
+    s->next_hop_strategy->markNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine), s->parent_result.hostname,
+                                      s->parent_result.port, NHCmd::MARK_DOWN);
+  } else if (nullptr != s->parent_params) {
     s->parent_params->markParentDown(&s->parent_result, s->txn_conf->parent_fail_threshold, s->txn_conf->parent_retry_time);
   }
 }
@@ -271,13 +298,12 @@ markParentDown(HttpTransact::State *s)
 inline static void
 markParentUp(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
   if (s->response_action.handled) {
     // Do nothing. If a plugin handled the response, let it handle markdown
-  } else if (mp && mp->strategy) {
-    mp->strategy->markNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine), s->parent_result.hostname, s->parent_result.port,
-                              NHCmd::MARK_UP);
-  } else if (s->parent_params) {
+  } else if (nullptr != s->next_hop_strategy) {
+    s->next_hop_strategy->markNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine), s->parent_result.hostname,
+                                      s->parent_result.port, NHCmd::MARK_UP);
+  } else if (nullptr != s->parent_params) {
     s->parent_params->markParentUp(&s->parent_result);
   }
 }
@@ -287,12 +313,11 @@ markParentUp(HttpTransact::State *s)
 inline static bool
 parentExists(HttpTransact::State *s)
 {
-  url_mapping *mp = s->url_map.getMapping();
   if (s->response_action.handled) {
     return s->response_action.action.nextHopExists;
-  } else if (mp && mp->strategy) {
-    return mp->strategy->nextHopExists(reinterpret_cast<TSHttpTxn>(s->state_machine));
-  } else if (s->parent_params) {
+  } else if (nullptr != s->next_hop_strategy) {
+    return s->next_hop_strategy->nextHopExists(reinterpret_cast<TSHttpTxn>(s->state_machine));
+  } else if (nullptr != s->parent_params) {
     return s->parent_params->parentExists(&s->request_data);
   } else {
     return false;
@@ -304,9 +329,10 @@ parentExists(HttpTransact::State *s)
 inline static void
 nextParent(HttpTransact::State *s)
 {
+  TxnDbg(dbg_ctl_http_trans, "nextParent");
+
   TxnDbg(dbg_ctl_parent_down, "connection to parent %s failed, conn_state: %s, request to origin: %s", s->parent_result.hostname,
          HttpDebugNames::get_server_state_name(s->current.state), s->request_data.get_host());
-  url_mapping *mp = s->url_map.getMapping();
   Metrics::Counter::increment(http_rsb.parent_count);
   if (s->response_action.handled) {
     s->parent_result.hostname = s->response_action.action.hostname;
@@ -319,10 +345,10 @@ nextParent(HttpTransact::State *s)
     } else {
       s->parent_result.result = ParentResultType::FAIL;
     }
-  } else if (mp && mp->strategy) {
+  } else if (nullptr != s->next_hop_strategy) {
     // NextHop only has a findNextHop() function.
-    mp->strategy->findNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine));
-  } else if (s->parent_params) {
+    s->next_hop_strategy->findNextHop(reinterpret_cast<TSHttpTxn>(s->state_machine));
+  } else if (nullptr != s->parent_params) {
     s->parent_params->nextParent(&s->request_data, &s->parent_result, s->txn_conf->parent_fail_threshold,
                                  s->txn_conf->parent_retry_time);
   }
@@ -404,12 +430,11 @@ response_is_retryable(HttpTransact::State *s, HTTPStatus response_code)
   if (s->response_action.handled) {
     return s->response_action.action.responseIsRetryable ? ParentRetry_t::SIMPLE : ParentRetry_t::NONE;
   }
-  const url_mapping *mp = s->url_map.getMapping();
-  if (mp && mp->strategy) {
-    return mp->strategy->responseIsRetryable(s->state_machine->sm_id, s->current, response_code);
+  if (nullptr != s->next_hop_strategy) {
+    return s->next_hop_strategy->responseIsRetryable(s->state_machine->sm_id, s->current, response_code);
   }
 
-  if (s->parent_params && !s->parent_result.response_is_retryable(s->parent_result.retry_type(), response_code)) {
+  if (nullptr != s->parent_params && !s->parent_result.response_is_retryable(s->parent_result.retry_type(), response_code)) {
     return ParentRetry_t::NONE;
   }
   const ParentRetry_t s_retry_type = retry_type(s);
@@ -537,6 +562,41 @@ HttpTransact::is_server_negative_cached(State *s)
   }
 }
 
+/**
+  ATS has two configuration options controlling how many times it retries a connection attempt against origin servers.
+
+  - proxy.config.http.connect_attempts_max_retries
+  - proxy.config.http.connect_attempts_max_retries_suspect_server
+
+  The choice is based on the state of the active HostDBInfo.
+
+  - HostDBInfo::State::UP: use proxy.config.http.connect_attempts_max_retries
+  - HostDBInfo::State::DOWN: no retry
+  - HostDBInfo::State::SUSPECT: use proxy.config.http.connect_attempts_max_retries_suspect_server
+
+*/
+uint8_t
+HttpTransact::origin_server_connect_attempts_max_retries(State *s)
+{
+  HostDBInfo *active = s->dns_info.active;
+  if (active == nullptr) {
+    return 0;
+  }
+
+  switch (active->state(ts_clock::now(), s->txn_conf->down_server_timeout)) {
+  case HostDBInfo::State::UP:
+    return s->txn_conf->connect_attempts_max_retries;
+  case HostDBInfo::State::DOWN:
+    return 0;
+  case HostDBInfo::State::SUSPECT:
+    return s->txn_conf->connect_attempts_max_retries_suspect_server;
+  default:
+    break;
+  }
+
+  return 0;
+}
+
 inline static void
 update_current_info(HttpTransact::CurrentInfo *into, HttpTransact::ConnectionAttributes *from,
                     ResolveInfo::UpstreamResolveStyle who, bool clear_retry_attempts)
@@ -610,10 +670,11 @@ find_server_and_update_current_info(HttpTransact::State *s)
     } else {
       findParent(s);
     }
-    if (!s->parent_result.is_some() || is_api_result(s) || parent_is_proxy(s)) {
+    if (!is_some(s) || is_api_result(s) || parent_is_proxy(s)) {
       TxnDbg(dbg_ctl_http_trans, "request not cacheable, so bypass parent");
       s->parent_result.result = ParentResultType::DIRECT;
     }
+
   } else if (s->txn_conf->uncacheable_requests_bypass_parent && s->txn_conf->no_dns_forward_to_parent == 0 &&
              !HttpTransact::is_request_cache_lookupable(s)) {
     // request not lookupable and cacheable, so bypass parent if the parent is not an origin server.
@@ -627,10 +688,12 @@ find_server_and_update_current_info(HttpTransact::State *s)
     } else {
       findParent(s);
     }
-    if (!s->parent_result.is_some() || is_api_result(s) || parent_is_proxy(s)) {
+
+    if (!is_some(s) || is_api_result(s) || parent_is_proxy(s)) {
       TxnDbg(dbg_ctl_http_trans, "request not cacheable, so bypass parent");
       s->parent_result.result = ParentResultType::DIRECT;
     }
+
   } else {
     switch (s->parent_result.result) {
     case ParentResultType::UNDEFINED:
@@ -671,14 +734,32 @@ find_server_and_update_current_info(HttpTransact::State *s)
   }
 
   switch (s->parent_result.result) {
-  case ParentResultType::SPECIFIED:
-    s->parent_info.name = s->arena.str_store(s->parent_result.hostname, strlen(s->parent_result.hostname));
+  case ParentResultType::SPECIFIED: {
+    char const *const hostname = s->parent_result.hostname;
+
+    if (nullptr != hostname) {
+      s->parent_info.name = s->arena.str_store(hostname, strlen(hostname));
+
+      // if host header override option enabled
+      if (host_override(s)) {
+        TxnDbg(dbg_ctl_http_trans, "overriding host header with parent %s", hostname);
+        if (!s->hdr_info.server_request.valid()) {
+          s->hdr_info.client_request.value_set(static_cast<std::string_view>(MIME_FIELD_HOST), hostname);
+          s->hdr_info.client_request.mark_target_dirty();
+        } else {
+          s->hdr_info.server_request.value_set(static_cast<std::string_view>(MIME_FIELD_HOST), hostname);
+          s->hdr_info.server_request.mark_target_dirty();
+        }
+      }
+    }
+
     update_current_info(&s->current, &s->parent_info, ResolveInfo::PARENT_PROXY, false);
     update_dns_info(&s->dns_info, &s->current);
     ink_assert(s->dns_info.looking_up == ResolveInfo::PARENT_PROXY);
     s->next_hop_scheme = URL_WKSIDX_HTTP;
 
     return ResolveInfo::PARENT_PROXY;
+  }
   case ParentResultType::FAIL:
     // No more parents - need to return an error message
     s->current.request_to = ResolveInfo::HOST_NONE;
@@ -906,6 +987,7 @@ HttpTransact::Forbidden(State *s)
 {
   TxnDbg(dbg_ctl_http_trans, "IpAllow marked request forbidden");
   bootstrap_state_variables_from_request(s, &s->hdr_info.client_request);
+  s->http_return_code_setter_name = "ip_allow";
   build_error_response(s, HTTPStatus::FORBIDDEN, "Access Denied", "access#denied");
   TRANSACT_RETURN(StateMachineAction_t::SEND_ERROR_CACHE_NOOP, nullptr);
 }
@@ -924,22 +1006,6 @@ HttpTransact::TooEarly(State *s)
   TxnDbg(dbg_ctl_http_trans, "Early Data method is not safe");
   bootstrap_state_variables_from_request(s, &s->hdr_info.client_request);
   build_error_response(s, HTTPStatus::TOO_EARLY, "Too Early", "too#early");
-  TRANSACT_RETURN(StateMachineAction_t::SEND_ERROR_CACHE_NOOP, nullptr);
-}
-
-void
-HttpTransact::OriginDown(State *s)
-{
-  TxnDbg(dbg_ctl_http_trans, "origin server is marked down");
-  bootstrap_state_variables_from_request(s, &s->hdr_info.client_request);
-  build_error_response(s, HTTPStatus::BAD_GATEWAY, "Origin Server Marked Down", "connect#failed_connect");
-  Metrics::Counter::increment(http_rsb.down_server_no_requests);
-  char            *url_str = s->hdr_info.client_request.url_string_get_ref(nullptr);
-  std::string_view host_name{s->unmapped_url.host_get()};
-  swoc::bwprint(error_bw_buffer, "CONNECT: down server no request to {} for host='{}' url='{}'", s->current.server->dst_addr,
-                host_name, swoc::bwf::FirstOf(url_str, "<none>"));
-  Log::error("%s", error_bw_buffer.c_str());
-
   TRANSACT_RETURN(StateMachineAction_t::SEND_ERROR_CACHE_NOOP, nullptr);
 }
 
@@ -1109,6 +1175,7 @@ HttpTransact::EndRemapRequest(State *s)
   // We must close this connection if client_connection_enabled == false //
   /////////////////////////////////////////////////////////////////////////
   if (!s->client_connection_allowed) {
+    s->http_return_code_setter_name = "ip_allow";
     build_error_response(s, HTTPStatus::FORBIDDEN, "Access Denied", "access#denied");
     s->reverse_proxy = false;
     goto done;
@@ -1249,7 +1316,7 @@ HttpTransact::handle_upgrade_request(State *s)
   HTTPHdr &request = s->hdr_info.client_request;
   s->method        = request.method_get_wksidx();
 
-  // Quickest way to determine that this is defintely not an upgrade.
+  // Quickest way to determine that this is definitely not an upgrade.
   /* RFC 6455 The method of the request MUST be GET, and the HTTP version MUST
         be at least 1.1. */
   if (!s->hdr_info.client_request.presence(MIME_PRESENCE_UPGRADE) ||
@@ -1517,12 +1584,6 @@ HttpTransact::HandleRequest(State *s)
   if (!s->state_machine->is_waiting_for_full_body && !s->state_machine->is_buffering_request_body) {
     ink_assert(!s->hdr_info.server_request.valid());
 
-    Metrics::Counter::increment(http_rsb.incoming_requests);
-
-    if (s->client_info.port_attribute == HttpProxyPort::TRANSPORT_SSL) {
-      Metrics::Counter::increment(http_rsb.https_incoming_requests);
-    }
-
     ///////////////////////////////////////////////
     // if request is bad, return error response  //
     ///////////////////////////////////////////////
@@ -1582,7 +1643,7 @@ HttpTransact::HandleRequest(State *s)
         }
       }
     }
-    if (s->txn_conf->request_buffer_enabled &&
+    if (s->txn_conf->request_buffer_enabled && s->http_config_param->post_copy_size > 0 &&
         s->state_machine->get_ua_txn()->has_request_body(s->hdr_info.request_content_length,
                                                          s->client_info.transfer_encoding == TransferEncoding_t::CHUNKED)) {
       TRANSACT_RETURN(StateMachineAction_t::WAIT_FOR_FULL_BODY, nullptr);
@@ -1758,7 +1819,6 @@ HttpTransact::HandleApiErrorJump(State *s)
   **/
   if (s->http_return_code != HTTPStatus::NONE && s->http_return_code >= HTTPStatus::BAD_REQUEST) {
     const char *reason = http_hdr_reason_lookup(s->http_return_code);
-    ;
     build_response(s, &s->hdr_info.client_response, s->client_info.http_version, s->http_return_code, reason ? reason : "Error");
   } else {
     build_response(s, &s->hdr_info.client_response, s->client_info.http_version, HTTPStatus::INTERNAL_SERVER_ERROR, "INKApi Error");
@@ -1925,9 +1985,12 @@ HttpTransact::OSDNSLookup(State *s)
       SET_VIA_STRING(VIA_DETAIL_TUNNEL, VIA_DETAIL_TUNNEL_NO_FORWARD);
       if (!s->dns_info.record || s->dns_info.record->is_failed()) {
         // Set to internal server error so later logging will pick up SquidLogCode::ERR_DNS_FAIL
-        build_error_response(s, HTTPStatus::INTERNAL_SERVER_ERROR, "Cannot find server.", "connect#dns_failed");
+        build_error_response(s, HTTPStatus::INTERNAL_SERVER_ERROR, "Cannot find server.", Dns_error_body);
         log_msg = "looking up";
       } else {
+        // HostDB has the record but every address is DOWN within `down_server.cache_time`. This is a refusal-to-attempt
+        // rather than a true DNS failure; track it under down_server_no_requests.
+        Metrics::Counter::increment(http_rsb.down_server_no_requests);
         build_error_response(s, HTTPStatus::INTERNAL_SERVER_ERROR, "No valid server.", "connect#all_down");
         log_msg = "no valid server";
       }
@@ -1957,7 +2020,8 @@ HttpTransact::OSDNSLookup(State *s)
     // We've backed off from a client supplied address and found some
     // HostDB addresses. We use those if they're different from the CTA.
     // In all cases we now commit to client or HostDB for our source.
-    if (s->dns_info.set_active(&s->current.server->dst_addr.sa) && s->dns_info.select_next_rr()) {
+    if (s->dns_info.set_active(&s->current.server->dst_addr.sa) &&
+        s->dns_info.select_next_rr(ts_clock::now(), s->txn_conf->down_server_timeout)) {
       s->dns_info.os_addr_style = ResolveInfo::OS_Addr::USE_HOSTDB;
     } else {
       // nothing else there, continue with CTA.
@@ -2145,16 +2209,15 @@ HttpTransact::DecideCacheLookup(State *s)
       // We could a) have 6000 alts (barf, puke, vomit) or b) use the original
       // host header in the url before doing all cache actions (lookups, writes, etc.)
       if (s->txn_conf->maintain_pristine_host_hdr) {
-        // So, the host header will have the original host header.
-        if (auto [field, host, port_sv]{incoming_request->get_host_port_values()}; field != nullptr) {
-          int port = 0;
-          if (!port_sv.empty()) {
+        if (auto host_field = incoming_request->field_find(static_cast<std::string_view>(MIME_FIELD_HOST)); host_field != nullptr) {
+          std::string_view host;
+          int              port     = 0;
+          bool             has_port = false;
+
+          if (http_parse_host_header(host_field->value_get(), host, port, has_port)) {
             s->cache_info.lookup_url->host_set(host);
-            port = ink_atoi(port_sv.data(), static_cast<int>(port_sv.length()));
-          } else {
-            s->cache_info.lookup_url->host_set(host);
+            s->cache_info.lookup_url->port_set(has_port ? port : 0);
           }
-          s->cache_info.lookup_url->port_set(port);
         }
       }
       ink_assert(s->cache_info.lookup_url->valid() == true);
@@ -2607,11 +2670,21 @@ HttpTransact::HandleCacheOpenReadHitFreshness(State *s)
     }
   }
 
+  // If we're serving stale due to write lock failure, override cache_lookup_result to HIT_STALE
+  // so plugins see the accurate status. what_is_document_freshness returns FRESH to bypass
+  // revalidation, but the content is actually stale.
+  if (s->serving_stale_due_to_write_lock) {
+    s->cache_lookup_result = HttpTransact::CacheLookupResult_t::HIT_STALE;
+  }
+
   ink_assert(s->cache_lookup_result != HttpTransact::CacheLookupResult_t::MISS);
   if (s->cache_lookup_result == HttpTransact::CacheLookupResult_t::HIT_STALE) {
     SET_VIA_STRING(VIA_DETAIL_CACHE_LOOKUP, VIA_DETAIL_MISS_EXPIRED);
     SET_VIA_STRING(VIA_CACHE_RESULT, VIA_IN_CACHE_STALE);
   }
+
+  // Clear the deferred flag if set (for READ_RETRY cases that found stale content)
+  s->cache_lookup_complete_deferred = false;
 
   TRANSACT_RETURN(StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE, HttpTransact::HandleCacheOpenReadHit);
 }
@@ -2637,6 +2710,7 @@ HttpTransact::CallOSDNSLookup(State *s)
     } else {
       s->cache_info.action = CacheAction_t::NO_ACTION;
     }
+    error_log_connection_failure(s, s->current.state);
     handle_server_connection_not_open(s);
   } else {
     TRANSACT_RETURN(StateMachineAction_t::DNS_LOOKUP, OSDNSLookup);
@@ -2803,7 +2877,9 @@ HttpTransact::HandleCacheOpenReadHit(State *s)
   //    proxy.config.http.cache.ignore_server_no_cache is set to 0 (i.e don't ignore no cache -- the default setting)
   //
   // But, we only do this if we're not in an API updating the cached object (see TSHttpTxnUpdateCachedObject)
-  if ((((s->cache_lookup_result == CacheLookupResult_t::HIT_STALE) ||
+  // Also skip revalidation if we're serving stale due to write lock failure - we've already decided
+  // to serve the stale content to avoid contention, so don't try to revalidate.
+  if ((((s->cache_lookup_result == CacheLookupResult_t::HIT_STALE && !s->serving_stale_due_to_write_lock) ||
         ((obj->response_get()->get_cooked_cc_mask() & MIME_COOKED_MASK_CC_NO_CACHE) && !s->cache_control.ignore_server_no_cache)) &&
        (s->api_update_cached_object != HttpTransact::UpdateCachedObject_t::CONTINUE))) {
     needs_revalidate = true;
@@ -2850,23 +2926,10 @@ HttpTransact::HandleCacheOpenReadHit(State *s)
 
     find_server_and_update_current_info(s);
 
-    // We do not want to try to revalidate documents if we think
-    //  the server is down due to the something report problem
-    //
-    // Note: we only want to skip origin servers because 1)
-    //  parent proxies have their own negative caching
-    //  scheme & 2) If we skip down parents, every page
-    //  we serve is potentially stale
-    //
-    if (s->current.request_to == ResolveInfo::ORIGIN_SERVER && is_server_negative_cached(s) && response_returnable == true &&
-        is_stale_cache_response_returnable(s) == true) {
-      server_up = false;
-      update_current_info(&s->current, nullptr, ResolveInfo::UNDEFINED_LOOKUP, true);
-      TxnDbg(dbg_ctl_http_trans, "CacheOpenReadHit - server_down, returning stale document");
-    }
-    // a parent lookup could come back as ParentResultType::FAIL if in parent.config, go_direct == false and
+    // For origin servers (ResolveInfo::ORIGIN_SERVER): OSDNSLookup handles serving stale when all origin servers are down.
+    // For parent proxies: a parent lookup could come back as ParentResultType::FAIL if in parent.config, go_direct == false and
     // there are no available parents (all down).
-    else if (s->current.request_to == ResolveInfo::HOST_NONE && s->parent_result.result == ParentResultType::FAIL) {
+    if (s->current.request_to == ResolveInfo::HOST_NONE && s->parent_result.result == ParentResultType::FAIL) {
       if (response_returnable == true && is_stale_cache_response_returnable(s) == true) {
         server_up = false;
         update_current_info(&s->current, nullptr, ResolveInfo::UNDEFINED_LOOKUP, true);
@@ -2958,14 +3021,27 @@ HttpTransact::HandleCacheOpenReadHit(State *s)
 
   HttpCacheSM &cache_sm = s->state_machine->get_cache_sm();
   TxnDbg(dbg_ctl_http_trans, "CacheOpenRead --- HIT-FRESH read while write %d", cache_sm.is_readwhilewrite_inprogress());
-  if (cache_sm.is_readwhilewrite_inprogress())
+  if (cache_sm.is_readwhilewrite_inprogress()) {
     SET_VIA_STRING(VIA_CACHE_RESULT, VIA_IN_CACHE_RWW_HIT);
+  }
+
+  // If serving stale due to write lock failure (actions 2, 3, or 6), adjust VIA to reflect stale serving.
+  // This ensures correct statistics attribution (cache_hit_stale_served instead of cache_hit_fresh).
+  // Note: VIA_SERVER_RESULT is left as default (space) since the origin server was never contacted.
+  if (s->serving_stale_due_to_write_lock) {
+    TxnDbg(dbg_ctl_http_trans, "Serving stale due to write lock failure, adjusting VIA for statistics");
+    SET_VIA_STRING(VIA_DETAIL_CACHE_LOOKUP, VIA_DETAIL_MISS_EXPIRED);
+    SET_VIA_STRING(VIA_CACHE_RESULT, VIA_IN_CACHE_STALE);
+  }
 
   if (s->cache_lookup_result == CacheLookupResult_t::HIT_WARNING) {
     build_response_from_cache(s, HTTPWarningCode::HERUISTIC_EXPIRATION);
-  } else if (s->cache_lookup_result == CacheLookupResult_t::HIT_STALE) {
+  } else if (s->cache_lookup_result == CacheLookupResult_t::HIT_STALE && !s->serving_stale_due_to_write_lock) {
     ink_assert(server_up == false);
     build_response_from_cache(s, HTTPWarningCode::REVALIDATION_FAILED);
+  } else if (s->serving_stale_due_to_write_lock) {
+    // Serving stale due to write lock failure - no Warning header (deprecated per RFC 9111)
+    build_response_from_cache(s, HTTPWarningCode::NONE);
   } else {
     build_response_from_cache(s, HTTPWarningCode::NONE);
   }
@@ -3182,7 +3258,9 @@ HttpTransact::handle_cache_write_lock(State *s)
       //  Write failed and read retry triggered
       //  Clean up server_request and re-initiate
       //  Cache Lookup
-      ink_assert(s->cache_open_write_fail_action == static_cast<MgmtByte>(CacheOpenWriteFailAction_t::READ_RETRY));
+      ink_assert(s->cache_open_write_fail_action == static_cast<MgmtByte>(CacheOpenWriteFailAction_t::READ_RETRY) ||
+                 s->cache_open_write_fail_action ==
+                   static_cast<MgmtByte>(CacheOpenWriteFailAction_t::READ_RETRY_STALE_ON_REVALIDATE));
       s->cache_info.write_status = CacheWriteStatus_t::LOCK_MISS;
       StateMachineAction_t next;
       next           = StateMachineAction_t::CACHE_LOOKUP;
@@ -3223,21 +3301,102 @@ HttpTransact::handle_cache_write_lock(State *s)
   }
 
   if (s->cache_info.write_lock_state == CacheWriteLock_t::READ_RETRY) {
-    TxnDbg(dbg_ctl_http_error, "calling hdr_info.server_request.destroy");
-    s->hdr_info.server_request.destroy();
-    HandleCacheOpenReadHitFreshness(s);
-  } else {
-    StateMachineAction_t next;
-    next = how_to_open_connection(s);
-    if (next == StateMachineAction_t::ORIGIN_SERVER_OPEN || next == StateMachineAction_t::ORIGIN_SERVER_RAW_OPEN) {
-      s->next_action = next;
-      TRANSACT_RETURN(next, nullptr);
+    // For READ_RETRY with cached object, evaluate actual freshness to decide the path.
+    // If the initial lookup was a MISS, cache_lookup_complete_deferred is true and we
+    // need to fire the hook here with the final result. If the initial lookup was a
+    // HIT_STALE (revalidation case), the hook already fired and deferred is false.
+    CacheHTTPInfo *obj = s->cache_info.object_read;
+    if (obj != nullptr) {
+      // Restore request/response times from cached object for freshness calculations and Age header.
+      // Similar to HandleCacheOpenReadHitFreshness, handle clock skew by capping times.
+      s->request_sent_time      = obj->request_sent_time_get();
+      s->response_received_time = obj->response_received_time_get();
+      s->request_sent_time      = std::min(s->client_request_time, s->request_sent_time);
+      s->response_received_time = std::min(s->client_request_time, s->response_received_time);
+
+      // Evaluate actual document freshness. Pass true to skip the STALE_ON_REVALIDATE
+      // short-circuit so we get the real freshness, not the "return FRESH to bypass revalidation" result.
+      Freshness_t freshness = what_is_document_freshness(s, &s->hdr_info.client_request, obj->response_get(), true);
+
+      if (freshness == Freshness_t::FRESH || freshness == Freshness_t::WARNING) {
+        // Object is fresh - serve it from cache for both action 5 and 6.
+        // This is the main benefit of request collapsing: we found a valid cached object.
+        // Clear stale-related state in case it was set during initial stale short-circuit.
+        s->serving_stale_due_to_write_lock = false;
+        s->cache_info.stale_fallback       = nullptr;
+
+        // Destroy server_request since we're serving from cache.
+        TxnDbg(dbg_ctl_http_trans, "READ_RETRY: found fresh object, serving from cache");
+        s->hdr_info.server_request.destroy();
+        s->cache_lookup_result =
+          (freshness == Freshness_t::FRESH) ? CacheLookupResult_t::HIT_FRESH : CacheLookupResult_t::HIT_WARNING;
+
+        if (s->cache_lookup_complete_deferred) {
+          s->cache_lookup_complete_deferred = false;
+          TRANSACT_RETURN(StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE, HandleCacheOpenReadHit);
+        }
+        HandleCacheOpenReadHit(s);
+      } else {
+        // Object is stale. Save it as potential fallback, then trigger actual cache retry.
+        // HandleCacheOpenReadMiss will serve stale fallback (action 6) or go to origin (action 5).
+        if (is_stale_cache_response_returnable(s)) {
+          s->cache_info.stale_fallback = s->cache_info.object_read;
+        }
+        TxnDbg(dbg_ctl_http_trans, "READ_RETRY: object stale, triggering actual cache retry");
+        s->cache_info.object_read  = nullptr;
+        s->cache_info.write_status = CacheWriteStatus_t::LOCK_MISS;
+        s->hdr_info.server_request.destroy();
+        TRANSACT_RETURN(StateMachineAction_t::CACHE_LOOKUP, nullptr);
+      }
     } else {
-      // hehe!
-      s->next_action = next;
-      ink_assert(s->next_action == StateMachineAction_t::DNS_LOOKUP);
-      return;
+      HandleCacheOpenReadMiss(s);
     }
+  } else {
+    handle_cache_write_lock_go_to_origin(s);
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Name       : handle_cache_write_lock_go_to_origin
+// Description: Helper to proceed to origin server from handle_cache_write_lock.
+//              Called when write lock succeeded or failed without READ_RETRY.
+//
+///////////////////////////////////////////////////////////////////////////////
+void
+HttpTransact::handle_cache_write_lock_go_to_origin(State *s)
+{
+  TxnDbg(dbg_ctl_http_trans, "handle_cache_write_lock_go_to_origin - proceeding to origin");
+
+  // If the CACHE_LOOKUP_COMPLETE hook was deferred (for action 5/6), fire it now.
+  // We're going to origin without READ_RETRY, so MISS is the final result.
+  if (s->cache_lookup_complete_deferred) {
+    TxnDbg(dbg_ctl_http_trans, "Firing deferred CACHE_LOOKUP_COMPLETE with MISS before origin");
+    s->cache_lookup_complete_deferred = false;
+    s->cache_lookup_result            = CacheLookupResult_t::MISS;
+    TRANSACT_RETURN(StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE, handle_cache_write_lock_go_to_origin_continue);
+  }
+
+  handle_cache_write_lock_go_to_origin_continue(s);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Name       : handle_cache_write_lock_go_to_origin_continue
+// Description: Continuation of handle_cache_write_lock_go_to_origin after
+//              the deferred CACHE_LOOKUP_COMPLETE hook fires.
+//
+///////////////////////////////////////////////////////////////////////////////
+void
+HttpTransact::handle_cache_write_lock_go_to_origin_continue(State *s)
+{
+  StateMachineAction_t next;
+  next = how_to_open_connection(s);
+  if (next == StateMachineAction_t::ORIGIN_SERVER_OPEN || next == StateMachineAction_t::ORIGIN_SERVER_RAW_OPEN) {
+    s->next_action = next;
+    TRANSACT_RETURN(next, nullptr);
+  } else {
+    s->next_action = next;
+    ink_assert(s->next_action == StateMachineAction_t::DNS_LOOKUP);
+    return;
   }
 }
 
@@ -3286,16 +3445,76 @@ HttpTransact::HandleCacheOpenReadMiss(State *s)
     s->cache_info.action = CacheAction_t::NO_ACTION;
   } else if (s->api_server_response_no_store) { // plugin may have decided not to cache the response
     s->cache_info.action = CacheAction_t::NO_ACTION;
+  } else if (s->cache_info.write_lock_state == CacheWriteLock_t::READ_RETRY) {
+    // READ_RETRY cache read failed (no fresh object found).
+    // Check if we have a stale fallback (saved from action 6 revalidation case).
+    bool is_action_6 =
+      (s->cache_open_write_fail_action & static_cast<MgmtByte>(CacheOpenWriteFailAction_t::STALE_ON_REVALIDATE)) != 0;
+
+    if (is_action_6 && s->cache_info.stale_fallback != nullptr) {
+      // Action 6: Serve stale fallback after retries exhausted.
+      TxnDbg(dbg_ctl_http_trans, "READ_RETRY: retries exhausted, serving stale (action 6)");
+      s->cache_info.object_read          = s->cache_info.stale_fallback;
+      s->cache_info.stale_fallback       = nullptr;
+      s->serving_stale_due_to_write_lock = true;
+      s->cache_lookup_result             = CacheLookupResult_t::HIT_STALE;
+
+      if (s->cache_lookup_complete_deferred) {
+        s->cache_lookup_complete_deferred = false;
+        TRANSACT_RETURN(StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE, HandleCacheOpenReadHit);
+      }
+      HandleCacheOpenReadHit(s);
+      return;
+    }
+    // Action 5 or no stale fallback: proceed to origin without caching.
+    TxnDbg(dbg_ctl_http_trans, "READ_RETRY cache read failed, bypassing cache");
+    s->cache_info.stale_fallback = nullptr; // Clear unused fallback
+    s->cache_info.action         = CacheAction_t::NO_ACTION;
+  } else if (s->cache_info.write_lock_state == CacheWriteLock_t::SUCCESS && s->cache_info.action == CacheAction_t::WRITE) {
+    // Origin retry paths such as TSHttpTxnServerAddrSet() can loop back through
+    // HandleCacheOpenReadMiss after we already own the cache write lock. This
+    // is still the same request, so keep the existing write lock instead of
+    // re-preparing a write as if this were a redirect or a new cache miss.
+    TxnDbg(dbg_ctl_http_trans, "Reusing existing cache write lock while retrying origin selection");
   } else {
     HttpTransact::set_cache_prepare_write_action_for_new_request(s);
   }
 
-  ///////////////////////////////////////////////////////////////
-  // a normal miss would try to fetch the document from the    //
-  // origin server, unless the origin server isn't resolvable, //
-  // but if "CacheControl: only-if-cached" is set, then we are //
-  // supposed to send a 504 (GATEWAY TIMEOUT) response.        //
-  ///////////////////////////////////////////////////////////////
+  // If the CACHE_LOOKUP_COMPLETE hook was deferred, decide whether to fire it now.
+  // Only fire when we're at a terminal state for cache lookup:
+  // - NO_ACTION: Not attempting write lock, MISS is the final result
+  // - READ_RETRY: Already retried and still missed, MISS is the final result
+  //
+  // Don't fire yet if action == PREPARE_TO_WRITE and write_lock_state != READ_RETRY,
+  // because we're about to attempt the write lock and may find content on retry.
+  // In that case, the hook will fire later:
+  // - If READ_RETRY finds HIT: handle_cache_write_lock fires CACHE_LOOKUP_COMPLETE with HIT
+  // - If READ_RETRY finds MISS: We come back here with write_lock_state == READ_RETRY
+  if (s->cache_lookup_complete_deferred) {
+    if (s->cache_info.action == CacheAction_t::NO_ACTION || s->cache_info.write_lock_state == CacheWriteLock_t::READ_RETRY) {
+      TxnDbg(dbg_ctl_http_trans, "Firing deferred CACHE_LOOKUP_COMPLETE with MISS (action=%d, write_lock_state=%d)",
+             static_cast<int>(s->cache_info.action), static_cast<int>(s->cache_info.write_lock_state));
+      s->cache_lookup_complete_deferred = false;
+      s->cache_lookup_result            = CacheLookupResult_t::MISS;
+      TRANSACT_RETURN(StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE, HandleCacheOpenReadMissGoToOrigin);
+    }
+    TxnDbg(dbg_ctl_http_trans, "Deferring CACHE_LOOKUP_COMPLETE hook - waiting for write lock attempt");
+  }
+
+  // Proceed to origin server (handles DNS lookup, parent proxy, etc.)
+  HandleCacheOpenReadMissGoToOrigin(s);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Name       : HandleCacheOpenReadMissGoToOrigin
+// Description: Contains the "go to origin" logic for cache miss cases.
+//              Handles DNS lookup, parent proxy selection, and request building.
+//
+///////////////////////////////////////////////////////////////////////////////
+void
+HttpTransact::HandleCacheOpenReadMissGoToOrigin(State *s)
+{
+  TxnDbg(dbg_ctl_http_trans, "HandleCacheOpenReadMissGoToOrigin - proceeding to origin");
 
   HTTPHdr *h = &s->hdr_info.client_request;
 
@@ -3338,8 +3557,6 @@ HttpTransact::HandleCacheOpenReadMiss(State *s)
     build_error_response(s, HTTPStatus::GATEWAY_TIMEOUT, "Not Cached", "cache#not_in_cache");
     s->next_action = StateMachineAction_t::SEND_ERROR_CACHE_NOOP;
   }
-
-  return;
 }
 
 void
@@ -3358,6 +3575,15 @@ HttpTransact::set_cache_prepare_write_action_for_new_request(State *s)
     // don't have a state for that.
     ink_release_assert(s->redirect_info.redirect_in_process);
     s->cache_info.action = CacheAction_t::WRITE;
+  } else if (s->cache_info.write_lock_state == CacheWriteLock_t::READ_RETRY &&
+             (!s->redirect_info.redirect_in_process || s->txn_conf->redirect_use_orig_cache_key)) {
+    // Defensive: Should not reach here if HandleCacheOpenReadMiss check is working.
+    // If we somehow get here in READ_RETRY state, bypass cache unless we're in a redirect
+    // that uses a different cache key (redirect_use_orig_cache_key == 0).
+    // When redirect_use_orig_cache_key is enabled, the redirect uses the same cache key
+    // as the original request, so we'd hit the same write lock contention.
+    Error("set_cache_prepare_write_action_for_new_request called with READ_RETRY state");
+    s->cache_info.action = CacheAction_t::NO_ACTION;
   } else {
     s->cache_info.action           = CacheAction_t::PREPARE_TO_WRITE;
     s->cache_info.write_lock_state = HttpTransact::CacheWriteLock_t::INIT;
@@ -3680,6 +3906,7 @@ HttpTransact::handle_response_from_parent(State *s)
   case ResolveInfo::HOST_NONE:
     // Check if content can be served from cache
     s->current.request_to = ResolveInfo::PARENT_PROXY;
+    error_log_connection_failure(s, s->current.state);
     handle_server_connection_not_open(s);
     break;
   default:
@@ -3712,7 +3939,6 @@ HttpTransact::handle_response_from_server(State *s)
 {
   TxnDbg(dbg_ctl_http_trans, "(hrfs)");
   HTTP_RELEASE_ASSERT(s->current.server == &s->server_info);
-  unsigned max_connect_retries = 0;
 
   // plugin call
   s->server_info.state = s->current.state;
@@ -3731,6 +3957,7 @@ HttpTransact::handle_response_from_server(State *s)
     TxnDbg(dbg_ctl_http_trans, "Error. congestion control -- congested.");
     SET_VIA_STRING(VIA_DETAIL_SERVER_CONNECT, VIA_DETAIL_SERVER_FAILURE);
     s->set_connect_fail(EUSERS); // too many users
+    error_log_connection_failure(s, s->current.state);
     handle_server_connection_not_open(s);
     break;
   case OPEN_RAW_ERROR:
@@ -3739,53 +3966,107 @@ HttpTransact::handle_response_from_server(State *s)
   case INACTIVE_TIMEOUT:
   case PARSE_ERROR:
   case CONNECTION_CLOSED:
-  case BAD_INCOMING_RESPONSE:
-
-    if (is_server_negative_cached(s)) {
-      max_connect_retries = s->txn_conf->connect_attempts_max_retries_down_server - 1;
-    } else {
-      // server not yet negative cached - use default number of retries
-      max_connect_retries = s->txn_conf->connect_attempts_max_retries;
+  case BAD_INCOMING_RESPONSE: {
+    // Ensure cause_of_death_errno is set for all error states if not already set.
+    // This prevents the assertion failure in retry_server_connection_not_open.
+    if (s->cause_of_death_errno == -UNKNOWN_INTERNAL_ERROR) {
+      if (s->current.state == PARSE_ERROR || s->current.state == BAD_INCOMING_RESPONSE) {
+        s->set_connect_fail(EBADMSG);
+      } else if (s->current.state == CONNECTION_CLOSED) {
+        s->set_connect_fail(EPIPE);
+      } else {
+        // Generic fallback for OPEN_RAW_ERROR, CONNECTION_ERROR,
+        // STATE_UNDEFINED, and any other unexpected error states.
+        s->set_connect_fail(EIO);
+      }
     }
 
+    unsigned max_connect_retries = s->txn_conf->connect_attempts_max_retries;
     TxnDbg(dbg_ctl_http_trans, "max_connect_retries: %d s->current.retry_attempts: %d", max_connect_retries,
            s->current.retry_attempts.get());
 
-    if (is_request_retryable(s) && s->current.retry_attempts.get() < max_connect_retries &&
-        !HttpTransact::is_response_valid(s, &s->hdr_info.server_response)) {
-      // If this is a round robin DNS entry & we're tried configured
-      //    number of times, we should try another node
-      if (ResolveInfo::OS_Addr::TRY_CLIENT == s->dns_info.os_addr_style) {
-        // attempt was based on client supplied server address. Try again using HostDB.
-        // Allow DNS attempt
-        s->dns_info.resolved_p = false;
-        // See if we can get data from HostDB for this.
-        s->dns_info.os_addr_style = ResolveInfo::OS_Addr::TRY_HOSTDB;
-        // Force host resolution to have the same family as the client.
-        // Because this is a transparent connection, we can't switch address
-        // families - that is locked in by the client source address.
-        ats_force_order_by_family(s->current.server->dst_addr.family(), s->my_txn_conf().host_res_data.order);
-        return CallOSDNSLookup(s);
-      } else {
-        if ((s->txn_conf->connect_attempts_rr_retries > 0) &&
-            ((s->current.retry_attempts.get() + 1) % s->txn_conf->connect_attempts_rr_retries == 0)) {
-          s->dns_info.select_next_rr();
-        }
-        retry_server_connection_not_open(s, s->current.state, max_connect_retries);
-        TxnDbg(dbg_ctl_http_trans, "Error. Retrying...");
-        s->next_action = how_to_open_connection(s);
-      }
-    } else {
+    // Bail out if the request is not retryable, the global retry cap is reached, or we already have a usable response.
+    if (!is_request_retryable(s) || s->current.retry_attempts.get() >= max_connect_retries ||
+        HttpTransact::is_response_valid(s, &s->hdr_info.server_response)) {
+      TxnDbg(dbg_ctl_http_trans, "Error. No more retries. %d/%d", s->current.retry_attempts.get(), max_connect_retries);
+      SET_VIA_STRING(VIA_DETAIL_SERVER_CONNECT, VIA_DETAIL_SERVER_FAILURE);
       error_log_connection_failure(s, s->current.state);
-      TxnDbg(dbg_ctl_http_trans, "Error. No more retries.");
+      s->state_machine->do_hostdb_update_if_necessary();
+      handle_server_connection_not_open(s);
+      break;
+    }
+
+    // Attempt was based on a client-supplied address. Re-resolve via HostDB.
+    if (ResolveInfo::OS_Addr::TRY_CLIENT == s->dns_info.os_addr_style) {
+      // Allow DNS attempt
+      s->dns_info.resolved_p = false;
+      // See if we can get data from HostDB for this.
+      s->dns_info.os_addr_style = ResolveInfo::OS_Addr::TRY_HOSTDB;
+      // Force host resolution to have the same family as the client.
+      // Because this is a transparent connection, we can't switch address
+      // families - that is locked in by the client source address.
+      ats_force_order_by_family(s->current.server->dst_addr.family(), s->my_txn_conf().host_res_data.order);
+      return CallOSDNSLookup(s);
+    }
+
+    // Plugin set the server address via TSHttpTxnServerAddrSet(). Clear resolution
+    // state to allow the OS_DNS hook to be called again, giving the plugin a chance
+    // to set a different server address for retry (issue #12611).
+    // Only retry once to avoid infinite loops if the plugin keeps setting failing addresses.
+    if (ResolveInfo::OS_Addr::USE_API == s->dns_info.os_addr_style && !s->api_server_addr_set_retried) {
+      s->api_server_addr_set_retried = true;
+      s->dns_info.resolved_p         = false;
+      s->dns_info.os_addr_style      = ResolveInfo::OS_Addr::TRY_DEFAULT;
+      // Clear the server request so it can be rebuilt for the new destination
+      s->hdr_info.server_request.destroy();
+      TxnDbg(dbg_ctl_http_trans, "Retrying with plugin-set address, returning to OS_DNS hook");
+      return CallOSDNSLookup(s);
+    }
+
+    // Record the failure on the current active target.
+    error_log_connection_failure(s, s->current.state);
+    s->state_machine->do_hostdb_update_if_necessary();
+
+    // Decide between switching to the next round-robin member or staying on the same target.
+    if ((s->txn_conf->connect_attempts_rr_retries > 0) &&
+        ((s->current.retry_attempts.get() + 1) % s->txn_conf->connect_attempts_rr_retries == 0)) {
+      if (s->dns_info.select_next_rr(ts_clock::now(), s->txn_conf->down_server_timeout)) {
+        // select_next_rr() only updates dns_info.active; change the dst_addr too.
+        s->dns_info.addr.assign(s->dns_info.active->data.ip);
+        s->server_info.dst_addr.assign(s->dns_info.active->data.ip, s->server_info.dst_addr.network_order_port());
+        if (dbg_ctl_http_trans.on()) {
+          ip_port_text_buffer addrbuf;
+          TxnDbg(dbg_ctl_http_trans, "switched to next round-robin upstream addr=%s",
+                 ats_ip_nptop(&s->server_info.dst_addr.sa, addrbuf, sizeof(addrbuf)));
+        }
+      } else {
+        TxnDbg(dbg_ctl_http_trans, "No round-robin targets available, retrying current upstream if possible");
+      }
+    }
+
+    // The active target (HostDB) may be SUSPECT state, so re-evaluate the retry limit.
+    // Skip when there is no HostDBInfo (e.g. USE_CLIENT / USE_API) and keep the configured baseline.
+    if (s->dns_info.active != nullptr) {
+      max_connect_retries = origin_server_connect_attempts_max_retries(s);
+    }
+    if (max_connect_retries <= s->current.retry_attempts.get()) {
+      TxnDbg(dbg_ctl_http_trans, "Per-host retries exhausted. Giving up. %d/%d", s->current.retry_attempts.get(),
+             max_connect_retries);
       SET_VIA_STRING(VIA_DETAIL_SERVER_CONNECT, VIA_DETAIL_SERVER_FAILURE);
       handle_server_connection_not_open(s);
+      break;
     }
+
+    TxnDbg(dbg_ctl_http_trans, "Error. Retrying...");
+    retry_server_connection_not_open(s, max_connect_retries);
+    s->next_action = how_to_open_connection(s);
     break;
+  }
   case ACTIVE_TIMEOUT:
     TxnDbg(dbg_ctl_http_trans, "[hrfs] connection not alive");
     SET_VIA_STRING(VIA_DETAIL_SERVER_CONNECT, VIA_DETAIL_SERVER_FAILURE);
     s->set_connect_fail(ETIMEDOUT);
+    s->state_machine->do_hostdb_update_if_necessary();
     handle_server_connection_not_open(s);
     break;
   default:
@@ -3810,9 +4091,9 @@ HttpTransact::error_log_connection_failure(State *s, ServerState_t conn_state)
       host_name = s->unmapped_url.host_get();
     }
     swoc::bwprint(error_bw_buffer,
-                  "CONNECT: attempt fail [{}] to {} for host='{}' "
+                  "CONNECT: attempt fail [{}] to {} for host='{}' sm_id={} "
                   "connection_result={::s} error={::s} retry_attempts={} url='{}'",
-                  HttpDebugNames::get_server_state_name(conn_state), s->current.server->dst_addr, host_name,
+                  HttpDebugNames::get_server_state_name(conn_state), s->current.server->dst_addr, host_name, s->state_machine_id(),
                   swoc::bwf::Errno(s->current.server->connect_result), swoc::bwf::Errno(s->cause_of_death_errno),
                   s->current.retry_attempts.get(), swoc::bwf::FirstOf(url_str, "<none>"));
     Log::error("%s", error_bw_buffer.c_str());
@@ -3834,14 +4115,12 @@ HttpTransact::error_log_connection_failure(State *s, ServerState_t conn_state)
 //
 ///////////////////////////////////////////////////////////////////////////////
 void
-HttpTransact::retry_server_connection_not_open(State *s, ServerState_t conn_state, unsigned max_retries)
+HttpTransact::retry_server_connection_not_open(State *s, unsigned max_retries)
 {
   ink_assert(s->current.state != CONNECTION_ALIVE);
   ink_assert(s->current.state != ACTIVE_TIMEOUT);
   ink_assert(s->current.retry_attempts.get() < max_retries);
   ink_assert(s->cause_of_death_errno != -UNKNOWN_INTERNAL_ERROR);
-
-  error_log_connection_failure(s, conn_state);
 
   //////////////////////////////////////////////
   // disable keep-alive for request and retry //
@@ -3875,9 +4154,6 @@ HttpTransact::handle_server_connection_not_open(State *s)
 
   SET_VIA_STRING(VIA_SERVER_RESULT, VIA_SERVER_ERROR);
   Metrics::Counter::increment(http_rsb.broken_server_connections);
-
-  // Fire off a hostdb update to mark the server as down
-  s->state_machine->do_hostdb_update_if_necessary();
 
   switch (s->cache_info.action) {
   case CacheAction_t::UPDATE:
@@ -4206,7 +4482,7 @@ HttpTransact::handle_cache_operation_on_forward_server_response(State *s)
           // No need to worry about If-Range headers because the request isn't conditional
           if (s->hdr_info.client_request.presence(MIME_PRESENCE_RANGE)) {
             s->state_machine->do_range_setup_if_necessary();
-            // Check client request range header if we cached a stealed content with cacheable=false
+            // Check client request range header if we cached a stolen content with cacheable=false
           }
           s->cache_info.action = CacheAction_t::SERVE_AND_DELETE;
           s->next_action       = StateMachineAction_t::SERVE_FROM_CACHE;
@@ -4333,6 +4609,9 @@ HttpTransact::handle_cache_operation_on_forward_server_response(State *s)
         base_response->set_expires(exp_time);
 
         SET_VIA_STRING(VIA_CACHE_FILL_ACTION, VIA_CACHE_UPDATED);
+        SET_VIA_STRING(VIA_CACHE_RESULT, VIA_IN_CACHE_STALE);
+        // change VIA_SERVER_RESULT to ERROR because this status hit the negative_revalidating_list
+        SET_VIA_STRING(VIA_SERVER_RESULT, VIA_SERVER_ERROR);
         Metrics::Counter::increment(http_rsb.cache_updates);
 
         // unset Cache-control: "need-revalidate-once" (if it's set)
@@ -5252,12 +5531,23 @@ HttpTransact::add_client_ip_to_outgoing_request(State *s, HTTPHdr *request)
   char   ip_string[INET6_ADDRSTRLEN + 1] = {'\0'};
   size_t ip_string_size                  = 0;
 
-  if (!ats_is_ip(&s->client_info.src_addr.sa)) {
+  // Prefer the PROXY-Protocol source address when one is present, so that
+  // Client-ip and X-Forwarded-For agree with Forwarded: for= regardless of
+  // whether the listener carries the :pp-clnt flag.
+  IpEndpoint src_addr = s->client_info.src_addr;
+  if (s->state_machine->get_ua_txn() && s->state_machine->get_ua_txn()->get_netvc()) {
+    const ProxyProtocol &pp = s->state_machine->get_ua_txn()->get_netvc()->get_proxy_protocol_info();
+    if (pp.version != ProxyProtocolVersion::UNDEFINED) {
+      src_addr = pp.src_addr;
+    }
+  }
+
+  if (!ats_is_ip(&src_addr.sa)) {
     return;
   }
 
   // Always prepare the IP string.
-  if (ats_ip_ntop(&s->client_info.src_addr.sa, ip_string, sizeof(ip_string)) != nullptr) {
+  if (ats_ip_ntop(&src_addr.sa, ip_string, sizeof(ip_string)) != nullptr) {
     ip_string_size += strlen(ip_string);
   } else {
     // Failure, omg
@@ -5720,11 +6010,7 @@ HttpTransact::initialize_state_variables_from_request(State *s, HTTPHdr *obsolet
   memset(&s->request_data.dest_ip, 0, sizeof(s->request_data.dest_ip));
   if (vc) {
     s->request_data.incoming_port = vc->get_local_port();
-    s->pp_info.version            = vc->get_proxy_protocol_version();
-    if (s->pp_info.version != ProxyProtocolVersion::UNDEFINED) {
-      ats_ip_copy(s->pp_info.src_addr, vc->get_proxy_protocol_src_addr());
-      ats_ip_copy(s->pp_info.dst_addr, vc->get_proxy_protocol_dst_addr());
-    }
+    s->pp_info                    = vc->get_proxy_protocol_info();
   }
   s->request_data.xact_start                      = s->client_request_time;
   s->request_data.api_info                        = &s->api_info;
@@ -5859,6 +6145,9 @@ HttpTransact::initialize_state_variables_from_response(State *s, HTTPHdr *incomi
 
           new_enc_val = new_enc_iter.get_next(&new_enc_len);
         }
+
+        // Store the original Transfer-Encoding value for logging before we delete it.
+        s->hdr_info.server_response_transfer_encoding.assign(field->value_get().data(), field->value_get().length());
 
         // We're done with the old field since we copied out everything
         //   we needed
@@ -6320,7 +6609,8 @@ HttpTransact::is_response_cacheable(State *s, HTTPHdr *request, HTTPHdr *respons
   }
 
   if ((response_code == HTTPStatus::OK) || (response_code == HTTPStatus::NOT_MODIFIED) ||
-      (response_code == HTTPStatus::NON_AUTHORITATIVE_INFORMATION) || (response_code == HTTPStatus::MOVED_PERMANENTLY) ||
+      (response_code == HTTPStatus::NON_AUTHORITATIVE_INFORMATION) || (response_code == HTTPStatus::NO_CONTENT) ||
+      (response_code == HTTPStatus::MOVED_PERMANENTLY) || (response_code == HTTPStatus::PERMANENT_REDIRECT) ||
       (response_code == HTTPStatus::MULTIPLE_CHOICES) || (response_code == HTTPStatus::GONE)) {
     TxnDbg(dbg_ctl_http_trans, "YES response code seems fine");
     return true;
@@ -6509,12 +6799,13 @@ HttpTransact::process_quick_http_filter(State *s, int method)
 {
   // connection already disabled by previous ACL filtering, don't modify it.
   if (!s->client_connection_allowed) {
+    s->http_return_code_setter_name = "ip_allow";
     return;
   }
 
   // if the "ip_allow" named filter is deactivated in the remap.config, then don't modify anything
-  url_mapping *mp = s->url_map.getMapping();
-  if (mp && !mp->ip_allow_check_enabled_p) {
+  url_mapping const *const mp = s->url_map.getMapping();
+  if (nullptr != mp && !mp->ip_allow_check_enabled_p) {
     return;
   }
 
@@ -6547,7 +6838,8 @@ HttpTransact::process_quick_http_filter(State *s, int method)
         TxnDbg(dbg_ctl_ip_allow, "Line %d denial for '%.*s' from %s", acl.source_line(), static_cast<int>(method_str.length()),
                method_str.data(), ats_ip_ntop(&s->client_info.src_addr.sa, ipb, sizeof(ipb)));
       }
-      s->client_connection_allowed = false;
+      s->http_return_code_setter_name = "ip_allow";
+      s->client_connection_allowed    = false;
     }
   }
 }
@@ -7259,7 +7551,8 @@ HttpTransact::calculate_document_freshness_limit(State *s, HTTPHdr *response, ti
 //
 //////////////////////////////////////////////////////////////////////////////
 HttpTransact::Freshness_t
-HttpTransact::what_is_document_freshness(State *s, HTTPHdr *client_request, HTTPHdr *cached_obj_response)
+HttpTransact::what_is_document_freshness(State *s, HTTPHdr *client_request, HTTPHdr *cached_obj_response,
+                                         bool evaluate_actual_freshness)
 {
   bool       heuristic, do_revalidate = false;
   int        age_limit;
@@ -7268,9 +7561,19 @@ HttpTransact::what_is_document_freshness(State *s, HTTPHdr *client_request, HTTP
   uint32_t   cc_mask, cooked_cc_mask;
   uint32_t   os_specifies_revalidate;
 
-  if (s->cache_open_write_fail_action & static_cast<MgmtByte>(CacheOpenWriteFailAction_t::STALE_ON_REVALIDATE)) {
+  // This check works for STALE_ON_REVALIDATE(0x2), ERROR_ON_MISS_STALE_ON_REVALIDATE(0x3), and
+  // READ_RETRY_STALE_ON_REVALIDATE(0x6).
+  // We return FRESH (not STALE) intentionally to bypass the revalidation code path in
+  // HandleCacheOpenReadHit. Returning STALE would trigger origin server contact for revalidation,
+  // but for write lock failure scenarios we want to serve the stale content directly without
+  // revalidation. The serving_stale_due_to_write_lock flag tracks that we're actually serving
+  // stale content, so VIA strings and statistics can be correctly attributed.
+  // When evaluate_actual_freshness is true, skip this short-circuit to get the real freshness.
+  if (!evaluate_actual_freshness &&
+      (s->cache_open_write_fail_action & static_cast<MgmtByte>(CacheOpenWriteFailAction_t::STALE_ON_REVALIDATE))) {
     if (is_stale_cache_response_returnable(s)) {
-      TxnDbg(dbg_ctl_http_match, "cache_serve_stale_on_write_lock_fail, return FRESH");
+      TxnDbg(dbg_ctl_http_match, "cache_serve_stale_on_write_lock_fail, return FRESH to bypass revalidation");
+      s->serving_stale_due_to_write_lock = true;
       return (Freshness_t::FRESH);
     }
   }
@@ -7278,18 +7581,27 @@ HttpTransact::what_is_document_freshness(State *s, HTTPHdr *client_request, HTTP
   //////////////////////////////////////////////////////
   // If config file has a ttl-in-cache field set,     //
   // it has priority over any other http headers and  //
-  // other configuration parameters.                  //
+  // other configuration parameters. Negative caching //
+  // is different however since the user would       //
+  // rather expect their explicitly configured        //
+  // negative_caching_lifetime to be used instead of  //
+  // ttl-in-cache.                                    //
   //////////////////////////////////////////////////////
   if (s->cache_control.ttl_in_cache > 0) {
-    // what matters if ttl is set is not the age of the document
-    // but for how long it has been stored in the cache (resident time)
-    int resident_time = s->current.now - s->response_received_time;
-
-    TxnDbg(dbg_ctl_http_match, "ttl-in-cache = %d, resident time = %d", s->cache_control.ttl_in_cache, resident_time);
-    if (resident_time > s->cache_control.ttl_in_cache) {
-      return (Freshness_t::STALE);
+    auto status = static_cast<int>(cached_obj_response->status_get());
+    if (s->txn_conf->negative_caching_enabled && s->txn_conf->negative_caching_list.contains(status)) {
+      TxnDbg(dbg_ctl_http_match, "ttl-in-cache set, but skipping for negative cached response %d", status);
     } else {
-      return (Freshness_t::FRESH);
+      // what matters if ttl is set is not the age of the document
+      // but for how long it has been stored in the cache (resident time)
+      int resident_time = s->current.now - s->response_received_time;
+
+      TxnDbg(dbg_ctl_http_match, "ttl-in-cache = %d, resident time = %d", s->cache_control.ttl_in_cache, resident_time);
+      if (resident_time > s->cache_control.ttl_in_cache) {
+        return (Freshness_t::STALE);
+      } else {
+        return (Freshness_t::FRESH);
+      }
     }
   }
 
@@ -7471,11 +7783,11 @@ HttpTransact::what_is_document_freshness(State *s, HTTPHdr *client_request, HTTP
 HttpTransact::Authentication_t
 HttpTransact::AuthenticationNeeded(const OverridableHttpConfigParams *p, HTTPHdr *client_request, HTTPHdr *obj_response)
 {
-  ///////////////////////////////////////////////////////////////////////
-  // from RFC2068, sec 14.8, if a client request has the Authorization //
-  // header set, we can't serve it unless the response is public, or   //
-  // if it has a Cache-Control revalidate flag, and we do revalidate.  //
-  ///////////////////////////////////////////////////////////////////////
+  ///////////////////////////////////////////////////////////////////////////////
+  // Per RFC 7234 section 3.2, if a client request has the Authorization      //
+  // header set, we can't serve a cached response unless the response has one //
+  // of: must-revalidate, proxy-revalidate, public, or s-maxage directives.   //
+  ///////////////////////////////////////////////////////////////////////////////
 
   if ((p->cache_ignore_auth == 0) && client_request->presence(MIME_PRESENCE_AUTHORIZATION)) {
     if (obj_response->is_cache_control_set(HTTP_VALUE_MUST_REVALIDATE.c_str()) ||
@@ -7484,6 +7796,8 @@ HttpTransact::AuthenticationNeeded(const OverridableHttpConfigParams *p, HTTPHdr
     } else if (obj_response->is_cache_control_set(HTTP_VALUE_PROXY_REVALIDATE.c_str())) {
       return Authentication_t::MUST_REVALIDATE;
     } else if (obj_response->is_cache_control_set(HTTP_VALUE_PUBLIC.c_str())) {
+      return Authentication_t::SUCCESS;
+    } else if (obj_response->is_cache_control_set(HTTP_VALUE_S_MAXAGE.c_str())) {
       return Authentication_t::SUCCESS;
     } else {
       if (obj_response->field_find("@WWW-Auth"sv) && client_request->method_get_wksidx() == HTTP_WKSIDX_GET) {
@@ -7838,6 +8152,12 @@ HttpTransact::build_response(State *s, HTTPHdr *base_response, HTTPHdr *outgoing
     HttpTransactHeaders::build_base_response(outgoing_response, status_code, reason_phrase, strlen(reason_phrase), s->current.now);
   } else {
     if ((status_code == HTTPStatus::NONE) || (status_code == base_response->status_get())) {
+      // Preemptively clean up the response in case a prior 1xx informational
+      // response was forwarded to the client. Otherwise, copy_header_fields
+      // will fail an assertion that the new header is not yet valid.
+      if (outgoing_response->valid()) {
+        outgoing_response->destroy();
+      }
       HttpTransactHeaders::copy_header_fields(base_response, outgoing_response, s->txn_conf->fwd_proxy_auth_to_parent);
 
       if (s->txn_conf->insert_age_in_response) {
@@ -8446,6 +8766,10 @@ HttpTransact::client_result_stat(State *s, ink_hrtime total_time, ink_hrtime req
   if (s->client_info.abort == ABORTED) {
     client_transaction_result = ClientTransactionResult_t::ERROR_ABORT;
   }
+  // Count 000 responses separately since they include aborts (the main source of 000).
+  if (static_cast<int>(client_response_status) == 0) {
+    Metrics::Counter::increment(http_rsb.response_status_000_count);
+  }
   // Count the status codes, assuming the client didn't abort (i.e. there is an m_http)
   if ((s->source != Source_t::NONE) && (s->client_info.abort == DIDNOT_ABORT)) {
     switch (static_cast<int>(client_response_status)) {
@@ -8550,6 +8874,9 @@ HttpTransact::client_result_stat(State *s, ink_hrtime total_time, ink_hrtime req
       break;
     case 416:
       Metrics::Counter::increment(http_rsb.response_status_416_count);
+      break;
+    case 429:
+      Metrics::Counter::increment(http_rsb.response_status_429_count);
       break;
     case 500:
       Metrics::Counter::increment(http_rsb.response_status_500_count);

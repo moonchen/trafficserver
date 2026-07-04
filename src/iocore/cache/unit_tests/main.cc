@@ -23,10 +23,12 @@
 
 #include "../P_CacheInternal.h"
 #include "api/HttpAPIHooks.h"
+#include "iocore/net/Net.h"
 #include "iocore/net/NetProcessor.h"
 #include "records/RecordsConfig.h"
 #include "tscore/ink_config.h"
 #include "tscore/Layout.h"
+#include "tscore/TSSystemState.h"
 
 #include "main.h"
 #include "swoc/swoc_file.h"
@@ -157,7 +159,7 @@ struct EventProcessorListener : Catch::EventListenerBase {
     thread->set_tail_handler(&uring_handler);
 #endif
 
-    std::string src_dir       = std::string(TS_ABS_TOP_SRCDIR) + "/src/iocore/cache/unit_tests";
+    std::string src_dir       = std::string(TS_ABS_TOP_SRCDIR) + "/src/iocore/cache/unit_tests/etc/";
     Layout::get()->sysconfdir = std::move(src_dir);
   }
 };
@@ -317,19 +319,23 @@ CacheReadTest::read_event(int event, void *e)
     this->process_event(event);
     break;
   case VC_EVENT_READ_READY: {
+    // Consume all available data blocks and validate against expected data
     while (this->_reader->block_read_avail()) {
       auto str = this->_reader->block_read_view();
       if (memcmp(str.data(), this->_cursor, str.size()) == 0) {
         this->_reader->consume(str.size());
         this->_cursor += str.size();
-        this->process_event(event);
       } else {
+        // Data corruption detected - fail the test immediately
         CHECK(false);
         this->close();
         TEST_DONE();
-        break;
+        return 0;
       }
     }
+    // After consuming all available data, reenable the VIO to signal readiness for more.
+    // This should only be called once per VC_EVENT_READ_READY event, not per-block.
+    this->process_event(event);
     break;
   }
   case VC_EVENT_ERROR:

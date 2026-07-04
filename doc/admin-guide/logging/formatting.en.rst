@@ -151,6 +151,7 @@ Cache Details
 .. _crc:
 .. _crsc:
 .. _chm:
+.. _ckh:
 .. _cwr:
 .. _cwtr:
 .. _crra:
@@ -166,6 +167,10 @@ Field Source         Description
 cluc  Client Request Cache Lookup URL, also known as the :term:`cache key`,
                      which is the canonicalized version of the client request
                      URL.
+ckh   Proxy Cache    Cache Key Hash. The base64-encoded cryptographic hash of the
+                     effective cache key used for cache lookup and storage. This
+                     is the actual key used to index cache objects. Empty
+                     (``-``) when no cache lookup was performed.
 crc   Proxy Cache    Cache Result Code. The result of |TS| attempting to obtain
                      the object from cache; :ref:`admin-logging-cache-results`.
 crsc  Proxy Cache    Cache Result Sub-Code. More specific code to complement the
@@ -314,8 +319,54 @@ prior to the log field's name, as so::
     Format = '%<{User-agent}cqh>'
 
 The above would insert the User Agent string from the client request headers
-into your log entry (or a blank string if no such header was present, or it did
-not contain a value).
+into your log entry (or ``-`` if no such header was present).
+
+Header fields can also be chained with a fallback operator, ``??``, when you want
+the log to use the first header that exists among n headers. For example::
+
+    Format = '%<{x-primary-id}cqh??{x-secondary-id}cqh??{x-tertiary-id}cqh>'
+
+|TS| evaluates the candidates from left to right and logs the first header that
+exists. If none of the headers exist, |TS| logs ``-`` by default. A header that
+exists but has an empty value is considered present, so |TS| logs the empty
+value instead of falling back. So in the example above, the value of
+x-primary-id of the client request is logged if it exists, otherwise the value
+of x-secondary-id is logged if it exists, otherwise ``-`` is logged if neither
+of the headers is present.
+
+The final log field in the chain can be a non-header log field whose value
+specifies the final fallback in the chain. This symbol is used only after all
+the previous header candidates in the chain are missing. For example::
+
+    Format = '%<{x-remote-ip}cqh??chi>'
+
+In this case, the value of the x-remote-ip HTTP header field is logged if that
+client request header exists. Otherwise, |TS| logs the value of ``chi``, the IP
+address of the client host.
+
+The final non-HTTP header log field must be the last term in the chain, so
+forms like ``%<chi??{x-id}cqh>`` are invalid.
+
+Alternatively, you can provide an explicit quoted default literal as the final
+term in the chain to use instead of the default ``-`` literal::
+
+    Format = '%<{x-primary-id}cqh??{x-secondary-id}cqh??"missing-id">'
+
+If none of the headers exist, |TS| logs the default literal instead,
+``missing-id`` in this case. The default literal must be quoted and must be the
+last term in the chain. Also, final non-header log fields and final default
+string literals cannot be used together. Thus forms like
+'%<{x-remote-ip}cqh??chi??"missing-id">' are invalid.
+
+
+Slices apply to each candidate in the fallback chain individually::
+
+    Format = '%<{x-primary-id}cqh[0:8]??{x-secondary-id}cqh[0:16]>'
+
+This is also true of non-header log fields. That is, if the final log field
+supports slicing, its own slice is preserved as usual::
+
+    Format = '%<{x-remote-ip}cqh??pqup[0:8]>'
 
 ===== ====================== ==================================================
 Field Source                 Description
@@ -426,6 +477,7 @@ Lengths and Sizes
 .. _cqcl:
 .. _cqhl:
 .. _cqql:
+.. _cqqtl:
 .. _csscl:
 .. _csshl:
 .. _cssql:
@@ -436,6 +488,7 @@ Lengths and Sizes
 .. _pscl:
 .. _pshl:
 .. _psql:
+.. _psqtl:
 .. _sscl:
 .. _sshl:
 .. _ssql:
@@ -451,6 +504,10 @@ cqcl  Client Request         Client request content length, in bytes.
 cqhl  Client Request         Client request header length, in bytes.
 cqql  Client Request         Client request header and content length combined,
                              in bytes.
+cqqtl Client Request         Same as cqql_, but for the first transaction on a
+                             TLS connection, also includes TLS handshake bytes
+                             received from the client. Note that this metric
+                             may not always be 100% accurate.
 csscl Cached Origin Response Content body length from cached origin response.
 csshl Cached Origin Response Header length from cached origin response.
 cssql Cached Origin Response Content and header length from cached origin
@@ -466,6 +523,10 @@ pscl  Proxy Response         Content body length of the |TS| proxy response.
 pshl  Proxy Response         Header length of the |TS| response to client.
 psql  Proxy Response         Content body and header length combined of the
                              |TS| response to client.
+psqtl Proxy Response         Same as psql_, but for the first transaction on a
+                             TLS connection, also includes TLS handshake bytes
+                             sent to the client. Note that this metric may not
+                             always be 100% accurate.
 sscl  Origin Response        Content body length of the origin server response
                              to |TS|.
 sshl  Origin Response        Header length of the origin server response.
@@ -480,6 +541,7 @@ Network Addresses, Ports, and Interfaces
 
 .. _chi:
 .. _chih:
+.. _chiv:
 .. _hii:
 .. _hiih:
 .. _chp:
@@ -498,14 +560,19 @@ incoming/outgoing ports, and network interfaces used during transactions.
 Field Source         Description
 ===== ============== ==========================================================
 chi   Client         IP address of the client's host. If :ref:`Proxy Protocol <proxy-protocol>`
-                     is used, this represents the IP address of the peer, rather than
-                     the client IP behind the peer.
+                     is configured with the pp-clnt flag, this represents the proxy protocol SRC IP address, otherwise
+                     the IP is that of the connected peer.
 chih  Client         IP address of the client's host, in hexadecimal.
+chiv  Client         IP address of the client's host verified by a plugin. If not available,
+                     ``chi`` is used.
+rchi  Remote Client  This is alway the IP address of the inbound remote peer.
+rchh  Remote Client  The IP address of the inbound remote peer in hexadecimal.
 hii   Proxy          IP address for the proxy's incoming interface (to which
                      the client connected).
 hiih  Proxy          IP address for the proxy's incoming interface (to which
                      the client connected), in hexadecimal.
 chp   Client         Port number of the client's host.
+rchp  Remote Client  Port number of the inbound remote peer.
 php   Proxy Response TCP port number from which |TS| serviced the request.
 pqsi  Proxy Request  IP address from which |TS| issued the proxy request to the
                      origin server. Cache hits will result in a value of ``0``.
@@ -526,7 +593,12 @@ ppd   Proxy Protocol Destination IP received via Proxy Protocol context from the
       Dest IP        to the |TS|
 ppa   Proxy Protocol The Authority TLV from Proxy Protocol context from the LB
       Authority      to the |TS|
-
+pptc  Proxy Protocol The TLS cipher from Proxy Protocol context from the LB
+      TLS Cipher     to the |TS|
+pptv  Proxy Protocol The TLS version from Proxy Protocol context from the LB
+      TLS version    to the |TS|
+pptg  Proxy Protocol The TLS group from Proxy Protocol context from the LB
+      TLS group      to the |TS|
 ===== ============== ==========================================================
 
 .. note::
@@ -619,6 +691,9 @@ SSL / Encryption
 .. _cqssc:
 .. _cqssu:
 .. _cqssa:
+.. _cthbr:
+.. _cthbt:
+.. _cthb:
 .. _pqssl:
 .. _pscert:
 
@@ -649,6 +724,17 @@ cqssg  Client Request SSL Group used by |TS| to communicate with the client.
                       OpenSSL 3.2 or later or a version of BoringSSL that
                       supports querying group names.
 cqssa  Client Request ALPN Protocol ID negotiated with the client.
+cthbr  Client Request TLS handshake bytes received from the client. This is the
+                      number of bytes read from the client during the TLS
+                      handshake. Populated for all transactions on a TLS connection,
+                      including reused connections.
+cthbt  Client Request TLS handshake bytes sent to the client. This is the number
+                      of bytes written to the client during the TLS handshake.
+                      Populated for all transactions on a TLS connection,
+                      including reused connections.
+cthb   Client Request Total TLS handshake bytes (received + sent). This is the
+                      sum of cthbr_ and cthbt_. Populated for all transactions
+                      on a TLS connection, including reused connections.
 pqssl  Proxy Request  Indicates whether the connection from |TS| to the origin
                       was over SSL or not.
 pqssr  Proxy Request  SSL session ticket reused status from |TS| to the origin;
@@ -668,6 +754,7 @@ Status Codes
 .. _cfsc:
 .. _csssc:
 .. _pfsc:
+.. _prscs:
 .. _pssc:
 .. _sssc:
 .. _prrp:
@@ -689,6 +776,14 @@ pfsc  Proxy Request         Finish status code specifying whether the proxy
                             (``INTR``), or timed out (``TIMEOUT``).
 prrp  Proxy Response        HTTP response reason phrase sent by |TS| proxy to the
                             client.
+prscs Proxy Response        The identifying label for the entity (such as a plugin
+                            name or component) that last set the HTTP status code
+                            for the transaction. This is set via
+                            :func:`TSHttpTxnStatusSet` with a ``setter`` parameter
+                            or :func:`TSHttpHdrStatusSet` with a ``setter``
+                            parameter. Shows ``-`` if no setter has been recorded.
+                            ``ip_allow`` will be set if the :file:`ip_allow.yaml`
+                            component denies the request.
 pssc  Proxy Response        HTTP response status code sent by |TS| proxy to the
                             client.
 sssc  Origin Response       HTTP response status code sent by the origin server
@@ -731,6 +826,7 @@ Timestamps and Durations
 .. _crat:
 .. _ms:
 .. _msdms:
+.. _mstsms:
 .. _stms:
 .. _stmsh:
 .. _stmsf:
@@ -750,54 +846,56 @@ Other fields in this category provide variously formatted timestamps of
 particular events within the current transaction (e.g. the time at which a
 client request was received by |TS|).
 
-===== ======================= =================================================
-Field Source                  Description
-===== ======================= =================================================
-cqtd  Client Request          Client request timestamp. Specifies the date of
-                              the client request in the format ``YYYY-MM-DD``
-                              (four digit year, two digit month, two digit day
-                              - with leading zeros as necessary for the latter
-                              two).
-cqtn  Client Request          Client request timestamp in the Netscape
-                              timestamp format.
-cqtq  Client Request          The time at which the client request was received
-                              expressed as fractional (floating point) seconds
-                              since midnight January 1, 1970 UTC (epoch), with
-                              millisecond resolution.
-cqts  Client Request          Same as cqtq_, but as an integer without
-                              sub-second resolution.
-cqth  Client Request          Same as cqts_, but represented in hexadecimal.
-cqtt  Client Request          Client request timestamp in the 24-hour format
-                              ``hh:mm:ss`` (two digit hour, minutes, and
-                              seconds - with leading zeros as necessary).
-crat  Origin Response         Retry-After time in seconds if specified in the
-                              origin server response.
-ms    Proxy                   Timestamp in milliseconds of a specific milestone
-                              for this request. See note below about specifying
-                              which milestone to use.
-msdms Proxy                   Difference in milliseconds between the timestamps
-                              of two milestones. See note below about
-                              specifying which milestones to use.
-stms  Proxy-Origin Connection Time (in milliseconds) spent accessing the origin
-                              server. Measured from the time the connection
-                              between proxy and origin is established to the
-                              time it was closed.
-stmsh Proxy-Origin Connection Same as stms_, but represented in hexadecimal.
-stmsf Proxy-Origin Connection Same as stms_, but in fractional (floating point)
-                              seconds.
-sts   Proxy-Origin Connection Same as stms_, but in integer seconds (no
-                              sub-second precision).
-ttms  Client-Proxy Connection Time in milliseconds spent by |TS| processing the
-                              entire client request. Measured from the time the
-                              connection between the client and |TS| proxy was
-                              established until the last byte of the proxy
-                              response was delivered to the client.
-ttmsh Client-Proxy Connection Same as ttms_, but represented in hexadecimal.
-ttmsf Client-Proxy Connection Same as ttms_, but in fraction (floating point)
-                              seconds.
-tts   Client Request          Same as ttms_, but in integer seconds (no
-                              sub-second precision).
-===== ======================= =================================================
+====== ======================= =================================================
+Field  Source                  Description
+====== ======================= =================================================
+cqtd   Client Request          Client request timestamp. Specifies the date of
+                               the client request in the format ``YYYY-MM-DD``
+                               (four digit year, two digit month, two digit day
+                               - with leading zeros as necessary for the latter
+                               two).
+cqtn   Client Request          Client request timestamp in the Netscape
+                               timestamp format.
+cqtq   Client Request          The time at which the client request was received
+                               expressed as fractional (floating point) seconds
+                               since midnight January 1, 1970 UTC (epoch), with
+                               millisecond resolution.
+cqts   Client Request          Same as cqtq_, but as an integer without
+                               sub-second resolution.
+cqth   Client Request          Same as cqts_, but represented in hexadecimal.
+cqtt   Client Request          Client request timestamp in the 24-hour format
+                               ``hh:mm:ss`` (two digit hour, minutes, and
+                               seconds - with leading zeros as necessary).
+crat   Origin Response         Retry-After time in seconds if specified in the
+                               origin server response.
+ms     Proxy                   Timestamp in milliseconds of a specific milestone
+                               for this request. See note below about specifying
+                               which milestone to use.
+msdms  Proxy                   Difference in milliseconds between the timestamps
+                               of two milestones. See note below about
+                               specifying which milestones to use.
+mstsms Proxy                   Slow log report in milliseconds as CSV.
+                               See note below about what timestamps are used.
+stms   Proxy-Origin Connection Time (in milliseconds) spent accessing the origin
+                               server. Measured from the time the connection
+                               between proxy and origin is established to the
+                               time it was closed.
+stmsh  Proxy-Origin Connection Same as stms_, but represented in hexadecimal.
+stmsf  Proxy-Origin Connection Same as stms_, but in fractional (floating point)
+                               seconds.
+sts    Proxy-Origin Connection Same as stms_, but in integer seconds (no
+                               sub-second precision).
+ttms   Client-Proxy Connection Time in milliseconds spent by |TS| processing the
+                               entire client request. Measured from the time the
+                               connection between the client and |TS| proxy was
+                               established until the last byte of the proxy
+                               response was delivered to the client.
+ttmsh  Client-Proxy Connection Same as ttms_, but represented in hexadecimal.
+ttmsf  Client-Proxy Connection Same as ttms_, but in fraction (floating point)
+                               seconds.
+tts    Client Request          Same as ttms_, but in integer seconds (no
+                               sub-second precision).
+====== ======================= =================================================
 
 .. note::
 
@@ -811,6 +909,32 @@ tts   Client Request          Same as ttms_, but in integer seconds (no
 
     For more information on transaction milestones in |TS|, refer to the
     documentation on :func:`TSHttpTxnMilestoneGet`.
+
+.. note::
+
+   A full milestone report can be generated as a CSV string that matches
+   the example slow log. Fields are:
+
+      1. tls_handshake
+      2. ua_begin
+      3. ua_first_read
+      4. ua_read_header_done
+      5. cache_open_read_begin
+      6. cache_open_read_end
+      7. cache_open_write_begin
+      8. cache_open_write_end
+      9. dns_lookup_begin
+      10. dns_lookup_end
+      11. server_connect
+      12. server_connect_end
+      13. server_first_read
+      14. server_read_header_done
+      15. server_close
+      16. ua_write
+      17. ua_close
+      18. sm_finish
+      19. plugin_active
+      20. plugin_total
 
 .. _admin-logging-fields-urls:
 

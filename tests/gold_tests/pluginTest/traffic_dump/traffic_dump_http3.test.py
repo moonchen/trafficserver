@@ -60,7 +60,13 @@ ts.Disk.records_config.update(
         'proxy.config.ssl.client.verify.server.policy': 'PERMISSIVE',
     })
 
-ts.Disk.ssl_multicert_config.AddLine('dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key')
+ts.Disk.ssl_multicert_yaml.AddLines(
+    """
+ssl_multicert:
+  - dest_ip: "*"
+    ssl_cert_name: server.pem
+    ssl_key_name: server.key
+""".split("\n"))
 
 ts.Disk.remap_config.AddLine(f'map https://www.client_only_tls.com/ http://127.0.0.1:{server.Variables.http_port}')
 ts.Disk.remap_config.AddLine(f'map https://www.tls.com/ https://127.0.0.1:{server.Variables.https_port}')
@@ -97,8 +103,7 @@ ts.Disk.traffic_out.Content += Testers.ContainsExpression(
 replay_file_session_1 = os.path.join(ts_log_dir, "127", "0000000000000000")
 ts.Disk.File(replay_file_session_1, exists=True)
 
-# Execute the first transaction. We limit the threads to 1 so that the sessions
-# are run in serial.
+# Execute the first transaction.
 tr = Test.AddTestRun("Run the test traffic.")
 tr.AddVerifierClientProcess(
     "client",
@@ -107,8 +112,7 @@ tr.AddVerifierClientProcess(
     https_ports=[ts.Variables.ssl_port],
     http3_ports=[ts.Variables.ssl_port],
     ssl_cert="ssl/server_combined.pem",
-    ca_cert="ssl/signer.pem",
-    other_args='--thread-limit 1')
+    ca_cert="ssl/signer.pem")
 
 tr.Processes.Default.StartBefore(server)
 tr.Processes.Default.StartBefore(ts)
