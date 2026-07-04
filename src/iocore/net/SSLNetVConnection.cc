@@ -922,16 +922,12 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc) : SSLNetVConnecti
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
-  // The consumer has detached: sever the user VIOs first, so nothing that runs after
-  // this point can signal a continuation that may already be freed -- the transport VC
-  // does the same (UnixNetVConnection::do_io_close sets op = NONE). The deferred
-  // close-drain below returns with the VC still live, and during a synchronous
-  // handshake-hook failure the whole close runs with _ssl_connect/_ssl_accept still on
-  // the stack: the VCONN_CLOSE hook callout just below re-invokes plugin hooks whose
-  // reenable_with_event(TS_EVENT_ERROR) re-signals the consumer, and the unwinding
-  // handshake error path signals it again. Each such late signal now takes
-  // _signal_user's null-cont branch instead of re-entering a consumer that closed us
-  // and freed itself (ConnectingEntry's double `delete this`).
+  // The consumer has detached: sever the user VIOs first, so no signal delivered after
+  // this point -- the unwinding handshake error path, a terminated-state mainEvent
+  // dispatch, a transport event during the close drain -- can reach a continuation that
+  // may already be freed (the deferred close-drain below returns with the VC still
+  // live). The transport VC does the same (UnixNetVConnection::do_io_close sets
+  // op = NONE); _signal_user's null-cont branch absorbs the late signals.
   _user_read_vio.cont     = nullptr;
   _user_read_vio.op       = VIO::NONE;
   _user_read_vio.nbytes   = 0;
@@ -1760,19 +1756,12 @@ SSLNetVConnection::reenable_with_event(int event)
   }
 
   if (event == TS_EVENT_ERROR) {
-    // A hook failed the handshake. Only record it here; do NOT signal the consumer from
-    // this stack. The reenable is usually synchronous -- the plugin calls it from inside
-    // its hook callout, with the handshake (and for the verify hooks, X509_verify_cert)
-    // still on the stack below -- and master's contract is that the remaining hooks of
-    // the chain still run (the tls_hooks_verify gold test asserts both callbacks see the
-    // verify event even when the first one errors) and the failure is delivered to the
-    // consumer exactly once by the handshake error path (_verify_certificate returns
-    // failure on SslState::ERROR -> SSL_connect/accept fails -> _trigger_ssl_read's
-    // EVENT_ERROR arm signals). Signalling here instead let the consumer tear us down
-    // mid-hook and re-entered it once per remaining hook (ConnectingEntry's double
-    // `delete this`). For an asynchronous reenable (hook held across a schedule, e.g.
-    // rate_limit_sni) no handshake is on the stack; the scheduled read-drive below
-    // delivers the error from mainEvent's terminated branch instead.
+    // A hook failed the handshake: record it and keep iterating hooks (the remaining
+    // hooks of the chain must still see their event). The failure reaches the consumer
+    // exactly once, downstream: a synchronous reenable (hook callout mid-SSL_connect/
+    // accept) via the unwinding handshake error path, an asynchronous one via the
+    // scheduled read-drive's terminated-state dispatch in mainEvent. Signalling from
+    // here would let the consumer tear us down while the hook chain is still running.
     _sslState = SslState::ERROR;
   }
 
@@ -3091,15 +3080,12 @@ SSLNetVConnection::mainEvent(int event, void *data)
       return EVENT_DONE;
     }
     if (isTerminated(_sslState)) {
-      // Deliver the terminal state to the consumer before this VC goes away -- e.g. a
-      // hook's reenable_with_event(TS_EVENT_ERROR) only records SslState::ERROR and
-      // schedules this dispatch (an async reenable has no handshake on the stack to
-      // deliver it). Freeing silently here stranded the waiting consumer (a
-      // ConnectingEntry or SSLNextProtocol trampoline whose VIOs point into us). If the
-      // consumer was already told (its do_io_close severed the user VIOs), _signal_user's
-      // null-cont branch is a no-op. _signal_user's recursion-gated tail then frees us
-      // (recursion is 0 on this clean scheduled stack) unless the consumer's handler
-      // started a deferred close-drain, which frees on a later dispatch.
+      // Deliver the terminal state to the consumer before this VC goes away: an async
+      // reenable_with_event(TS_EVENT_ERROR) has no handshake on the stack to deliver it,
+      // only this scheduled dispatch -- freeing silently would strand the waiting
+      // consumer. A severed/already-notified consumer hits _signal_user's null-cont
+      // branch; its recursion-gated tail frees us unless the handler deferred to a
+      // close-drain.
       _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
       return EVENT_DONE;
     }
@@ -3146,7 +3132,13 @@ SSLNetVConnection::mainEvent(int event, void *data)
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: handle_event received event %d from transport VIO %p", this, event, transport_vio);
 
   if (isTerminated(_sslState)) {
-    this->free_thread(this_ethread());
+    // Deliver-before-free, as in the scheduled dispatch above: a transport event can
+    // reach the terminal state ahead of the scheduled read-drive (reenable_with_event's
+    // own transport reenable races it, and free_thread's destructor would cancel the
+    // pending drive event) -- freeing silently would strand a never-notified consumer.
+    // A severed/already-notified consumer hits _signal_user's null-cont branch; its
+    // recursion-gated tail frees us unless the handler deferred to a close-drain.
+    _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
     return EVENT_DONE;
   }
 
