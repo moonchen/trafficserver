@@ -3500,8 +3500,13 @@ SSLNetVConnection::reenable(VIO *vio)
 void
 SSLNetVConnection::reenable_re(VIO *vio)
 {
-  ink_assert(_unvc != nullptr);
-  _unvc->reenable_re(vio);
+  // The vio here is the *user's* VIO; the inner VC routes reenable_re by
+  // comparing against its own read.vio/write.vio, so forwarding a foreign VIO
+  // would always take the write branch. Dispatch through our own reenable(),
+  // which maps user VIO -> transport VIO. Deferred (non-inline) semantics are
+  // within reenable_re's contract: the base itself falls back to reenable()
+  // whenever the NetHandler lock is not already held.
+  this->reenable(vio);
 }
 
 SOCKET
