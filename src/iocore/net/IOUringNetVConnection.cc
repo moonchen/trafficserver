@@ -1651,9 +1651,12 @@ IOUringNetVConnection::_connect()
   // Try-lock and retry like the read/write drives do; a connect has no ready-list to be
   // rescheduled from, so the retry await is a short io_uring timeout on this ring. The
   // timeout op is registered as _connect_op so a deferred close can still cancel it.
+  // Lock action_.mutex, not action_.continuation->mutex: a cancelled continuation may
+  // already be freed, and the Action holds its own reference to the mutex precisely so
+  // the cancelled check does not have to touch the continuation.
   for (;;) {
     {
-      MUTEX_TRY_LOCK(lock, action_.continuation->mutex, this_ethread());
+      MUTEX_TRY_LOCK(lock, action_.mutex, this_ethread());
       if (lock.is_locked()) {
         if (action_.cancelled) {
           nh->free_netevent(this);

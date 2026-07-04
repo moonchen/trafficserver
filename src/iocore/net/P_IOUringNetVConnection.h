@@ -91,6 +91,15 @@ public:
   // delivers NET_EVENT_OPEN synchronously, like the base.
   int connectUp(EThread *t, int fd) override;
 
+  // The connect CQE has not been reaped yet: _connect_op is only non-null between
+  // the connect (or its lock-retry timeout) submit and the completion that
+  // delivers NET_EVENT_OPEN / NET_EVENT_OPEN_FAILED.
+  bool
+  connect_is_pending() const override
+  {
+    return _connect_op != nullptr;
+  }
+
   // If an io_uring op is in flight, cancel it and defer teardown until the
   // (cancelled) completion(s) resume the coroutine(s): an in-flight op holds a
   // pointer into this VC, so freeing before the completion is observed is a

@@ -191,6 +191,18 @@ public:
   int         acceptEvent(int event, Event *e);
   int         mainEvent(int event, Event *e);
   virtual int connectUp(EThread *t, int fd);
+  /** Whether a successful connectUp() has deferred NET_EVENT_OPEN delivery.
+   *
+   * The base connectUp signals the connecting continuation before returning, so
+   * connect_re can truthfully report ACTION_RESULT_DONE. A transport whose
+   * connect completes asynchronously (io_uring) returns true here so connect_re
+   * hands the caller a cancellable Action for the in-flight window instead.
+   */
+  virtual bool
+  connect_is_pending() const
+  {
+    return false;
+  }
   /**
    * Populate the current object based on the socket information in the
    * con parameter.

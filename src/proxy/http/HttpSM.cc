@@ -1862,14 +1862,14 @@ HttpSM::state_http_server_open(int event, void *data)
 
   switch (event) {
   case NET_EVENT_OPEN: {
-    // Since the UnixNetVConnection::action_ or SocksEntry::action_ may be returned from netProcessor.connect_re, and the
-    // SocksEntry::action_ will be copied into UnixNetVConnection::action_ before call back NET_EVENT_OPEN from
-    // SocksEntry::free(), so we just compare the Continuation between pending_action and VC's action_.
-    _netvc                 = static_cast<NetVConnection *>(data);
-    _netvc_read_buffer     = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
-    _netvc_reader          = _netvc_read_buffer->alloc_reader();
-    UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(_netvc);
-    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
+    // netProcessor.connect_re may have returned a deferred Action (UnixNetVConnection::action_,
+    // SocksEntry::action_, or the layered SSL VC's Action); in every case its continuation is
+    // this SM, so a mismatch means pending_action is stale. (The VC cannot be inspected here:
+    // data may be a layered SSLNetVConnection, which is not a UnixNetVConnection.)
+    _netvc             = static_cast<NetVConnection *>(data);
+    _netvc_read_buffer = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
+    _netvc_reader      = _netvc_read_buffer->alloc_reader();
+    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == this);
     pending_action = nullptr;
 
     if (this->plugin_tunnel_type == HttpPluginTunnel_t::NONE) {
@@ -2305,6 +2305,10 @@ HttpSM::cancel_pending_server_connection()
       // Found the sm, remove it.
       connecting_entry->connect_sms.erase(entry);
       if (connecting_entry->connect_sms.empty()) {
+        // No SM is waiting anymore. The connect may still be in flight (io_uring
+        // defers NET_EVENT_OPEN to the connect completion): cancel it so the net
+        // layer does not deliver into the entry we are about to delete.
+        connecting_entry->cancel_pending_action();
         if (connecting_entry->netvc) {
           connecting_entry->netvc->do_io_write(nullptr, 0, nullptr);
           connecting_entry->netvc->do_io_close();
@@ -5905,7 +5909,8 @@ HttpSM::do_http_server_open(bool raw, bool only_direct)
     }
   }
 
-  Continuation *cont = new_entry;
+  Continuation *cont           = new_entry;
+  Action       *connect_action = nullptr;
   if (!cont) {
     cont = this;
   }
@@ -5928,14 +5933,25 @@ HttpSM::do_http_server_open(bool raw, bool only_direct)
       opt.set_ssl_servername(t_state.server_info.name);
     }
 
-    pending_action = sslNetProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
+    connect_action = sslNetProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
                                                 &t_state.current.server->dst_addr.sa, // addr + port
                                                 opt);
   } else {
     SMDbg(dbg_ctl_http, "calling netProcessor.connect_re");
-    pending_action = netProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
+    connect_action = netProcessor.connect_re(cont,                                 // state machine or ConnectingEntry
                                              &t_state.current.server->dst_addr.sa, // addr + port
                                              opt);
+  }
+
+  if (new_entry != nullptr) {
+    // The Action's continuation is the ConnectingEntry, so the entry owns it:
+    // one SM abandoning a shared connect must not cancel it (and this SM's
+    // pending_action must stay empty for the CONNECT_EVENT_TXN path).
+    if (connect_action != ACTION_RESULT_DONE) {
+      new_entry->set_pending_action(connect_action);
+    }
+  } else {
+    pending_action = connect_action;
   }
 
   return;

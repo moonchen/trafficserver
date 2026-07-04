@@ -1076,6 +1076,10 @@ SSLNetVConnection::~SSLNetVConnection()
   // clear variables for reuse
   this->mutex.clear();
   _action.mutex.clear();
+  _action.continuation = nullptr;
+  // A cancelled outbound connect ends here via startEvent; the flag must not
+  // leak into this allocation's next life.
+  _action.cancelled = false;
   _user_read_vio.mutex.clear();
   _user_read_vio.cont = nullptr;
   _user_write_vio.mutex.clear();
@@ -3009,9 +3013,15 @@ SSLNetVConnection::startEvent(int event, void *data)
   case NET_EVENT_ACCEPT: {
     // On a successful open/accept, data is the underlying transport VConnection.
     UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
-    // The SSL VC's own _action is never cancelled: SSLNetProcessor::connect_re returns the inner
-    // unvc's Action (so external cancellation targets that), and Action::operator=(Continuation*)
-    // never sets `cancelled`. NET_EVENT_OPEN therefore always proceeds to setup.
+    // When the transport connect was deferred, SSLNetProcessor::connect_re handed
+    // the caller our _action. If the caller cancelled it while the connect was in
+    // flight, it may already be freed: close the just-delivered transport and
+    // unwind without signalling.
+    if (event == NET_EVENT_OPEN && _action.cancelled) {
+      unvc->do_io_close();
+      this->free_thread(this_ethread());
+      return EVENT_DONE;
+    }
     // Successful establishment of TCP connection
     // This is where we would set up the SSL context and start the handshake.
     _transport_state = TransportState::TRANSPORT_CONNECTED;
@@ -3044,7 +3054,9 @@ SSLNetVConnection::startEvent(int event, void *data)
     // Failed to establish TCP connection; data is the errno, not a VConnection.
     int res = reinterpret_cast<intptr_t>(data);
     lerrno  = -res;
-    _action.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    if (!_action.cancelled) {
+      _action.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    }
     this->free_thread(thread);
   } break;
   default:

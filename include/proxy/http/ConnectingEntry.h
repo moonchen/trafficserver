@@ -35,8 +35,31 @@ class ConnectingEntry : public Continuation
 public:
   ConnectingEntry() = default;
   ~ConnectingEntry() override;
-  void                    remove_entry();
-  int                     state_http_server_open(int event, void *data);
+  void remove_entry();
+  int  state_http_server_open(int event, void *data);
+
+  /** Store the connect Action when netProcessor.connect_re() defers completion.
+   *
+   * The Action's continuation is this entry, so the entry owns cancellation: a
+   * single HttpSM abandoning a shared connect must not cancel it, only the
+   * teardown of the whole entry may (see cancel_pending_action()).
+   */
+  void
+  set_pending_action(Action *a)
+  {
+    _pending_action = a;
+  }
+
+  /// Cancel the in-flight connect, if any. Must precede deleting an entry that
+  /// never received its NET_EVENT_OPEN / NET_EVENT_OPEN_FAILED.
+  void
+  cancel_pending_action()
+  {
+    if (_pending_action != nullptr) {
+      _pending_action->cancel();
+      _pending_action = nullptr;
+    }
+  }
   static PoolableSession *create_server_session(HttpSM *root_sm, NetVConnection *netvc, MIOBuffer *netvc_read_buffer,
                                                 IOBufferReader *netvc_reader);
 

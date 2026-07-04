@@ -150,17 +150,26 @@ public:
   int sslClientHandShakeEvent(int &err);
 
   // NetVConnection
-  VIO       *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
-  VIO       *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
-  void       do_io_close(int lerrno = -1) override;
-  void       do_io_shutdown(ShutdownHowTo_t howto) override;
-  void       set_active_timeout(ink_hrtime timeout_in) override;
-  void       set_inactivity_timeout(ink_hrtime timeout_in) override;
-  void       set_default_inactivity_timeout(ink_hrtime timeout_in) override;
-  bool       is_default_inactivity_timeout() override;
-  void       cancel_active_timeout() override;
-  void       cancel_inactivity_timeout() override;
-  void       set_action(Continuation *c) override;
+  VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
+  VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
+  void do_io_close(int lerrno = -1) override;
+  void do_io_shutdown(ShutdownHowTo_t howto) override;
+  void set_active_timeout(ink_hrtime timeout_in) override;
+  void set_inactivity_timeout(ink_hrtime timeout_in) override;
+  void set_default_inactivity_timeout(ink_hrtime timeout_in) override;
+  bool is_default_inactivity_timeout() override;
+  void cancel_active_timeout() override;
+  void cancel_inactivity_timeout() override;
+  void set_action(Continuation *c) override;
+  /** The Action handed to the outbound-connect caller when the transport connect
+   * is deferred (SSLNetProcessor::connect_re). startEvent honors its cancellation
+   * when the connect resolves, so a torn-down caller is never signalled.
+   */
+  Action *
+  get_connect_action()
+  {
+    return &_action;
+  }
   void       add_to_keep_alive_queue() override;
   void       remove_from_keep_alive_queue() override;
   bool       add_to_active_queue() override;

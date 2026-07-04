@@ -257,9 +257,15 @@ UnixNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOp
       ret = vc->connectUp(t, NO_FD);
       if ((using_socks) && (ret == CONNECT_SUCCESS)) {
         return &socksEntry->action_;
-      } else {
-        return ACTION_RESULT_DONE;
       }
+      if (ret == CONNECT_SUCCESS && vc->connect_is_pending()) {
+        // NET_EVENT_OPEN is deferred (io_uring delivers it from the connect
+        // CQE): the caller needs a cancellable Action for the in-flight window.
+        // ACTION_RESULT_DONE would leave a torn-down caller unreachable and the
+        // eventual delivery a use-after-free.
+        return result;
+      }
+      return ACTION_RESULT_DONE;
     }
   }
 

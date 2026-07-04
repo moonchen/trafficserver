@@ -138,5 +138,14 @@ SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOpt
   ssl_netvc->set_action(cont);
   ssl_netvc->mutex = cont->mutex;
   Action *action   = unix_netProcessor.connect_re(ssl_netvc, target, opt);
-  return action;
+  if (action == ACTION_RESULT_DONE || action == nullptr) {
+    return action;
+  }
+  // The transport connect is deferred. The inner Action's continuation is this
+  // SSL VC, not the caller's continuation, so handing it out would misdirect a
+  // cancel (stranding this VC and, in HttpSM, failing the pending-action
+  // continuation check). Return the SSL VC's own Action (continuation = cont,
+  // set by set_action above); startEvent honors its cancellation when the
+  // transport connect resolves.
+  return ssl_netvc->get_connect_action();
 }
