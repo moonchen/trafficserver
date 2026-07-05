@@ -922,6 +922,26 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc) : SSLNetVConnecti
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
+  // A consumer may close right after queuing a final plaintext write (e.g. an HTTP/2 GOAWAY
+  // frame) via do_io_write()+reenable(), without waiting for WRITE_COMPLETE. The graceful-close
+  // drain below only looks at already-encrypted ciphertext, and the VIO sever just below discards
+  // the plaintext, so that final write would otherwise be silently dropped. Encrypt it now,
+  // synchronously and without signalling the consumer, before the sever and SSL_shutdown() below
+  // (SSL_write() is invalid once SSL_shutdown() has run).
+  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_state != TransportState::TRANSPORT_ERROR &&
+      getSSLHandShakeComplete() && _user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled() &&
+      _user_write_vio.ntodo() > 0) {
+    MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
+    if (lock.is_locked()) {
+      int64_t total_plaintext_written = 0;
+      int     needs                   = 0;
+      _encrypt_data_for_transport(_user_write_vio.ntodo(), _user_write_vio.buffer, total_plaintext_written, needs);
+      if (total_plaintext_written > 0) {
+        _user_write_vio.ndone += total_plaintext_written;
+      }
+    }
+  }
+
   // The consumer has detached: sever the user VIOs first, so no signal delivered after
   // this point -- the unwinding handshake error path, a terminated-state mainEvent
   // dispatch, a transport event during the close drain -- can reach a continuation that
