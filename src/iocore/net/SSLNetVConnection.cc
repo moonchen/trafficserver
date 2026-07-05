@@ -2790,7 +2790,6 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   }
 
   // Give user a chance to fill buffer
-  bool signalled_ready = false;
   // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
   // SSL transport is unable to send.
   if (towrite != ntodo && !_write_buf->high_water()) {
@@ -2798,7 +2797,6 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // User closed connection in the handler
       return EVENT_DONE;
     }
-    signalled_ready = true;
 
     // The user may have stopped a do_io_write, or even started a new one
     if (_user_write_vio.cont != user_cont || _user_write_vio.op != VIO::WRITE || _user_write_vio.is_disabled()) {
