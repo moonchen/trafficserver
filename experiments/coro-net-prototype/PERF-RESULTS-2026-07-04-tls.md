@@ -311,10 +311,13 @@ TLS at this operating point is ≈ parity-to-slightly-behind. Large is a win on 
 | ioudef   | **0.65595** (0.6520–0.6595)  | 0.2994 / 0.3541 | 13.98  | 494.1  | 0.0425           |
 | ioutuned | **0.62280** (0.6164–0.6317)  | 0.3239 / 0.3005 | 16.11  | 494.6  | 0.0319           |
 
-All three ranges fully disjoint — robust. **ioudef −7.0% vs epoll** (net-path + AIO-backend
-swap together); **ioutuned −11.7% vs epoll**; lever attribution **ioutuned −5.1% vs ioudef**
-(send_zc_fixed + arena `_write_buf` + 256 KiB watermark; AIO identical). The two steps
-compose multiplicatively: 0.930 × 0.949 = 0.883 ≈ the −11.7% total. The loopback
+All three ranges fully disjoint — robust *within this boot*. **ioudef −7.0% vs epoll**
+(net-path + AIO-backend swap together); **ioutuned −11.7% vs epoll**; lever attribution
+**ioutuned −5.1% vs ioudef** (send_zc_fixed + arena `_write_buf` + 256 KiB watermark; AIO
+identical). ⚠️ **SUPERSEDED for the tuned/arena cell: the ladder section below shows the
+arena cell is boot-sensitive (~5%) and this boot's 0.6228 / −11.7% / −5.1% did not
+reproduce — cite the ladder's per-lever numbers instead.** The two steps compose
+multiplicatively: 0.930 × 0.949 = 0.883 ≈ the −11.7% total. The loopback
 large-object bimodality did NOT reappear: io_uring rounds are tight (spread ≤1.2% of
 median in ioudef). Tuned costs +2.1 ms p50 (256 KiB ciphertext staging before first send)
 — an efficiency/latency trade to name when enabling the watermark. ZC engagement across
@@ -332,12 +335,155 @@ tickets-off keep-alive, Release -O3, 4 pinned P-cores no-turbo, NIC IRQs on E-co
 1. **TLS-over-io_uring is cheaper per request than TLS-over-epoll on the real NIC at
    these operating points** — the loopback verdict inverts, matching the plain-HTTP
    precedent (NV1): small −3.7% (default levers; tuned moot at 4 KB), large −7.0%
-   (default) / −11.7% (tuned) process-cpu/1k.
-2. **The WS-B1 levers are worth −5.1% on disk-served 1 MiB TLS** on top of default
-   io_uring, with proven true zero-copy (zc_fixed-only, 0 copied) — at the cost of
-   +2.1 ms p50 from ciphertext staging.
+   (default) / −11.7% (tuned, ⚠️ this boot only — see the ladder section)
+   process-cpu/1k.
+2. **The WS-B1 levers measured −5.1% on disk-served 1 MiB TLS this boot** on top of
+   default io_uring, with proven true zero-copy (zc_fixed-only, 0 copied) — at the cost
+   of +2.1 ms p50 from ciphertext staging. ⚠️ The ladder section below found the arena
+   cell boot-sensitive and this number non-reproducible; the robust lever is anonymous
+   send_zc (ladder −11.9% vs epoll without the arena).
 3. Small-object caveat: on a total-system view (process + softirq) the small-object win
    dissolves to ≈ +3% (overlapping ranges); the large-object win survives both views.
 4. No throughput claim: every ceiling here is the 1 GbE wire. The loopback −28%
    large-object ceiling gap remains unmeasured on a NIC-bound link; re-test at ≥10 GbE
    before citing any io_uring TLS throughput ceiling.
+
+## TLS lever ladder (BoringSSL, real NIC), session 2026-07-05
+
+The campaign above measured three points; its "ioutuned −5.1% vs ioudef" attributed the
+whole lever package (watermark + send_zc + fixed arena) as one step. This ladder isolates
+each lever, and reruns EVERY cell interleaved in one session — cross-boot variance is
+±2%, so mixing rounds from different boots cannot resolve per-lever deltas of this size.
+That discipline turned out to be the finding: the fixed-arena point itself moved ~+5%
+across boots (below).
+
+### Conditions
+
+- ONE binary throughout: branch `io-uring-tls-wip` @ `34a8f84525` (2 commits past the
+  campaign above: docs + thread-exit destructors for the read buf ring/frame pool — no
+  steady-state path change), `build-bssl-rel` Release, BoringSSL @ `b19c870c5`, installed
+  /tmp/ts-bssl-rel (binary md5 ed9161a7ddca39b51c8ad6b7cac1b6f1). Cells differ ONLY in
+  records.yaml. Same box/client/method as the campaign above (i9-12900K pinned 0,2,4,6,
+  no-turbo, atlantic 1 GbE, IOMMU group 18 identity, NIC IRQs on E-cores 16–23, wrk on
+  hawaii, 12 s in-window samples, 6 passes with all 7 cells interleaved per pass; 42/42
+  rounds passed the hard-fail validation, zero Non-2xx/timeouts).
+- Fresh ceiling probes this session: small 26 114 / 26 114; large 111.9 / 112.2 / 112.0 /
+  112.3 / 111.7 req/s (epoll/ioudef/iouwm/iouzc/iouzcfix) — all wire-bound, equal within
+  0.5%. Large rounds: delay 750 ms → 78.2–78.8 req/s ≈ 70% of ceiling. Small rounds:
+  wrk's delay() is integer-ms, and 11 ms (closest to 70%) settled at ~19.9k ≈ 76% of
+  ceiling in steady state (the cal round read 17.7k; the closed loop crept up) — delays
+  IDENTICAL across cells, so the A/B is unaffected; two client-side rate blips (17.5k,
+  18.8k) left in, cpu/1k is per-request and in-family.
+- AIO is asserted per boot from diags ("Using thread for AIO" in epoll, "Using io_uring
+  for AIO" in every iou cell — aio left `auto` there, proven not assumed). The
+  epoll→ioudef step therefore still conflates the net-path swap with the AIO-backend
+  swap on this disk-served workload; every later step holds AIO fixed.
+
+### Cells (each = previous + ONE change)
+
+| cell     | delta vs previous                                                        |
+| -------- | ------------------------------------------------------------------------ |
+| epoll    | `enabled=0`, `aio.mode=thread` (prod-like baseline)                       |
+| ioudef   | `enabled=1`, all levers default                                           |
+| iouwm    | + `ssl.write_buffer_water_mark=262144` (bigger ciphertext staging only)   |
+| iouzc    | + `write_zerocopy=1, threshold=262144`, arena OFF (anonymous send_zc)     |
+| iouzcfix | + `fixed_arena_size=1GiB, block=2MiB` (send_zc_fixed; = prior "ioutuned") |
+
+### Large: 1 MiB disk-served, 64 conns, ~78.4 req/s (12 s × 6, interleaved)
+
+| cell     | cpu/1k median (min–max)     | Δ vs prev | Δ vs epoll | user/sys /1k    | p50 ms | p99 ms | softirq s/1k |
+| -------- | --------------------------- | --------- | ---------- | --------------- | ------ | ------ | ------------ |
+| epoll    | **0.69830** (0.6931–0.7052) | —         | —          | 0.3183 / 0.3780 | 14.49  | 493.7  | 0.0318       |
+| ioudef   | **0.64970** (0.6481–0.6561) | −7.0%     | −7.0%      | 0.2930 / 0.3591 | 13.71  | 485.7  | 0.0319       |
+| iouwm    | **0.64910** (0.6405–0.6546) | −0.1%     | −7.0%      | 0.3087 / 0.3388 | 14.14  | 487.1  | 0.0318       |
+| iouzc    | **0.61510** (0.6082–0.6211) | −5.2%     | −11.9%     | 0.3387 / 0.2734 | 15.88  | 493.9  | 0.0373       |
+| iouzcfix | **0.65455** (0.6514–0.6564) | +6.4%     | −6.3%      | 0.3416 / 0.3115 | 17.14  | 490.6  | 0.0319       |
+
+Steps compose multiplicatively: 0.9304 × 0.9991 × 0.9476 = 0.8809 (iouzc's −11.9%) and
+× 1.0641 = 0.9374 (iouzcfix's −6.3%). Range structure per step:
+
+- **epoll → ioudef −7.0%**: disjoint ranges; replicates the campaign above (−7.0%).
+  Net-path + AIO-backend conflated (see Conditions).
+- **ioudef → iouwm ~0**: ranges overlap almost completely — the 256 KiB ciphertext
+  staging watermark alone buys nothing measurable here. Its role is enabling: without
+  it, TLS sends stay at ~16 KiB records, below the 256 KiB ZC threshold, and the ZC
+  levers never engage. Costs nothing either (+0.4 ms p50, in-noise).
+- **iouwm → iouzc −5.2%**: fully disjoint below every other io_uring cell — anonymous
+  send_zc on the staged ciphertext is THE lever that pays. All of it is system-time
+  (sys 0.3388→0.2734/1k, the copy leaving the kernel path); +1.7 ms p50 and +0.0055
+  softirq s/1k move against it (ZC notification work), and it still wins on the
+  system-total view (0.65340 vs epoll 0.73300, −10.9%).
+- **iouzc → iouzcfix +6.4%**: disjoint above iouzc, landing back at the ioudef/iouwm
+  level (its range overlaps ioudef's — vs ioudef it is parity, +0.7%). In THIS session
+  the fixed-arena/registered-buffer lever undoes most of the anonymous-ZC win.
+
+### The iouzcfix point vs the campaign above (cross-session shift, binary ruled out)
+
+The prior session's equivalent cell (ioutuned) measured **0.62280** — today the same
+configuration measures ~0.652 no matter how it is asked: iouzcfix 0.65455 (×6), literal
+`ioutuned` records including its explicit `aio.mode=io_uring` 0.6492/0.6529 (tags
+xt1–2), and — the decisive test — the prior campaign's own source (`da9b6dc9f5`, fresh
+worktree build, same flags/BoringSSL) interleaved against the tip binary in this same
+session: prior binary 0.6465/0.6579 (xp1–2) vs tip 0.6643/0.6513 (xt3–4). Overlapping,
+both at today's level. So: not the 2-commit code delta, not the aio-mode nuance —
+the send_zc_fixed/arena cell's absolute level is boot-sensitive by ~5% while epoll and
+ioudef moved <1% between the same two boots. Cause not identified; after config and
+binary were excluded in-session, boot-level state interacting with the
+registered-buffer path is what remains (IOMMU group read `identity` both sessions).
+Consequence for the campaign above: its −5.1% "lever package" step should be read as
+that boot's arena point, not a stable property; the package's robust decomposition on
+today's boot is watermark ~0, anonymous ZC −5.2%, registration +6.4%.
+
+Mechanism observation (recorded, not causal): the arena-backed `_write_buf` issues
+~3.05 sends/req (~350 KB) vs ~2.0 sends/req (~512 KB) for the malloc-backed staging
+buffer — 50% more, smaller sends on the fixed path. The prior session showed the same
+3.05 sends/req at its faster level, so send count alone does not explain the shift.
+
+### Small: 4 KB RAM-hit, 256 conns, ~19.9k req/s (12 s × 6, interleaved)
+
+| cell   | cpu/1k median (min–max)     | Δ vs epoll | user/sys /1k    | p50 ms | p99 ms | softirq s/1k |
+| ------ | --------------------------- | ---------- | --------------- | ------ | ------ | ------------ |
+| epoll  | **0.02095** (0.0206–0.0215) | —          | 0.0146 / 0.0060 | 1.28   | 3.08   | 0.0079       |
+| ioudef | **0.02065** (0.0203–0.0213) | −1.4%      | 0.0142 / 0.0066 | 1.34   | 3.11   | 0.0100       |
+
+Ranges overlap heavily: −1.4% is parity-to-slight-win, weaker than the prior session's
+−3.7% (same direction; both sessions' small deltas are within each other's overlap
+structure). On the system-total view (process + softirq) it flips to +5.4% io_uring,
+same caveat as the campaign above. The ZC/arena levers are not re-measured at 4 KB —
+the campaign above already established them moot there (threshold 256 KiB, zc=0 all
+rounds, tuned ≈ default +0.5%).
+
+### Engagement evidence (hard-fail gates, all 42 rounds + 6 xt/xp rounds green)
+
+- iouwm: `write_zerocopy`=0 and `write_zerocopy_fixed`=0 every round (watermark only).
+- iouzc: 11 252 anonymous ZC sends across 6 rounds (~2.0/req), **fixed=0, copied=0** —
+  true anonymous zero-copy on the NIC, no kernel copy-back, no registered path.
+- iouzcfix: 17 201 ZC / 17 208 fixed (±edge-of-window sampling), **copied=0**, arena
+  allocs ~8 480/round — every ZC send took the registered-buffer path.
+- Per boot: AIO-backend Note asserted; disk-serving proven (pread/req ≈100%, ram 0.0%,
+  hit ≈100%); small 100% mem-fresh; TLSv1.3 from hawaii; pinning 0,2,4,6.
+
+### Conclusions (qualified — this box/NIC/client/boot, these operating points)
+
+1. On today's boot, the per-lever decomposition of the large-object win is: io_uring
+   net+AIO −7.0%, staging watermark ~0 (enabler only), anonymous send_zc −5.2%,
+   buffer registration (send_zc_fixed + arena) **+6.4%** — the best configuration this
+   session is watermark + anonymous ZC at **−11.9%** vs epoll, not the full package
+   (−6.3%).
+2. The registered-buffer point is boot-sensitive (~5% swing across two boots, binary
+   and config ruled out in-session); do not cite either session's arena number as a
+   stable property. The anonymous-ZC step is the largest single lever measured under
+   same-session discipline — noting iouzc itself has no cross-boot measurement yet, so
+   its boot-stability is untested (its same-session disjointness is the evidence), and
+   the boot-sensitivity mechanism is not isolated to buffer registration per se
+   (registration vs DMA/IOMMU boot state vs other per-boot layout effects remain
+   candidates).
+3. Small-object: io_uring default −1.4% process-cpu (overlapping ranges — parity-to-
+   slight-win), +5.4% on system-total view.
+4. Wire-limited: all ceilings are the 1 GbE wire (equal within 0.5% across cells);
+   per-request efficiency at fixed ~70%/~76% loads, NO throughput claims.
+
+Raw rows: bench repo `results/tlsnic-ladder-{small,large}.csv` (probe/cal/xt/xp rows
+tagged); driver `scripts/campaign-tls-ladder.sh` + extended `scripts/measure-tls-nic.sh`
+(per-cell engagement gates, AIO-note gate, TSPREFIX binary-A/B hook), aggregation
+`scripts/agg-tls-ladder.py`.
