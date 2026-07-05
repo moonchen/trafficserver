@@ -33,6 +33,12 @@
 #include "P_SSLNetVConnection.h"
 #include "P_TunnelNetVConnection.h"
 #include "P_UnixNetProcessor.h"
+#include "tscore/ink_config.h"
+#if TS_USE_LINUX_IO_URING
+#include "P_IOUringNetVConnection.h"
+#include "iocore/io_uring/UringFixedBufArena.h"
+#include "records/RecCore.h"
+#endif
 #include "iocore/eventsystem/Continuation.h"
 #include "iocore/eventsystem/Event.h"
 #include "iocore/eventsystem/EventSystem.h"
@@ -48,7 +54,6 @@
 #include "iocore/net/TLSALPNSupport.h"
 #include "ts/apidefs.h"
 #include "tscore/ink_assert.h"
-#include "tscore/ink_config.h"
 #include "tscore/Layout.h"
 #include "tscore/InkErrno.h"
 #include "tscore/TSSystemState.h"
@@ -3028,6 +3033,26 @@ SSLNetVConnection::startEvent(int event, void *data)
     ink_release_assert(unvc != nullptr);
     ink_release_assert(_sslState == SslState::INIT);
     this->_unvc = unvc;
+#if TS_USE_LINUX_IO_URING
+    // send_zc_fixed engagement gate: back _write_buf's blocks with the io_uring registered
+    // arena if and only if (a) this connection's inner transport is the io_uring VC (the only
+    // send path that can use a registered block), (b) write zero-copy is enabled, and (c) the
+    // fixed arena is built -- so the staged ciphertext can go out as send_zc_fixed. Blocks are
+    // sized to span the staging water mark; below the arena's 64 KiB floor the hook declines
+    // and, like arena exhaustion, the normal allocator backs the block (which every send path
+    // handles). When any condition is off, behavior is byte-identical to the unhooked buffer.
+    // Installed here, before the transport write VIO below, so no ciphertext block predates
+    // the gate decision (only the constructor's initial heap block does, and a heap block just
+    // stays on the anonymous/copy send path).
+    static const bool write_zc_on = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy").value_or(0) != 0;
+    if (write_zc_on && UringFixedBufArena::instance().enabled() && dynamic_cast<IOUringNetVConnection *>(unvc) != nullptr) {
+      int64_t const arena_index = buffer_size_to_index(_write_buf->water_mark, MAX_BUFFER_SIZE_INDEX);
+      if (arena_index > _write_buf->size_index) {
+        _write_buf->size_index = arena_index;
+      }
+      _write_buf->_block_alloc = &UringFixedBufArena::block_alloc_hook;
+    }
+#endif
     SET_HANDLER(&SSLNetVConnection::mainEvent);
     _sslState = SslState::HANDSHAKE_WANTED;
     // Once the handshake starts, we will need to be ready to write
