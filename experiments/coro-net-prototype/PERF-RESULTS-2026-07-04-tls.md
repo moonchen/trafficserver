@@ -204,3 +204,140 @@ tracepoints for loop rates.
 
 The large-object bimodality was not explained by this campaign (no small-object evidence
 transferred; it likely lives in the send-path structure behind the −28% ceiling probe).
+
+## Prod-like NIC campaign (BoringSSL), session 2026-07-04/05
+
+The loopback verdict above does not transfer to a real NIC (its own §"Why" attributes ~32%
+of the small-object gap to loopback kernel-path pricing that the plain-HTTP NIC campaign
+saw flip to a win). This campaign measures the TLS verdict directly under prod-like
+conditions: BoringSSL, a real 1 GbE NIC, a remote client, disk-served large objects, and
+the tuned io_uring levers (send_zc_fixed out of the arena-backed SSL `_write_buf`,
+WS-B1). Raw CSVs: bench repo `results/tlsnic-{small,large}.csv`; driver
+`scripts/measure-tls-nic.sh` + `scripts/campaign-tls-nic.sh` + client-side
+`scripts/tlsrate.lua`.
+
+### Environment
+
+- Branch `io-uring-tls-wip` @ `da9b6dc9f5`; ONE binary throughout: `build-bssl-rel`
+  (Release gcc `-O3 -DNDEBUG`, `USE_IOURING=ON`, glibc malloc) linked against **BoringSSL**
+  shared libs (`~/work/boringssl` @ `b19c870c5`, API version 41; `ldd` shows
+  `boringssl-root/lib/libssl.so`), installed to `/tmp/ts-bssl-rel`. Cells differ ONLY in
+  records.yaml.
+- Server box: i9-12900K, kernel 6.17.0-29-generic, ATS pinned via cgroup cpuset `atsbench`
+  to P-cores 0,2,4,6 (4 ET_NET + 1 accept), governor performance, turbo off. NIC atlantic
+  1 GbE `enp6s0`, IOMMU group 18 = `identity` (verified), NIC IRQs steered to E-cores
+  16–23. nginx origin (warm fill only, loopback :8090) confined to CPUs 1,3,5,7 by the
+  cpuset partitions; idle during every measurement window (0 misses in-window).
+- Client: hawaii (M1 Mac Mini, 8 cores) over the 1 GbE link, wrk 4.2.0 (kqueue, links
+  openssl@4), `ulimit -n 8192` (macOS default 256 silently drops 5 of 256 conns). wrk 4.x
+  has no `-R`, so fixed rates are closed-loop delay-shaped (`tlsrate.lua delay()`),
+  calibrated once per workload and IDENTICAL across cells; achieved rates matched across
+  cells (small 18.4–18.5k, large 78.2–79.0 — one ioudef round hit 15.9k, a client-side
+  blip; its cpu/1k is per-request and in-family). Client headroom during rounds: ≥80% idle.
+- TLS: TLSv1.3 `TLS_AES_256_GCM_SHA384` (verified from hawaii per boot), RSA-2048
+  self-signed, session tickets off, HTTP/1.1 keep-alive. Measurement is an in-window
+  sample (8 s into the wrk run, 12 s window): steady-state keep-alive, handshake ramp
+  excluded (unlike the loopback tables above, which include round-start handshakes).
+- Metric: cpu/1k = ATS-cgroup `usage_usec`/req (gold, same as loopback). Global softirq
+  s/1k recorded separately (NIC rx/tx completion work lands on the E-cores, off the ATS
+  cgroup). %iowait/%idle from the ATS cores per round.
+- 1 GbE bounds everything: ceilings probed per cell first (closed loop), all six ceilings
+  are line-rate-equal, rounds then ran at ~70% of the slower ceiling. This is a
+  per-request efficiency A/B at fixed offered load, NOT a throughput comparison — the
+  −28% loopback ceiling gap has no NIC counterpart to measure at 1 GbE (both cells idle
+  waiting for the wire).
+
+### Cells
+
+| cell     | records delta vs common                                                                                  |
+| -------- | -------------------------------------------------------------------------------------------------------- |
+| epoll    | `net.io_uring.enabled=0`, `aio.mode=thread` (prod-like master baseline; ssl watermark default)            |
+| ioudef   | `enabled=1`, everything else default (aio auto → **io_uring AIO**, verified "Using io_uring for AIO" Note) |
+| ioutuned | `enabled=1, write_zerocopy=1, write_zerocopy_threshold=262144, fixed_arena_size=1GiB, fixed_arena_block_size=2MiB` + `ssl.write_buffer_water_mark=262144` + `aio.mode=io_uring` |
+
+Note the epoll baseline sets `aio.mode=thread` explicitly: with the default `auto` this
+build would run io_uring AIO under an epoll net path, which is not a prod baseline (prod
+epoll builds run thread AIO). Consequence: in the LARGE cell, ioudef−epoll conflates the
+net-path swap with the AIO-backend swap; ioutuned−ioudef is a clean lever attribution
+(both use io_uring AIO). In the SMALL cell (RAM-hit, zero in-window disk I/O) all deltas
+are pure net-path.
+
+### Validation (hard-fail per boot/round, all 36 recorded rounds passed)
+
+200 + exact body size over TLS from hawaii; TLSv1.3 s_client probe from hawaii; io_uring
+accept-for-TLS-port + NetVConnection Notes in diags.log iff enabled=1; Cpus_allowed_list
+0,2,4,6; small = 100% `cache_hit_mem_fresh`; large = disk-served proven per round by
+`cache.pread_count`/req ≈ 100% + `hit_fresh` ≈ 100% + mem-serves ≈ 0% (rotation widened to
+200×1 MiB objects after the initial 50-object config showed 0–22% phase-dependent serves
+from the cache's single-doc last-open-read lookaside — 64 in-flight conns over 50 objects
+always hold duplicates); tuned large = `write_zerocopy_fixed>0` AND `write_zerocopy_copied==0`
+in-window AND arena allocs >0; zero Non-2xx and zero timeouts everywhere.
+
+### Ceiling probes (closed loop, single rounds)
+
+small: epoll 26 106, ioudef 26 109, ioutuned 26 108 req/s — identical, wire-bound
+(≈115 MB/s with headers), ATS cores ≈86% non-busy in every cell. large: epoll 112.2,
+ioudef 113.2, ioutuned 112.1 req/s — identical, wire-bound. Rounds: small R≈18.4k
+(delay 12 ms), large R≈78.4 (delay 750 ms).
+
+### Small object: 4 KB RAM-hit, 256 conns, ~18.4k req/s (12 s × 6, interleaved boots)
+
+| cell     | cpu/1k median (min–max)      | user/sys /1k    | p50 ms | p99 ms | softirq s/1k med |
+| -------- | ---------------------------- | --------------- | ------ | ------ | ---------------- |
+| epoll    | **0.02175** (0.0209–0.0220)  | 0.0167 / 0.0051 | 1.25   | 3.06   | 0.0080           |
+| ioudef   | **0.02095** (0.0208–0.0211)  | 0.0154 / 0.0055 | 1.29   | 3.13   | 0.0097           |
+| ioutuned | **0.02105** (0.0209–0.0212)  | 0.0146 / 0.0065 | 1.29   | 3.12   | 0.0092           |
+
+io_uring −3.7% (default) / −3.2% (tuned) process-cpu/1k vs epoll; tuned≈default (+0.5%,
+noise) — the ZC/arena levers are moot for 4 KB sends (threshold 256 KiB; zc=0 all rounds),
+as expected. The epoll range overlaps the io_uring cells at its best round (0.0209; the
+other five ≥0.0216), so this is a modest, mostly-consistent win, not a disjoint-range one.
+p50 +0.04 ms for io_uring. Contrast loopback: **+10.5% → −3.7%**, i.e. the small-object
+verdict flips on a real NIC exactly as the "Why" section's loopback-pricing term (and
+plain-HTTP NV1, −6%) predicted.
+
+**System-view caveat**: counting global softirq alongside process cpu, small flips to
+io_uring +3.0% (default; ranges overlap) — io_uring's small-object rounds carry ~+0.0017
+softirq s/1k that epoll does in syscall context instead. On the process/cgroup gold
+metric (what the prior campaigns cite) io_uring wins; on total-system cost small-object
+TLS at this operating point is ≈ parity-to-slightly-behind. Large is a win on BOTH views
+(process −11.7%, system-total −12.0%, tuned).
+
+### Large object: 1 MiB disk-served, 64 conns, ~78.4 req/s (12 s × 6, interleaved boots)
+
+| cell     | cpu/1k median (min–max)      | user/sys /1k    | p50 ms | p99 ms | softirq s/1k med |
+| -------- | ---------------------------- | --------------- | ------ | ------ | ---------------- |
+| epoll    | **0.70535** (0.6925–0.7082)  | 0.3158 / 0.3873 | 13.93  | 486.6  | 0.0423           |
+| ioudef   | **0.65595** (0.6520–0.6595)  | 0.2994 / 0.3541 | 13.98  | 494.1  | 0.0425           |
+| ioutuned | **0.62280** (0.6164–0.6317)  | 0.3239 / 0.3005 | 16.11  | 494.6  | 0.0319           |
+
+All three ranges fully disjoint — robust. **ioudef −7.0% vs epoll** (net-path + AIO-backend
+swap together); **ioutuned −11.7% vs epoll**; lever attribution **ioutuned −5.1% vs ioudef**
+(send_zc_fixed + arena `_write_buf` + 256 KiB watermark; AIO identical). The two steps
+compose multiplicatively: 0.930 × 0.949 = 0.883 ≈ the −11.7% total. The loopback
+large-object bimodality did NOT reappear: io_uring rounds are tight (spread ≤1.2% of
+median in ioudef). Tuned costs +2.1 ms p50 (256 KiB ciphertext staging before first send)
+— an efficiency/latency trade to name when enabling the watermark. ZC engagement across
+the six tuned rounds: 17 245 zerocopy sends, **17 244 send_zc_fixed, 0 copied** (~3.05
+sends/req at ~350 KB/send), arena allocs ~8 450/round — true zero-copy on the NIC, no
+kernel copy-back, every ZC send took the registered-buffer path.
+
+### Conclusions (qualified — this box/NIC/client, these operating points)
+
+Under: 1 GbE atlantic NIC (wire-bound ceilings), BoringSSL TLSv1.3 AES-256-GCM RSA-2048
+tickets-off keep-alive, Release -O3, 4 pinned P-cores no-turbo, NIC IRQs on E-cores,
+256 conns × 4 KB RAM-hit @ ~18.4k req/s and 64 conns × 1 MiB disk-served @ ~78 req/s
+(both ≈70% of line rate), steady-state windows excluding handshake ramp:
+
+1. **TLS-over-io_uring is cheaper per request than TLS-over-epoll on the real NIC at
+   these operating points** — the loopback verdict inverts, matching the plain-HTTP
+   precedent (NV1): small −3.7% (default levers; tuned moot at 4 KB), large −7.0%
+   (default) / −11.7% (tuned) process-cpu/1k.
+2. **The WS-B1 levers are worth −5.1% on disk-served 1 MiB TLS** on top of default
+   io_uring, with proven true zero-copy (zc_fixed-only, 0 copied) — at the cost of
+   +2.1 ms p50 from ciphertext staging.
+3. Small-object caveat: on a total-system view (process + softirq) the small-object win
+   dissolves to ≈ +3% (overlapping ranges); the large-object win survives both views.
+4. No throughput claim: every ceiling here is the 1 GbE wire. The loopback −28%
+   large-object ceiling gap remains unmeasured on a NIC-bound link; re-test at ≥10 GbE
+   before citing any io_uring TLS throughput ceiling.
