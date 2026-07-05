@@ -202,6 +202,14 @@ Http2ClientSession::main_event_handler(int event, void *edata)
     Http2SsnDebug("Closing event: %s", HttpDebugNames::get_event_name(event));
     this->set_dying_event(event);
     this->do_io_close();
+    // A layered (TLS-terminated) SSLNetVConnection self-frees on its recursion unwind immediately
+    // after delivering VC_EVENT_ERROR (SSLNetVConnection::_signal_user), while this session's
+    // teardown is still asynchronous and only reaches destroy() later. Drop the netvc reference now
+    // so destroy() does not call _vc->do_io_close() on the freed VC (rate_limit_sni queue-expiry
+    // reject use-after-free). The self-freeing VC needs no further close from us.
+    if (event == VC_EVENT_ERROR) {
+      this->_vc = nullptr;
+    }
     retval     = 0;
     set_closed = true;
     break;
