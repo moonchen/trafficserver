@@ -100,6 +100,25 @@ namespace detail
       ::operator delete(p);
     }
 
+    // The pool is a per-thread (thread_local) object; its destructor runs when the
+    // net thread exits at shutdown. Free only the cached (already-deallocated)
+    // frames on the free list --- those are what leaks at exit. A frame belonging to
+    // a coroutine still suspended on an in-flight op is live, not on this list (it is
+    // only pushed here by deallocate(), i.e. after the coroutine completed), so
+    // draining the free list can never free a frame the kernel still references ---
+    // no thread-quiesce assumption is needed.
+    ~FramePool()
+    {
+      for (Slot &s : slots_) {
+        while (s.head != nullptr) {
+          void *p = s.head;
+          s.head  = *static_cast<void **>(p);
+          ::operator delete(p);
+        }
+        s.count = 0;
+      }
+    }
+
   private:
     struct Slot {
       std::size_t size  = 0;

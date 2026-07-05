@@ -209,6 +209,7 @@ public:
 // The shared per-thread provided-buffer ring. Lazily set up on first use; if setup
 // fails (old kernel / no memory) the read path falls back to single-shot recvmsg.
 struct ReadBufRing {
+  IOUringContext    *_ctx     = nullptr; // the ring this buf_ring is registered on
   io_uring_buf_ring *_br      = nullptr;
   char              *_pool    = nullptr; // _nbuf contiguous buffers of _bufsize
   unsigned           _nbuf    = 0;
@@ -216,6 +217,30 @@ struct ReadBufRing {
   int                _mask    = 0;
   int64_t            _sizeidx = 0; // IOBufferData size index whose block_size() == _bufsize
   RingBufferData    *_free    = nullptr;
+
+  // Runs when the net thread exits at shutdown (this is a thread_local). The
+  // buf_ring must be unregistered before the ring's io_uring_queue_exit; that
+  // holds because every path that can make a VC readable (accept/connect
+  // submission, the net-loop head) calls local_context() first, so the
+  // thread_local IOUringContext is always constructed before this object and
+  // therefore destroyed after it --- _ctx is still alive here. Assumes all ring
+  // blocks were released on this (owning) thread before it exited: a
+  // RingBufferData freed after this dtor would touch the freed _br/_pool via
+  // its back-pointer, the same thread-confinement invariant recycle() already
+  // relies on.
+  ~ReadBufRing()
+  {
+    if (_br != nullptr) {
+      _ctx->free_buf_ring(_br, _nbuf, IOU_READ_BGID); // io_uring_unregister_buf_ring + free(_br)
+      ats_free(_pool);
+    }
+    // Idle buffer descriptors owned by this ring (a live one is owned by its block).
+    for (RingBufferData *d = _free; d != nullptr;) {
+      RingBufferData *next = d->_flink;
+      delete d;
+      d = next;
+    }
+  }
 
   bool
   ok() const
@@ -284,7 +309,8 @@ struct ReadBufRing {
     _bufsize = BUFFER_SIZE_FOR_INDEX(_sizeidx); // exact, so block_size() matches the buffer
 
     int err = 0;
-    _br     = IOUringContext::local_context()->setup_buf_ring(nbuf, IOU_READ_BGID, &err);
+    _ctx    = IOUringContext::local_context();
+    _br     = _ctx->setup_buf_ring(nbuf, IOU_READ_BGID, &err);
     if (_br == nullptr) {
       Warning("io_uring read_provided_buffers: buf_ring setup failed (%d); falling back to recvmsg", err);
       return false;
