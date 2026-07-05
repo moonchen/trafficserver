@@ -16,6 +16,7 @@
 - Full build before install; never gate a build behind a pipe (masks the return code). Autests run the **installed** tree: `cmake --install <builddir>` after every build or the test silently uses a stale binary.
 - `claude-dev` preset → `build-dev/`, installs to `/tmp/ats-dev`. `claude-dev-asan` → `build-dev-asan/`, installs to `/tmp/ats-dev-asan`.
 - Run autest suites serially. If two `autest.sh` runs must overlap, give each a distinct `AUTEST_PORT_OFFSET` (0, 1000, …) or they deterministically collide.
+- **Every `autest.sh` invocation must pass `--build-root <builddir>`** pointing at the build directory matching the binary under test (`build-dev` for `/tmp/ats-dev`, `build-forceon` for `/tmp/ats-forceon`, `build-forceon-asan` for `/tmp/ats-forceon-asan`). Without it, 11 TLS tests (plugin-loading + ssl-post ones, incl. `tls`, `tls_engine*`, `tls_keepalive`) fail on missing build artifacts. ASan runs must use the ASan build dir so test plugins are ASan-built.
 - A "flaky" SEGV under concurrent autests is a known port-collision artifact — rerun solo before believing it.
 - The TLS gold suite lives in `tests/gold_tests/tls/` (69 test files post-merge); the io_uring suite in `tests/gold_tests/io_uring/` (21 files, each sets `proxy.config.net.io_uring.enabled: 1` itself).
 - Commit messages: state the change and its motivation only; no meta-commentary, no attribution trailers.
@@ -262,7 +263,7 @@ tr.StillRunningAfter = tls_server
 - [ ] **Step 3: Run it — verify it fails on the diags assertion**
 
 ```bash
-cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --sandbox /tmp/au-tls-route -f io_uring_tls
+cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --build-root /home/mo/work/trafficserver-io-uring/build-dev --sandbox /tmp/au-tls-route -f io_uring_tls
 ```
 
 Expected: FAIL, specifically the `diags_log` `ContainsExpression("io_uring accept enabled for TLS port", ...)` tester (the curl runs may pass or fail — either is acceptable pre-change; the diags tester must fail).
@@ -329,7 +330,7 @@ If `SSLNetProcessor.cc` does not already include `P_UnixNetProcessor.h` (for `ne
 
 ```bash
 cmake --build build-dev -j"$(nproc)" && cmake --install build-dev
-cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --sandbox /tmp/au-tls-route -f io_uring_tls
+cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --build-root /home/mo/work/trafficserver-io-uring/build-dev --sandbox /tmp/au-tls-route -f io_uring_tls
 ```
 
 Expected: PASS (both test runs + the diags assertion).
@@ -337,7 +338,7 @@ Expected: PASS (both test runs + the diags assertion).
 - [ ] **Step 7: Confirm no regression in the rest of the io_uring suite**
 
 ```bash
-./autest.sh --ats-bin /tmp/ats-dev/bin --sandbox /tmp/au-tls-route2 -f $(ls gold_tests/io_uring/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
+./autest.sh --ats-bin /tmp/ats-dev/bin --build-root /home/mo/work/trafficserver-io-uring/build-dev --sandbox /tmp/au-tls-route2 -f $(ls gold_tests/io_uring/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
 ```
 
 Expected: 22/22 (21 + the new test).
@@ -408,7 +409,7 @@ Expected: clean build.
 - [ ] **Step 3: TLS suite spot-check (epoll transport)**
 
 ```bash
-cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --sandbox /tmp/au-reenre -f io_uring_tls tls_flow_control tls_reload_under_load
+cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin --build-root /home/mo/work/trafficserver-io-uring/build-dev --sandbox /tmp/au-reenre -f io_uring_tls tls_flow_control tls_reload_under_load
 ```
 
 Expected: all pass.
@@ -459,7 +460,7 @@ git checkout -- src/records/RecordsConfig.cc              # revert immediately a
 - [ ] **Step 2: Run the full TLS suite against it**
 
 ```bash
-cd tests && ./autest.sh --ats-bin /tmp/ats-forceon/bin --sandbox /tmp/au-forceon-tls -f $(ls gold_tests/tls/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
+cd tests && ./autest.sh --ats-bin /tmp/ats-forceon/bin --build-root /home/mo/work/trafficserver-io-uring/build-forceon --sandbox /tmp/au-forceon-tls -f $(ls gold_tests/tls/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
 ```
 
 Expected: pass/fail equal to the Task 2 epoll baseline. Tests that specifically stand in for spec frictions — confirm these in particular:
@@ -503,8 +504,8 @@ git checkout -- src/records/RecordsConfig.cc
 
 ```bash
 cd tests
-./autest.sh --ats-bin /tmp/ats-forceon-asan/bin --sandbox /tmp/au-asan-tls -f $(ls gold_tests/tls/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
-./autest.sh --ats-bin /tmp/ats-forceon-asan/bin --sandbox /tmp/au-asan-iou -f $(ls gold_tests/io_uring/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
+./autest.sh --ats-bin /tmp/ats-forceon-asan/bin --build-root /home/mo/work/trafficserver-io-uring/build-forceon-asan --sandbox /tmp/au-asan-tls -f $(ls gold_tests/tls/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
+./autest.sh --ats-bin /tmp/ats-forceon-asan/bin --build-root /home/mo/work/trafficserver-io-uring/build-forceon-asan --sandbox /tmp/au-asan-iou -f $(ls gold_tests/io_uring/*.test.py | xargs -n1 basename | sed 's/\.test\.py//')
 ```
 
 Expected: same pass set as Task 5 (ASan timing skew may need single-test reruns), and **zero ASan reports** in any `traffic.out`/`error.log`:
@@ -523,12 +524,16 @@ The freelist recycles outside malloc/free, so it masks userspace UAF from ASan-l
 cd /home/mo/work/trafficserver-io-uring
 sed -i "s/^    ts_args = ''$/    ts_args = ' -f'/" tests/gold_tests/autest-site/trafficserver.test.ext
 grep -n "ts_args = " tests/gold_tests/autest-site/trafficserver.test.ext   # confirm the injection
-cd tests && ./autest.sh --ats-bin /tmp/ats-forceon/bin --sandbox /tmp/au-freelist \
+cd tests && ./autest.sh --ats-bin /tmp/ats-forceon/bin --build-root /home/mo/work/trafficserver-io-uring/build-forceon --sandbox /tmp/au-freelist \
   -f io_uring_tls io_uring_close_inflight tls_tunnel_timeout allow-plain
 cd .. && git checkout -- tests/gold_tests/autest-site/trafficserver.test.ext
 ```
 
 Expected: all listed tests pass and no crash/`Fatal` in any sandbox `traffic.out`. This catches userspace UAF only (kernel writes bypass it — that class is regression-covered by the io_uring suite's existing pin tests).
+
+---
+
+### Task 7: Perf A/B — TLS over io_uring vs TLS over epoll
 
 **Files:**
 - Modify (out of tree): `~/work/io-uring-coro-bench/` — add a TLS workload variant to the existing measure scripts.
@@ -571,4 +576,63 @@ git commit -m "experiments: TLS-over-io_uring vs TLS-over-epoll A/B results"
 
 ## Notes / recorded baselines
 
-(appended during execution)
+### Task 2 baselines (2026-07-04, merge commit `5f35ef7062`, build installed at `/tmp/ats-dev`)
+
+**io_uring suite** (`tests/gold_tests/io_uring/*`, `--ats-bin /tmp/ats-dev/bin --sandbox /tmp/au-merge-iou`):
+21/21 pass. One transient failure on first run (`io_uring_post_abort`, sub-run "[singleshot] vc_deferred_close metric engaged" — `ReturnCode 1 != 0`, missing `DEFERRED_CLOSE_OK` in stdout); solo rerun (`-f io_uring_post_abort`) passed clean (1/1). Treated as a flake, not a regression — matches the pre-existing race-timing nature of that sub-test.
+
+**TLS suite** (`tests/gold_tests/tls/*`, epoll transport): **66 of the 69 suite tests pass; 2 fail MERGE-CAUSED (`tls_hooks_verify`, `tls_hooks_client_verify` — deterministic traffic_server SIGSEGV); 1 legitimate environmental skip (`tls_cert_comp`).**
+
+⚠️ **`--build-root` is REQUIRED for the TLS suite** (Tasks 5/6 must pass it): 12 of the tests need build artifacts — autest plugins under `<build>/tests/tools/plugins/.libs/*.so` and the `ssl-post` helper under `<build>/tests/gold_tests/tls/`. The plain source-tree `tests/autest.sh` doesn't set it, and `Variables.BuildRoot` (`setup.cli.ext:117`) then points at the repo root where the artifacts don't exist — 11 tests fail on setup, identically on the pre-merge reference tree (verified). `build-dev` also needs `-DENABLE_AUTEST=ON` (the `claude-dev` preset leaves it OFF, so the plugin targets don't exist); after reconfiguring, build just the needed targets: `cmake --build build-dev --target async_engine ssl_client_verify_test ssl_secret_load_test ssl_verify_test ssl-post`. Canonical invocation:
+
+```bash
+cd tests && ./autest.sh --ats-bin /tmp/ats-dev/bin \
+  --build-root /home/mo/work/trafficserver-io-uring/build-dev \
+  --sandbox /tmp/au-... -f <tests>
+```
+
+Baseline composition (two runs): run 1 without `--build-root` (`/tmp/au-merge-tls`) gave 57 pass / 11 setup-failures / 2 skip; rerunning exactly those 11 with `--build-root` (`/tmp/au-merge-tls-br`) gave 9 pass / 2 fail. The 57 + 9 = 66 passing; the 2 remaining failures are real.
+
+**MERGE-CAUSED failures (gate for Tasks 3–6): `tls_hooks_verify`, `tls_hooks_client_verify`.**
+- Symptom: traffic_server exits `-11` (SIGSEGV) mid-test; deterministic (2/2 solo reruns on the merged tree in fresh sandboxes).
+- Crash point (from `traffic.out`/crashlog, both tests same shape): plugin verify-hook calls `TSVConnReenableEx` from `CB_server_verify` inside `SSLNetVConnection::_verify_certificate` → `TLSBasicSupport::verify_certificate` → outbound `SSLNetVConnection::_ssl_connect`; crashing frame `ConnectingEntry::state_http_server_open` (SEGV at a garbage address).
+- Classification evidence: both tests PASS on the reference tree `/home/mo/work/trafficserver-tls-refactor` (its own `/tmp/ts-autest/bin` build, same `--build-root`-corrected invocation, sandbox `/tmp/au-ref-br`: 2/2 Passed). Test scripts and plugin sources (`ssl_verify_test.cc`, `ssl_client_verify_test.cc`) are byte-identical across the two trees, ruling out test drift. Fails only on the merged tree ⇒ merge-caused. Root cause NOT investigated (out of Task-2 scope; needs its own debugging task before Tasks 3+ proceed).
+
+Skipped (legitimate, not regressions): `tls_cert_comp` ("ATS feature not enabled: TS_HAS_CERT_COMPRESSION_CALLBACKS" — system OpenSSL lacks the compression callback API). `txn_box_tls` (from `pluginTest/txn_box/basic/`) is collateral of the brief's name-based `-f` filter, out of scope for this baseline (skips: `txn_box.so` not installed).
+
+**Anomalies:**
+- No port collisions or timeouts observed. Suites were run strictly sequentially as instructed.
+
+**Corrected epoll TLS baseline (post 5a3d49874a):** 68 pass / 0 fail / 2 env-skips (tls_cert_comp, txn_box_tls). The earlier "2 merge-caused SIGSEGVs" were a latent tls-refactor-wip bug (see .superpowers/sdd/task-2.5-report.md), fixed on this branch; MUST also be fixed on tls-refactor-wip before its upstream PR.
+
+### Task 5 acceptance result (2026-07-04, force-on sweep at `proxy.config.net.io_uring.enabled=1`)
+
+Force-on binary: `build-forceon` (claude-dev preset + `-DENABLE_AUTEST=ON` + `-DCMAKE_INSTALL_PREFIX=/tmp/ats-forceon`), RecordsConfig default temporarily flipped to "1" for the build only (reverted; never committed). Runtime engagement verified per sandbox: diags.log `NOTE: io_uring accept enabled for TLS port ...`.
+
+**Pre-fix sweep (HEAD 289f4590d9):** TLS suite (69 files): 65 pass / 3 fail / 1 env-skip (tls_cert_comp). Fails: `tls_global_pool_h2_origin`, `tls_global_pool_migration` (both the designed startup Fatal: io_uring requires `server_session_sharing.pool=thread` — design-mandated incompatibility, classified, not fixed) and `tls_sni_ticket` (deterministic, 2/2 — real integration bug).
+
+**Integration bug fixed (commit `28c86a0d46` "net: make the deferred io_uring connect cancellable through its Action"):** client abort during an in-flight io_uring origin connect → `HttpSM::cancel_pending_server_connection` deleted the ConnectingEntry while `connect_re` had returned ACTION_RESULT_DONE (truthful only for epoll's synchronous NET_EVENT_OPEN) → connect CQE delivered NET_EVENT_OPEN into freed memory (SIGSEGV, `[ET_NET x]` `IOUringNetVConnection::_connect` → `Continuation::handleEvent`). Fix: connect_re returns a cancellable Action while the connect is pending; ConnectingEntry owns/cancels it; SSL connect_re returns the SSL VC's own Action (startEvent honors cancel); `_connect` locks `action_.mutex` not `action_.continuation->mutex`.
+
+**Post-fix acceptance sweep (HEAD 28c86a0d46):** TLS suite: **66 pass / 2 design-mandated fails (global-pool Fatal) / 1 env-skip — differential vs the 68/0/2 epoll baseline is ZERO modulo the design-mandated classifications** (the 2 global-pool tests pass on epoll and Fatal by design at enabled=1). `tls_sni_ticket` 3/3 solo post-fix. Collateral: `io_uring_tls` passed in-sweep, `txn_box_tls` env-skip.
+
+**Regression guards with the fixed binary:** io_uring gold suite 22/22 on `/tmp/ats-dev` (`/tmp/au-iou-a`, `/tmp/au-iou-b`); full epoll TLS suite re-run on `/tmp/ats-dev`: 68 pass / 0 fail / 2 env-skips — identical to baseline (fix touches shared HttpSM/SSLNetProcessor code; `tls_global_pool_*` still pass on epoll).
+
+**Spec-friction verdicts at enabled=1:** (1) downgrade/abandon — `allow-plain` PASS (composes as expected, no pre-fix needed); (3) SSL dtor inline close vs cancel-then-unwind — `tls_tunnel_timeout`, `tls_handshake_timeout`, `tls_origin_post_abort` PASS; (4) blind tunnel adopt + `_propagateHandShakeBuffer` — `tls_tunnel`, `tls_tunnel_forward`, `tls_partial_blind_tunnel` PASS; (5) TLS-async via poll bridge — `tls_engine`, `tls_engine_teardown` PASS (not deferred).
+
+Sweep mechanics: suite run in 7 serial slices (distinct sandboxes /tmp/au-fo2-s1..s7) to fit invocation timeouts; slices are strictly serial so no port-offset needed.
+
+### Task 6 result (2026-07-04, ASan + freelist sweeps at `proxy.config.net.io_uring.enabled=1`)
+
+ASan binary: `build-forceon-asan` (`claude-dev-asan` preset + `-DCMAKE_INSTALL_PREFIX=/tmp/ats-forceon-asan` + `-DENABLE_AUTEST=ON`; RecordsConfig default temporarily flipped to "1" for the build only, reverted, never committed). `vm.mmap_rnd_bits` was already 28 (no change needed).
+
+**Zero memory-corruption findings.** No `ERROR: AddressSanitizer: heap-buffer-overflow|heap-use-after-free|stack-buffer-overflow|double-free`, no SEGV, across every slice of both suites — the actual target of this task (buffer-lifetime bugs in the new SSL↔io_uring interaction) is clean.
+
+**Concern found (test-invocation issue, not a product bug — escalated, not fixed):** the literal brief invocation (no `ASAN_OPTIONS`) makes almost every TLS test fail its `ReturnCode == 0` check, because ASan's LeakSanitizer runs at graceful `traffic_server` exit and its default `exitcode=1` on any detected leak turns a clean shutdown into a nonzero-exit "failure" — unrelated to functional correctness. Proved via A/B on `exit_on_cert_load_fail`: fails (`ReturnCode 1 != 0`) with default `ASAN_OPTIONS`, passes clean with `ASAN_OPTIONS=detect_leaks=0`. The leaks themselves are real (not false positives) but look like ATS's existing "process exit reclaims OS memory, per-thread pools are never explicitly freed" pattern extended to two new io_uring allocation sites: `IOUringContext::setup_buf_ring` (`ats_malloc`, `io_uring.cc:266/294`) and `ts::iouring::detail::FramePool::allocate` (coroutine frame pool, `Coroutine.h:88`) — sizes scale with ET_NET thread count and ranged 15KB (bare startup) to 134MB (heavy TLS test) across ~91 tests. No repo precedent sets `ASAN_OPTIONS`/`LSAN_OPTIONS` for the full `traffic_server` gold_test corpus (only for a few isolated unit tests), so this is likely the first time the full suite has run under ASan at all. Full stacks captured in `.superpowers/sdd/task-6-report.md`. Controller should decide: accept `detect_leaks=0` as the standing convention for full-suite ASan gold_test runs, or open a follow-up to add explicit teardown for the two new io_uring pools.
+
+**TLS suite under ASan** (`ASAN_OPTIONS=detect_leaks=0`, 4 slices, distinct sandboxes): **66 pass / 2 design-mandated fail (`tls_global_pool_h2_origin`, `tls_global_pool_migration` — same Fatal as Task 5) / 1 env-skip (`tls_cert_comp`) — identical to the Task 5 baseline.**
+
+**io_uring suite under ASan** (`ASAN_OPTIONS=detect_leaks=0`, 2 slices): **22/22 pass** (`io_uring_read_backpressure` failed once in-slice on a body-size/timing mismatch — ASan-timing flake per the brief's expectation — solo rerun passed clean, 1/1).
+
+**Freelist spot-check** (non-ASan `/tmp/ats-forceon/bin`, `--build-root build-forceon`, `trafficserver.test.ext` `ts_args` temporarily patched to `' -f'`, reverted after): `io_uring_tls`, `io_uring_close_inflight`, `tls_tunnel_timeout`, `allow-plain` — **4/4 pass, no crash/Fatal in any sandbox.**
+
+**Verdict: DONE_WITH_CONCERNS.** No buffer-lifetime bug found (the task's actual target). The LeakSanitizer/exitcode interaction is a test-harness-convention gap, captured and escalated per instructions rather than fixed. Tree left clean (both temporary sed patches reverted) apart from this Notes edit.
