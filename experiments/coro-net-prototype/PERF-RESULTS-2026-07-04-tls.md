@@ -121,3 +121,86 @@ handshakes only at round start:
    send-side levers that won on the NIC (send_zc / registered-arena buffers) were NOT enabled
    in this campaign (default config; ciphertext went out through the plain copy write path in
    both cells). Real-NIC TLS and TLS-write ZC/coalescing levers are unmeasured.
+
+## Why: the small-object gap, root-caused (session 2026-07-04/05)
+
+What is decomposed below is the **steady-state keep-alive gap: +1.93 µs/req (+8.5%)**,
+measured clean across interleaved boots (+7–10% per boot pair). The campaign's +10.5%
+headline is the same effect at its operating point; the difference is within boot-to-boot
+variance (~±2%) plus each campaign round's 600 fresh-connection handshakes (≈0.5% of round
+requests, not separately decomposed here).
+
+Method: same binary/box/cell, three cells (epoll; io_uring; io_uring with
+`read_provided_buffers=0`), n=3 interleaved boots each. Per boot: a clean HW-counter window
+(no tracepoints — tracepoint handlers run in task context and tax the syscall-heavy epoll arm
+~1 µs/req if mixed in), a syscall-tracepoint window, two uprobe-count windows (SSL-layer and
+event-loop dispatch seams + libssl SSL_read/SSL_write; used only for per-request call counts),
+and a filtered SQE-opcode window. Plus one DWARF profile boot per arm (cpu-clock 999 Hz and
+PEBS cache-misses, per-request-normalized; sampled totals reconcile with the cgroup gold
+metric to 5%). Gap reproduced at +7–10% across boots (campaign's +10.5% included per-round
+fresh-connection handshakes). Full evidence log: `.superpowers/sdd/wsA-report.md` (repo),
+scripts in `~/work/io-uring-coro-bench` (`evidence-tls.sh`, `probes-tls.sh`, `profile-tls.sh`).
+
+The headline decomposition (means, e1 − e0, per request): **+1.93 µs cgroup (+8.5%)** =
+user +1.10 / system +0.82; instructions +4.8k (+4.5%, almost all :u), cycles +6.4k (+9.1%),
+cache-references **+42%**, cache-misses **+40%**, dTLB-load-misses **+59%**, IPC 1.50→1.43.
+Meanwhile the *dispatch structure is identical*: uprobe counts/req match across arms for
+SSLNetVConnection::mainEvent (4.5), transport read/write drives (0.89/1.78), _signal_user
+(2.67), SSL_read (2.7), SSL_write (1.8), EThread::schedule_imm (1.9) — and io_uring does
+**0.43 syscalls/req vs epoll's 3.69** (which include ~0.95 wasted EAGAIN recvmsg probes/req
+that io_uring avoids). SQE mix: 1.96/req = RECV 0.98 + SEND 0.85 + SENDMSG 0.13.
+
+Ranked mechanisms. The ns values close against the profile-measured delta by construction
+(+1 186 + 611 + 39 = +1 836 ≈ +1 835 sampled), and the sampled total reconciles with the
+cgroup gold metric to ~5% (+1 835 vs +1 926); shares below are of the cgroup +1.93 µs and
+sum to 100%:
+
+1. **Same-code locality/IPC degradation — ≈ +1.19 µs/req, ~62% of the gap.** This value is
+   the user-total delta minus the (neutral) net-machinery swap — a residual after
+   subtraction — but the direct PMU/PEBS spread corroborates it independently: +148 user
+   cache-misses/req and the IPC drop land across dozens of unchanged functions (HttpTunnel
+   ctor, HttpTransact::State, HdrHeap, IOBufferBlock, allocator, libssl/libcrypto +0.25 µs
+   at identical call counts) with no hot spot. Ruled out as drivers: the provided-buffer
+   pool (PB-off cell is a wash on cpu, instr AND cache-misses), queue depth (half-rate test:
+   user gap persists as in-flight depth halves), SSL dispatch structure (counts identical).
+   This is plain-HTTP's A3 residual (cold-line/capacity at rings/frames, LLC+dTLB-walk),
+   amplified ~4× because TLS roughly doubles the per-request instruction/data footprint
+   (105k vs 58k instr/req) that the added resident state and irq-exit task_work interleaving
+   can cool. Fix candidates are weak by prior evidence (frame levers null per the A3
+   appendix); the honest statement is that this is the structural cost of the
+   completion-driven design at sub-saturation on loopback — it already vanishes at CPU
+   saturation (ceiling probes: parity) and the prior plain-HTTP NIC results say the verdict
+   flips when syscalls carry real cost.
+2. **Kernel path swap at loopback prices — ≈ +0.61 µs/req, ~32%.** Replacing 3.7
+   syscalls/req with 1.96 SQE+CQE/req costs MORE kernel time on loopback: io_uring
+   completions run as task_work on interrupt-exit (`irqentry_exit_to_user_mode`
+   +0.35 µs/req alone), plus per-op fget/apparmor/sock_from_file and `io_submit_sqes`,
+   against the cheap saved syscall entries (do_syscall_64/fdget/ep_item_poll/sock_poll all
+   ≈ removed). Rate-dependent: at 60k req/s this term is ≈ 0 (epoll amortizes its wakeups
+   worse at low load). On the real NIC the same swap measured as a net WIN for plain HTTP
+   (prior plain-HTTP NV1: −6% total), so there is nothing to fix for production; it is a
+   loopback-pricing artifact. One named, separately fixable subset INSIDE this bucket (not
+   additive to it): the unconditional `do_poll(0)` epoll harvest per ring wake — the
+   io_uring arm still makes 0.22 epoll_wait/req because `NetHandler::waitForActivity`
+   harvests the epoll-only fds (`NetHandler.cc:483`) on EVERY iteration rather than only
+   when the poll-bridge CQE fired. Modeled at ~0.07 µs/req (0.22/req × ~300 ns; not
+   separately measured). Cheap, real cleanup.
+3. **User net-machinery swap — ≈ +0.04 µs/req, ~2% (neutral).** io_uring's own user-side
+   machinery (+937 ns: actors, submit paths, signal helpers, liburing) almost exactly
+   replaces the epoll machinery it removes (−898 ns: net_read_io, net_write_io,
+   load_buffer_and_write, EventIO, libc recv/send/epoll wrappers).
+4. Unattributed residual ≈ +0.09 µs (~5%): the profile-vs-cgroup reconciliation slack.
+   Boot-to-boot variance (~±2% cpu/1k between boots of the same cell — larger than
+   within-boot round variance) bounds how finely the shares should be read.
+
+Also count-neutral (not a cost): on io_uring nearly every request delivers the user
+WRITE_COMPLETE via the deferred `_scheduleWriteComplete` dispatch (0.89/req vs 0.03 on epoll,
+where the inline sendmsg drains the wbio before the consumer could observe a completing
+re-entry) — but it shares the read-drive event slot, so total mainEvent/schedule_imm traffic
+is unchanged. Measurement gotchas recorded in the report: `proxy.process.io_uring.submitted`
+counts only one submit path (0.84/req vs the tracepoint's true 1.96/req); the
+`nh_wait`/`iou_saw` uprobes undercount ~30× (contradicted by syscall callchains) — use
+tracepoints for loop rates.
+
+The large-object bimodality was not explained by this campaign (no small-object evidence
+transferred; it likely lives in the send-path structure behind the −28% ceiling probe).
