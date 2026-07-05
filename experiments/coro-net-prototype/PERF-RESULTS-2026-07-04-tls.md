@@ -311,12 +311,13 @@ TLS at this operating point is ≈ parity-to-slightly-behind. Large is a win on 
 | ioudef   | **0.65595** (0.6520–0.6595)  | 0.2994 / 0.3541 | 13.98  | 494.1  | 0.0425           |
 | ioutuned | **0.62280** (0.6164–0.6317)  | 0.3239 / 0.3005 | 16.11  | 494.6  | 0.0319           |
 
-All three ranges fully disjoint — robust *within this boot*. **ioudef −7.0% vs epoll**
+All three ranges fully disjoint — robust *within this session*. **ioudef −7.0% vs epoll**
 (net-path + AIO-backend swap together); **ioutuned −11.7% vs epoll**; lever attribution
 **ioutuned −5.1% vs ioudef** (send_zc_fixed + arena `_write_buf` + 256 KiB watermark; AIO
-identical). ⚠️ **SUPERSEDED for the tuned/arena cell: the ladder section below shows the
-arena cell is boot-sensitive (~5%) and this boot's 0.6228 / −11.7% / −5.1% did not
-reproduce — cite the ladder's per-lever numbers instead.** The two steps compose
+identical). ⚠️ **SUPERSEDED for the tuned/arena cell: the arena cell's level moves ~5%
+between SESSIONS (session state, not boot state — the box never rebooted; see the
+root-cause subsection at the end of the ladder section) and this session's
+0.6228 / −11.7% / −5.1% did not reproduce — cite the ladder's per-lever numbers instead.** The two steps compose
 multiplicatively: 0.930 × 0.949 = 0.883 ≈ the −11.7% total. The loopback
 large-object bimodality did NOT reappear: io_uring rounds are tight (spread ≤1.2% of
 median in ioudef). Tuned costs +2.1 ms p50 (256 KiB ciphertext staging before first send)
@@ -335,13 +336,17 @@ tickets-off keep-alive, Release -O3, 4 pinned P-cores no-turbo, NIC IRQs on E-co
 1. **TLS-over-io_uring is cheaper per request than TLS-over-epoll on the real NIC at
    these operating points** — the loopback verdict inverts, matching the plain-HTTP
    precedent (NV1): small −3.7% (default levers; tuned moot at 4 KB), large −7.0%
-   (default) / −11.7% (tuned, ⚠️ this boot only — see the ladder section)
+   (default) / −11.7% (tuned, ⚠️ that session only — see the ladder section)
    process-cpu/1k.
-2. **The WS-B1 levers measured −5.1% on disk-served 1 MiB TLS this boot** on top of
+2. **The WS-B1 levers measured −5.1% on disk-served 1 MiB TLS that session** on top of
    default io_uring, with proven true zero-copy (zc_fixed-only, 0 copied) — at the cost
    of +2.1 ms p50 from ciphertext staging. ⚠️ The ladder section below found the arena
-   cell boot-sensitive and this number non-reproducible; the robust lever is anonymous
-   send_zc (ladder −11.9% vs epoll without the arena).
+   cell session-state-sensitive and this number non-reproducible. At the 256 KiB
+   watermark the robust lever is anonymous send_zc (ladder −11.9% vs epoll without the
+   arena); the root-cause subsection's wm=1M pair then shows the arena beating anon
+   once staging blocks are 1 MiB (−11.9% vs the wm=1M anon cell) — best measured TLS
+   config now = watermark 1M + write_zerocopy + arena, subject to the unexplained ~5%
+   arena session swing.
 3. Small-object caveat: on a total-system view (process + softirq) the small-object win
    dissolves to ≈ +3% (overlapping ranges); the large-object win survives both views.
 4. No throughput claim: every ceiling here is the 1 GbE wire. The loopback −28%
@@ -352,10 +357,10 @@ tickets-off keep-alive, Release -O3, 4 pinned P-cores no-turbo, NIC IRQs on E-co
 
 The campaign above measured three points; its "ioutuned −5.1% vs ioudef" attributed the
 whole lever package (watermark + send_zc + fixed arena) as one step. This ladder isolates
-each lever, and reruns EVERY cell interleaved in one session — cross-boot variance is
-±2%, so mixing rounds from different boots cannot resolve per-lever deltas of this size.
+each lever, and reruns EVERY cell interleaved in one session — cross-session variance is
+±2%, so mixing rounds from different sessions cannot resolve per-lever deltas of this size.
 That discipline turned out to be the finding: the fixed-arena point itself moved ~+5%
-across boots (below).
+across sessions (below).
 
 ### Conditions
 
@@ -426,13 +431,14 @@ xt1–2), and — the decisive test — the prior campaign's own source (`da9b6d
 worktree build, same flags/BoringSSL) interleaved against the tip binary in this same
 session: prior binary 0.6465/0.6579 (xp1–2) vs tip 0.6643/0.6513 (xt3–4). Overlapping,
 both at today's level. So: not the 2-commit code delta, not the aio-mode nuance —
-the send_zc_fixed/arena cell's absolute level is boot-sensitive by ~5% while epoll and
-ioudef moved <1% between the same two boots. Cause not identified; after config and
-binary were excluded in-session, boot-level state interacting with the
-registered-buffer path is what remains (IOMMU group read `identity` both sessions).
-Consequence for the campaign above: its −5.1% "lever package" step should be read as
-that boot's arena point, not a stable property; the package's robust decomposition on
-today's boot is watermark ~0, anonymous ZC −5.2%, registration +6.4%.
+the send_zc_fixed/arena cell's absolute level moves ~5% between SESSIONS while epoll
+and ioudef moved <1% between the same two sessions. Config and binary were excluded
+in-session; ⚠️ the root-cause subsection below then ruled out boot state entirely (the
+box never rebooted between any of these sessions) plus THP, NIC-IRQ affinity, and
+IOMMU — the session-state mechanism remains unidentified. Consequence for the campaign
+above: its −5.1% "lever package" step should be read as that session's arena point,
+not a stable property; the package's robust decomposition in this session is
+watermark ~0, anonymous ZC −5.2%, registration +6.4%.
 
 Mechanism observation (recorded, not causal): the arena-backed `_write_buf` issues
 ~3.05 sends/req (~350 KB) vs ~2.0 sends/req (~512 KB) for the malloc-backed staging
@@ -463,21 +469,25 @@ rounds, tuned ≈ default +0.5%).
 - Per boot: AIO-backend Note asserted; disk-serving proven (pread/req ≈100%, ram 0.0%,
   hit ≈100%); small 100% mem-fresh; TLSv1.3 from hawaii; pinning 0,2,4,6.
 
-### Conclusions (qualified — this box/NIC/client/boot, these operating points)
+### Conclusions (qualified — this box/NIC/client/session, these operating points)
 
-1. On today's boot, the per-lever decomposition of the large-object win is: io_uring
+1. In this session, the per-lever decomposition of the large-object win is: io_uring
    net+AIO −7.0%, staging watermark ~0 (enabler only), anonymous send_zc −5.2%,
-   buffer registration (send_zc_fixed + arena) **+6.4%** — the best configuration this
-   session is watermark + anonymous ZC at **−11.9%** vs epoll, not the full package
-   (−6.3%).
-2. The registered-buffer point is boot-sensitive (~5% swing across two boots, binary
-   and config ruled out in-session); do not cite either session's arena number as a
+   buffer registration (send_zc_fixed + arena) **+6.4%** — the best configuration at
+   the 256 KiB watermark is watermark + anonymous ZC at **−11.9%** vs epoll, not the
+   full package (−6.3%). ⚠️ Superseded as the overall best config: the root-cause
+   subsection's wm=1M pair shows watermark 1M + arena beating the wm=1M anon cell by
+   −11.9% — best measured TLS config = watermark 1M + write_zerocopy + arena, subject
+   to (2).
+2. The registered-buffer point is session-state-sensitive (~5% swing between sessions,
+   binary and config ruled out in-session; NOT boot state — the box never rebooted,
+   see the root-cause subsection); do not cite either session's arena number as a
    stable property. The anonymous-ZC step is the largest single lever measured under
-   same-session discipline — noting iouzc itself has no cross-boot measurement yet, so
-   its boot-stability is untested (its same-session disjointness is the evidence), and
-   the boot-sensitivity mechanism is not isolated to buffer registration per se
-   (registration vs DMA/IOMMU boot state vs other per-boot layout effects remain
-   candidates).
+   same-session discipline at wm=256K — noting iouzc's cross-session stability was
+   untested here (its same-session disjointness is the evidence; the root-cause
+   session later found it stable within global drift), and the session-state mechanism
+   is not isolated to buffer registration per se (THP and NIC-IRQ affinity have since
+   been ruled out in the root-cause subsection; what remains is unidentified).
 3. Small-object: io_uring default −1.4% process-cpu (overlapping ranges — parity-to-
    slight-win), +5.4% on system-total view.
 4. Wire-limited: all ceilings are the 1 GbE wire (equal within 0.5% across cells);
@@ -487,3 +497,80 @@ Raw rows: bench repo `results/tlsnic-ladder-{small,large}.csv` (probe/cal/xt/xp 
 tagged); driver `scripts/campaign-tls-ladder.sh` + extended `scripts/measure-tls-nic.sh`
 (per-cell engagement gates, AIO-note gate, TSPREFIX binary-A/B hook), aggregation
 `scripts/agg-tls-ladder.py`.
+
+### Why the arena regresses under TLS (root-cause session 2026-07-05)
+
+Root-cause of the iouzc → iouzcfix +6.4% step. Same box/client/method, ONE binary
+(`/tmp/ts-bssl-rel` @ `34a8f84525`) for every cell INCLUDING the plain-HTTP control;
+every comparison same-session interleaved. Raw rows: bench repo `results/arena-ctl.csv`
+(+ `results/arena-smaps.csv`); full evidence log: `.superpowers/sdd/arena-tls-report.md`;
+new rig: `scripts/{probe-round.sh,sendtrace.bt,perfstat-round.sh}`.
+
+**Control (plain-HTTP vs TLS, interleaved, one binary).** The 2026-06-28 plain-HTTP
+disk-served 1 MiB A/B re-run in the same hours as the TLS pair: plain anon 0.3029 /
+fixed **0.2625** (−13.3%, disjoint over 3 passes, instr/req 683K→504K) while TLS iouzc
+0.6241 / iouzcfix 0.6210 (parity, overlapping, 3+5 rounds). Registration still wins on
+plain HTTP while doing nothing for TLS in the same session → the deficit is
+TLS-structural. Two footnotes: (i) the ladder's +6.4% itself did NOT reproduce — today
+the arena cell sits at the 07-04 campaign's fast level while epoll/ioudef anchors are
++1.0–1.7% (global drift), i.e. the arena cell ALONE moved ≈ −6% session-relative;
+(ii) today's plain-HTTP ABSOLUTE levels sit well above the 06-28 table — anon +40–44%,
+fixed +93–99% (the arena's plain win compressed −37% → −13%) — on BOTH the June FP
+binary (re-run: 0.2963/0.2543) and the tip binary; box drift across sessions, only
+within-session deltas transfer.
+
+**Mechanism (send structure), measured.** `_write` issues ONE `send_zc_fixed` per
+CONTIGUOUS registered run and the arena's LIFO free lists hand out non-abutting 256K
+blocks, so a run ≈ one block (ZC sends >512K: 4 of 2173); the anon path gathers up to
+16 × 32K heap blocks per `sendmsg_zc` (sends cluster at the 512K cap). bpftrace window,
+per request:
+
+| per req            | iouzc  | iouzcfix wm=256K | iouzcfix wm=1M |
+| ------------------ | ------ | ---------------- | -------------- |
+| ZC sends / F_NOTIF | 2.0    | 3.09 (+55%)      | 1.93           |
+| plain-copy sends   | 0.9 (~25 KB) | 2.07 (**~185 KB**) | 1.04 (~10 KB) |
+| io_uring_enter     | 7.4    | 10.6             | 7.4            |
+| arena allocs       | 0      | 9.0              | 3.6            |
+
+Three structural costs at wm=256K: (1) +1.1 ZC sends/req → +1.1 notification CQEs +
+enters/task_work, and the coroutine awaits each F_NOTIF before the next send, so more
+sends also serialize (p50 +1.2–1.9 ms); (2) broken runs leave ~0.9 tails/req of
+128–256K UNDER the 256K ZC threshold re-gate → plain copy sends — **~185 KB/req of
+kernel memcpy reintroduced**, the copy the lever exists to remove (anon has no tails:
+the gather sends everything staged); (3) staging churn: ~8 × 256K arena allocs/req for
+~4.2 blocks of ciphertext (bursts end in partial blocks, freed after drain). Against
+that, registration saves the per-send pin — HW counters/req: instr 2252K→2073K (−8%),
+cycles −5%, dTLB-misses −27%, but cache-misses +21% — and the two sides cancel: parity.
+Under plain HTTP none of this exists (the Doc is ONE contiguous 2M-class block → ~1.4
+sends/req, no tails) — registration is pure profit there.
+
+**Causal confirmation.** Raising ONLY `ssl.write_buffer_water_mark` to 1 MiB (staging
+blocks = the arena's 1M class) flips the verdict: iouzcfix **0.5400/0.5500** vs iouzc
+0.6169/0.6205 interleaved — parity → **−11.9%** (median-vs-median of the wm=1M pair),
+sys/1k 0.335→0.17–0.19, p50 IMPROVES
+17.1→14.5 ms; the anon cell does not move (its 512K gather cap already binds). The
+deficit is entirely send structure; the arena wins under TLS as soon as its sends are
+big and few — the same regime as its plain-HTTP win.
+
+**What would make the arena win under TLS**: (a) proven — watermark 1M + arena block
+class ≥1M (−11.9% vs the wm=1M anon pair, better p50; costs up to ~1 MiB staged
+ciphertext/conn); (b) plausible, unimplemented — gathered registered sends: set
+`IORING_RECVSEND_FIXED_BUF` + `buf_index` on a `SENDMSG_ZC` SQE (liburing has no
+helper for that combination and kernel support is UNVERIFIED); all arena blocks share
+one registered region (buf_index 0), so `_write` could gather non-abutting arena
+blocks into one fixed send — would remove the extra notifs AND the copy tails without
+(a)'s memory, if the kernel accepts it; (c) ascending-adjacent arena allocation — weaker.
+Independently worth fixing: the sub-threshold tail copies (2) and the underfill churn (3).
+
+**The "boot sensitivity" (H3), corrected and narrowed.** The box has not rebooted since
+May 23 — every session above shares ONE boot, so the arena swing is SESSION state, not
+boot state. Ruled out empirically: THP backing (arena AnonHugePages=0 under madvise AND
+always; zone Normal has zero free order-9/10 blocks even after compact_memory — the
+arena was 4K-paged in fast and slow sessions alike); NIC IRQ affinity (found reset to
+0-23 today — the campaign's 16-23 steering did not persist — and re-steering to 16-23
+did not move the arena cell: 0.6173); IOMMU (identity, unchanged); binary/config
+(ladder's xp rounds). Fast and slow sessions show IDENTICAL send counts (3.05 ZC/req,
+9 allocs/req), so the state scales the PRICE of the arena cell's extra kernel ops, not
+their count — consistent with only the notif-heaviest cell swinging. The mechanism of
+the ~5% arena-only session swing remains unexplained; treat arena@wm=256K as
+parity-with-variance and cite the wm=1M point as its structure-fixed configuration.
