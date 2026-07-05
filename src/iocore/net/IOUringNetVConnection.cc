@@ -1659,6 +1659,11 @@ IOUringNetVConnection::_connect()
       MUTEX_TRY_LOCK(lock, action_.mutex, this_ethread());
       if (lock.is_locked()) {
         if (action_.cancelled) {
+          // con.open() already gave us a real fd, but the increment below never ran for
+          // this attempt; close it now so free_thread's is_ok()-gated decrement doesn't
+          // fire without a matching increment (and so free_thread's own con.close() isn't
+          // asked to close this fd a second time).
+          con.close();
           nh->free_netevent(this);
           co_return;
         }
@@ -1669,6 +1674,8 @@ IOUringNetVConnection::_connect()
           int err      = (res == -ECANCELED) ? ETIMEDOUT : -res;
           this->lerrno = err;
           action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(-err)));
+          // Same close-now requirement as the cancelled arm above: no increment ran.
+          con.close();
           nh->free_netevent(this);
           co_return;
         }
