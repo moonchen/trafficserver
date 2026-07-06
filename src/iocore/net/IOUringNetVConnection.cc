@@ -181,6 +181,17 @@ write_zc_threshold()
   return t;
 }
 
+// Gather non-adjacent arena blocks that share the registered region into a single
+// sendmsg_zc_fixed instead of one send_zc_fixed per block. Default on; setting it 0 restores the
+// per-block split (the run breaks at the first non-abutting block), which is the A/B baseline for
+// measuring the gather's send-path saving.
+bool
+write_zc_gather_enabled()
+{
+  static const bool on = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy_gather").value_or(1) != 0;
+  return on;
+}
+
 // WI-4 rate-adaptive staging depth. Both knobs are RECU_DYNAMIC: RecEstablishStaticConfigInt links
 // each global to its record so a config reload updates it in place (no restart), and the initial
 // read seeds it. Linked lazily on first use so no module-init hook is needed. Default off.
@@ -220,6 +231,12 @@ Metrics::Counter::AtomicType *write_zc_stat = Metrics::Counter::createPtr("proxy
 // of the zero-copy sends, the ones issued as send_zc_fixed from the registered arena (no
 // per-send pin / IOMMU map) --- the rest are anonymous send_zc (pinned per send).
 Metrics::Counter::AtomicType *write_zc_fixed_stat = Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_fixed");
+// of the arena-backed sends, the ones that gathered multiple non-adjacent registered blocks into
+// a single sendmsg_zc_fixed (arena LIFO pops leave the staged ciphertext scattered); the rest are
+// contiguous single-range send_zc_fixed. A deep-staged response now leaves as one gather, not one
+// send per block.
+Metrics::Counter::AtomicType *write_zc_gather_stat =
+  Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_gather");
 Metrics::Counter::AtomicType *write_zc_copied_stat =
   Metrics::Counter::createPtr("proxy.process.net.io_uring.write_zerocopy_copied");
 
@@ -1338,8 +1355,10 @@ IOUringNetVConnection::_write()
     Ptr<IOBufferBlock> anchor[IOU_FRAME_IOV]; // zero-copy: hold the source pages until the NOTIF
     bool               use_zc       = false;
     int                reg_idx      = -1;      // registered buf_index of the source run (send_zc_fixed)
-    bool               fixed_ok     = false;   // all iovec blocks are one registered buffer + contiguous
+    bool               fixed_ok     = false;   // all iovec blocks share the one registered buffer reg_idx
+    bool               fixed_contig = false;   // ...and abut: a single range (send_zc_fixed) vs a gather (sendmsg_zc_fixed)
     char              *fixed_end    = nullptr; // running end pointer for the contiguity check
+    bool               gather_zc    = write_zc_gather_enabled(); // else break non-adjacent runs (per-block send_zc_fixed)
     int                fd           = this->con.sock.get_fd();
     int64_t            try_to_write = 0;
 
@@ -1436,21 +1455,30 @@ IOUringNetVConnection::_write()
         // this send's CQE. The blocks are RefCountObj, so the MIOBuffer can go while these live.
         anchor[niov] = tmp->block;
         if (use_zc) {
-          // send_zc_fixed needs one registered buffer over a contiguous range, so a registered
-          // (arena) run stops at the first block that is a different registered buffer or does
-          // not abut the previous block (the body windows of one cache fragment do abut). An
-          // anonymous run has no such constraint -- sendmsg_zc takes discontiguous blocks -- so
-          // it keeps accumulating up to IOU_FRAME_IOV, stopping only ahead of a registered
-          // block so an arena run behind a heap block (e.g. the HTTP-header block in front of
-          // an arena-backed body) still goes out as its own send_zc_fixed.
+          // A registered (arena) run accumulates every block that shares reg_idx, adjacent or not.
+          // Abutting blocks merge into a single range (send_zc_fixed); non-adjacent blocks -- what
+          // arena LIFO pops normally produce -- are gathered by one sendmsg_zc_fixed over the
+          // registered sub-ranges, so a deep-staged response is one zero-copy op, not one per
+          // block. The run still stops at a block of a different registered buffer or an anonymous
+          // (heap) block; an anonymous run in turn stops ahead of a registered block so an
+          // arena-backed body behind a heap header block still goes out on the registered path.
           int   reg  = (tmp->block && tmp->block->data) ? tmp->block->data->registered_index() : -1;
           char *base = static_cast<char *>(tiovec[niov].iov_base);
           if (niov == 0) {
-            reg_idx  = reg;
-            fixed_ok = (reg >= 0);
-          } else if (fixed_ok && (reg != reg_idx || base != fixed_end)) {
-            break; // end of the registered run; the boundary block starts the next send
-          } else if (!fixed_ok && reg >= 0) {
+            reg_idx      = reg;
+            fixed_ok     = (reg >= 0);
+            fixed_contig = fixed_ok;
+          } else if (fixed_ok) {
+            if (reg != reg_idx) {
+              break; // end of the registered run; a different buffer or a heap block starts the next send
+            }
+            if (base != fixed_end) {
+              if (!gather_zc) {
+                break; // gather disabled: end the run at the non-abutting block (per-block send_zc_fixed)
+              }
+              fixed_contig = false; // same registered region, non-adjacent: gather instead of one range
+            }
+          } else if (reg >= 0) {
             break; // a registered run starts here; leave it for its own fixed send
           }
           fixed_end = base + len;
@@ -1496,14 +1524,27 @@ IOUringNetVConnection::_write()
       }
       if (fixed_ok) {
         Metrics::Counter::increment(write_zc_fixed_stat);
+        if (!fixed_contig) {
+          Metrics::Counter::increment(write_zc_gather_stat);
+        }
       }
       ts::iouring::UringMultishotOp op([&](io_uring_sqe *sqe) {
-        if (fixed_ok) {
+        if (fixed_ok && fixed_contig) {
           // Arena-backed contiguous run: DMA from the pre-registered, pre-pinned region (no
           // per-send get_user_pages / IOMMU map). reg_idx selects the registered region;
           // try_to_write is the merged length of the contiguous blocks.
           io_uring_prep_send_zc_fixed(sqe, fd, tiovec[0].iov_base, try_to_write, MSG_NOSIGNAL, IORING_SEND_ZC_REPORT_USAGE,
                                       reg_idx);
+        } else if (fixed_ok) {
+          // Arena-backed but non-adjacent (LIFO pops): gather the registered sub-ranges into ONE
+          // zero-copy op. Every iovec entry lies in the buf_index reg_idx region, so sendmsg_zc +
+          // FIXED_BUF DMAs from the pre-pinned arena with a single notification, replacing the N
+          // separate send_zc_fixed the contiguity split used to emit. Inlines
+          // io_uring_prep_sendmsg_zc_fixed (absent from the linked liburing 2.4): the fixed helper
+          // is prep_sendmsg_zc + IORING_RECVSEND_FIXED_BUF in ioprio + buf_index.
+          io_uring_prep_sendmsg_zc(sqe, fd, &msg, MSG_NOSIGNAL);
+          sqe->ioprio    |= IORING_SEND_ZC_REPORT_USAGE | IORING_RECVSEND_FIXED_BUF;
+          sqe->buf_index  = reg_idx;
         } else if (msg.msg_iovlen == 1) {
           io_uring_prep_send_zc(sqe, fd, msg.msg_iov[0].iov_base, msg.msg_iov[0].iov_len, MSG_NOSIGNAL,
                                 IORING_SEND_ZC_REPORT_USAGE);

@@ -28,9 +28,14 @@ ciphertext goes out as send_zc_fixed:
       full body integrity (marker + exact byte count). On loopback the kernel
       copy-falls-back internally, but the FIXED counter still counts engagement.
 
-  (b) Off-path: with the feature records at their defaults (write_zerocopy=0, no
-      arena, default water mark), the same TLS transfer must leave
-      write_zerocopy_fixed at 0 and be byte-identical (marker + exact byte count).
+  (b) Gather: with the water mark raised ABOVE the 2 MiB max IOBuffer block, one
+      response stages several non-adjacent 2 MiB arena blocks, which _write folds into
+      a single sendmsg_zc_fixed instead of one send_zc_fixed per block. That must
+      advance write_zerocopy_gather (> 0), with the transfer byte-exact.
+
+  (c) Off-path: with the feature records at their defaults (write_zerocopy=0, no
+      arena, default water mark), the same TLS transfer must leave write_zerocopy_fixed
+      and write_zerocopy_gather at 0 and be byte-identical (marker + exact byte count).
 
 EXPERIMENTAL (write_zerocopy and the arena are both off by default).
 '''
@@ -57,6 +62,19 @@ response_header = {
 }
 request_header = {"headers": "GET /big HTTP/1.1\r\nHost: www.example.com\r\n\r\n", "timestamp": "1469733493.993", "body": ""}
 server.addResponse("sessionfile.log", request_header, response_header)
+
+# ~6 MiB body for the gather cell: with the SSL write-buffer water mark raised above the 2 MiB
+# max IOBuffer block (see ts_gather) and the client throttled so ciphertext backs up to the water
+# mark, one response stages several *non-adjacent* 2 MiB arena blocks -- the case _write now folds
+# into a single sendmsg_zc_fixed instead of one send per block.
+huge_body = ("io_uring_tls_zc." * 393216) + "END_TLS_ZC_MARKER"  # 6291456 + 17 bytes
+huge_response_header = {
+    "headers": "HTTP/1.1 200 OK\r\nContent-Length: {0}\r\n\r\n".format(len(huge_body)),
+    "timestamp": "1469733493.993",
+    "body": huge_body
+}
+huge_request_header = {"headers": "GET /huge HTTP/1.1\r\nHost: www.example.com\r\n\r\n", "timestamp": "1469733493.993", "body": ""}
+server.addResponse("sessionfile.log", huge_request_header, huge_response_header)
 
 
 def _make_ts(name, extra_records):
@@ -107,19 +125,37 @@ ts_zc = _make_ts(
         'proxy.config.io_uring.entries': 8192,
     })
 
-# Cell 2: feature records at their defaults (write_zerocopy off, no arena, default
-# water mark). Same transfer must be byte-identical with write_zerocopy_fixed pinned at 0.
+# Cell 2: deep staging -- same engagement stack as ts_zc, but the SSL write-buffer water mark is
+# raised to 4 MiB, ABOVE the 2 MiB max IOBuffer block (MAX_BUFFER_SIZE_INDEX). With the client
+# throttled (--limit-rate below), ciphertext backs up to the water mark, so staging depth spans
+# two full 2 MiB arena blocks. The arena hands those out non-adjacent (LIFO free list), so one
+# response's ciphertext leaves as a single gathered sendmsg_zc_fixed over both blocks rather than
+# one send_zc_fixed per block: write_zerocopy_gather advances. (4 MiB == two blocks of the 2 MiB
+# class, well within the ~5 that a 64 MiB arena carves for that class.)
+ts_gather = _make_ts(
+    "ts_gather", {
+        'proxy.config.net.io_uring.write_zerocopy': 1,
+        'proxy.config.net.io_uring.write_zerocopy_threshold': 4096,
+        'proxy.config.net.io_uring.fixed_arena_size': 67108864,
+        'proxy.config.net.io_uring.fixed_arena_block_size': 2097152,
+        'proxy.config.ssl.write_buffer_water_mark': 4194304,
+        'proxy.config.io_uring.entries': 8192,
+    })
+
+# Cell 3: feature records at their defaults (write_zerocopy off, no arena, default
+# water mark). Same transfer must be byte-identical with the zero-copy counters pinned at 0.
 ts_off = _make_ts("ts_off", {})
 
 
-def _curl_body(ts):
-    return ('-s -o - -k --resolve www.example.com:{0}:127.0.0.1 "https://www.example.com:{0}/big"'.format(ts.Variables.ssl_port))
+def _curl_body(ts, path="/big"):
+    return (
+        '-s -o - -k --resolve www.example.com:{0}:127.0.0.1 "https://www.example.com:{0}{1}"'.format(ts.Variables.ssl_port, path))
 
 
-def _curl_size(ts):
+def _curl_size(ts, path="/big"):
     return (
         '-s -o /dev/null -w "SIZE=%{{size_download}}\\n" -k --resolve www.example.com:{0}:127.0.0.1 '
-        '"https://www.example.com:{0}/big"'.format(ts.Variables.ssl_port))
+        '"https://www.example.com:{0}{1}"'.format(ts.Variables.ssl_port, path))
 
 
 # =====================================================================================
@@ -161,7 +197,41 @@ tr.Processes.Default.Streams.stdout = Testers.All(
 tr.StillRunningAfter = ts_zc
 
 # =====================================================================================
-# Cell 2 (ts_off): defaults -- same transfer, write_zerocopy_fixed stays 0
+# Cell 2 (ts_gather): deep staging -> non-adjacent arena blocks folded into one sendmsg_zc_fixed
+# =====================================================================================
+
+# --limit-rate throttles the client read so ciphertext backs up to the (4 MiB) water mark: a high
+# water mark only *permits* deep staging; a fast loopback reader would drain _write_buf a block at
+# a time and never present a multi-block run. Throttled, _write_buf holds two 2 MiB arena blocks
+# when _write locks -> one gather. The transfer still completes, so the exact-size check holds.
+tr = Test.AddTestRun("gather: large (6 MiB) throttled TLS fetch, body integrity (exact size)")
+tr.MakeCurlCommand('--limit-rate 4m ' + _curl_size(ts_gather, "/huge"), ts=ts_gather)
+tr.Processes.Default.StartBefore(ts_gather)
+tr.Processes.Default.ReturnCode = 0
+tr.Processes.Default.Streams.stdout = Testers.ContainsExpression(
+    "SIZE={0}".format(len(huge_body)), "the deep-staged TLS response must be exactly {0} bytes".format(len(huge_body)))
+tr.StillRunningAfter = ts_gather
+
+# The load-bearing assertion: a multi-block response's ciphertext went out as ONE gathered
+# sendmsg_zc_fixed over non-adjacent registered blocks, not one send_zc_fixed per block.
+tr = Test.AddTestRun("gather: write_zerocopy_gather advanced (non-adjacent arena blocks gathered)")
+tr.Processes.Default.Command = (
+    'for i in $$(seq 1 50); do '
+    "csv=$$(curl -s -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts_gather.Variables.port) + "/_stats/csv\"); "
+    "gw=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_gather,' | cut -d, -f2); "
+    "fx=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_fixed,' | cut -d, -f2); "
+    'if [ "$${gw:-0}" -gt 0 ]; then '
+    'echo "TLS_GATHER_OK gather=$$gw fixed=$$fx"; exit 0; fi; '
+    'sleep 0.2; done; echo "TLS_GATHER_FAIL gather=$${gw:-0} fixed=$${fx:-0}"; exit 1')
+tr.Processes.Default.ReturnCode = 0
+tr.Processes.Default.Streams.stdout = Testers.All(
+    Testers.ContainsExpression("TLS_GATHER_OK", "write_zerocopy_gather must advance: a multi-block response gathered"),
+    Testers.ExcludesExpression("TLS_GATHER_FAIL", "the gather counter must move"),
+)
+tr.StillRunningAfter = ts_gather
+
+# =====================================================================================
+# Cell 3 (ts_off): defaults -- same transfer, the zero-copy counters stay 0
 # =====================================================================================
 
 tr = Test.AddTestRun("off: large TLS fetch, body integrity (marker)")
@@ -181,15 +251,16 @@ tr.StillRunningAfter = ts_off
 
 # All sends for the transfer were submitted before the client saw the last body byte,
 # so a single post-transfer read proves the counter never moved.
-tr = Test.AddTestRun("off: write_zerocopy_fixed stays 0 on a default-config run")
+tr = Test.AddTestRun("off: the zero-copy counters stay 0 on a default-config run")
 tr.Processes.Default.Command = (
     "csv=$$(curl -s -H 'Accept: text/csv' \"http://127.0.0.1:" + str(ts_off.Variables.port) + "/_stats/csv\"); "
     "fx=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_fixed,' | cut -d, -f2); "
-    'if [ "$${fx:-0}" -eq 0 ]; then echo "OFF_OK fixed=$${fx:-0}"; exit 0; fi; '
-    'echo "OFF_FAIL fixed=$$fx"; exit 1')
+    "gw=$$(echo \"$$csv\" | grep '^proxy.process.net.io_uring.write_zerocopy_gather,' | cut -d, -f2); "
+    'if [ "$${fx:-0}" -eq 0 ] && [ "$${gw:-0}" -eq 0 ]; then echo "OFF_OK fixed=$${fx:-0} gather=$${gw:-0}"; exit 0; fi; '
+    'echo "OFF_FAIL fixed=$${fx:-0} gather=$${gw:-0}"; exit 1')
 tr.Processes.Default.ReturnCode = 0
 tr.Processes.Default.Streams.stdout = Testers.All(
-    Testers.ContainsExpression("OFF_OK", "write_zerocopy_fixed must stay 0 with the feature records at defaults"),
-    Testers.ExcludesExpression("OFF_FAIL", "the fixed counter must not move by default"),
+    Testers.ContainsExpression("OFF_OK", "the fixed and gather counters must stay 0 with the feature records at defaults"),
+    Testers.ExcludesExpression("OFF_FAIL", "neither zero-copy counter must move by default"),
 )
 tr.StillRunningAfter = ts_off
