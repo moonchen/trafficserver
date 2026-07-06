@@ -79,8 +79,8 @@ public:
   bool          is_default_inactivity_timeout() override;
   void          cancel_active_timeout() override;
   void          cancel_inactivity_timeout() override;
-  void          set_action(Continuation *c) override;
-  const Action *get_action() const;
+  void          set_open_continuation(Continuation *c) override;
+  Continuation *get_open_continuation() const override;
   void          add_to_keep_alive_queue() override;
   void          remove_from_keep_alive_queue() override;
   bool          add_to_active_queue() override;
@@ -350,13 +350,13 @@ UnixNetVConnection::get_socket()
 }
 
 inline void
-UnixNetVConnection::set_action(Continuation *c)
+UnixNetVConnection::set_open_continuation(Continuation *c)
 {
   action_ = c;
 }
 
-inline const Action *
-UnixNetVConnection::get_action() const
+inline Continuation *
+UnixNetVConnection::get_open_continuation() const
 {
-  return &action_;
+  return action_.continuation;
 }

@@ -50,7 +50,7 @@ ConnectingEntry::state_http_server_open(int event, void *data)
   switch (event) {
   case NET_EVENT_OPEN: {
     netvc = static_cast<NetVConnection *>(data);
-    // ink_release_assert(_pending_action == nullptr || _pending_action->continuation == vc->get_action()->continuation);
+    // ink_release_assert(_pending_action == nullptr || _pending_action->continuation == vc->get_open_continuation());
     _pending_action = nullptr;
     Dbg(dbg_ctl_http_connect, "ConnectingEntrysetting handler for connection handshake");
     // Just want to get a write-ready event so we know that the connection handshake is complete.

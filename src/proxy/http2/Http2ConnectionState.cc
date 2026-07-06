@@ -2012,8 +2012,8 @@ Http2ConnectionState::cleanup_streams()
   if (!is_state_closed()) {
     SCOPED_MUTEX_LOCK(lock, this->session->get_mutex(), this_ethread());
 
-    UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(session->get_netvc());
-    if (vc && vc->active_timeout_in == 0) {
+    NetVConnection *vc = session->get_netvc();
+    if (vc && vc->get_active_timeout() == 0) {
       vc->add_to_keep_alive_queue();
     }
   }
@@ -2101,8 +2101,8 @@ Http2ConnectionState::release_stream()
         // then mark the connection as inactive
         session->do_clear_session_active();
         session->set_no_activity_timeout();
-        UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(session->get_netvc());
-        if (vc && vc->active_timeout_in == 0) {
+        NetVConnection *vc = session->get_netvc();
+        if (vc && vc->get_active_timeout() == 0) {
           // With heavy traffic, session could be destroyed. Do not touch session after this.
           vc->add_to_keep_alive_queue();
         }

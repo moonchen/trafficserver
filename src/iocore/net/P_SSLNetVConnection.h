@@ -150,31 +150,32 @@ public:
   int sslClientHandShakeEvent(int &err);
 
   // NetVConnection
-  VIO       *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
-  VIO       *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
-  void       do_io_close(int lerrno = -1) override;
-  void       do_io_shutdown(ShutdownHowTo_t howto) override;
-  void       set_active_timeout(ink_hrtime timeout_in) override;
-  void       set_inactivity_timeout(ink_hrtime timeout_in) override;
-  void       set_default_inactivity_timeout(ink_hrtime timeout_in) override;
-  bool       is_default_inactivity_timeout() override;
-  void       cancel_active_timeout() override;
-  void       cancel_inactivity_timeout() override;
-  void       set_action(Continuation *c) override;
-  void       add_to_keep_alive_queue() override;
-  void       remove_from_keep_alive_queue() override;
-  bool       add_to_active_queue() override;
-  ink_hrtime get_active_timeout() override;
-  ink_hrtime get_inactivity_timeout() override;
-  void       apply_options() override;
-  void       reenable(VIO *vio) override;
-  void       reenable_re(VIO *vio) override;
-  SOCKET     get_socket() override;
-  int        set_tcp_congestion_control(tcp_congestion_control_side side) override;
-  void       set_local_addr() override;
-  void       set_remote_addr() override;
-  void       set_remote_addr(const sockaddr *addr) override;
-  void       set_mptcp_state() override;
+  VIO          *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
+  VIO          *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
+  void          do_io_close(int lerrno = -1) override;
+  void          do_io_shutdown(ShutdownHowTo_t howto) override;
+  void          set_active_timeout(ink_hrtime timeout_in) override;
+  void          set_inactivity_timeout(ink_hrtime timeout_in) override;
+  void          set_default_inactivity_timeout(ink_hrtime timeout_in) override;
+  bool          is_default_inactivity_timeout() override;
+  void          cancel_active_timeout() override;
+  void          cancel_inactivity_timeout() override;
+  void          set_open_continuation(Continuation *c) override;
+  Continuation *get_open_continuation() const override;
+  void          add_to_keep_alive_queue() override;
+  void          remove_from_keep_alive_queue() override;
+  bool          add_to_active_queue() override;
+  ink_hrtime    get_active_timeout() override;
+  ink_hrtime    get_inactivity_timeout() override;
+  void          apply_options() override;
+  void          reenable(VIO *vio) override;
+  void          reenable_re(VIO *vio) override;
+  SOCKET        get_socket() override;
+  int           set_tcp_congestion_control(tcp_congestion_control_side side) override;
+  void          set_local_addr() override;
+  void          set_remote_addr() override;
+  void          set_remote_addr(const sockaddr *addr) override;
+  void          set_mptcp_state() override;
 
 #if TS_USE_TLS_ASYNC
   // AsyncTLSEventCallback
@@ -510,7 +511,12 @@ private:
   // lingering second reader otherwise wedges the rbio and stalls large reads.
   void _releaseHandshakeReader();
 
-  Action _action;
+  // The continuation to notify once this VC's own open (connect+handshake) or accept
+  // (accept+handshake) completes - see NetVConnection::set_open_continuation(). Not a cancellable
+  // Action: external cancellation of an outbound connect targets the inner _unvc's own Action (see
+  // SSLNetVConnection::startEvent), so this is never cancelled - just reassigned or nulled as
+  // ownership of the VC's open/accept completion hands off between setup stages.
+  Continuation *_open_continuation = nullptr;
 };
 
 extern ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator;

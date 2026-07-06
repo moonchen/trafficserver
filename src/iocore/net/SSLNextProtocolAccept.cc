@@ -94,7 +94,7 @@ struct SSLNextProtocolTrampoline : public Continuation {
       // Cancel the action, so later timeouts and errors don't try to
       // send the event to the Accept object.  After this point, the accept
       // object does not care.
-      netvc->set_action(nullptr);
+      netvc->set_open_continuation(nullptr);
 
       Continuation *endpoint_cont = netvc->endpoint();
       if (!endpoint_cont) {
@@ -141,7 +141,7 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
     ssl_netvc->set_is_proxy_protocol(netvc->get_is_proxy_protocol(), netvc->get_is_proxy_protocol_cp_src());
     ssl_netvc->options = netvc->options;
     ssl_netvc->set_context(NET_VCONNECTION_IN);
-    netvc->set_action(ssl_netvc);
+    netvc->set_open_continuation(ssl_netvc);
     ssl_netvc->setTransparentPassThrough(transparent_passthrough);
     ssl_netvc->setAllowPlain(allow_plain);
     ssl_netvc->mutex = netvc->mutex; // Tie the mutexes together for the entire protocol stack so handlers can take the fast path

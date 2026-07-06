@@ -1095,7 +1095,7 @@ SSLNetVConnection::~SSLNetVConnection()
 
   // clear variables for reuse
   this->mutex.clear();
-  _action.mutex.clear();
+  _open_continuation = nullptr;
   _user_read_vio.mutex.clear();
   _user_read_vio.cont = nullptr;
   _user_write_vio.mutex.clear();
@@ -3029,9 +3029,10 @@ SSLNetVConnection::startEvent(int event, void *data)
   case NET_EVENT_ACCEPT: {
     // On a successful open/accept, data is the underlying transport VConnection.
     UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
-    // The SSL VC's own _action is never cancelled: SSLNetProcessor::connect_re returns the inner
-    // unvc's Action (so external cancellation targets that), and Action::operator=(Continuation*)
-    // never sets `cancelled`. NET_EVENT_OPEN therefore always proceeds to setup.
+    // _open_continuation is never cancelled: SSLNetProcessor::connect_re returns the inner unvc's
+    // own Action (so external cancellation targets that), and _open_continuation is just the plain
+    // continuation to notify once this VC's own open/accept completes.
+    // NET_EVENT_OPEN therefore always proceeds to setup.
     // Successful establishment of TCP connection
     // This is where we would set up the SSL context and start the handshake.
     _transport_state = TransportState::TRANSPORT_CONNECTED;
@@ -3052,19 +3053,19 @@ SSLNetVConnection::startEvent(int event, void *data)
     // matching MUTEX_UNTAKE_LOCK, permanently leaking a lock level on the shared
     // connection mutex and aborting in ink_mutex_destroy at teardown) and holds a
     // ref so the mutex survives if the continuation frees this VC.
-    // The only writer of the SSL VC's _action is the outbound connect (SSLNetProcessor::
+    // The only writer of the SSL VC's _open_continuation is the outbound connect (SSLNetProcessor::
     // connect_re), which always supplies a continuation whose mutex is non-null (it sets
     // ssl_netvc->mutex = cont->mutex), so the null-mutex fallback is unreachable.
-    if (_action.continuation) {
-      SCOPED_MUTEX_LOCK(lock, _action.continuation->mutex, this_ethread());
-      _action.continuation->handleEvent(event, this);
+    if (_open_continuation) {
+      SCOPED_MUTEX_LOCK(lock, _open_continuation->mutex, this_ethread());
+      _open_continuation->handleEvent(event, this);
     }
   } break;
   case NET_EVENT_OPEN_FAILED: {
     // Failed to establish TCP connection; data is the errno, not a VConnection.
     int res = reinterpret_cast<intptr_t>(data);
     lerrno  = -res;
-    _action.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    _open_continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
     this->free_thread(thread);
   } break;
   default:
@@ -3311,9 +3312,15 @@ SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
 }
 
 void
-SSLNetVConnection::set_action(Continuation *a)
+SSLNetVConnection::set_open_continuation(Continuation *a)
 {
-  _action = a;
+  _open_continuation = a;
+}
+
+Continuation *
+SSLNetVConnection::get_open_continuation() const
+{
+  return _open_continuation;
 }
 
 void

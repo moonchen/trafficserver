@@ -1865,11 +1865,16 @@ HttpSM::state_http_server_open(int event, void *data)
     // Since the UnixNetVConnection::action_ or SocksEntry::action_ may be returned from netProcessor.connect_re, and the
     // SocksEntry::action_ will be copied into UnixNetVConnection::action_ before call back NET_EVENT_OPEN from
     // SocksEntry::free(), so we just compare the Continuation between pending_action and VC's action_.
-    _netvc                 = static_cast<NetVConnection *>(data);
-    _netvc_read_buffer     = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
-    _netvc_reader          = _netvc_read_buffer->alloc_reader();
-    UnixNetVConnection *vc = static_cast<UnixNetVConnection *>(_netvc);
-    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == vc->get_action()->continuation);
+    _netvc             = static_cast<NetVConnection *>(data);
+    _netvc_read_buffer = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
+    _netvc_reader      = _netvc_read_buffer->alloc_reader();
+    // For a plain transport, _netvc's own recorded open continuation (get_open_continuation()) is
+    // what pending_action's Action points at. For a layered transport (e.g. an SSL-terminated
+    // origin), the raw connect's Action targets _netvc itself (SSLNetProcessor::connect_re passes
+    // the SSLNetVConnection as the inner connect's continuation), so pending_action's continuation
+    // is _netvc rather than whatever _netvc itself forwards its own completion to.
+    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == _netvc->get_open_continuation() ||
+                       pending_action.get_continuation() == _netvc);
     pending_action = nullptr;
 
     if (this->plugin_tunnel_type == HttpPluginTunnel_t::NONE) {
@@ -6826,7 +6831,7 @@ HttpSM::attach_server_session()
   server_entry->vc_type          = HttpVC_t::SERVER_VC;
   server_entry->vc_write_handler = &HttpSM::state_send_server_request_header;
 
-  UnixNetVConnection *server_vc = static_cast<UnixNetVConnection *>(server_txn->get_netvc());
+  NetVConnection *server_vc = server_txn->get_netvc();
 
   // set flag for server session is SSL
   if (server_vc->get_service<TLSBasicSupport>()) {

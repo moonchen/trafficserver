@@ -238,19 +238,27 @@ public:
   */
   virtual void cancel_inactivity_timeout() = 0;
 
-  /** Set the action to use a continuation.
-      The action continuation will be called with an event if there is no pending I/O operation
-      to receive the event.
+  /** Set the continuation to notify of this VC's own open/accept completion.
+      NET_EVENT_OPEN/NET_EVENT_ACCEPT/NET_EVENT_OPEN_FAILED necessarily fire before the caller can
+      have registered a read or write VIO (a VIO can't exist until the VC has finished connecting
+      or accepting), so there is no VIO to deliver that first event to; this is that handoff.
 
       Pass @c nullptr to disable.
 
-      @internal Subclasses should implement this if they support actions. This abstract class does
-      not. If the subclass doesn't have an action this method is silently ignored.
+      @internal Subclasses should implement this if they support this. This abstract class does
+      not. If the subclass doesn't track this, this method is silently ignored.
   */
   virtual void
-  set_action(Continuation *)
+  set_open_continuation(Continuation *)
   {
     return;
+  }
+
+  /** Get the continuation last set by @c set_open_continuation, or @c nullptr if none. */
+  virtual Continuation *
+  get_open_continuation() const
+  {
+    return nullptr;
   }
 
   virtual void add_to_keep_alive_queue() = 0;

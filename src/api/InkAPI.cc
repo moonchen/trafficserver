@@ -6247,19 +6247,7 @@ TSCont
 TSNetInvokingContGet(TSVConn conn)
 {
   NetVConnection *vc = reinterpret_cast<NetVConnection *>(conn);
-  // NOTE: post-refactor an SSLNetVConnection is no longer a UnixNetVConnection,
-  // so this dynamic_cast yields null for an SSL VC and the function returns
-  // nullptr. No in-tree path hands a plugin an SSL outbound VC today (plugin
-  // connects route through unix_netProcessor), so this is latent. If a
-  // TLS-capable plugin connect API is added, give SSLNetVConnection a
-  // get_action() returning its own _action and branch here on the VC type.
-  UnixNetVConnection *net_vc = dynamic_cast<UnixNetVConnection *>(vc);
-  TSCont              ret    = nullptr;
-  if (net_vc) {
-    const Action *action = net_vc->get_action();
-    ret                  = reinterpret_cast<TSCont>(action->continuation);
-  }
-  return ret;
+  return reinterpret_cast<TSCont>(vc->get_open_continuation());
 }
 
 TSHttpTxn

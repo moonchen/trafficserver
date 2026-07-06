@@ -121,7 +121,7 @@ SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOpt
   ssl_netvc->set_remote_addr(target);
   ssl_netvc->options = opt;
   ssl_netvc->set_context(NET_VCONNECTION_OUT);
-  ssl_netvc->set_action(cont);
+  ssl_netvc->set_open_continuation(cont);
   ssl_netvc->mutex = cont->mutex;
   Action *action   = unix_netProcessor.connect_re(ssl_netvc, target, opt);
   return action;
