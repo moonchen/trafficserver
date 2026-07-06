@@ -574,3 +574,152 @@ did not move the arena cell: 0.6173); IOMMU (identity, unchanged); binary/config
 their count — consistent with only the notif-heaviest cell swinging. The mechanism of
 the ~5% arena-only session swing remains unexplained; treat arena@wm=256K as
 parity-with-variance and cite the wm=1M point as its structure-fixed configuration.
+
+## WI-1 / WI-2 / WI-4 campaign — results (2026-07-05)
+
+Executes the three benchmarkable items from `TLS-WRITE-ZC-WORKITEMS.md` (the
+send-structure follow-ups to the arena root-cause above). Same box/NIC/client and
+gold metric as the ladder; ONE binary throughout except WI-1, which is a
+standalone kernel microbench. **All numbers here are workflow-produced.** Decision
+for this run: **1 GbE now, 10 GbE later** — the slow-client cells carry the memory
+/ backpressure half of WI-4 and are valid on 1 GbE; the fast-client cells approach
+the ~940 Mbit wire ceiling, so WI-4's fast-client CPU win is **understated** here
+and the definitive fast-client cell is deferred to a 10 GbE pass. cpu/1k only, no
+throughput claims.
+
+### WI-1 — gathered registered zero-copy send: **YES (gate passes)**
+
+Standalone sender microbench (modeled on `sender_zc.c`), real NIC atlantic→hawaii,
+sink logs received bytes, **n=20000 sends/mode**, sender pinned in the `atsbench`
+cgroup (0,2,4,6). liburing 2.15 in a scratch prefix, kernel 6.17. Stages 4×256 KiB
+non-adjacent registered arena blocks and sends them via each candidate op vs
+today's 4× separate `send_zc_fixed`.
+
+| candidate                                          | kernel result | vs base send_zc_fixed |
+| -------------------------------------------------- | ------------- | --------------------- |
+| (i) `sendmsg_zc` + `IORING_RECVSEND_FIXED_BUF`     | **ACCEPTED**  | **wins** (below)      |
+| (ii) send bundle (`IORING_RECVSEND_BUNDLE`) + fixed | rejected `-95 EOPNOTSUPP` | — |
+| (iii) `IORING_SEND_VECTORIZED` + fixed             | rejected `-14 EFAULT` (VECTORIZED+FIXED_BUF combo) | — |
+
+Candidate (i) — `io_uring_prep_sendmsg_zc_fixed`, gathering the run's non-abutting
+registered arena blocks (all share `buf_index 0`) into ONE gather+fixed op —
+against per-block `send_zc_fixed`:
+
+| per req            | base (per-block) | candidate (i) |
+| ------------------ | ---------------- | ------------- |
+| sends / req        | 4                | **1**         |
+| F_NOTIF / req      | 4                | **1**         |
+| io_uring_enter/req | 4                | **1**         |
+| cgroup cpu_usec/req | 94.684          | **47.072** (**−50.3%**) |
+| zc_copied          | 0 (true ZC)      | 0 (true ZC)   |
+
+Sink independently logged exactly 20,971,520,000 B (= 20000 × 4 × 256 KiB) for
+BOTH runs (end-to-end integrity). `zc_copied=0` across all 20000 reqs each — and it
+tracked the medium (1 on the loopback prep smoke, 0 on the NIC), so it is not a
+stuck zero. Candidates (ii)/(iii) were only proven rejected on loopback (irrelevant
+once (i) is the winner).
+
+**Qualification (do not over-read):** WI-1 is a send-path-only microbench, so
+−50.3% is the send syscall/notif/completion saving **in isolation** — it will NOT
+translate to −50% ATS request cpu/1k (under TLS the AES pass already touches every
+byte; ZC only removes the ciphertext→socket copy). The gate criterion (kernel-
+accepted AND beats per-block `send_zc_fixed`) is met regardless.
+
+**Consequence:** candidate (i) is exactly the missing branch at
+`IOUringNetVConnection.cc:1485-1513`, which today issues `send_zc_fixed` only for a
+contiguous registered run and falls back to anonymous `sendmsg_zc` (losing fixed-
+buffer registration) for non-adjacent blocks. **WI-3 (`vio.nbytes` block sizing) is
+skippable** — the send-structure problem is solved in the op. Follow-on: wire
+`io_uring_prep_sendmsg_zc_fixed` into `_write` near `IOUringNetVConnection.cc:1471`,
+gathering the arena run's `reg_idx` blocks into one gather+fixed send.
+
+### WI-2 — watermark knee sweep: **knee = 384K** (n=7, 0 failures)
+
+1 MiB disk-served TLS, BoringSSL, NIC, arena ON (`write_zerocopy=1`, threshold
+262144, fixed arena on), sweeping `ssl.write_buffer_water_mark`; 6 campaign passes +
+1 probe pass, **all cells interleaved same-session** (keeps the ~5% arena session
+swing common-mode), **n=7/cell, 0 failures**. Anonymous-ZC (arena off) as the fixed
+comparator. Raw: bench repo `results/tlsnic-wm-large.csv`, `tlsnic-wm-probe.csv`.
+
+| watermark | arena cpu/1k median (min–max) | Δ vs 256K |
+| --------- | ----------------------------- | --------- |
+| 256K      | 0.5919                        | —         |
+| 384K      | **0.5131** (0.5091–0.5231)    | **−13.3%** |
+| 512K      | ~0.513                        | −13.4% (flat) |
+| 768K      | ~0.513                        | −13.3% (flat) |
+| 1M        | ~0.508 (0.5042–0.5122)        | −14.1% (flat) |
+
+Arena cpu/1k drops −13.3% from 256K to 384K, then plateaus flat through 512K / 768K
+/ 1M (the 384K range 0.5091–0.5231 fully overlaps the 1M range 0.5042–0.5122 — ≥384K
+are statistically indistinguishable). The 256K penalty is the copy-tail ballooning
+to **112,315 B/req** (vs 3,884–10,068 B/req elsewhere). Anonymous-ZC comparator
+stays flat ~0.614–0.620 across the whole sweep. Arena engaged every round
+(`zc_fixed>0`, `arena_alloc>0`, `zc_copied==0`; probe rounds: `oversize_fallback=0`,
+`class_exhausted=0` — no silent heap fallback).
+
+**Recommend wm=384K.** It captures 95% of the total 256K→1M win (−13.3% of −14.1%);
+1M adds only −0.9% (noise). 384K is the smallest watermark that clears the knee — it
+rounds up into the arena's 512K size class, so the knee sits at the class boundary.
+**This CORRECTS the earlier n=2 "wm=1M −11.9%"**, which mis-attributed the whole
+benefit to reaching 1M: with n=7 the win is realized at the 384K knee and 1M buys
+nothing extra.
+
+### WI-4 — rate-adaptive staging depth: **validated (self-tuning cpu win; memory floor)**
+
+WI-4 adds `proxy.config.net.io_uring.write_adaptive_depth` (0/1, default off) +
+`write_adaptive_tau_ms` (default **50**) and the `proxy.process.net.io_uring.write_adaptive_staged`
+counter. The io_uring VC EWMAs a drain-rate `r` from true-ZC F_NOTIF completions (each = the
+peer ACKed those pinned bytes, so the completion stream is a drain-rate clock) and exposes a
+staging target `S = r × τ`; the SSL encrypt-ahead loop caps `_write_buf` at `S` (in addition to
+the static high-water break). Flag-off is a strict no-op. It is a self-tuning replacement for the
+static `ssl.write_buffer_water_mark`: shallow staging for slow clients, deep for fast, no knob.
+
+**Method (corrects the first attempt).** An earlier run reported "not validated / gate never
+engaged"; that was two harness bugs, not the feature: (a) the workload served **1 MiB** objects but
+the arena block is **2 MiB**, so each response fit in ONE block and the depth policy had nothing to
+bound — fixed by serving **8 MiB** disk-served objects (object ≫ block → multi-block staging); (b) a
+cpuset bug — `setup-box` makes atsbench an *exclusive* partition, carving 0,2,4,6 out of root, so ATS
+launched on the leftover HT-siblings and a late cgroup-move stranded some threads (invisible to
+`cpu.stat`) — fixed by pinning ATS *before* it spawns threads. Client bandwidth is shaped TLS-only
+(HTB on the response flow, never the box's default-route root qdisc). n=3, interleaved same session,
+cgroup `cpu.stat` cpu/1k, `zc_copied=0` verified every cell.
+
+**τ sweep (n=3, 8 MiB disk-served TLS, NIC atlantic→hawaii).** cpu/1k and peak `_write_buf`
+residency (MB/conn), adaptive at τ∈{10,25,50,75} ms vs the two static references:
+
+| client bw | metric | τ=10 | τ=25 | **τ=50** | τ=75 | static256 | static1m |
+|---|---|---|---|---|---|---|---|
+| 900 Mbit (fast)† | cpu/1k | 2.82 | 2.58 | **2.38** | 2.43 | 2.86 | 2.46 |
+| 900 Mbit | mem MB/conn | 3.25 | 3.94 | 4.88 | 5.25 | 2.56 | 4.50 |
+| 400 Mbit | cpu/1k | 4.29 | 3.05 | 2.87 | 2.85 | 3.14 | 2.82 |
+| 400 Mbit | mem MB/conn | 3.38 | 3.28 | 3.69 | 3.75 | 2.69 | 3.25 |
+| 50 Mbit (slow)* | mem MB/conn | 3.36 | 3.45 | 3.48 | 3.58 | 3.09 | 3.88 |
+
+\* 50 Mbit cpu/1k is noise (≈23 req/window) — memory only. † 900 Mbit is wire-capped on 1 GbE, so
+the fast-client cpu win is understated; the definitive fast cell is deferred to a 10 GbE pass.
+
+**Findings.**
+1. **Adaptive engages and is true-ZC** — `write_adaptive_staged` > 0 on every NIC cell, `zc_copied=0`
+   throughout.
+2. **cpu win at speed.** At τ=50, adaptive has the best cpu/1k of the whole matrix at 900 Mbit
+   (2.38, beats static1m 2.46 and static256 2.86) and matches static1m at 400 — without an operator
+   choosing a watermark. On a wire-capped 1 GbE, so the margin is a floor, not a ceiling.
+3. **τ is the tradeoff dial; 50 ms is the knee.** τ < 25 ms over-fragments (τ=10 @ 400 Mbit = 4.29,
+   worse than every static, `adstaged`=1350 — tiny sends); τ > 50 ms only adds memory. 50 ms
+   maximizes the cpu win at acceptable memory → **new default**.
+4. **The slow-client memory win is modest and structurally floored.** Tighter τ does shrink slow-cell
+   staging (bw50 mem 3.58→3.36 as τ 75→10, confirming the lever), but it never reaches static256's
+   3.09: for a slow client on the ZC path, peak memory is dominated by ciphertext **pinned in-flight
+   awaiting the ACK/F_NOTIF**, not by staging depth. `r × τ` has a hard floor there. This tempers
+   WI-4's original "shallow staging saves memory for slow clients" ambition.
+
+**Config decisions (committed).** `write_adaptive_tau_ms` default = **50** (swept-optimal).
+`write_adaptive_depth` and `ssl.write_buffer_water_mark` are **mutually exclusive** — adaptive depth
+self-tunes exactly what the watermark bounds statically, so ATS rejects (`DL_Fatal` at SSL config
+load) any config that enables adaptive depth while `ssl.write_buffer_water_mark` is set off-default.
+
+**Verdict.** WI-4 is a self-tuning replacement for `ssl.write_buffer_water_mark`: it matches-or-beats
+the best static watermark on cpu/1k with no operator tuning, at τ≈50 ms. Its memory-reduction goal
+for slow clients is only weakly realized (ZC-pinning sets the slow-client memory floor). Rig:
+`measure-tls-adaptive.sh` (8 MiB workload, TLS-only shaping, pin-before-spawn) + `campaign-tls-adaptive.sh`
++ the τ driver `wi4-tau-sweep.sh`; data in `results/tlsnic-adaptive.csv` and `tlsnic-tau.csv`.
