@@ -111,6 +111,15 @@ DbgCtl dbg_ctl_proxyprotocol{"proxyprotocol"};
 DbgCtl dbg_ctl_inactivity_cop{"inactivity_cop"};
 DbgCtl dbg_ctl_ssl_io{"ssl_io"};
 
+#if TS_USE_LINUX_IO_URING
+// WI-4 engagement counter: incremented when the rate-adaptive depth gate stops the encrypt-ahead
+// loop with the response not yet fully staged --- i.e. the drain-rate target (r*tau) is actively
+// bounding how far SSL_write runs ahead of the socket. Zero unless
+// proxy.config.net.io_uring.write_adaptive_depth is on and the gate is engaging.
+ts::Metrics::Counter::AtomicType *ssl_write_adaptive_staged_stat =
+  ts::Metrics::Counter::createPtr("proxy.process.net.io_uring.write_adaptive_staged");
+#endif
+
 const char *
 resolve_client_ca_cert_path(const SSLConfigParams *params, const char *path, std::string &storage)
 {
@@ -785,6 +794,31 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
 
   Dbg(dbg_ctl_ssl, "towrite=%" PRId64, towrite);
 
+  // WI-4 rate-adaptive staging depth. stage_target == 0 means the feature is off, so adaptive
+  // stays false and everything below is a strict no-op: the while gate degenerates to today's
+  // condition, the block size is left as startEvent set it, and the counter never fires.
+  int64_t stage_target = 0;
+  bool    adaptive     = false;
+#if TS_USE_LINUX_IO_URING
+  if (_io_transport != nullptr) {
+    stage_target = _io_transport->adaptive_stage_target();
+    adaptive     = stage_target > 0;
+  }
+  if (adaptive) {
+    // Clamp the ciphertext block size to min(S, arena top class): blocks allocated below draw from
+    // that class so a contiguous run leaves as one send_zc_fixed instead of a per-block split.
+    // Composes with the arena hook installed in startEvent; a request over the top class falls
+    // back to the heap (copy send). Only future block allocations change, so a keep-alive
+    // connection re-sizes its ciphertext blocks as the drain-rate estimate moves.
+    int64_t const top  = UringFixedBufArena::instance().top_block_size();
+    int64_t const want = (top > 0 && stage_target > top) ? top : stage_target;
+    int64_t const idx  = buffer_size_to_index(want, MAX_BUFFER_SIZE_INDEX);
+    if (idx >= BUFFER_SIZE_INDEX_64K && idx != _write_buf->size_index) {
+      _write_buf->size_index = idx;
+    }
+  }
+#endif
+
   ERR_clear_error();
   do {
     // What is remaining left in the next block?
@@ -837,7 +871,17 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
     // Stop pulling plaintext once enough ciphertext is queued for the transport. This
     // bounds _write_buf to ~the water mark plus one record and lets backpressure reach
     // the producer, instead of encrypting all staged plaintext into memory in one pull.
-  } while (num_really_written == try_to_write && total_written < towrite && !_write_buf->high_water());
+    // The adaptive term (WI-4, no-op unless the feature is on) additionally caps staged
+    // ciphertext to the client's drain-rate budget S so encryption never runs further ahead
+    // of the socket than the peer can absorb in ~tau.
+  } while (num_really_written == try_to_write && total_written < towrite && !_write_buf->high_water() &&
+           (!adaptive || _write_buf_reader->read_avail() < stage_target));
+
+#if TS_USE_LINUX_IO_URING
+  if (adaptive && total_written < towrite && _write_buf_reader->read_avail() >= stage_target) {
+    Metrics::Counter::increment(ssl_write_adaptive_staged_stat);
+  }
+#endif
 
   if (total_written > 0) {
     sslLastWriteTime   = now;
@@ -3044,8 +3088,10 @@ SSLNetVConnection::startEvent(int event, void *data)
     // Installed here, before the transport write VIO below, so no ciphertext block predates
     // the gate decision (only the constructor's initial heap block does, and a heap block just
     // stays on the anonymous/copy send path).
+    auto *iou                     = dynamic_cast<IOUringNetVConnection *>(unvc);
+    _io_transport                 = iou; // WI-4: cached for the rate-adaptive staging query on the encrypt path
     static const bool write_zc_on = RecGetRecordInt("proxy.config.net.io_uring.write_zerocopy").value_or(0) != 0;
-    if (write_zc_on && UringFixedBufArena::instance().enabled() && dynamic_cast<IOUringNetVConnection *>(unvc) != nullptr) {
+    if (write_zc_on && UringFixedBufArena::instance().enabled() && iou != nullptr) {
       int64_t const arena_index = buffer_size_to_index(_write_buf->water_mark, MAX_BUFFER_SIZE_INDEX);
       if (arena_index > _write_buf->size_index) {
         _write_buf->size_index = arena_index;

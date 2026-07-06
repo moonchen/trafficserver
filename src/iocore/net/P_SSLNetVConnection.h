@@ -83,6 +83,9 @@ constexpr int      SSL_DEF_TLS_RECORD_MSEC_THRESHOLD = 1000;
 
 struct SSLCertLookup;
 class Event;
+// Forward-declared for the WI-4 adaptive-staging pointer below; the type is only defined under
+// TS_USE_LINUX_IO_URING, but a pointer member needs no definition (nullptr elsewhere).
+class IOUringNetVConnection;
 
 enum class SslVConnOp {
   SSL_HOOK_OP_DEFAULT,  ///< Null / initialization value. Do normal processing.
@@ -432,6 +435,11 @@ private:
 
   // underlying TCP connection
   UnixNetVConnection *_unvc = nullptr;
+
+  // The inner transport when it is the io_uring VC (nullptr otherwise, and always on non-io_uring
+  // builds). Cached at startEvent so the encrypt-ahead path can query the WI-4 rate-adaptive
+  // staging target without a per-write dynamic_cast.
+  IOUringNetVConnection *_io_transport = nullptr;
 
   // We give these VIOs to our consumer
   VIO _user_read_vio;
