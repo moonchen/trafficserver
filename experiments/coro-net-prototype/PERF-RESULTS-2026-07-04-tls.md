@@ -723,3 +723,55 @@ the best static watermark on cpu/1k with no operator tuning, at τ≈50 ms. Its 
 for slow clients is only weakly realized (ZC-pinning sets the slow-client memory floor). Rig:
 `measure-tls-adaptive.sh` (8 MiB workload, TLS-only shaping, pin-before-spawn) + `campaign-tls-adaptive.sh`
 + the τ driver `wi4-tau-sweep.sh`; data in `results/tlsnic-adaptive.csv` and `tlsnic-tau.csv`.
+
+## WI-1 follow-on — gathered registered ZC send wired into `_write` (2026-07-06)
+
+The gate (WI-1 above) proved candidate (i) wins in isolation; this wires it into ATS and
+measures it in the full proxy on the NIC.
+
+**Change.** `IOUringNetVConnection::_write`: a registered (arena) run now accumulates every
+block sharing `reg_idx` — adjacent or not — instead of breaking at the first non-abutting block.
+A contiguous run still issues one `send_zc_fixed`; a **non-adjacent** run issues one
+`sendmsg_zc_fixed` over the registered sub-ranges (inlined: `prep_sendmsg_zc` +
+`IORING_RECVSEND_FIXED_BUF` in `ioprio` + `buf_index`; the linked liburing 2.4 lacks the combined
+helper). New counter `write_zerocopy_gather`; new records toggle
+`net.io_uring.write_zerocopy_gather` (default 1, set 0 to restore per-block sends = the A/B
+baseline). Gold test `io_uring_tls_write_zc.test.py` gains a deep-staging cell (watermark above
+the 2 MiB block) asserting the gather engages, byte-exact, `copied=0`.
+
+**A/B (NIC, BoringSSL Release, hawaii en7 10 GbE — forced + verified per cell).** `deep` cell:
+static `write_buffer_water_mark=8 MiB`, 8 MiB disk-served object, 1 GiB→2 MiB arena, 8 conns,
+unshaped (fast client), gather ON vs OFF, **6 rounds interleaved**. Rig: `measure-tls-gather.sh`
++ `campaign-gather.sh` + `agg-tls-gather.py`; data `results/tlsnic-gather.csv`.
+
+| median, n=6              | OFF (per-block)   | ON (gather)       | Δ                    |
+| ------------------------ | ----------------- | ----------------- | -------------------- |
+| sends / req              | 6.582             | 4.694             | **−28.6%** (−28…−30% every round) |
+| cpu/1k                   | 7.959 (7.92–8.12) | 7.953 (7.91–8.11) | **−0.24% (flat, noise)** |
+| gather ops / fixed sends | 0 / 46602         | 18958 / 32143     | —                    |
+| zc_copied (all 12 cells) | 0                 | 0                 | true ZC on the NIC   |
+
+**Read (honest).** The gather engages as designed and removes block-boundary send splits: a deep
+buffer of N non-adjacent arena blocks goes out in ~`ceil(bytes / socket_buf)` sends instead of
+that plus a split per block boundary (OFF avg 1.28 MB/send, capped by boundaries; ON avg
+1.79 MB/send, capped by the ~1.7 MB socket buffer). But **cpu/1k does not move** — confirming the
+gate's qualification empirically: under TLS the AES pass dominates, and with *large* blocks (the
+correct choice for large-object/fast-client) there are only ~4 blocks/response, so few boundaries
+to remove and the socket buffer is already ≈ one block. The spike's 4→1 fold needs *many*
+non-adjacent blocks; large blocks deliberately keep the count low. Smaller blocks would give the
+gather more to fold but are the wrong design for this workload, so that regime is moot.
+
+**Verdict.** Shipped as a **no-regression cleanup** (−28.6% send syscalls / CQEs / notifs, flat
+cpu, `copied=0`), default on. Its durable property is that **block size stops affecting send
+count** — a 256 K-block buffer now sends as efficiently as a 2 MiB-block one — which matters for
+mixed/adaptive workloads (a slow client wanting small blocks for memory no longer pays a send
+penalty), not for the pure large-object/fast-client case where large blocks were already fine.
+Not the −50% the isolated spike suggested; that path is already cheap in the full proxy.
+
+**WI-4 interaction (bug found, not fixed here).** The A/B cell is *static* because WI-4 adaptive
+cannot deep-stage on the committed binary: `high_water()` binds at `water_mark`, the adaptive path
+never raises `water_mark`, and `SSLConfig` rejects `write_adaptive_depth` together with a
+non-default `write_buffer_water_mark`. So adaptive runs only at the 64 KiB default watermark, which
+caps staging at ~64 KiB (one block) — no deep buffer. WI-4 adaptive as committed does not stage
+past 64 KiB; a follow-up is needed (raise the effective staging cap when adaptive is on, or allow a
+raised watermark alongside it).
