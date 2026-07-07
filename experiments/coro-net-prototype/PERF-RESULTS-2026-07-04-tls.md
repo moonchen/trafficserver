@@ -664,7 +664,17 @@ rounds up into the arena's 512K size class, so the knee sits at the class bounda
 benefit to reaching 1M: with n=7 the win is realized at the 384K knee and 1M buys
 nothing extra.
 
-### WI-4 — rate-adaptive staging depth: **validated (self-tuning cpu win; memory floor)**
+### WI-4 — rate-adaptive staging depth: ~~validated~~ **RETRACTED / REMOVED (2026-07-06)**
+
+> **This section is superseded by
+> [`WI-4-ADAPTIVE-STAGING-REMOVED-2026-07-06.md`](WI-4-ADAPTIVE-STAGING-REMOVED-2026-07-06.md).**
+> A follow-up investigation on 10 GbE found the rate estimator does not work across
+> normal client speeds (it under-reads 4–7×; `S` stays pinned at the 256 KiB cold-start
+> from 500 kbit to 1 Gbit), and that deep staging has no benefit regime (flat at 1 MiB,
+> *worse* for 8 MiB). The "cpu win" below was produced with a **manual 2 MiB watermark**
+> workaround on a pre-check binary — i.e. a de-facto fixed watermark, not adaptation.
+> WI-4 has been removed; the TLS write path uses a fixed watermark (default raised to
+> 256 KiB). The measurements below are left for the record but should not be relied on.
 
 WI-4 adds `proxy.config.net.io_uring.write_adaptive_depth` (0/1, default off) +
 `write_adaptive_tau_ms` (default **50**) and the `proxy.process.net.io_uring.write_adaptive_staged`

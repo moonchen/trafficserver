@@ -191,7 +191,16 @@ bloat B1's watermark bound prevents).
 
 ---
 
-## WI-4 — Rate-adaptive staging depth (`rate × τ`)  (needed regardless of WI-1)
+## WI-4 — Rate-adaptive staging depth (`rate × τ`)  ❌ TRIED & REMOVED (2026-07-06)
+
+> **Outcome: abandoned.** Implemented, then investigated on 10 GbE and removed. The
+> `rate × τ` policy is sound in principle but the only available drain-rate signal
+> (F_NOTIF timing under serialized ZC sends) under-reads the client rate 4–7× and never
+> leaves the 256 KiB cold-start for normal speeds; and the premise fails anyway — deep
+> staging is flat-benefit at 1 MiB and *counterproductive* at 8 MiB (AES-bound + cache
+> pressure). The TLS write path now uses a **fixed watermark** (default 256 KiB). Full
+> analysis: [`WI-4-ADAPTIVE-STAGING-REMOVED-2026-07-06.md`](WI-4-ADAPTIVE-STAGING-REMOVED-2026-07-06.md).
+> The design notes below are retained for context only.
 
 **Goal.** Bound how far encryption runs ahead of the socket to the client's actual
 drain rate, so a slow client gets shallow staging (bounded memory, tight
