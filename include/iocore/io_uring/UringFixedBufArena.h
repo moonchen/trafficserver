@@ -113,14 +113,6 @@ public:
   {
     return _classes[i].block_size;
   }
-  // Bytes in the largest size class, or 0 when the arena is disabled. Callers clamp a requested
-  // block size to this before drawing: a larger request exceeds the top class and falls back to
-  // the heap (a plain/anonymous send rather than send_zc_fixed).
-  int64_t
-  top_block_size() const
-  {
-    return _nclasses > 0 ? static_cast<int64_t>(_classes[_nclasses - 1].block_size) : 0;
-  }
   unsigned
   class_nblocks(size_t i) const
   {

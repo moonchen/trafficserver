@@ -192,38 +192,6 @@ write_zc_gather_enabled()
   return on;
 }
 
-// WI-4 rate-adaptive staging depth. Both knobs are RECU_DYNAMIC: RecEstablishStaticConfigInt links
-// each global to its record so a config reload updates it in place (no restart), and the initial
-// read seeds it. Linked lazily on first use so no module-init hook is needed. Default off.
-RecInt g_write_adaptive_depth  = 0;  // 0 == off
-RecInt g_write_adaptive_tau_ms = 50; // staging horizon tau, milliseconds (swept-optimal default)
-
-void
-ensure_adaptive_cfg_linked()
-{
-  static std::once_flag once;
-  std::call_once(once, [] {
-    RecEstablishStaticConfigInt(g_write_adaptive_depth, "proxy.config.net.io_uring.write_adaptive_depth");
-    RecEstablishStaticConfigInt(g_write_adaptive_tau_ms, "proxy.config.net.io_uring.write_adaptive_tau_ms");
-  });
-}
-
-bool
-write_adaptive_depth_on()
-{
-  ensure_adaptive_cfg_linked();
-  return g_write_adaptive_depth != 0;
-}
-
-int64_t
-write_adaptive_tau_ms()
-{
-  return g_write_adaptive_tau_ms > 0 ? g_write_adaptive_tau_ms : 50;
-}
-
-// Cold-start staging target used until the first drain-rate sample arrives (WI-4).
-constexpr int64_t ADAPTIVE_COLD_START_BYTES = 262144;
-
 // write_zerocopy: sends issued on the zero-copy path. write_zerocopy_copied: of those, the
 // ones the kernel fell back to copying (IORING_NOTIF_USAGE_ZC_COPIED in the notification) ---
 // a nonzero ratio means the fast path is not actually engaging.
@@ -1568,12 +1536,6 @@ IOUringNetVConnection::_write()
         if (op.flags() & IORING_CQE_F_NOTIF) {
           if (static_cast<unsigned>(n) & IORING_NOTIF_USAGE_ZC_COPIED) {
             Metrics::Counter::increment(write_zc_copied_stat);
-          } else {
-            // True zero-copy: the kernel held the source pages until the peer ACKed, so this
-            // notification is a real drain-rate sample of try_to_write bytes. A copy fallback
-            // (above) releases the pages at send time, not on ACK, so it is not a rate signal.
-            // WI-4; a strict no-op unless write_adaptive_depth is on.
-            _adaptive_note_drain(try_to_write);
           }
         }
       }
@@ -1652,51 +1614,6 @@ IOUringNetVConnection::_write()
       // the user to produce more once the buffer runs low).
     }
   }
-}
-
-void
-IOUringNetVConnection::_adaptive_note_drain(int64_t bytes_released)
-{
-  if (!write_adaptive_depth_on() || bytes_released <= 0) {
-    return; // feature off (or nothing released): strict no-op
-  }
-  ink_hrtime now = ink_get_hrtime();
-  if (_adaptive_last_notif == 0) {
-    _adaptive_last_notif = now; // first sample only starts the clock; there is no interval yet
-    return;
-  }
-  ink_hrtime dt        = now - _adaptive_last_notif;
-  _adaptive_last_notif = now;
-  if (dt <= 0) {
-    return; // same-tick / clock skew: keep the prior estimate (guards the divide below)
-  }
-  double inst = static_cast<double>(bytes_released) * HRTIME_SECOND / static_cast<double>(dt);
-  if (_adaptive_rate_bps <= 0.0) {
-    _adaptive_rate_bps = inst; // seed the EWMA with the first real interval
-  } else {
-    constexpr double alpha = 0.25;
-    _adaptive_rate_bps     = alpha * inst + (1.0 - alpha) * _adaptive_rate_bps;
-  }
-}
-
-int64_t
-IOUringNetVConnection::adaptive_stage_target() const
-{
-  if (!write_adaptive_depth_on()) {
-    return 0; // feature off: the SSL VC treats 0 as "no adaptive gate / no clamp" (strict no-op)
-  }
-  if (_adaptive_rate_bps <= 0.0) {
-    return ADAPTIVE_COLD_START_BYTES; // no estimate yet: 256 KiB default, then adapt
-  }
-  double  tau_s  = static_cast<double>(write_adaptive_tau_ms()) / 1000.0;
-  int64_t target = static_cast<int64_t>(_adaptive_rate_bps * tau_s);
-  // Floor at the arena's 64 KiB block floor: this target also sizes the ciphertext blocks (see
-  // the clamp in SSLNetVConnection::_encrypt_data_for_transport), which must stay at/above a
-  // registerable block so a slow client still stages whole records rather than fragments.
-  if (target < UringFixedBufArena::MIN_BLOCK_SIZE) {
-    target = UringFixedBufArena::MIN_BLOCK_SIZE;
-  }
-  return target;
 }
 
 int

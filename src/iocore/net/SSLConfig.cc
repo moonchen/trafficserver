@@ -60,7 +60,7 @@ int                SSLCertificateConfig::configid                    = 0;
 int                SSLTicketKeyConfig::configid                      = 0;
 int                SSLConfigParams::ssl_maxrecord                    = 0;
 int                SSLConfigParams::ssl_misc_max_iobuffer_size_index = 8;
-int                SSLConfigParams::ssl_write_buffer_water_mark      = 65536;
+int                SSLConfigParams::ssl_write_buffer_water_mark      = 262144;
 bool               SSLConfigParams::ssl_allow_client_renegotiation   = false;
 bool               SSLConfigParams::ssl_ocsp_enabled                 = false;
 int                SSLConfigParams::ssl_ocsp_cache_timeout           = 3600;
@@ -577,17 +577,7 @@ SSLConfigParams::initialize(ConfigContext ctx)
 
   ssl_misc_max_iobuffer_size_index = RecGetRecordInt("proxy.config.ssl.misc.io.max_buffer_index").value_or(0);
 
-  ssl_write_buffer_water_mark = RecGetRecordInt("proxy.config.ssl.write_buffer_water_mark").value_or(65536);
-
-  // proxy.config.net.io_uring.write_adaptive_depth self-tunes the ciphertext staging depth from the
-  // client's drain rate -- exactly what ssl.write_buffer_water_mark bounds statically. The two are
-  // mutually exclusive; setting both is contradictory config, so reject it loudly rather than let one
-  // silently shadow the other.
-  if (RecGetRecordInt("proxy.config.net.io_uring.write_adaptive_depth").value_or(0) != 0 && ssl_write_buffer_water_mark != 65536) {
-    CfgLoadLog(ctx, DL_Fatal,
-               "proxy.config.net.io_uring.write_adaptive_depth and proxy.config.ssl.write_buffer_water_mark are "
-               "mutually exclusive (adaptive depth self-tunes staging); unset one");
-  }
+  ssl_write_buffer_water_mark = RecGetRecordInt("proxy.config.ssl.write_buffer_water_mark").value_or(262144);
 
   // Enable client regardless of config file settings as remap file
   // can cause HTTP layer to connect using SSL. But only if SSL

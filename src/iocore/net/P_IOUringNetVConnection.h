@@ -121,21 +121,7 @@ public:
   IOUringNetVConnection *_cancel_retry_next    = nullptr;
   bool                   _cancel_retry_pending = false;
 
-  // WI-4 rate-adaptive staging depth (proxy.config.net.io_uring.write_adaptive_depth). The
-  // layered SSLNetVConnection consults its transport here to bound how far SSL_write runs ahead
-  // of the socket: returns the staging target S = drain_rate * tau in bytes, or 0 when the
-  // feature is off (the SSL VC then behaves exactly as if the feature were absent). Cold start
-  // (no drain-rate sample yet) returns the 256 KiB default. Cheap: a config load + a multiply.
-  int64_t adaptive_stage_target() const;
-
 private:
-  // Feed the drain-rate EWMA from a _write F_NOTIF completion: the notification means the kernel
-  // released the just-sent pinned ciphertext (== the peer ACKed those bytes), so the completion
-  // stream is a drain-rate clock. A strict no-op unless write_adaptive_depth is on.
-  void       _adaptive_note_drain(int64_t bytes_released);
-  double     _adaptive_rate_bps   = 0.0; // EWMA drain rate, bytes/second; 0 == no estimate yet
-  ink_hrtime _adaptive_last_notif = 0;   // hrtime of the previous F_NOTIF drain; 0 == cold start
-
   // The asynchronous read/write/connect coroutines: drive one io_uring op, await
   // it, then signal. Fire-and-forget (DetachedTask); the frame self-cleans at
   // completion.
