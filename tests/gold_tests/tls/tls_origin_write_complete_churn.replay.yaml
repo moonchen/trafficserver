@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with this
+# work for additional information regarding copyright ownership.  The ASF
+# licenses this file to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
+meta:
+  version: "1.0"
+
+# Each session is a separate client connection that drives several POST
+# transactions over one keep-alive origin connection. The POST bodies force the
+# layered SSL origin VC through repeated encrypt-and-drain WRITE_COMPLETE cycles;
+# combining that with the global pool + several ET_NET threads (see the test)
+# churns origin sessions (release/reacquire/migrate) while writes are completing
+# -- the ingredients of the production WRITE_COMPLETE-after-close crash.
+sessions:
+- protocol:
+  - name: tls
+    sni: example.com
+  - name: tcp
+  - name: ip
+  transactions:
+  - client-request:
+      method: POST
+      url: /post/small
+      version: "1.1"
+      headers:
+        fields:
+        - [ Host, example.com ]
+        - [ uuid, "1" ]
+        - [ Content-Length, "512" ]
+      content:
+        encoding: plain
+        size: 512
+    proxy-response:
+      status: 200
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, "16" ]
+
+  - client-request:
+      method: POST
+      url: /post/medium
+      version: "1.1"
+      headers:
+        fields:
+        - [ Host, example.com ]
+        - [ uuid, "2" ]
+        - [ Content-Length, "20000" ]
+      content:
+        encoding: plain
+        size: 20000
+    proxy-response:
+      status: 200
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, "16" ]
+
+  - client-request:
+      method: POST
+      url: /post/large
+      version: "1.1"
+      headers:
+        fields:
+        - [ Host, example.com ]
+        - [ uuid, "3" ]
+        - [ Content-Length, "100000" ]
+      content:
+        encoding: plain
+        size: 100000
+    proxy-response:
+      status: 200
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, "16" ]
+
+  - client-request:
+      method: GET
+      url: /get/tail
+      version: "1.1"
+      headers:
+        fields:
+        - [ Host, example.com ]
+        - [ uuid, "4" ]
+    proxy-response:
+      status: 200
+    server-response:
+      status: 200
+      reason: OK
+      headers:
+        fields:
+        - [ Content-Length, "16" ]

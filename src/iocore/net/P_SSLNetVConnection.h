@@ -436,13 +436,39 @@ private:
   enum class SignalSide { READ, WRITE };
   int        _signal_user(SignalSide side, int event);
   SignalSide _handshake_fail_side() const;
-  // Schedule the user-facing WRITE_COMPLETE to be delivered from a clean dispatch (see the
-  // definition and _write_complete_pending).
-  void _scheduleWriteComplete();
+  // Deliver the user-facing WRITE_COMPLETE synchronously and, if that causes the consumer to
+  // reentrantly queue a new write, self-schedule a clean-stack rearm (see the definition and
+  // _write_rearm_pending).
+  int  _deliverWriteComplete();
+  void _scheduleWriteRearm();
 
-  // Re-entrancy depth of _signal_user; the outermost unwind performs the deferred free of a
-  // VC that terminated while a signal was still on the stack.
+  // Re-entrancy depth covering two distinct hazards with the same fix: (1) _signal_user's own
+  // synchronous re-entrancy (a consumer's handler drives more work on this same VC before
+  // unwinding), and (2) synchronous re-entrancy into a foreign C callback frame -- OpenSSL
+  // invoking one of our registered hooks (SNI/cert/client-hello/verify) mid SSL_accept()/
+  // SSL_connect()/SSL_read()/SSL_write()/SSL_shutdown(), which may itself call back into us
+  // (e.g. a plugin calling TSVConnAbort from a hook). Both cases make it unsafe to free `this`
+  // or its owned _ssl inline: case (1) because an enclosing frame on our own stack still
+  // expects `this` to be valid, case (2) because OpenSSL's own C code keeps running after the
+  // callback returns and would touch a freed _ssl. do_io_close's inline-free decision and
+  // _signal_user's unwind-time free both gate on recursion == 0 -- never on lerrno or on
+  // which specific call triggered the close. See RecursionGuard below; wrap every OpenSSL
+  // entry point with one, scoped tightly to just that call.
   int recursion = 0;
+
+  // RAII guard for `recursion` -- construct immediately before an OpenSSL call that may invoke
+  // a registered ATS callback (SSL_accept/SSL_connect/SSL_do_handshake/SSL_read/SSL_write/
+  // SSL_shutdown), scoped to end immediately after that call returns. Using RAII here (rather
+  // than manual increment/decrement, as _signal_user still does for its own narrower,
+  // single-exit-path case) avoids the classic bug of forgetting to decrement on one of several
+  // early-return paths through the surrounding function.
+  struct RecursionGuard {
+    int &r;
+    explicit RecursionGuard(int &r) : r(r) { ++r; }
+    ~RecursionGuard() { --r; }
+    RecursionGuard(const RecursionGuard &)            = delete;
+    RecursionGuard &operator=(const RecursionGuard &) = delete;
+  };
 
   std::unique_ptr<SSL, decltype(&SSL_free)>                              _ssl{nullptr, &SSL_free};
   std::unique_ptr<MIOBuffer, decltype(&free_MIOBuffer)>                  _read_buf;
@@ -476,23 +502,31 @@ private:
   // ClientHello). Like the blind-tunnel handoff above, downgrading to a plain UnixNetVC frees
   // this VC, so it is deferred out of line (schedule_imm; see sslServerHandShakeEvent / mainEvent).
   bool _downgrade_to_plain_pending = false;
-  // True while an out-of-line read drive (schedule_imm) is pending so we never
-  // queue more than one. See do_io_read / _handle_transport_eos / mainEvent.
-  bool _read_drive_scheduled = false;
-  // The pending read-drive event, so it can be cancelled if this VC is freed
-  // before it fires (otherwise the stale event would run on freed memory).
-  Event *_read_drive_event = nullptr;
+  // True while a piece of self-targeted deferred work (schedule_imm) is pending so we
+  // never queue more than one. This one slot multiplexes several purposes -- the rbio
+  // read-drive (do_io_read / _handle_transport_eos / mainEvent), blind-tunnel handoff,
+  // downgrade-to-plain, async-hook handshake resumption, and the write-rearm follow-up
+  // (_scheduleWriteRearm) -- all of them self-targeted (re-invoke this VC's own
+  // mainEvent, never a consumer), so none carry the receiver-liveness risk deferred
+  // consumer-facing signals do. See mainEvent's scheduled-dispatch branch for the
+  // dispatch-time disambiguation among these purposes.
+  bool _deferred_work_scheduled = false;
+  // The pending deferred-work event, so it can be cancelled if this VC is freed, its
+  // mutex changes (_adoptConsumerMutex), or it migrates threads before the event fires
+  // (otherwise the stale event would run on freed memory, under the wrong lock, or on
+  // the wrong thread).
+  Event *_deferred_work_event = nullptr;
   // True while do_io_close is lingering to flush buffered ciphertext (the response
   // plus close-notify) to the transport before tearing it down. See do_io_close /
   // _handle_transport_write_ready.
   bool _closing = false;
-  // Set when all queued plaintext has been encrypted AND drained to the transport, to
-  // deliver the user-facing WRITE_COMPLETE from a clean scheduled dispatch instead of
-  // synchronously from inside the inner transport's net_write_io stack. The consumer
-  // usually closes/reconfigures from its WRITE_COMPLETE handler, which would reset the
-  // transport write VIO underneath the live net_write_io (use-after-free). See
-  // _handle_transport_write_ready / mainEvent.
-  bool _write_complete_pending = false;
+  // Set when a consumer reentrantly queues a new write from its (synchronously-delivered)
+  // WRITE_COMPLETE handler while we're nested inside the inner transport's net_write_io. That
+  // reentrant reenable() is doomed on this stack -- net_write_io's own still-executing tail
+  // finds _write_buf empty (demand-driven encryption hasn't run yet) and disables the write,
+  // undoing it. This flag arms a self-targeted, clean-stack re-issue of that reenable() once
+  // net_write_io's current pass has fully unwound. See _deliverWriteComplete / mainEvent.
+  bool _write_rearm_pending = false;
   static bool
   isTerminated(TransportState state)
   {
