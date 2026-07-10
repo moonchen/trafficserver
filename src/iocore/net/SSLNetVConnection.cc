@@ -1146,7 +1146,7 @@ SSLNetVConnection::~SSLNetVConnection()
   got_local_addr  = false;
   attributes      = 0;
   options.reset();
-  _sslState = SslState::INIT;
+  _sslState = SslState::HANDSHAKING;
 
   netvc_context = NET_VCONNECTION_UNSET;
   ink_assert(!link.next && !link.prev);
@@ -1470,7 +1470,6 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   }
 #endif
 
-  _sslState             = SslState::HANDSHAKE_IN_PROGRESS;
   ssl_error_t ssl_error = this->_ssl_accept();
 #if TS_USE_TLS_ASYNC
   if (ssl_error == SSL_ERROR_WANT_ASYNC) {
@@ -1526,7 +1525,6 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
           // start a blind tunnel if tr-pass is set and data does not look like ClientHello
           SSLVCDebug(this, "Data does not look like SSL handshake, starting blind tunnel");
           this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-          _sslState        = SslState::HANDSHAKE_IN_PROGRESS;
           return EVENT_CONT;
         } else {
           SSLVCDebug(this, "Give up");
@@ -1635,7 +1633,6 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 #if defined(SSL_ERROR_WANT_SNI_RESOLVE) || defined(SSL_ERROR_WANT_X509_LOOKUP) || defined(SSL_ERROR_PENDING_CERTIFICATE)
     if (this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL || SslVConnOp::SSL_HOOK_OP_TUNNEL == hookOpRequested) {
       this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-      _sslState        = SslState::HANDSHAKE_IN_PROGRESS;
       return EVENT_CONT;
     } else {
       //  Stopping for some other reason, perhaps loading certificate
@@ -3124,10 +3121,9 @@ SSLNetVConnection::startEvent(int event, void *data)
     // This is where we would set up the SSL context and start the handshake.
     _transport_state = TransportState::TRANSPORT_CONNECTED;
     ink_release_assert(unvc != nullptr);
-    ink_release_assert(_sslState == SslState::INIT);
+    ink_release_assert(this->_unvc == nullptr); // not wired up yet (was: _sslState == INIT)
     this->_unvc = unvc;
     SET_HANDLER(&SSLNetVConnection::mainEvent);
-    _sslState = SslState::HANDSHAKE_WANTED;
     // Once the handshake starts, we will need to be ready to write
     _transport_read_vio  = _unvc->do_io_read(this, INT64_MAX, _read_buf.get());
     _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);

@@ -114,16 +114,15 @@ class SSLNetVConnection : public NetVConnection,
 private:
   // SSL state management
   enum class SslState {
-    INIT                  = 0, // SSL object not created or initialized
-    HANDSHAKE_WANTED      = 1, // Ready to start or continue the SSL handshake
-    HANDSHAKE_IN_PROGRESS = 2, // SSL_connect or SSL_accept called, waiting for IO
-    HANDSHAKE_DONE        = 3, // Handshake complete, ready for application data
-    SHUTDOWN_IN_PROGRESS  = 4, // Graceful close: draining buffered ciphertext (+ close-notify) to
-                               // the transport before teardown. do_io_close's lingering close.
-    CLOSED = 5,                // Clean SSL shutdown complete (close_notify sent/received)
-    ERROR  = 6                 // An SSL error occurred (handshake, read/write, or shutdown)
+    HANDSHAKING = 0,          // Handshake not yet complete: created, in ClientHello, or mid-handshake.
+                              // The sub-stages carried no read-side distinction, so they are one state.
+    HANDSHAKE_DONE       = 1, // Handshake complete, ready for application data
+    SHUTDOWN_IN_PROGRESS = 2, // Graceful close: draining buffered ciphertext (+ close-notify) to
+                              // the transport before teardown. do_io_close's lingering close.
+    CLOSED = 3,               // Clean SSL shutdown complete (close_notify sent/received)
+    ERROR  = 4                // An SSL error occurred (handshake, read/write, or shutdown)
   };
-  enum SslState _sslState = SslState::INIT;
+  enum SslState _sslState = SslState::HANDSHAKING;
   static bool
   isTerminated(SslState state)
   {
