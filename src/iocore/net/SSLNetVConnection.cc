@@ -443,7 +443,7 @@ SSLNetVConnection::_releaseHandshakeReader()
   // response and stalls. Free it once the handshake is established (and no blind tunnel will adopt
   // it) so the rbio recycles and can stream bodies larger than one block.
   if (handShakeHolder != nullptr && getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
-      !_blind_tunnel_handoff_pending) {
+      _pending_handoff != PendingHandoff::BLIND_TUNNEL) {
     handShakeHolder->dealloc();
     handShakeHolder = nullptr;
   }
@@ -519,7 +519,7 @@ SSLNetVConnection::_trigger_ssl_read()
       // Defer the handoff out of line: it frees this VC, and we may be on the stack of a
       // transport read handler that inspects _sslState after we return. The scheduled
       // mainEvent dispatch is the one safe place to free inline.
-      _blind_tunnel_handoff_pending = true;
+      _pending_handoff = PendingHandoff::BLIND_TUNNEL;
       if (_transport_read_vio != nullptr) {
         // No more SSL-side reads before the handoff; the pass-through VC re-drives the
         // transport itself, and the buffered bytes remain in _read_buf.
@@ -1035,8 +1035,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   // half-closed its write side (TRANSPORT_CLOSED) while still reading our response; only a
   // truly broken transport (TRANSPORT_ERROR) skips the drain and tears down inline.
   if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_state != TransportState::TRANSPORT_ERROR) {
-    _sslState = SslState::SHUTDOWN_IN_PROGRESS;
-    _closing  = true;
+    _sslState = SslState::SHUTDOWN_IN_PROGRESS; // == draining; see _isDraining()
     if (_write_buf_reader && _write_buf_reader->read_avail() > 0) {
       Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: draining %" PRId64 " buffered bytes before close vc %p",
           _write_buf_reader->read_avail(), this);
@@ -1514,7 +1513,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
           // hand the buffered packet to HTTP processing. _downgradeToPlain() frees this VC, and we
           // are on the handshake read stack that still dereferences `this` after we return, so defer
           // it out of line to a clean mainEvent dispatch -- the same handoff the blind tunnel uses.
-          _downgrade_to_plain_pending = true;
+          _pending_handoff = PendingHandoff::DOWNGRADE_PLAIN;
           if (_transport_read_vio != nullptr) {
             _transport_read_vio->disable();
           }
@@ -2129,8 +2128,9 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
   // acquire. If the VC is mid-operation (handshaking, closing, or pending a
   // tunnel/downgrade handoff) decline rather than risk migrating mid-flight; the
   // caller (HttpSessionManager) then opens a fresh connection.
-  bool const migratable = _sslState == SslState::HANDSHAKE_DONE && recursion == 0 && !_closing && !_blind_tunnel_handoff_pending &&
-                          !_downgrade_to_plain_pending;
+  // _sslState == HANDSHAKE_DONE already excludes draining/handshaking; also require no armed
+  // handoff (which is a mid-handshake decision, so normally implied, but checked explicitly).
+  bool const migratable = _sslState == SslState::HANDSHAKE_DONE && recursion == 0 && _pending_handoff == PendingHandoff::NONE;
   if (!migratable) {
     return nullptr;
   }
@@ -2728,14 +2728,14 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
 
   ink_release_assert(vio == _transport_read_vio);
 
-  // mainEvent owns the terminated/_closing gate (it early-returns on isTerminated(_sslState),
-  // and short-circuits reads while _closing, before dispatching here), so no redundant entry
+  // mainEvent owns the terminated/draining gate (it early-returns on isTerminated(_sslState),
+  // and short-circuits reads while _isDraining(), before dispatching here), so no redundant entry
   // check is needed.
   if (isTerminated(_transport_state)) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: transport closed, but we have data to read", this);
   }
 
-  if (_blind_tunnel_handoff_pending) {
+  if (_pending_handoff == PendingHandoff::BLIND_TUNNEL) {
     // The blind-tunnel decision is made; the deferred handoff will re-drive the transport
     // from the pass-through VC. Do not run any more SSL-side reads here.
     return EVENT_CONT;
@@ -2766,7 +2766,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
   _releaseHandshakeReader();
 
-  if (_closing) {
+  if (_isDraining()) {
     // Lingering close: flush the remaining ciphertext (response + close-notify), then
     // tear down. read_avail()==0 means it has all been handed to the socket.
     if (!_write_buf_reader || _write_buf_reader->read_avail() == 0) {
@@ -3053,7 +3053,7 @@ SSLNetVConnection::_handle_transport_eos(VIO *vio)
   // inner transport's read path is still on the stack. Skip while closing: the
   // consumer is gone and we are only flushing our write side (the peer may have
   // half-closed its write while still reading our response).
-  if (!_closing && !isTerminated(_sslState) && !_deferred_work_scheduled) {
+  if (!_isDraining() && !isTerminated(_sslState) && !_deferred_work_scheduled) {
     _deferred_work_scheduled = true;
     _deferred_work_event     = this_ethread()->schedule_imm(this);
   }
@@ -3073,7 +3073,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   lerrno           = err;
   // If we were lingering to flush a response, the transport is now broken; abandon
   // the drain and tear down.
-  if (_closing) {
+  if (_isDraining()) {
     _sslState = SslState::CLOSED;
     this->free_thread(this_ethread());
     return EVENT_DONE;
@@ -3173,17 +3173,17 @@ SSLNetVConnection::mainEvent(int event, void *data)
   if (data != _transport_read_vio && data != _transport_write_vio) {
     _deferred_work_scheduled = false;
     _deferred_work_event     = nullptr; // this event is now firing
-    if (_blind_tunnel_handoff_pending) {
+    if (_pending_handoff == PendingHandoff::BLIND_TUNNEL) {
       // Safe place to free this VC inline: we return EVENT_DONE immediately after.
-      _blind_tunnel_handoff_pending = false;
+      _pending_handoff = PendingHandoff::NONE;
       _handoffBlindTunnel();
       return EVENT_DONE;
     }
-    if (_downgrade_to_plain_pending) {
+    if (_pending_handoff == PendingHandoff::DOWNGRADE_PLAIN) {
       // Safe place to free this VC inline (see sslServerHandShakeEvent): we return EVENT_DONE
       // immediately after, so _downgradeToPlain()'s inline do_io_close() cannot pull `this` out
       // from under a caller still on the handshake read stack.
-      _downgrade_to_plain_pending = false;
+      _pending_handoff = PendingHandoff::NONE;
       _downgradeToPlain();
       return EVENT_DONE;
     }
@@ -3224,7 +3224,7 @@ SSLNetVConnection::mainEvent(int event, void *data)
       }
       return EVENT_DONE;
     }
-    if (_closing) {
+    if (_isDraining()) {
       // Close-drain teardown deferred out of the inner transport's net_write_io. If the
       // buffer has drained, free on this clean stack; otherwise the drain is still in
       // flight (the transport reschedules itself), so wait for the next dispatch.
@@ -3254,13 +3254,13 @@ SSLNetVConnection::mainEvent(int event, void *data)
     return EVENT_DONE;
   }
 
-  // do_io_close() may have started a deferred close-drain (_closing, _sslState ==
-  // SHUTDOWN_IN_PROGRESS, which is not yet "terminated"). Once the consumer has closed us it
-  // has detached and may already be freed, so a transport event arriving mid-drain must NOT be
-  // routed to its (now dangling) continuation in _user_*_vio. The write path keeps flushing the
-  // drain and EOS/ERROR tear down in their helpers (they all check _closing), but an idle
-  // timeout and a consumer-less read would otherwise reach _signal_user -- handle them here.
-  if (_closing) {
+  // do_io_close() may have started a deferred close-drain (_sslState == SHUTDOWN_IN_PROGRESS,
+  // which is not yet "terminated"). Once the consumer has closed us it has detached and may
+  // already be freed, so a transport event arriving mid-drain must NOT be routed to its (now
+  // dangling) continuation in _user_*_vio. The write path keeps flushing the drain and EOS/ERROR
+  // tear down in their helpers (they all check _isDraining()), but an idle timeout and a
+  // consumer-less read would otherwise reach _signal_user -- handle them here.
+  if (_isDraining()) {
     switch (event) {
     case VC_EVENT_INACTIVITY_TIMEOUT:
     case VC_EVENT_ACTIVE_TIMEOUT:
@@ -3273,7 +3273,7 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // No consumer for inbound bytes during the drain; ignore and keep flushing the write side.
       return EVENT_CONT;
     default:
-      break; // WRITE_*/EOS/ERROR fall through; their helpers handle _closing.
+      break; // WRITE_*/EOS/ERROR fall through; their helpers handle the drain.
     }
   }
 

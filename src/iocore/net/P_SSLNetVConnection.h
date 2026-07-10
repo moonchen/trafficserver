@@ -118,10 +118,10 @@ private:
     HANDSHAKE_WANTED      = 1, // Ready to start or continue the SSL handshake
     HANDSHAKE_IN_PROGRESS = 2, // SSL_connect or SSL_accept called, waiting for IO
     HANDSHAKE_DONE        = 3, // Handshake complete, ready for application data
-    SHUTDOWN_WANTED       = 4, // Application requested close, SSL_shutdown needs to run
-    SHUTDOWN_IN_PROGRESS  = 5, // SSL_shutdown called, waiting for IO or peer close_notify
-    CLOSED                = 6, // Clean SSL shutdown complete (close_notify sent/received)
-    ERROR                 = 7  // An SSL error occurred (handshake, read/write, or shutdown)
+    SHUTDOWN_IN_PROGRESS  = 4, // Graceful close: draining buffered ciphertext (+ close-notify) to
+                               // the transport before teardown. do_io_close's lingering close.
+    CLOSED = 5,                // Clean SSL shutdown complete (close_notify sent/received)
+    ERROR  = 6                 // An SSL error occurred (handshake, read/write, or shutdown)
   };
   enum SslState _sslState = SslState::INIT;
   static bool
@@ -129,6 +129,28 @@ private:
   {
     return state == SslState::CLOSED || state == SslState::ERROR;
   }
+  // In the graceful close-drain (do_io_close's lingering close): user VIOs are severed and the
+  // transport is flushing the final ciphertext before teardown. SHUTDOWN_IN_PROGRESS is reached
+  // from exactly one site (do_io_close) and the VC is freed the instant it leaves the state, so
+  // this is the sole meaning of "draining".
+  bool
+  _isDraining() const
+  {
+    return _sslState == SslState::SHUTDOWN_IN_PROGRESS;
+  }
+
+  // A deferred handshake-time handoff that frees this VC and hands its transport elsewhere. Both
+  // arms are decided mid-handshake and executed out of line on a clean mainEvent dispatch (they
+  // cannot free this VC inline while a transport read handler still inspects it). Kept as its own
+  // small axis rather than folded into SslState: the blind-tunnel arm can be armed while the SSL
+  // state is still HANDSHAKE_DONE (the OPT_TUNNEL path), so it must not overwrite that value.
+  enum class PendingHandoff {
+    NONE,            // no deferred handoff armed
+    BLIND_TUNNEL,    // hand the transport to a dedicated pass-through VC (SNI blind-tunnel route)
+    DOWNGRADE_PLAIN, // convert to a plain UnixNetVConnection (leading bytes are not a ClientHello)
+  };
+  PendingHandoff _pending_handoff = PendingHandoff::NONE;
+
   void _trackFirstHandshake();
 
 public:
@@ -493,15 +515,6 @@ private:
     TRANSPORT_ERROR       // TCP connection encountered an error
   };
   TransportState _transport_state = TransportState::TRANSPORT_INIT;
-  // True once the inbound blind-tunnel decision has been made. The handoff to a
-  // dedicated pass-through VC is deferred out of line (schedule_imm; see
-  // _trigger_ssl_read / mainEvent) so we never free this VC while a transport read
-  // handler is still on the stack.
-  bool _blind_tunnel_handoff_pending = false;
-  // True once the inbound allow-plain decision has been made (the leading bytes are not a
-  // ClientHello). Like the blind-tunnel handoff above, downgrading to a plain UnixNetVC frees
-  // this VC, so it is deferred out of line (schedule_imm; see sslServerHandShakeEvent / mainEvent).
-  bool _downgrade_to_plain_pending = false;
   // True while a piece of self-targeted deferred work (schedule_imm) is pending so we
   // never queue more than one. This one slot multiplexes several purposes -- the rbio
   // read-drive (do_io_read / _handle_transport_eos / mainEvent), blind-tunnel handoff,
@@ -516,10 +529,6 @@ private:
   // (otherwise the stale event would run on freed memory, under the wrong lock, or on
   // the wrong thread).
   Event *_deferred_work_event = nullptr;
-  // True while do_io_close is lingering to flush buffered ciphertext (the response
-  // plus close-notify) to the transport before tearing it down. See do_io_close /
-  // _handle_transport_write_ready.
-  bool _closing = false;
   // Set when a consumer reentrantly queues a new write from its (synchronously-delivered)
   // WRITE_COMPLETE handler while we're nested inside the inner transport's net_write_io. That
   // reentrant reenable() is doomed on this stack -- net_write_io's own still-executing tail
