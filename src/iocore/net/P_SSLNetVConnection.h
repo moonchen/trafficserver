@@ -273,8 +273,7 @@ public:
   void
   initialize_handshake_buffers()
   {
-    this->handShakeHolder    = this->_read_buf->alloc_reader();
-    this->handShakeBioStored = 0;
+    this->handShakeHolder = this->_read_buf->alloc_reader();
   }
 
   void
@@ -400,7 +399,6 @@ private:
   bool             sslClientRenegotiationAbort = false;
   bool             first_ssl_connect           = true;
   IOBufferReader  *handShakeHolder             = nullptr;
-  int              handShakeBioStored          = 0;
 
   bool transparentPassThrough = false;
   bool allowPlain             = false;
@@ -506,28 +504,32 @@ public:
   int mainEvent(int event, void *data);
 
 private:
+  // The connecting/connected progression carried no observable behavior (nothing ever read it),
+  // so the transport axis holds only three states: live, or terminated by EOS/error. The
+  // terminal status is orthogonal to _sslState -- after transport EOS the VC keeps delivering
+  // ciphertext still buffered in the rbio while _sslState remains HANDSHAKE_DONE.
   enum class TransportState {
-    TRANSPORT_INIT,       // Initial state, not connected
-    TRANSPORT_CONNECTING, // TCP connection requested
-    TRANSPORT_CONNECTED,  // TCP connection established
-    TRANSPORT_CLOSED,     // TCP connection received EOS or normal close initiated
-    TRANSPORT_ERROR       // TCP connection encountered an error
+    TRANSPORT_LIVE,   // Connecting or established -- not terminated
+    TRANSPORT_CLOSED, // TCP connection received EOS or normal close initiated
+    TRANSPORT_ERROR   // TCP connection encountered an error
   };
-  TransportState _transport_state = TransportState::TRANSPORT_INIT;
-  // True while a piece of self-targeted deferred work (schedule_imm) is pending so we
-  // never queue more than one. This one slot multiplexes several purposes -- the rbio
-  // read-drive (do_io_read / _handle_transport_eos / mainEvent), blind-tunnel handoff,
+  TransportState _transport_state = TransportState::TRANSPORT_LIVE;
+  // The pending self-targeted deferred-work event (schedule_imm), or nullptr when none is
+  // outstanding -- we never queue more than one. This one slot multiplexes several purposes --
+  // the rbio read-drive (do_io_read / _handle_transport_eos / mainEvent), blind-tunnel handoff,
   // downgrade-to-plain, async-hook handshake resumption, and the write-rearm follow-up
-  // (_scheduleWriteRearm) -- all of them self-targeted (re-invoke this VC's own
-  // mainEvent, never a consumer), so none carry the receiver-liveness risk deferred
-  // consumer-facing signals do. See mainEvent's scheduled-dispatch branch for the
-  // dispatch-time disambiguation among these purposes.
-  bool _deferred_work_scheduled = false;
-  // The pending deferred-work event, so it can be cancelled if this VC is freed, its
-  // mutex changes (_adoptConsumerMutex), or it migrates threads before the event fires
-  // (otherwise the stale event would run on freed memory, under the wrong lock, or on
-  // the wrong thread).
+  // (_scheduleWriteRearm) -- all of them self-targeted (re-invoke this VC's own mainEvent, never
+  // a consumer), so none carry the receiver-liveness risk deferred consumer-facing signals do.
+  // See mainEvent's scheduled-dispatch branch for the dispatch-time disambiguation among these
+  // purposes. Held as a pointer (not a bool) so it can be cancelled if this VC is freed, its
+  // mutex changes (_adoptConsumerMutex), or it migrates threads before the event fires (otherwise
+  // the stale event would run on freed memory, under the wrong lock, or on the wrong thread).
   Event *_deferred_work_event = nullptr;
+  bool
+  _deferred_work_pending() const
+  {
+    return _deferred_work_event != nullptr;
+  }
   // Set when a consumer reentrantly queues a new write from its (synchronously-delivered)
   // WRITE_COMPLETE handler while we're nested inside the inner transport's net_write_io. That
   // reentrant reenable() is doomed on this stack -- net_write_io's own still-executing tail
