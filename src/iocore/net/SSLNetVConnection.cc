@@ -1199,11 +1199,8 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
     Dbg(dbg_ctl_ssl, "Stopping handshake due to server shutting down.");
     return EVENT_ERROR;
   }
-  if (this->get_tls_handshake_begin_time() == 0) {
-    this->_record_tls_handshake_begin_time();
-    // net_activity will not be triggered until after the handshake
-    set_inactivity_timeout(HRTIME_SECONDS(SSLConfigParams::ssl_handshake_timeout_in));
-  }
+  // The handshake begin time and its inactivity timeout are recorded/installed together in
+  // _trackFirstHandshake(), which every caller runs before reaching here.
   SSLConfig::scoped_config params;
   switch (event) {
   case SSL_EVENT_SERVER:
@@ -3271,6 +3268,12 @@ SSLNetVConnection::mainEvent(int event, void *data)
     return _handle_transport_error(transport_vio, _unvc->lerrno); // Call helper
   case VC_EVENT_INACTIVITY_TIMEOUT:
   case VC_EVENT_ACTIVE_TIMEOUT:
+    // A timeout before the handshake completes is the handshake timeout expiring (installed in
+    // _trackFirstHandshake); note it explicitly since the teardown below goes through the generic
+    // timeout path, not the handshake driver.
+    if (!getSSLHandShakeComplete()) {
+      Dbg(dbg_ctl_ssl, "ssl handshake for vc %p expired, release the connection", this);
+    }
     // Propagate the transport timeout to the consumer so it tears the connection down,
     // routed to whichever side's transport VIO timed out. Without this the SSL VC would
     // ignore transport timeouts (idle connections would never close) and log a spurious
@@ -3679,5 +3682,11 @@ SSLNetVConnection::_trackFirstHandshake()
   bool is_first = this->get_tls_handshake_begin_time() == 0;
   if (is_first) {
     this->_record_tls_handshake_begin_time();
+    // Install the handshake inactivity timeout atomically with recording the begin time:
+    // net_activity is not triggered until the handshake completes, so an idle partial
+    // handshake is bounded only by this timer. Recording the timestamp here while installing
+    // the timer elsewhere left that install gated on a timestamp this call had already set,
+    // so the configured ssl.handshake_timeout_in never took effect for a fully idle handshake.
+    set_inactivity_timeout(HRTIME_SECONDS(SSLConfigParams::ssl_handshake_timeout_in));
   }
 }
