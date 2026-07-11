@@ -113,3 +113,15 @@ TEST_CASE("baseline: outbound SUT completes a real handshake and moves a record"
   fx.consumer()->read_reader->memcpy(got, 4);
   CHECK(std::string(got, 4) == "ping");
 }
+
+TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  fx.attach_cancelled();
+
+  // Cancelled branch must close the mock inner and must NOT notify the consumer of an open.
+  CHECK(fx.mock()->closed());
+  CHECK_FALSE(fx.consumer()->got_open);
+  // Reaching here without an assert/abort is the #7 regression signal (pre-Phase-A this aborted).
+  SUCCEED("cancel-before-open did not crash");
+}

@@ -269,6 +269,25 @@ ReducerFixture::attach()
 }
 
 void
+ReducerFixture::attach_cancelled()
+{
+  _vc        = sslNetVCAllocator.alloc();
+  _vc->mutex = _mutex;
+  _vc->set_context(NET_VCONNECTION_OUT);
+  _vc->set_open_continuation(_consumer);
+
+  _mock         = new MockTransportVC();
+  _mock->mutex  = _mutex;
+  _mock->thread = this_ethread();
+
+  Action *a = _vc->arm_connect_action(_consumer);
+  a->cancel(); // sets _connect_action.cancelled
+
+  SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+  _vc->startEvent(NET_EVENT_OPEN, _mock); // hits the cancelled branch: closes mock, frees outer
+}
+
+void
 ReducerFixture::wake_sut(bool write_side)
 {
   SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());

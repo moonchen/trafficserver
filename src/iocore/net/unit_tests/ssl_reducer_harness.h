@@ -232,6 +232,7 @@ public:
   }
 
   void attach();
+  void attach_cancelled();
   void drive_handshake();
   void pump_sut_to_peer();
   void pump_peer_to_sut(bool corrupt = false);
