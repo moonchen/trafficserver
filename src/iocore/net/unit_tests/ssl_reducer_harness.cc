@@ -266,6 +266,11 @@ ScriptableConsumer::handle(int event, void *data)
     got_open = true;
     return EVENT_CONT;
   }
+  if (event == VC_EVENT_ERROR && h2_mode) {
+    read_signals.push_back(event);
+    // Emulate Http2ClientSession with active streams: assume the VC self-freed, do NOT close it.
+    return EVENT_CONT;
+  }
   if (vio && vio->op == VIO::WRITE) {
     write_signals.push_back(event);
   } else {

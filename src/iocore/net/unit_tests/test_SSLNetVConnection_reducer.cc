@@ -164,3 +164,32 @@ TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer][!
   // Correct: the write-side waiter is told. (Fails today: signal went to the absent read side.)
   CHECK_FALSE(fx.consumer()->write_signals.empty());
 }
+
+// FIX: Phase B step 8 (fail(side,err) sets terminal state before notify so a self-freeing
+// consumer leaves no orphan). In the real system this is a UAF (VC self-frees on the error
+// unwind, then Http2ClientSession::destroy touches the freed _vc); the reducer surfaces the
+// underlying VC defect through the inner's close errno, which encodes which path closed it.
+TEST_CASE("#8: post-handshake error reclaims a self-freeing consumer's VC", "[SSLReducer][!shouldfail]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.consumer()->h2_mode = true;
+  fx.attach();
+  fx.drive_handshake();
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+
+  // Peer sends a valid record; corrupt it on the wire so the SUT's SSL_read errors.
+  const char *msg = "corruptme";
+  fx.peer()->write_app(msg, 9);
+  fx.pump_peer_to_sut(/* corrupt */ true);
+
+  // The inner's close errno tells which path closed it. Correct (post-fix): fail() sets terminal
+  // before notify, the self-freeing consumer returns EVENT_DONE, and only the SUT's destructor
+  // closes the inner -- with the default sentinel -1 -> the outer was reclaimed. Today (orphan):
+  // the read-error handler closes the inner explicitly with ssl_read_errno (0 for an SSL-layer
+  // error, no syscall errno) while the outer leaks -> close_errno() == 0, so this assertion fails.
+  CHECK(fx.mock()->close_errno() == -1);
+}

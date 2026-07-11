@@ -201,6 +201,7 @@ public:
   std::vector<int> read_signals;
   std::vector<int> write_signals;
   bool             got_open = false;
+  bool             h2_mode  = false;
 
   MIOBuffer      *read_buf    = nullptr;
   IOBufferReader *read_reader = nullptr;
