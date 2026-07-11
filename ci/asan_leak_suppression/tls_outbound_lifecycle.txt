@@ -1,0 +1,48 @@
+# LeakSanitizer suppressions for the DEDICATED quiescent outbound-lifecycle
+# profile (ASAN + ENABLE_ALLOCATOR_METRICS build).
+#
+# Premise (differs from the broad fast-exit profile tls_autest.txt):
+#   This profile is NOT used with a SIGINT fast-exit snapshot. The driver first
+#   drives the scenario, then polls metrics to a fully quiescent barrier
+#   (proxy.process.net.connections_currently_open + current client/server
+#   transactions/streams + pooled_server_connections all at baseline for
+#   several consecutive samples, with session sharing / keep-alive-out / prewarm
+#   disabled so nothing pools), THEN triggers a LIVE snapshot via the
+#   lsan_snapshot plugin (__lsan_do_recoverable_leak_check) while ATS and its
+#   ownership roots are still alive.
+#
+#   Because in-flight connection/session state is provably drained at the barrier,
+#   the in-flight suppressions from the broad profile are DELIBERATELY DROPPED
+#   here: any allocation that still looks like an in-flight outbound VC / SSL /
+#   session after quiescence is a genuine orphan (e.g. the #7 deferred-startEvent
+#   cancel-before-open leak), not a shutdown artifact. Stack-based suppression
+#   cannot separate the two; a quiescent live snapshot can.
+#
+#   The allocator-in-use gauges are the primary growth/readiness oracle:
+#     proxy.process.allocator.inuse.sslNetVCAllocator  (outer SSL VC)
+#     proxy.process.allocator.inuse.netVCAllocator     (inner Unix VC)
+#   LSan here is the stack-level corroborator, not the sole detector.
+#
+# Kept from the broad profile: one-time process-lifetime singletons (no per-conn
+# growth) and the two genuine, documented, PRE-EXISTING (non-refactor) leaks so
+# this profile stays focused on the outbound VC lifecycle under test.
+
+# --- one-time startup / config singletons (bounded, process-lifetime) ---
+leak:Log::create_threads
+leak:SSLConfigParams::getCTX
+leak:SSLMultiCertConfigLoader::load_certs
+leak:setup_callbacks
+
+# --- genuine PRE-EXISTING growing leaks (not the TLS refactor); see
+#     tls_autest_LEAK_NOTES.md. Kept suppressed so they don't mask the VC leak
+#     under test; fix tracked separately. ---
+leak:SSLPrivateKeyHandler
+leak:ConfigReloadTask::start_progress_checker
+
+# DROPPED here (present in the broad profile) so they SURFACE after quiescence:
+#   leak:SSLNetProcessor::connect_re
+#   leak:SSLNetVConnection::_make_ssl_connection
+#   leak:SSLNetVConnection::_ssl_connect
+#   leak:Http2ServerSession::Http2ServerSession
+#   leak:ProxySession::_handle_if_ssl
+#   leak:Http2ConnectionState::create_stream
