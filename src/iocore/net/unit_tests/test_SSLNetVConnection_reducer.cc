@@ -114,6 +114,20 @@ TEST_CASE("baseline: outbound SUT completes a real handshake and moves a record"
   CHECK(std::string(got, 4) == "ping");
 }
 
+TEST_CASE("baseline: inbound SUT completes a real handshake", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.attach();
+  fx.drive_handshake();
+
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+  REQUIRE(fx.peer()->handshake_done());
+}
+
 TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SSLReducer]")
 {
   ReducerFixture fx(/* inbound */ false);

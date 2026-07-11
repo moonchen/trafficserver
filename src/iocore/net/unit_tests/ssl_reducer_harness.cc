@@ -24,15 +24,22 @@
 #include "ssl_reducer_harness.h"
 
 #include "../SSLStats.h"
+#include "../P_SSLConfig.h"
+#include "../P_SSLCertLookup.h"
 
+#include "api/LifecycleAPIHooks.h"
 #include "iocore/eventsystem/EThread.h"
 #include "iocore/net/SSLSNIConfig.h"
+#include "records/RecCore.h"
+#include "tscore/Layout.h"
 #include "tscore/ink_platform.h"
 
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
 
+#include <fstream>
+#include <filesystem>
 #include <mutex>
 #include <unistd.h>
 
@@ -47,6 +54,9 @@ namespace
 //   * SSLInitializeStatistics() registers the ssl_rsb counters the handshake increments; without
 //     it Metrics::Counter::increment aborts on an unregistered id. It skips its cert-dependent
 //     cipher/group enumeration when no certificate config is loaded, so it is safe here.
+//   * init_global_lifecycle_hooks() allocates g_lifecycle_hooks, which the inbound cert loader
+//     dereferences unconditionally (SSLSecret::loadSecret consults TS_LIFECYCLE_SSL_SECRET_HOOK).
+//     Production allocates it in api_init(); the unit_test_main does not.
 // Production pairs these in SSLNetProcessor::start; do the same once, before any fixture runs.
 void
 ensure_ssl_runtime()
@@ -56,6 +66,9 @@ ensure_ssl_runtime()
     SSLInitializeLibrary();
     SNIConfig::startup();
     SSLInitializeStatistics();
+    if (g_lifecycle_hooks == nullptr) {
+      init_global_lifecycle_hooks();
+    }
   });
 }
 } // namespace
@@ -96,6 +109,42 @@ reducer_make_self_signed(std::string &cert_pem, std::string &key_pem)
   BIO_free(kbio);
   X509_free(x);
   EVP_PKEY_free(pkey);
+}
+
+void
+reducer_install_server_cert(const std::string &cert_pem, const std::string &key_pem, const std::string &dir)
+{
+  ensure_ssl_runtime(); // the cert loader dereferences g_lifecycle_hooks; make this callable standalone
+
+  std::filesystem::create_directories(dir);
+
+  const std::string cert_path      = dir + "/server.pem";
+  const std::string key_path       = dir + "/server.key";
+  const std::string multicert_path = dir + "/ssl_multicert.config";
+  {
+    std::ofstream(cert_path) << cert_pem;
+    std::ofstream(key_path) << key_pem;
+    std::ofstream(multicert_path) << "dest_ip=* ssl_cert_name=server.pem ssl_key_name=server.key\n";
+  }
+
+  // Don't let a load hiccup abort the process; point the loader at our files.
+  RecSetRecordInt("proxy.config.ssl.server.multicert.exit_on_load_fail", 0, REC_SOURCE_EXPLICIT);
+  RecSetRecordString("proxy.config.ssl.server.multicert.filename", const_cast<char *>(multicert_path.c_str()), REC_SOURCE_EXPLICIT);
+  RecSetRecordString("proxy.config.ssl.server.cert.path", const_cast<char *>(dir.c_str()), REC_SOURCE_EXPLICIT);
+  RecSetRecordString("proxy.config.ssl.server.private_key.path", const_cast<char *>(dir.c_str()), REC_SOURCE_EXPLICIT);
+
+  SSLConfig::reconfigure();            // republish params with the new paths
+  SSLCertificateConfig::reconfigure(); // load the cert and publish the default context (sets configid)
+
+  // Publish a ticket-key config (a random default keyblock, since no ticket_key file is set). The
+  // server's session-ticket callback dereferences SSLTicketKeyConfig::scoped_config during SSL_accept.
+  SSLTicketKeyConfig::reconfigure();
+
+  // With the default context now published, re-run stats init so it can enumerate the ciphers into
+  // cipher_map. The first pass (in ensure_ssl_runtime, before any cert) bailed out with an empty map,
+  // which would trip ssl_callback_info's `it != cipher_map.end()` assert when the inbound handshake
+  // completes. Metric and cipher registration are both idempotent, so a second pass is safe.
+  SSLInitializeStatistics();
 }
 
 BarePeer::BarePeer(bool server, const std::string &cert_pem, const std::string &key_pem)
@@ -255,10 +304,20 @@ ReducerFixture::attach(bool install_read)
   _vc->options.verifyServerPolicy = YamlSNIConfig::Policy::DISABLED;
   _vc->set_open_continuation(_consumer);
 
+  if (_inbound) {
+    // The inbound handshake calls safe_getsockname(get_socket()); a bound AF_INET fd keeps it valid.
+    _sock_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in sin{};
+    sin.sin_family      = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port        = 0;
+    ::bind(_sock_fd, reinterpret_cast<sockaddr *>(&sin), sizeof(sin));
+  }
+
   _mock         = new MockTransportVC();
   _mock->mutex  = _mutex;
   _mock->thread = this_ethread();
-  _mock->set_test_fd(_sock_fd); // NO_FD for outbound; a real fd is set for inbound in Task 7
+  _mock->set_test_fd(_sock_fd); // NO_FD for outbound; a real bound fd for inbound
 
   {
     SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());

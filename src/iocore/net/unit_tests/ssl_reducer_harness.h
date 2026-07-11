@@ -34,6 +34,10 @@
 
 void reducer_make_self_signed(std::string &cert_pem, std::string &key_pem);
 
+// Publishes a self-signed server cert as the default TLS context so an inbound
+// SUT can complete SSL_accept. Writes files into `dir` (use a scratch dir).
+void reducer_install_server_cert(const std::string &cert_pem, const std::string &key_pem, const std::string &dir);
+
 class BarePeer
 {
 public:
