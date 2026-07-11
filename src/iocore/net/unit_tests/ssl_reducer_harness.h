@@ -80,4 +80,106 @@ private:
   BIO     *_wbio = nullptr; // memory BIO the peer writes ciphertext to
 };
 
-// Filled in by later tasks.
+class MockTransportVC : public UnixNetVConnection
+{
+public:
+  MockTransportVC();
+
+  VIO *do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf) override;
+  VIO *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner = false) override;
+  void do_io_close(int lerrno = -1) override;
+  void do_io_shutdown(ShutdownHowTo_t howto) override;
+  void reenable(VIO *vio) override;
+  void reenable_re(VIO *vio) override;
+
+  // Socket/timeout methods must not touch real NetHandler/fd state in a unit test.
+  SOCKET
+  get_socket() override { return _test_fd; }
+  void
+  set_active_timeout(ink_hrtime) override
+  {
+  }
+  void
+  set_inactivity_timeout(ink_hrtime) override
+  {
+  }
+  void
+  set_default_inactivity_timeout(ink_hrtime) override
+  {
+  }
+  bool
+  is_default_inactivity_timeout() override
+  {
+    return false;
+  }
+  void
+  cancel_active_timeout() override
+  {
+  }
+  void
+  cancel_inactivity_timeout() override
+  {
+  }
+  void
+  add_to_keep_alive_queue() override
+  {
+  }
+  void
+  remove_from_keep_alive_queue() override
+  {
+  }
+  bool
+  add_to_active_queue() override
+  {
+    return true;
+  }
+  void
+  apply_options() override
+  {
+  }
+
+  VIO *
+  read_vio()
+  {
+    return &_read_vio;
+  }
+  VIO *
+  write_vio()
+  {
+    return &_write_vio;
+  }
+  MIOBuffer *
+  sut_read_buf() const
+  {
+    return _sut_read_buf;
+  }
+  IOBufferReader *
+  sut_write_reader() const
+  {
+    return _sut_write_reader;
+  }
+  bool
+  closed() const
+  {
+    return _closed;
+  }
+  int
+  close_errno() const
+  {
+    return _close_errno;
+  }
+  void
+  set_test_fd(int fd)
+  {
+    _test_fd = fd;
+  }
+
+private:
+  VIO             _read_vio{VIO::READ};
+  VIO             _write_vio{VIO::WRITE};
+  MIOBuffer      *_sut_read_buf     = nullptr;
+  IOBufferReader *_sut_write_reader = nullptr;
+  bool            _closed           = false;
+  int             _close_errno      = 0;
+  SOCKET          _test_fd          = NO_FD;
+};

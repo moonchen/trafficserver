@@ -68,3 +68,29 @@ TEST_CASE("BarePeer pair completes a real handshake and exchanges a record", "[S
   REQUIRE(server.read_app(got, sizeof(got)) == 5);
   CHECK(std::string(got, 5) == "hello");
 }
+
+TEST_CASE("MockTransportVC attaches under an outbound SSLNetVConnection", "[SSLReducer]")
+{
+  SSLNetVConnection *vc = sslNetVCAllocator.alloc();
+  Ptr<ProxyMutex>    mtx{new_ProxyMutex()};
+  vc->mutex = mtx;
+  vc->set_context(NET_VCONNECTION_OUT);
+
+  auto *mock   = new MockTransportVC();
+  mock->mutex  = mtx;
+  mock->thread = this_ethread();
+
+  {
+    SCOPED_MUTEX_LOCK(lock, vc->mutex, this_ethread());
+    vc->startEvent(NET_EVENT_OPEN, mock); // wires _unvc, creates transport VIOs, SET_HANDLER(mainEvent)
+  }
+
+  REQUIRE(vc->getUnixNetVC() == mock);
+  // The SUT called do_io_read/do_io_write on the mock; the mock captured the SUT buffers.
+  REQUIRE(mock->sut_read_buf() != nullptr);
+  REQUIRE(mock->sut_write_reader() != nullptr);
+  // The transport VIOs the SUT drives are the mock's own VIOs, wired back to the SUT.
+  REQUIRE(mock->read_vio()->cont == vc);
+  REQUIRE(mock->read_vio()->vc_server == mock);
+  REQUIRE(mock->write_vio()->op == VIO::WRITE);
+}

@@ -104,3 +104,60 @@ BarePeer::do_handshake()
   int rc = SSL_do_handshake(_ssl);
   return rc == 1 ? 0 : SSL_get_error(_ssl, rc);
 }
+
+MockTransportVC::MockTransportVC() : UnixNetVConnection()
+{
+  // nh stays nullptr: the SUT's teardown selects the plain do_io_close() branch for a null nh.
+}
+
+VIO *
+MockTransportVC::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
+{
+  _sut_read_buf       = buf; // SUT's _read_buf: ciphertext-in lands here
+  _read_vio.op        = VIO::READ;
+  _read_vio.cont      = c;
+  _read_vio.mutex     = c->mutex;
+  _read_vio.vc_server = this;
+  _read_vio.nbytes    = nbytes;
+  _read_vio.ndone     = 0;
+  _read_vio.set_writer(buf);
+  return &_read_vio;
+}
+
+VIO *
+MockTransportVC::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool /* owner */)
+{
+  _sut_write_reader    = buf; // SUT's _write_buf_reader: ciphertext-out is read from here
+  _write_vio.op        = VIO::WRITE;
+  _write_vio.cont      = c;
+  _write_vio.mutex     = c->mutex;
+  _write_vio.vc_server = this;
+  _write_vio.nbytes    = nbytes;
+  _write_vio.ndone     = 0;
+  _write_vio.set_reader(buf);
+  return &_write_vio;
+}
+
+void
+MockTransportVC::do_io_close(int lerrno)
+{
+  _closed      = true;
+  _close_errno = lerrno;
+}
+
+void
+MockTransportVC::do_io_shutdown(ShutdownHowTo_t /* howto */)
+{
+}
+
+void
+MockTransportVC::reenable(VIO * /* vio */)
+{
+  // No auto-pump: the fixture drives ciphertext movement explicitly for determinism.
+}
+
+void
+MockTransportVC::reenable_re(VIO *vio)
+{
+  reenable(vio);
+}
