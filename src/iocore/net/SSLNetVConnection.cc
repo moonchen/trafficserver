@@ -3098,14 +3098,15 @@ SSLNetVConnection::startEvent(int event, void *data)
     UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
     ink_release_assert(unvc != nullptr);
     if (_connect_action.cancelled) {
-      // The outbound consumer cancelled after the transport opened. Close the transport and discard
-      // this VC rather than handing them up. Hold the transport's NetHandler mutex so do_io_close
-      // reaps it inline -- an idle just-connected VC has no I/O to trigger the deferred reap, so
-      // do_io_close without the mutex would only mark it closed and leak it. (_connect_action is
-      // unused, never cancelled, on the accept path.)
-      {
+      // The outbound consumer cancelled after the transport opened. Close the transport -- inline
+      // under its NetHandler mutex when we can take it, so the fd closes now rather than on the
+      // InactivityCop's next sweep (connectUp already started the cop, so a merely-marked-closed VC
+      // is still reaped, just ~1s later) -- and discard this VC. (_connect_action is unused, never
+      // cancelled, on the accept path.) Mirrors the destructor's _unvc close.
+      if (unvc->nh != nullptr && unvc->nh->thread == this_ethread()) {
         MUTEX_TRY_LOCK(lock, unvc->nh->mutex, this_ethread());
-        ink_release_assert(lock.is_locked());
+        unvc->do_io_close();
+      } else {
         unvc->do_io_close();
       }
       this->free_thread(thread);

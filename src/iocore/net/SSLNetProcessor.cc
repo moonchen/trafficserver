@@ -132,5 +132,12 @@ SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOpt
     // The transport connected synchronously and already signalled this VC's open; nothing to cancel.
     return ACTION_RESULT_DONE;
   }
+  if (inner == nullptr) {
+    // Event system shutting down: connect_re scheduled nothing, so no open/open-failed will ever
+    // fire to reclaim this VC. Free it here rather than orphan it, and pass the nullptr sentinel
+    // through unchanged.
+    ssl_netvc->free_thread(this_ethread());
+    return nullptr;
+  }
   return action;
 }
