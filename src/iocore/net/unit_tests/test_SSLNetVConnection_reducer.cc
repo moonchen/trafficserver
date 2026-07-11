@@ -125,3 +125,28 @@ TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SS
   // Reaching here without an assert/abort is the #7 regression signal (pre-Phase-A this aborted).
   SUCCEED("cancel-before-open did not crash");
 }
+
+// FIX: Phase B step 8 (idempotent fail(side,err) delivering to the explicit waiter).
+// Correct behavior: a handshake timeout reaches the side the consumer is waiting on.
+// Current tree routes by transport face (read side), so the write waiter is never notified.
+TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer][!shouldfail]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  fx.attach(/* install_read */ false);
+
+  // Mimic HttpSM's direct-outbound path: a write-only waiter (do_io_write, no read VIO).
+  {
+    SCOPED_MUTEX_LOCK(lock, fx.vc()->mutex, this_ethread());
+    MIOBuffer      *ob = new_MIOBuffer(BUFFER_SIZE_INDEX_128);
+    IOBufferReader *rd = ob->alloc_reader();
+    fx.vc()->do_io_write(fx.consumer(), 1, rd, false);
+  }
+
+  fx.wake_sut(/* write_side */ true); // begin the handshake (ClientHello emitted), then stall
+
+  // The inner transport delivers timeouts on the read VIO; inject that.
+  fx.inject(VC_EVENT_ACTIVE_TIMEOUT, /* write_side */ false);
+
+  // Correct: the write-side waiter is told. (Fails today: signal went to the absent read side.)
+  CHECK_FALSE(fx.consumer()->write_signals.empty());
+}

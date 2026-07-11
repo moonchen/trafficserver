@@ -247,7 +247,7 @@ ReducerFixture::~ReducerFixture()
 }
 
 void
-ReducerFixture::attach()
+ReducerFixture::attach(bool install_read)
 {
   _vc        = sslNetVCAllocator.alloc();
   _vc->mutex = _mutex;
@@ -263,8 +263,10 @@ ReducerFixture::attach()
   {
     SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
     _vc->startEvent(_inbound ? NET_EVENT_ACCEPT : NET_EVENT_OPEN, _mock);
-    // Consumer attaches its user VIOs so decrypted reads have somewhere to land.
-    _vc->do_io_read(_consumer, INT64_MAX, _consumer->read_buf);
+    if (install_read) {
+      // Consumer attaches its user VIOs so decrypted reads have somewhere to land.
+      _vc->do_io_read(_consumer, INT64_MAX, _consumer->read_buf);
+    }
   }
 }
 

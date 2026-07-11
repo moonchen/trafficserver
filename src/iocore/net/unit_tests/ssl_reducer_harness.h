@@ -231,7 +231,7 @@ public:
     return _peer;
   }
 
-  void attach();
+  void attach(bool install_read = true);
   void attach_cancelled();
   void drive_handshake();
   void pump_sut_to_peer();
