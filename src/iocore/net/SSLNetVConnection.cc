@@ -3605,7 +3605,13 @@ void
 SSLNetVConnection::reenable_re(VIO *vio)
 {
   ink_assert(_unvc != nullptr);
-  _unvc->reenable_re(vio);
+  // Do not forward the outer user VIO straight to the inner transport: this VIO is embedded in
+  // the SSL VC, not in _unvc's NetState, and UnixNetVConnection::reenable_re -> set_enabled()
+  // derives the inner NetState from the VIO address with STATE_FROM_VIO pointer arithmetic
+  // (UnixNetVConnection.cc:39) -- a wild write when handed a foreign VIO, and the read/write
+  // classification would be wrong too. Delegate to reenable(), which does the correct
+  // user->transport translation. Mirror of TunnelNetVConnection::reenable_re.
+  reenable(vio);
 }
 
 SOCKET
