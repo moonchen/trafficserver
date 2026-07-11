@@ -29,10 +29,12 @@
 
 #include "api/LifecycleAPIHooks.h"
 #include "iocore/eventsystem/EThread.h"
+#include "iocore/net/SSLAPIHooks.h"
 #include "iocore/net/SSLSNIConfig.h"
 #include "records/RecCore.h"
 #include "tscore/Layout.h"
 #include "tscore/ink_platform.h"
+#include "ts/InkAPIPrivateIOCore.h"
 
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -71,7 +73,62 @@ ensure_ssl_runtime()
     }
   });
 }
+
+bool               g_hook_fired = false;
+bool               g_hook_armed = false;
+SSLNetVConnection *g_hook_vc    = nullptr;
+INKContInternal   *g_hook_cont  = nullptr; // process-global parking hook; held here so it stays reachable
+
+// One-shot cert hook. The chain is process-global and append-only, so once registered this callback
+// fires for every inbound handshake -- including those of unrelated tests. To avoid polluting them,
+// it parks only the single armed handshake (records the VC and returns without reenabling, so
+// callHooks() reports "not reenabled" and SSL_accept pauses), then disarms itself. Every other
+// handshake takes the pass-through branch and reenables synchronously (the ordinary way a
+// synchronous plugin lets a handshake proceed), so it completes as if no hook were present.
+int
+reducer_cert_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
+{
+  auto *vc = static_cast<SSLNetVConnection *>(edata);
+  if (g_hook_armed) {
+    g_hook_armed = false; // one-shot: park this handshake only
+    g_hook_fired = true;
+    g_hook_vc    = vc;
+    return 0; // park: do not reenable
+  }
+  vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
+  return 0;
+}
 } // namespace
+
+void
+reducer_install_parking_cert_hook()
+{
+  g_hook_fired = false;
+  g_hook_vc    = nullptr;
+  g_hook_armed = true; // arm the next inbound handshake to park
+  if (g_hook_cont == nullptr) {
+    // Register the cert hook once for the whole process: the hook chain is global, so re-appending
+    // would stack duplicate parks. Construct the continuation directly rather than via
+    // TSContCreate()/TSMutexCreate() -- those live in libtsapi.so, which test_net does not link
+    // (only INKContInternal, from libtsapibackend.a, is available); this mirrors what TSContCreate
+    // does internally. The cont is a deliberate never-freed registration (as a real plugin's hook
+    // is); holding it in g_hook_cont keeps it reachable so LSan does not flag it.
+    g_hook_cont = new INKContInternal(reducer_cert_hook_cb, reinterpret_cast<TSMutex>(new_ProxyMutex()));
+    SSLAPIHooks::instance()->append(TSSslHookInternalID{TS_SSL_CERT_HOOK}, g_hook_cont);
+  }
+}
+
+bool
+reducer_hook_fired()
+{
+  return g_hook_fired;
+}
+
+SSLNetVConnection *
+reducer_hook_vc()
+{
+  return g_hook_vc;
+}
 
 void
 reducer_make_self_signed(std::string &cert_pem, std::string &key_pem)
@@ -394,6 +451,13 @@ ReducerFixture::inject(int event, bool write_side)
 {
   SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
   _vc->handleEvent(event, write_side ? _mock->write_vio() : _mock->read_vio());
+}
+
+void
+ReducerFixture::resume_hook(bool error)
+{
+  SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+  _vc->reenable_with_event(error ? TS_EVENT_ERROR : TS_EVENT_CONTINUE);
 }
 
 void

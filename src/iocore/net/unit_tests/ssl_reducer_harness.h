@@ -38,6 +38,14 @@ void reducer_make_self_signed(std::string &cert_pem, std::string &key_pem);
 // SUT can complete SSL_accept. Writes files into `dir` (use a scratch dir).
 void reducer_install_server_cert(const std::string &cert_pem, const std::string &key_pem, const std::string &dir);
 
+// Appends a process-global, one-shot cert hook: it parks the next inbound handshake at
+// TS_SSL_CERT_HOOK (records the VC, does not reenable), then disarms itself so every later
+// handshake passes through -- unrelated tests sharing the process are unaffected regardless of
+// run order. Registration happens once; observe the park via reducer_hook_fired()/reducer_hook_vc().
+void               reducer_install_parking_cert_hook();
+bool               reducer_hook_fired();
+SSLNetVConnection *reducer_hook_vc();
+
 class BarePeer
 {
 public:
@@ -243,6 +251,7 @@ public:
   void pump_peer_to_sut(bool corrupt = false);
   void inject(int event, bool write_side);
   void wake_sut(bool write_side);
+  void resume_hook(bool error);
 
 private:
   bool                _inbound;

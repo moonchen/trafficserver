@@ -193,3 +193,55 @@ TEST_CASE("#8: post-handshake error reclaims a self-freeing consumer's VC", "[SS
   // error, no syscall errno) while the outer leaks -> close_errno() == 0, so this assertion fails.
   CHECK(fx.mock()->close_errno() == -1);
 }
+
+// FIX: Phase B steps 7-9 (notification/reclamation split + fail(side,err) + typed PendingWork).
+// A transport error arriving while a cert hook is parked mid-handshake must tear the connection
+// down cleanly: deliver the failure once, to the waiting side, and then reclaim the VC. On the
+// current tree the delivery is already correct -- exactly one VC_EVENT_ERROR reaches the inbound
+// consumer's read side, and never the (absent) write side, so there is no stale or misdirected
+// delivery. The defect is reclamation: the handshake-error path signals the consumer but, because
+// the consumer does not close, never reaches terminal state, so the outer VC is orphaned (never
+// returned to its allocator, and its inner transport is never closed). Resuming the hook afterward
+// is benign here -- the VC stays parked and alive, so this ordering is UAF-free on the current tree.
+// The orphan is observed via the reclamation oracle (mirrors #8): close_errno() == -1 means the SUT
+// destructor closed the inner (outer reclaimed). Pre-fix the inner is never closed at all, so
+// close_errno() stays at the mock's default 0 (closed() is likewise false) and this assertion fails
+// -- reported green by [!shouldfail] until steps 7-9 land, when the VC self-frees on the error.
+TEST_CASE("async-hook: transport error while a cert hook is parked tears down cleanly", "[SSLReducer][!shouldfail]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+  reducer_install_parking_cert_hook();
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.attach();
+
+  // Drive the inbound handshake far enough to invoke and park the cert hook.
+  for (int i = 0; i < 10 && !reducer_hook_fired(); ++i) {
+    fx.wake_sut(false);
+    fx.pump_sut_to_peer();
+    fx.peer()->do_handshake();
+    fx.pump_peer_to_sut();
+  }
+  REQUIRE(reducer_hook_fired());                     // the hook actually parked ...
+  REQUIRE(reducer_hook_vc() == fx.vc());             // ... on this VC ...
+  REQUIRE_FALSE(fx.vc()->getSSLHandShakeComplete()); // ... mid-handshake.
+
+  const size_t reads_before = fx.consumer()->read_signals.size();
+
+  // Transport error arrives while parked, then the hook resumes. Do not touch fx.vc() past this
+  // point: post-fix the SUT self-frees on the error, so only fixture-owned observers are safe.
+  fx.inject(VC_EVENT_ERROR, /* write_side */ false);
+  fx.resume_hook(/* error */ false);
+
+  // Right-reason: the failure reached the waiting (read) side exactly once, and never the write
+  // side -- no stale or misdirected delivery. This holds pre- and post-fix.
+  REQUIRE(fx.consumer()->read_signals.size() == reads_before + 1);
+  CHECK(fx.consumer()->read_signals.back() == VC_EVENT_ERROR);
+  CHECK(fx.consumer()->write_signals.empty());
+
+  // Primary invariant (fails pre-fix): the VC is reclaimed, so only the destructor closes the inner
+  // (default sentinel -1). Pre-fix it is orphaned -- the inner is never closed -- so this is 0.
+  CHECK(fx.mock()->close_errno() == -1);
+}
