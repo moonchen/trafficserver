@@ -3096,13 +3096,21 @@ SSLNetVConnection::startEvent(int event, void *data)
   case NET_EVENT_ACCEPT: {
     // On a successful open/accept, data is the underlying transport VConnection.
     UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
-    // _open_continuation is never cancelled: SSLNetProcessor::connect_re returns the inner unvc's
-    // own Action (so external cancellation targets that), and _open_continuation is just the plain
-    // continuation to notify once this VC's own open/accept completes.
-    // NET_EVENT_OPEN therefore always proceeds to setup.
-    // Successful establishment of TCP connection
-    // This is where we would set up the SSL context and start the handshake.
     ink_release_assert(unvc != nullptr);
+    if (_connect_action.cancelled) {
+      // The outbound consumer cancelled after the transport opened. Close the transport and discard
+      // this VC rather than handing them up. Hold the transport's NetHandler mutex so do_io_close
+      // reaps it inline -- an idle just-connected VC has no I/O to trigger the deferred reap, so
+      // do_io_close without the mutex would only mark it closed and leak it. (_connect_action is
+      // unused, never cancelled, on the accept path.)
+      {
+        MUTEX_TRY_LOCK(lock, unvc->nh->mutex, this_ethread());
+        ink_release_assert(lock.is_locked());
+        unvc->do_io_close();
+      }
+      this->free_thread(thread);
+      return EVENT_DONE;
+    }
     ink_release_assert(this->_unvc == nullptr); // not wired up yet
     this->_unvc = unvc;
     SET_HANDLER(&SSLNetVConnection::mainEvent);
@@ -3130,7 +3138,10 @@ SSLNetVConnection::startEvent(int event, void *data)
     // Failed to establish TCP connection; data is the errno, not a VConnection.
     int res = reinterpret_cast<intptr_t>(data);
     lerrno  = -res;
-    _open_continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    // Skip the notify if the consumer already cancelled -- it does not want the callback.
+    if (!_connect_action.cancelled) {
+      _open_continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+    }
     this->free_thread(thread);
   } break;
   default:

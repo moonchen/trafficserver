@@ -123,6 +123,14 @@ SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOpt
   ssl_netvc->set_context(NET_VCONNECTION_OUT);
   ssl_netvc->set_open_continuation(cont);
   ssl_netvc->mutex = cont->mutex;
-  Action *action   = unix_netProcessor.connect_re(ssl_netvc, target, opt);
+  // Return this VC's own action, not the inner transport's: a consumer cancel then targets this VC
+  // (handled in startEvent) rather than the inner connect, which would orphan this VC -- or crash
+  // its cancelled-before-connectUp teardown.
+  Action *action = ssl_netvc->arm_connect_action(cont);
+  Action *inner  = unix_netProcessor.connect_re(ssl_netvc, target, opt);
+  if (inner == ACTION_RESULT_DONE) {
+    // The transport connected synchronously and already signalled this VC's open; nothing to cancel.
+    return ACTION_RESULT_DONE;
+  }
   return action;
 }

@@ -926,7 +926,11 @@ UnixNetVConnection::startEvent(int /* event ATS_UNUSED */, Event *e)
   if (!action_.cancelled) {
     connectUp(e->ethread, NO_FD);
   } else {
-    get_NetHandler(e->ethread)->free_netevent(this);
+    // Cancelled before connectUp ran, so this VC never registered with the NetHandler (no
+    // thread/nh, no startIO). Reclaim it with the plain allocator free -- as the startIO-failure
+    // paths in acceptEvent/connectUp do -- not free_netevent, which unregisters a registered VC
+    // and release-asserts thread/nh are set (they are still null here).
+    this->free_thread(e->ethread);
   }
   return EVENT_DONE;
 }

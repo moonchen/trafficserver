@@ -184,20 +184,27 @@ public:
   void          cancel_inactivity_timeout() override;
   void          set_open_continuation(Continuation *c) override;
   Continuation *get_open_continuation() const override;
-  void          add_to_keep_alive_queue() override;
-  void          remove_from_keep_alive_queue() override;
-  bool          add_to_active_queue() override;
-  ink_hrtime    get_active_timeout() override;
-  ink_hrtime    get_inactivity_timeout() override;
-  void          apply_options() override;
-  void          reenable(VIO *vio) override;
-  void          reenable_re(VIO *vio) override;
-  SOCKET        get_socket() override;
-  int           set_tcp_congestion_control(tcp_congestion_control_side side) override;
-  void          set_local_addr() override;
-  void          set_remote_addr() override;
-  void          set_remote_addr(const sockaddr *addr) override;
-  void          set_mptcp_state() override;
+  // Arm the cancellable handle an outbound consumer holds and return it; see _connect_action.
+  Action *
+  arm_connect_action(Continuation *c)
+  {
+    _connect_action = c;
+    return &_connect_action;
+  }
+  void       add_to_keep_alive_queue() override;
+  void       remove_from_keep_alive_queue() override;
+  bool       add_to_active_queue() override;
+  ink_hrtime get_active_timeout() override;
+  ink_hrtime get_inactivity_timeout() override;
+  void       apply_options() override;
+  void       reenable(VIO *vio) override;
+  void       reenable_re(VIO *vio) override;
+  SOCKET     get_socket() override;
+  int        set_tcp_congestion_control(tcp_congestion_control_side side) override;
+  void       set_local_addr() override;
+  void       set_remote_addr() override;
+  void       set_remote_addr(const sockaddr *addr) override;
+  void       set_mptcp_state() override;
 
 #if TS_USE_TLS_ASYNC
   // AsyncTLSEventCallback
@@ -557,11 +564,14 @@ private:
   void _releaseHandshakeReader();
 
   // The continuation to notify once this VC's own open (connect+handshake) or accept
-  // (accept+handshake) completes - see NetVConnection::set_open_continuation(). Not a cancellable
-  // Action: external cancellation of an outbound connect targets the inner _unvc's own Action (see
-  // SSLNetVConnection::startEvent), so this is never cancelled - just reassigned or nulled as
-  // ownership of the VC's open/accept completion hands off between setup stages.
+  // (accept+handshake) completes - see NetVConnection::set_open_continuation().
   Continuation *_open_continuation = nullptr;
+
+  // The cancellable handle an outbound consumer holds (returned by SSLNetProcessor::connect_re).
+  // Cancelling it targets THIS outer VC rather than the inner transport connect, so a cancel
+  // cleans this VC up on open/open-failed (startEvent) instead of orphaning it -- or crashing the
+  // inner's cancelled-before-connectUp teardown. Unused on the inbound (accept) path.
+  Action _connect_action;
 };
 
 extern ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator;
