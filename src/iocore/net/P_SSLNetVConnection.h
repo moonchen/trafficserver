@@ -175,6 +175,7 @@ public:
   VIO          *do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *reader, bool owner) override;
   void          do_io_close(int lerrno = -1) override;
   void          do_io_shutdown(ShutdownHowTo_t howto) override;
+  bool          get_data(int id, void *data) override;
   void          set_active_timeout(ink_hrtime timeout_in) override;
   void          set_inactivity_timeout(ink_hrtime timeout_in) override;
   void          set_default_inactivity_timeout(ink_hrtime timeout_in) override;

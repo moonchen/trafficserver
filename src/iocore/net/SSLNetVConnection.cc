@@ -3615,6 +3615,35 @@ SSLNetVConnection::reenable_re(VIO *vio)
   reenable(vio);
 }
 
+bool
+SSLNetVConnection::get_data(int id, void *data)
+{
+  union {
+    TSVIO *vio;
+    void  *data;
+    int   *n;
+  } ptr;
+
+  ptr.data = data;
+
+  // Expose the consumer-facing (outer) VIOs and logical closed state, not the inner transport's;
+  // without this override the base VConnection::get_data returns false and TSVConnReadVIOGet /
+  // TSVConnWriteVIOGet / TSVConnClosedGet silently fail for a TLS-terminated connection.
+  switch (id) {
+  case TS_API_DATA_READ_VIO:
+    *ptr.vio = reinterpret_cast<TSVIO>(&this->_user_read_vio);
+    return true;
+  case TS_API_DATA_WRITE_VIO:
+    *ptr.vio = reinterpret_cast<TSVIO>(&this->_user_write_vio);
+    return true;
+  case TS_API_DATA_CLOSED:
+    *ptr.n = (isTerminated(_sslState) || _isDraining()) ? 1 : 0;
+    return true;
+  default:
+    return false;
+  }
+}
+
 SOCKET
 SSLNetVConnection::get_socket()
 {
