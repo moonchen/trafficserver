@@ -3709,11 +3709,15 @@ SSLNetVConnection::_trackFirstHandshake()
   bool is_first = this->get_tls_handshake_begin_time() == 0;
   if (is_first) {
     this->_record_tls_handshake_begin_time();
-    // Install the handshake inactivity timeout atomically with recording the begin time:
-    // net_activity is not triggered until the handshake completes, so an idle partial
-    // handshake is bounded only by this timer. Recording the timestamp here while installing
-    // the timer elsewhere left that install gated on a timestamp this call had already set,
-    // so the configured ssl.handshake_timeout_in never took effect for a fully idle handshake.
-    set_inactivity_timeout(HRTIME_SECONDS(SSLConfigParams::ssl_handshake_timeout_in));
+    // Install the handshake inactivity timeout atomically with recording the begin time, but only
+    // for inbound handshakes. net_activity is not triggered until the handshake completes, so an
+    // idle inbound partial handshake is otherwise bounded only by the looser default inactivity
+    // timeout (recording the timestamp separately from installing the timer left the install
+    // gated on a timestamp this call had already set, so ssl.handshake_timeout_in never took
+    // effect). An outbound origin handshake is bounded by connect_attempts_timeout (HttpSM);
+    // overwriting the VC inactivity timeout here would defeat it (see tls_conn_timeout).
+    if (get_context() == NET_VCONNECTION_IN) {
+      set_inactivity_timeout(HRTIME_SECONDS(SSLConfigParams::ssl_handshake_timeout_in));
+    }
   }
 }
