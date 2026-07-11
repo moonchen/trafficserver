@@ -2733,13 +2733,11 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
   }
 
   _trigger_ssl_read();
-
-  if (isTerminated(_sslState)) {
-    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Closed during _trigger_ssl_read", this);
-    return EVENT_DONE;
-  } else {
-    return EVENT_CONT;
-  }
+  // _trigger_ssl_read() may have freed this VC on a terminal signal's recursion-0 unwind (e.g. a
+  // hook-flagged handshake error), so do not read any member -- reading _sslState here was a
+  // use-after-free. The transport read path (read_signal_and_update) ignores this return value
+  // and drives the inner VC's teardown from its own state.
+  return EVENT_CONT;
 }
 
 int
