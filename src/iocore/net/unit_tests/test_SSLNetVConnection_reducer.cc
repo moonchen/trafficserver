@@ -35,3 +35,36 @@ TEST_CASE("reducer harness premises hold", "[SSLReducer]")
   SSLConfig::scoped_config params;
   REQUIRE(params->client_ctx != nullptr); // outbound handshakes need this; must be non-null by default
 }
+
+TEST_CASE("BarePeer pair completes a real handshake and exchanges a record", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+
+  BarePeer server(true, cert, key);
+  BarePeer client(false, cert, key);
+
+  // Pump ciphertext between the two mem-BIO pairs until both finish.
+  auto move = [](BarePeer &from, BarePeer &to) {
+    char buf[16384];
+    int  n;
+    while ((n = BIO_read(from.wbio(), buf, sizeof(buf))) > 0) {
+      BIO_write(to.rbio(), buf, n);
+    }
+  };
+  for (int i = 0; i < 20 && !(server.handshake_done() && client.handshake_done()); ++i) {
+    client.do_handshake();
+    move(client, server);
+    server.do_handshake();
+    move(server, client);
+  }
+  REQUIRE(client.handshake_done());
+  REQUIRE(server.handshake_done());
+
+  const char *msg = "hello";
+  REQUIRE(client.write_app(msg, 5) == 5);
+  move(client, server);
+  char got[16] = {0};
+  REQUIRE(server.read_app(got, sizeof(got)) == 5);
+  CHECK(std::string(got, 5) == "hello");
+}

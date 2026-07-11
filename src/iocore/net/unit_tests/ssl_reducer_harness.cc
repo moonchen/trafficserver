@@ -23,4 +23,84 @@
 
 #include "ssl_reducer_harness.h"
 
-// Definitions added by later tasks.
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+
+void
+reducer_make_self_signed(std::string &cert_pem, std::string &key_pem)
+{
+  EVP_PKEY     *pkey = nullptr;
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+  EVP_PKEY_keygen_init(pctx);
+  EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048);
+  EVP_PKEY_keygen(pctx, &pkey);
+  EVP_PKEY_CTX_free(pctx);
+
+  X509 *x = X509_new();
+  X509_set_version(x, 2);
+  ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+  X509_gmtime_adj(X509_getm_notBefore(x), 0);
+  X509_gmtime_adj(X509_getm_notAfter(x), 60 * 60 * 24 * 365);
+  X509_set_pubkey(x, pkey);
+  X509_NAME *name = X509_get_subject_name(x);
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("reducer.test"), -1, -1, 0);
+  X509_set_issuer_name(x, name);
+  X509_sign(x, pkey, EVP_sha256());
+
+  BIO *cbio = BIO_new(BIO_s_mem());
+  PEM_write_bio_X509(cbio, x);
+  BIO *kbio = BIO_new(BIO_s_mem());
+  PEM_write_bio_PrivateKey(kbio, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+
+  char *data = nullptr;
+  long  len  = BIO_get_mem_data(cbio, &data);
+  cert_pem.assign(data, len);
+  len = BIO_get_mem_data(kbio, &data);
+  key_pem.assign(data, len);
+
+  BIO_free(cbio);
+  BIO_free(kbio);
+  X509_free(x);
+  EVP_PKEY_free(pkey);
+}
+
+BarePeer::BarePeer(bool server, const std::string &cert_pem, const std::string &key_pem)
+{
+  _ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
+
+  BIO  *cbio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+  X509 *x    = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+  SSL_CTX_use_certificate(_ctx, x);
+  X509_free(x);
+  BIO_free(cbio);
+
+  BIO      *kbio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+  EVP_PKEY *k    = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+  SSL_CTX_use_PrivateKey(_ctx, k);
+  EVP_PKEY_free(k);
+  BIO_free(kbio);
+
+  _ssl  = SSL_new(_ctx);
+  _rbio = BIO_new(BIO_s_mem());
+  _wbio = BIO_new(BIO_s_mem());
+  SSL_set_bio(_ssl, _rbio, _wbio); // SSL takes ownership of both BIOs
+  if (server) {
+    SSL_set_accept_state(_ssl);
+  } else {
+    SSL_set_connect_state(_ssl);
+  }
+}
+
+BarePeer::~BarePeer()
+{
+  SSL_free(_ssl); // frees _rbio/_wbio too
+  SSL_CTX_free(_ctx);
+}
+
+int
+BarePeer::do_handshake()
+{
+  int rc = SSL_do_handshake(_ssl);
+  return rc == 1 ? 0 : SSL_get_error(_ssl, rc);
+}
