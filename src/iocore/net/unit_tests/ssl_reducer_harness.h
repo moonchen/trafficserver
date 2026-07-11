@@ -183,3 +183,68 @@ private:
   int             _close_errno      = 0;
   SOCKET          _test_fd          = NO_FD;
 };
+
+// A stand-in consumer (HttpSM's role): owns the user VIOs the SUT hands back and records the
+// signals the SUT delivers, per side, so tests can assert on the exact event stream.
+class ScriptableConsumer : public Continuation
+{
+public:
+  explicit ScriptableConsumer(Ptr<ProxyMutex> m);
+  ~ScriptableConsumer() override;
+
+  int handle(int event, void *data);
+
+  std::vector<int> read_signals;
+  std::vector<int> write_signals;
+  bool             got_open = false;
+
+  MIOBuffer      *read_buf    = nullptr;
+  IOBufferReader *read_reader = nullptr;
+};
+
+// Assembles the whole reducer scenario: the SUT (SSLNetVConnection), its mock transport, a real
+// TLS peer, and the scriptable consumer, and drives ciphertext between them deterministically.
+class ReducerFixture
+{
+public:
+  explicit ReducerFixture(bool inbound);
+  ~ReducerFixture();
+
+  SSLNetVConnection *
+  vc() const
+  {
+    return _vc;
+  }
+  MockTransportVC *
+  mock() const
+  {
+    return _mock;
+  }
+  ScriptableConsumer *
+  consumer() const
+  {
+    return _consumer;
+  }
+  BarePeer *
+  peer() const
+  {
+    return _peer;
+  }
+
+  void attach();
+  void drive_handshake();
+  void pump_sut_to_peer();
+  void pump_peer_to_sut(bool corrupt = false);
+  void inject(int event, bool write_side);
+  void wake_sut(bool write_side);
+
+private:
+  bool                _inbound;
+  Ptr<ProxyMutex>     _mutex;
+  SSLNetVConnection  *_vc       = nullptr;
+  MockTransportVC    *_mock     = nullptr;
+  ScriptableConsumer *_consumer = nullptr;
+  BarePeer           *_peer     = nullptr;
+  std::string         _cert, _key;
+  int                 _sock_fd = NO_FD;
+};

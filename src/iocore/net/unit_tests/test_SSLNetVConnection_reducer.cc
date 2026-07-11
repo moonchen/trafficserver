@@ -94,3 +94,22 @@ TEST_CASE("MockTransportVC attaches under an outbound SSLNetVConnection", "[SSLR
   REQUIRE(mock->read_vio()->vc_server == mock);
   REQUIRE(mock->write_vio()->op == VIO::WRITE);
 }
+
+TEST_CASE("baseline: outbound SUT completes a real handshake and moves a record", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  fx.attach();
+  fx.drive_handshake();
+
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+  REQUIRE(fx.peer()->handshake_done());
+
+  // Peer -> SUT app record surfaces to the consumer as plaintext.
+  const char *msg = "ping";
+  REQUIRE(fx.peer()->write_app(msg, 4) == 4);
+  fx.pump_peer_to_sut();
+  REQUIRE(fx.consumer()->read_reader->read_avail() >= 4);
+  char got[8] = {0};
+  fx.consumer()->read_reader->memcpy(got, 4);
+  CHECK(std::string(got, 4) == "ping");
+}

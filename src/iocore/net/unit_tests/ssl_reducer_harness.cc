@@ -23,9 +23,42 @@
 
 #include "ssl_reducer_harness.h"
 
+#include "../SSLStats.h"
+
+#include "iocore/eventsystem/EThread.h"
+#include "iocore/net/SSLSNIConfig.h"
+#include "tscore/ink_platform.h"
+
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
+
+#include <mutex>
+#include <unistd.h>
+
+namespace
+{
+// Bring up the SSL runtime the SUT's handshake needs but unit_test_main does not install:
+//   * SSLInitializeLibrary() reserves the per-SSL ex_data indices (ssl_vc_index and every
+//     TLS*Support index). Without it _bindSSLObject binds to index -1 and getInstance(_ssl)
+//     returns null, tripping sslClientHandShakeEvent's identity assert. Idempotent.
+//   * SNIConfig::startup() loads the SNI config the outbound handshake driver always consults
+//     (sslStartHandShake's client path). A missing sni.yaml loads an empty, no-op config.
+//   * SSLInitializeStatistics() registers the ssl_rsb counters the handshake increments; without
+//     it Metrics::Counter::increment aborts on an unregistered id. It skips its cert-dependent
+//     cipher/group enumeration when no certificate config is loaded, so it is safe here.
+// Production pairs these in SSLNetProcessor::start; do the same once, before any fixture runs.
+void
+ensure_ssl_runtime()
+{
+  static std::once_flag once;
+  std::call_once(once, [] {
+    SSLInitializeLibrary();
+    SNIConfig::startup();
+    SSLInitializeStatistics();
+  });
+}
+} // namespace
 
 void
 reducer_make_self_signed(std::string &cert_pem, std::string &key_pem)
@@ -160,4 +193,135 @@ void
 MockTransportVC::reenable_re(VIO *vio)
 {
   reenable(vio);
+}
+
+ScriptableConsumer::ScriptableConsumer(Ptr<ProxyMutex> m) : Continuation(m)
+{
+  SET_HANDLER(&ScriptableConsumer::handle);
+  read_buf    = new_MIOBuffer(BUFFER_SIZE_INDEX_8K);
+  read_reader = read_buf->alloc_reader();
+}
+
+ScriptableConsumer::~ScriptableConsumer()
+{
+  if (read_buf) {
+    free_MIOBuffer(read_buf);
+  }
+}
+
+int
+ScriptableConsumer::handle(int event, void *data)
+{
+  VIO *vio = static_cast<VIO *>(data);
+  if (event == NET_EVENT_OPEN) {
+    got_open = true;
+    return EVENT_CONT;
+  }
+  if (vio && vio->op == VIO::WRITE) {
+    write_signals.push_back(event);
+  } else {
+    read_signals.push_back(event);
+  }
+  return EVENT_CONT;
+}
+
+ReducerFixture::ReducerFixture(bool inbound) : _inbound(inbound)
+{
+  ensure_ssl_runtime();
+  reducer_make_self_signed(_cert, _key);
+  _mutex    = new_ProxyMutex();
+  _consumer = new ScriptableConsumer(_mutex);
+  // Peer is the opposite role: server when the SUT is an outbound client.
+  _peer = new BarePeer(/* server */ !_inbound, _cert, _key);
+}
+
+ReducerFixture::~ReducerFixture()
+{
+  delete _peer;
+  delete _consumer;
+  delete _mock;
+  // _vc is returned to its allocator by the SUT's own teardown; the fixture never deletes it.
+  if (_sock_fd != NO_FD) {
+    ::close(_sock_fd);
+  }
+}
+
+void
+ReducerFixture::attach()
+{
+  _vc        = sslNetVCAllocator.alloc();
+  _vc->mutex = _mutex;
+  _vc->set_context(_inbound ? NET_VCONNECTION_IN : NET_VCONNECTION_OUT);
+  _vc->options.verifyServerPolicy = YamlSNIConfig::Policy::DISABLED;
+  _vc->set_open_continuation(_consumer);
+
+  _mock         = new MockTransportVC();
+  _mock->mutex  = _mutex;
+  _mock->thread = this_ethread();
+  _mock->set_test_fd(_sock_fd); // NO_FD for outbound; a real fd is set for inbound in Task 7
+
+  {
+    SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+    _vc->startEvent(_inbound ? NET_EVENT_ACCEPT : NET_EVENT_OPEN, _mock);
+    // Consumer attaches its user VIOs so decrypted reads have somewhere to land.
+    _vc->do_io_read(_consumer, INT64_MAX, _consumer->read_buf);
+  }
+}
+
+void
+ReducerFixture::wake_sut(bool write_side)
+{
+  SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+  _vc->handleEvent(write_side ? VC_EVENT_WRITE_READY : VC_EVENT_READ_READY, write_side ? _mock->write_vio() : _mock->read_vio());
+}
+
+void
+ReducerFixture::pump_sut_to_peer()
+{
+  IOBufferReader *r = _mock->sut_write_reader();
+  char            buf[16384];
+  int64_t         avail;
+  while ((avail = r->read_avail()) > 0) {
+    int64_t n = avail > static_cast<int64_t>(sizeof(buf)) ? static_cast<int64_t>(sizeof(buf)) : avail;
+    r->memcpy(buf, n);
+    r->consume(n);
+    BIO_write(_peer->rbio(), buf, static_cast<int>(n));
+  }
+}
+
+void
+ReducerFixture::pump_peer_to_sut(bool corrupt)
+{
+  char buf[16384];
+  int  n;
+  while ((n = BIO_read(_peer->wbio(), buf, sizeof(buf))) > 0) {
+    if (corrupt && n > 8) {
+      buf[n / 2] ^= 0xFF; // flip a byte mid-record to force an SSL_read error at the SUT
+    }
+    _mock->sut_read_buf()->write(buf, n);
+    SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+    _vc->handleEvent(VC_EVENT_READ_READY, _mock->read_vio());
+  }
+}
+
+void
+ReducerFixture::inject(int event, bool write_side)
+{
+  SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+  _vc->handleEvent(event, write_side ? _mock->write_vio() : _mock->read_vio());
+}
+
+void
+ReducerFixture::drive_handshake()
+{
+  // Run until BOTH endpoints are established, not just the SUT. The SUT finishes on the round it
+  // reads the peer's flight, but its own final flight (e.g. the TLS 1.3 client Finished) is then
+  // still sitting in _write_buf: one more iteration pumps it to the peer so the peer can complete.
+  for (int i = 0; i < 20 && !(_vc->getSSLHandShakeComplete() && _peer->handshake_done()); ++i) {
+    wake_sut(/* write_side */ true);  // let the SUT emit its next flight into _write_buf
+    wake_sut(/* write_side */ false); // and consume anything already pending
+    pump_sut_to_peer();
+    _peer->do_handshake();
+    pump_peer_to_sut();
+  }
 }
