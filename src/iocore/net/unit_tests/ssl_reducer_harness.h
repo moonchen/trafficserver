@@ -62,11 +62,6 @@ public:
   {
     return _wbio;
   }
-  SSL *
-  ssl() const
-  {
-    return _ssl;
-  }
 
   int do_handshake();
   bool

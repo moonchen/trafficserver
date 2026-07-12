@@ -28,6 +28,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
+namespace
+{
+bool
+signals_contain(const std::vector<int> &signals, int event)
+{
+  return std::find(signals.begin(), signals.end(), event) != signals.end();
+}
+} // namespace
+
 TEST_CASE("reducer harness premises hold", "[SSLReducer]")
 {
   REQUIRE(this_ethread() != nullptr);
@@ -140,6 +151,30 @@ TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SS
   SUCCEED("cancel-before-open did not crash");
 }
 
+// Precondition guard for #5. Its [!shouldfail] sibling asserts the write waiter is notified, but
+// [!shouldfail] masks any failing assertion -- a harness that never processed the timeout at all
+// would report green just the same. This untagged (must-pass) test proves the scenario is reached:
+// the injected ACTIVE_TIMEOUT is processed and the VC is torn down (its inner is closed). The
+// write-only consumer means the misrouted read-side signal lands on a null read cont and is
+// dropped, so both signal vectors stay empty -- mock()->closed() is the "was reached" signal.
+TEST_CASE("#5 precondition: handshake timeout tears the VC down", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  fx.attach(/* install_read */ false);
+
+  {
+    SCOPED_MUTEX_LOCK(lock, fx.vc()->mutex, this_ethread());
+    MIOBuffer      *ob = new_MIOBuffer(BUFFER_SIZE_INDEX_128);
+    IOBufferReader *rd = ob->alloc_reader();
+    fx.vc()->do_io_write(fx.consumer(), 1, rd, false);
+  }
+
+  fx.wake_sut(/* write_side */ true);
+  fx.inject(VC_EVENT_ACTIVE_TIMEOUT, /* write_side */ false); // VC self-frees; do not touch fx.vc() after
+
+  CHECK(fx.mock()->closed());
+}
+
 // FIX: Phase B step 8 (idempotent fail(side,err) delivering to the explicit waiter).
 // Correct behavior: a handshake timeout reaches the side the consumer is waiting on.
 // Current tree routes by transport face (read side), so the write waiter is never notified.
@@ -163,6 +198,29 @@ TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer][!
 
   // Correct: the write-side waiter is told. (Fails today: signal went to the absent read side.)
   CHECK_FALSE(fx.consumer()->write_signals.empty());
+}
+
+// Precondition guard for #8. Its [!shouldfail] sibling asserts on the inner's close_errno(), but
+// [!shouldfail] masks any failing assertion -- a harness that never delivered the error would
+// report green just the same. This untagged (must-pass) test proves the scenario is reached: the
+// corrupt-record pump drives an SSL_read error all the way to the h2-mode consumer's read side.
+TEST_CASE("#8 precondition: corrupt record delivers VC_EVENT_ERROR", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.consumer()->h2_mode = true;
+  fx.attach();
+  fx.drive_handshake();
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+
+  const char *msg = "corruptme";
+  fx.peer()->write_app(msg, 9);
+  fx.pump_peer_to_sut(/* corrupt */ true);
+
+  CHECK(signals_contain(fx.consumer()->read_signals, VC_EVENT_ERROR));
 }
 
 // FIX: Phase B step 8 (fail(side,err) sets terminal state before notify so a self-freeing
@@ -192,6 +250,41 @@ TEST_CASE("#8: post-handshake error reclaims a self-freeing consumer's VC", "[SS
   // the read-error handler closes the inner explicitly with ssl_read_errno (0 for an SSL-layer
   // error, no syscall errno) while the outer leaks -> close_errno() == 0, so this assertion fails.
   CHECK(fx.mock()->close_errno() == -1);
+}
+
+// Precondition guard for the async-hook characterization. Its [!shouldfail] sibling asserts on the
+// inner's close_errno(), but [!shouldfail] masks any failing assertion -- a harness that never
+// parked the hook or never delivered the error would report green just the same. This untagged
+// (must-pass) test proves the scenario is reached: the cert hook parks mid-handshake and the
+// injected error is delivered once to the waiting read side, and never the write side.
+TEST_CASE("#9 precondition: parked-hook error is delivered read-side", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+  reducer_install_parking_cert_hook();
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.attach();
+
+  for (int i = 0; i < 10 && !reducer_hook_fired(); ++i) {
+    fx.wake_sut(false);
+    fx.pump_sut_to_peer();
+    fx.peer()->do_handshake();
+    fx.pump_peer_to_sut();
+  }
+  REQUIRE(reducer_hook_fired());
+  REQUIRE(reducer_hook_vc() == fx.vc());
+  REQUIRE_FALSE(fx.vc()->getSSLHandShakeComplete());
+
+  // On the current tree the VC stays parked and alive across the error+resume, so the fixture-owned
+  // consumer is safe to inspect afterward.
+  fx.inject(VC_EVENT_ERROR, /* write_side */ false);
+  fx.resume_hook(/* error */ false);
+
+  CHECK(reducer_hook_fired());
+  CHECK(signals_contain(fx.consumer()->read_signals, VC_EVENT_ERROR));
+  CHECK(fx.consumer()->write_signals.empty());
 }
 
 // FIX: Phase B steps 7-9 (notification/reclamation split + fail(side,err) + typed PendingWork).
