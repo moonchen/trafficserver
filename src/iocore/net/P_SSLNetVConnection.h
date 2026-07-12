@@ -461,7 +461,20 @@ private:
   VIO *_transport_write_vio = nullptr;
 
   enum class SignalSide { READ, WRITE };
-  int        _signal_user(SignalSide side, int event);
+  // Notification only: deliver `event` to the consumer's VIO on `side` (or, for a severed/
+  // mismatched cont, run the null-cont arm, which sets a terminal _sslState for a terminal
+  // event). It NEVER frees `this`. Reclamation is a separate, explicit step the caller makes on
+  // the same stack immediately after, via _reclaimIfTerminated() -- so a terminal state set
+  // before the notify (step 8's fail()) cannot turn the notify itself into a self-free.
+  void _signal_user(SignalSide side, int event);
+  // The single same-turn reclaim point paired with _signal_user. Frees `this` (returning true)
+  // iff _sslState is terminal and no reentrant frame that still needs `this` alive is on the
+  // stack (recursion == 0 -- covers _signal_user's own notify reentrancy and any OpenSSL
+  // callback frame). Synchronous, never schedule_imm. Correct because nothing frees `this` while
+  // recursion >= 1 (do_io_close's inline free is gated on !recursion; migration on recursion ==
+  // 0), so a deferred close from inside the notify is reclaimed here on unwind. The caller must
+  // touch nothing after this returns true.
+  bool       _reclaimIfTerminated();
   SignalSide _handshake_fail_side() const;
   // Deliver the user-facing WRITE_COMPLETE synchronously and, if that causes the consumer to
   // reentrantly queue a new write, self-schedule a clean-stack rearm (see the definition and
@@ -478,9 +491,9 @@ private:
   // or its owned _ssl inline: case (1) because an enclosing frame on our own stack still
   // expects `this` to be valid, case (2) because OpenSSL's own C code keeps running after the
   // callback returns and would touch a freed _ssl. do_io_close's inline-free decision and
-  // _signal_user's unwind-time free both gate on recursion == 0 -- never on lerrno or on
-  // which specific call triggered the close. See RecursionGuard below; wrap every OpenSSL
-  // entry point with one, scoped tightly to just that call.
+  // _reclaimIfTerminated (the reclaim paired with each _signal_user) both gate on recursion == 0
+  // -- never on lerrno or on which specific call triggered the close. See RecursionGuard below;
+  // wrap every OpenSSL entry point with one, scoped tightly to just that call.
   int recursion = 0;
 
   // RAII guard for `recursion` -- construct immediately before an OpenSSL call that may invoke

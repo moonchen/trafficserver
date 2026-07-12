@@ -376,9 +376,10 @@ SSLNetVConnection::_parse_proxy_protocol(IOBufferReader *reader)
 }
 
 //
-// Signal an event
+// Notify the consumer of an event. Notification only -- see _reclaimIfTerminated for the
+// paired reclaim.
 //
-int
+void
 SSLNetVConnection::_signal_user(SignalSide side, int event)
 {
   recursion++;
@@ -409,14 +410,24 @@ SSLNetVConnection::_signal_user(SignalSide side, int event)
       break;
     }
   }
-  if (!--recursion && isTerminated(this->_sslState)) {
+  --recursion;
+}
+
+// The reclaim paired with _signal_user (and, from step 8, with fail()). Frees this VC iff it has
+// reached a terminal SSL state and no reentrant frame that still needs it alive is on the stack.
+// Called on the same stack immediately after the notify, so the gate sees the same recursion
+// depth and _sslState the old notify-and-free tail did. Returns true when it reclaimed; the
+// caller must touch nothing afterward.
+bool
+SSLNetVConnection::_reclaimIfTerminated()
+{
+  if (recursion == 0 && isTerminated(this->_sslState)) {
     /* BZ  31932 */
     ink_assert(thread == this_ethread());
     this->free_thread(this_ethread());
-    return EVENT_DONE;
-  } else {
-    return EVENT_CONT;
+    return true;
   }
+  return false;
 }
 
 // Which side to deliver a handshake failure on: the consumer waiting on the handshake
@@ -476,6 +487,7 @@ SSLNetVConnection::_trigger_ssl_read()
   if (sslClientRenegotiationAbort == true) {
     lerrno = -ENET_SSL_FAILED;
     _signal_user(SignalSide::READ, VC_EVENT_ERROR);
+    _reclaimIfTerminated();
     Dbg(dbg_ctl_ssl, "client renegotiation setting read signal error");
     return;
   }
@@ -543,15 +555,17 @@ SSLNetVConnection::_trigger_ssl_read()
     // more specific `err` to report.
     if (ret != EVENT_ERROR && isTerminated(_sslState)) {
       _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+      _reclaimIfTerminated();
       return;
     }
 
     switch (ret) {
     case EVENT_ERROR:
       lerrno = err;
-      // _signal_user may free this VC; on error there is nothing more to do, so
+      // The paired reclaim may free this VC; on error there is nothing more to do, so
       // return rather than falling through to the member access below.
       _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+      _reclaimIfTerminated();
       return;
     case SSL_HANDSHAKE_WANT_READ:
     case SSL_HANDSHAKE_WANT_ACCEPT:
@@ -570,6 +584,7 @@ SSLNetVConnection::_trigger_ssl_read()
           lerrno = EPIPE;
         }
         _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+        _reclaimIfTerminated();
         return;
       }
       if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
@@ -580,6 +595,7 @@ SSLNetVConnection::_trigger_ssl_read()
           Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, expired, release the connection", this);
           lerrno = ETIMEDOUT;
           _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+          _reclaimIfTerminated();
           return;
         }
       }
@@ -604,7 +620,8 @@ SSLNetVConnection::_trigger_ssl_read()
       // the WRITE_READY on its pending write once the final flight flushes. The signal may
       // free this VC, so bail out before the member access below if it did.
       if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() <= 0) {
-        if (_signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE) == EVENT_DONE) {
+        _signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE);
+        if (_reclaimIfTerminated()) {
           return;
         }
       }
@@ -680,8 +697,9 @@ SSLNetVConnection::_trigger_ssl_read()
 
   if (bytes > 0) {
     if (ret == SSL_READ_WOULD_BLOCK || ret == SSL_READ_READY) {
-      if (_signal_user(SignalSide::READ, VC_EVENT_READ_READY) != EVENT_CONT) {
-        Dbg(dbg_ctl_ssl, "readSignal != EVENT_CONT");
+      _signal_user(SignalSide::READ, VC_EVENT_READ_READY);
+      if (_reclaimIfTerminated()) {
+        Dbg(dbg_ctl_ssl, "read signal reclaimed the vc");
         return;
       }
     }
@@ -734,7 +752,8 @@ SSLNetVConnection::_trigger_ssl_read()
         Dbg(dbg_ctl_ssl, "read would block but transport closed - signalling EOS vc %p", this);
         _signal_user(SignalSide::READ, VC_EVENT_EOS);
       }
-      // _signal_user may have freed this VC; touch nothing after it.
+      // The paired reclaim may free this VC; touch nothing after it.
+      _reclaimIfTerminated();
     } else {
       _transport_read_vio->reenable();
       Dbg(dbg_ctl_ssl, "read finished - would block - need read");
@@ -746,6 +765,7 @@ SSLNetVConnection::_trigger_ssl_read()
     // SSL_ERROR_ZERO_RETURN from SSL_get_error()
     // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
     _signal_user(SignalSide::READ, VC_EVENT_EOS);
+    _reclaimIfTerminated();
 
     if (bytes > 0) {
       Dbg(dbg_ctl_ssl, "read finished - EOS");
@@ -756,14 +776,16 @@ SSLNetVConnection::_trigger_ssl_read()
   case SSL_READ_COMPLETE:
     Dbg(dbg_ctl_ssl, "read finished - signal done");
     _signal_user(SignalSide::READ, VC_EVENT_READ_COMPLETE);
+    _reclaimIfTerminated();
     break;
   case SSL_READ_ERROR:
     Dbg(dbg_ctl_ssl, "read finished - read error");
-    // _signal_user may free this VC (the error handler closes us and the recursion
-    // unwinds to free_thread). Only touch members if it did NOT free us (EVENT_CONT);
+    // The paired reclaim may free this VC (the error handler closes us and the recursion
+    // unwinds so _reclaimIfTerminated frees it). Only touch members if it did NOT free us;
     // when it frees us the destructor closes _unvc, so the explicit close is both
     // redundant and a use-after-free here.
-    if (_signal_user(SignalSide::READ, VC_EVENT_ERROR) == EVENT_CONT && _unvc != nullptr) {
+    _signal_user(SignalSide::READ, VC_EVENT_ERROR);
+    if (!_reclaimIfTerminated() && _unvc != nullptr) {
       _unvc->do_io_close(ssl_read_errno);
       _unvc = nullptr; // ownership transferred to the unvc allocator; do not double-close in dtor
     }
@@ -2782,11 +2804,12 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
 
     if (ret == EVENT_ERROR) {
       lerrno = err;
-      // Set the state before signalling: _signal_user may free this VC, so the
+      // Set the state before signalling: the paired reclaim may free this VC, so the
       // member write must happen first (and the terminated state also lets
-      // _signal_user free us on unwind).
+      // _reclaimIfTerminated free us).
       _sslState = SslState::ERROR;
       _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+      _reclaimIfTerminated();
       return EVENT_DONE;
     } else if (isTerminated(_sslState)) {
       // A hook may have synchronously flagged an error mid SSL_accept()/SSL_connect() without
@@ -2795,6 +2818,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // frame here -- always safe to deliver synchronously. See the read-side twin of this
       // check in _trigger_ssl_read for the full rationale.
       _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+      _reclaimIfTerminated();
       return EVENT_DONE;
     } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
       _transport_read_vio->reenable();
@@ -2816,6 +2840,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       if (_user_write_vio.ntodo() <= 0) {
         // Read side is on purpose
         _signal_user(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
+        _reclaimIfTerminated();
       }
     } else {
       _transport_write_vio->reenable();
@@ -2865,7 +2890,8 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
   // SSL transport is unable to send.
   if (towrite != ntodo && !_write_buf->high_water()) {
-    if (_signal_user(SignalSide::WRITE, VC_EVENT_WRITE_READY) == EVENT_DONE) {
+    _signal_user(SignalSide::WRITE, VC_EVENT_WRITE_READY);
+    if (_reclaimIfTerminated()) {
       // User closed connection in the handler
       return EVENT_DONE;
     }
@@ -2935,6 +2961,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
         this, needs);
     this->lerrno = EIO;
     _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+    _reclaimIfTerminated();
     return EVENT_DONE;
   }
 
@@ -2947,6 +2974,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     // propagate to HttpSM::set_connect_fail() but is not currently distinguished.
     this->lerrno = EIO;
     _signal_user(SignalSide::WRITE, VC_EVENT_ERROR);
+    _reclaimIfTerminated();
     return EVENT_DONE;
   }
 
@@ -3004,8 +3032,8 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
 int
 SSLNetVConnection::_deliverWriteComplete()
 {
-  int result = _signal_user(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE);
-  if (result == EVENT_DONE) {
+  _signal_user(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE);
+  if (_reclaimIfTerminated()) {
     return EVENT_DONE; // consumer closed/freed us from its handler
   }
   if (!isTerminated(_sslState) && _transport_state != TransportState::TRANSPORT_ERROR && _user_write_vio.op == VIO::WRITE &&
@@ -3073,6 +3101,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
       lerrno = EPIPE;
     }
     _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+    _reclaimIfTerminated();
     return EVENT_DONE;
   }
   // Schedule an out-of-line read drive so any decrypted bytes still buffered are
@@ -3181,9 +3210,10 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // reenable_with_event(TS_EVENT_ERROR) has no handshake on the stack to deliver it,
       // only this scheduled dispatch -- freeing silently would strand the waiting
       // consumer. A severed/already-notified consumer hits _signal_user's null-cont
-      // branch; its recursion-gated tail frees us unless the handler deferred to a
+      // branch; the paired reclaim frees us unless the handler deferred to a
       // close-drain.
       _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+      _reclaimIfTerminated();
       return EVENT_DONE;
     }
     if (_write_rearm_pending) {
@@ -3236,9 +3266,10 @@ SSLNetVConnection::mainEvent(int event, void *data)
     // reach the terminal state ahead of the scheduled read-drive (reenable_with_event's
     // own transport reenable races it, and free_thread's destructor would cancel the
     // pending drive event) -- freeing silently would strand a never-notified consumer.
-    // A severed/already-notified consumer hits _signal_user's null-cont branch; its
-    // recursion-gated tail frees us unless the handler deferred to a close-drain.
+    // A severed/already-notified consumer hits _signal_user's null-cont branch; the
+    // paired reclaim frees us unless the handler deferred to a close-drain.
     _signal_user(_handshake_fail_side(), VC_EVENT_ERROR);
+    _reclaimIfTerminated();
     return EVENT_DONE;
   }
 
@@ -3288,7 +3319,8 @@ SSLNetVConnection::mainEvent(int event, void *data)
     // routed to whichever side's transport VIO timed out. Without this the SSL VC would
     // ignore transport timeouts (idle connections would never close) and log a spurious
     // "Unexpected event" warning.
-    return _signal_user(transport_vio == _transport_write_vio ? SignalSide::WRITE : SignalSide::READ, event);
+    _signal_user(transport_vio == _transport_write_vio ? SignalSide::WRITE : SignalSide::READ, event);
+    return _reclaimIfTerminated() ? EVENT_DONE : EVENT_CONT;
   default:
     Warning("SSLNetVConnection %p: Unexpected event %d in handle_event", this, event);
     return EVENT_CONT;
