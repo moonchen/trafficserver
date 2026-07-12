@@ -200,11 +200,19 @@ public:
   ~ScriptableConsumer() override;
 
   int handle(int event, void *data);
+  // Model an H2 session's last stream releasing (destroy() -> _vc->do_io_close()): drive the
+  // deferred close that h2_mode marked pending on the terminal event.
+  void release();
 
   std::vector<int> read_signals;
   std::vector<int> write_signals;
   bool             got_open = false;
-  bool             h2_mode  = false;
+  // Consumer-driven teardown: like HttpSM / Http2ClientSession / the accept trampoline, close the
+  // VC on a terminal event. h2_mode models an H2 session with active streams -- it defers the
+  // close (see release()) instead of closing inline.
+  bool            h2_mode       = false;
+  bool            pending_close = false;
+  NetVConnection *vc            = nullptr; // set by the fixture so the consumer can close it
 
   MIOBuffer      *read_buf    = nullptr;
   IOBufferReader *read_reader = nullptr;
@@ -247,6 +255,10 @@ public:
   void inject(int event, bool write_side);
   void wake_sut(bool write_side);
   void resume_hook(bool error);
+  // Complete any consumer-driven deferred teardown: drain the SUT's outbound ciphertext (simulate
+  // the transport flushing the close-notify) and fire the SUT's scheduled dispatch, so a pending
+  // close-drain / reclaim runs to completion on a clean stack. Safe once the VC has freed.
+  void pump();
 
 private:
   bool                _inbound;

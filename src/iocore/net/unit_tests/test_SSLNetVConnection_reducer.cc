@@ -151,34 +151,12 @@ TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SS
   SUCCEED("cancel-before-open did not crash");
 }
 
-// Precondition guard for #5. Its [!shouldfail] sibling asserts the write waiter is notified, but
-// [!shouldfail] masks any failing assertion -- a harness that never processed the timeout at all
-// would report green just the same. This untagged (must-pass) test proves the scenario is reached:
-// the injected ACTIVE_TIMEOUT is processed and the VC is torn down (its inner is closed). The
-// write-only consumer means the misrouted read-side signal lands on a null read cont and is
-// dropped, so both signal vectors stay empty -- mock()->closed() is the "was reached" signal.
-TEST_CASE("#5 precondition: handshake timeout tears the VC down", "[SSLReducer]")
-{
-  ReducerFixture fx(/* inbound */ false);
-  fx.attach(/* install_read */ false);
-
-  {
-    SCOPED_MUTEX_LOCK(lock, fx.vc()->mutex, this_ethread());
-    MIOBuffer      *ob = new_MIOBuffer(BUFFER_SIZE_INDEX_128);
-    IOBufferReader *rd = ob->alloc_reader();
-    fx.vc()->do_io_write(fx.consumer(), 1, rd, false);
-  }
-
-  fx.wake_sut(/* write_side */ true);
-  fx.inject(VC_EVENT_ACTIVE_TIMEOUT, /* write_side */ false); // VC self-frees; do not touch fx.vc() after
-
-  CHECK(fx.mock()->closed());
-}
-
-// FIX: Phase B step 8 (idempotent fail(side,err) delivering to the explicit waiter).
-// Correct behavior: a handshake timeout reaches the side the consumer is waiting on.
-// Current tree routes by transport face (read side), so the write waiter is never notified.
-TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer][!shouldfail]")
+// #5: a handshake timeout must reach the side the consumer is waiting on. The inner transport
+// always times out on its read VIO, but a direct-outbound waiter installs only a do_io_write, so
+// routing by the transport face would drop it. Consumer-driven: the timeout reaches the write
+// waiter, which closes the VC (like HttpSM), and the reclaim frees it -- close_errno() == -1
+// witnesses that only the SUT destructor closed the inner.
+TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer]")
 {
   ReducerFixture fx(/* inbound */ false);
   fx.attach(/* install_read */ false);
@@ -195,39 +173,20 @@ TEST_CASE("#5: handshake timeout reaches the write-side waiter", "[SSLReducer][!
 
   // The inner transport delivers timeouts on the read VIO; inject that.
   fx.inject(VC_EVENT_ACTIVE_TIMEOUT, /* write_side */ false);
+  fx.pump(); // complete the consumer-driven close-drain
 
-  // Correct: the write-side waiter is told. (Fails today: signal went to the absent read side.)
+  // Routed to the write waiter (not the absent read face); the consumer's close reclaimed the VC.
   CHECK_FALSE(fx.consumer()->write_signals.empty());
+  CHECK(fx.mock()->close_errno() == -1);
 }
 
-// Precondition guard for #8. Its [!shouldfail] sibling asserts on the inner's close_errno(), but
-// [!shouldfail] masks any failing assertion -- a harness that never delivered the error would
-// report green just the same. This untagged (must-pass) test proves the scenario is reached: the
-// corrupt-record pump drives an SSL_read error all the way to the h2-mode consumer's read side.
-TEST_CASE("#8 precondition: corrupt record delivers VC_EVENT_ERROR", "[SSLReducer]")
-{
-  std::string cert, key;
-  reducer_make_self_signed(cert, key);
-  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
-
-  ReducerFixture fx(/* inbound */ true);
-  fx.consumer()->h2_mode = true;
-  fx.attach();
-  fx.drive_handshake();
-  REQUIRE(fx.vc()->getSSLHandShakeComplete());
-
-  const char *msg = "corruptme";
-  fx.peer()->write_app(msg, 9);
-  fx.pump_peer_to_sut(/* corrupt */ true);
-
-  CHECK(signals_contain(fx.consumer()->read_signals, VC_EVENT_ERROR));
-}
-
-// FIX: Phase B step 8 (fail(side,err) sets terminal state before notify so a self-freeing
-// consumer leaves no orphan). In the real system this is a UAF (VC self-frees on the error
-// unwind, then Http2ClientSession::destroy touches the freed _vc); the reducer surfaces the
-// underlying VC defect through the inner's close errno, which encodes which path closed it.
-TEST_CASE("#8: post-handshake error reclaims a self-freeing consumer's VC", "[SSLReducer][!shouldfail]")
+// #8: a post-handshake TLS error to an H2 client session with active streams. Consumer-driven:
+// the session receives VC_EVENT_ERROR and marks its close pending -- master defers
+// _vc->do_io_close() to destroy() when the last stream releases -- so the outer VC stays ALIVE
+// across the error (no orphan, no self-free, and no pooled-session UAF) and is reclaimed only when
+// the session finally closes it. Pre-pivot the eager self-free/orphan (a5da2d0672 + the read-error
+// inner close) made close_errno() 0.
+TEST_CASE("#8: post-handshake error, H2 session closes and reclaims the VC", "[SSLReducer]")
 {
   std::string cert, key;
   reducer_make_self_signed(cert, key);
@@ -244,63 +203,28 @@ TEST_CASE("#8: post-handshake error reclaims a self-freeing consumer's VC", "[SS
   fx.peer()->write_app(msg, 9);
   fx.pump_peer_to_sut(/* corrupt */ true);
 
-  // The inner's close errno tells which path closed it. Correct (post-fix): fail() sets terminal
-  // before notify, the self-freeing consumer returns EVENT_DONE, and only the SUT's destructor
-  // closes the inner -- with the default sentinel -1 -> the outer was reclaimed. Today (orphan):
-  // the read-error handler closes the inner explicitly with ssl_read_errno (0 for an SSL-layer
-  // error, no syscall errno) while the outer leaks -> close_errno() == 0, so this assertion fails.
+  // The error reached the h2 consumer. With active streams it has NOT closed yet, so the VC is
+  // still alive -- not orphaned, not self-freed.
+  CHECK(signals_contain(fx.consumer()->read_signals, VC_EVENT_ERROR));
+  CHECK_FALSE(fx.mock()->closed());
+
+  // The last stream releases -> destroy() -> _vc->do_io_close(): now the outer is reclaimed and
+  // only the SUT destructor closes the inner (default sentinel -1).
+  {
+    SCOPED_MUTEX_LOCK(lock, fx.vc()->mutex, this_ethread());
+    fx.consumer()->release();
+  }
+  fx.pump();
   CHECK(fx.mock()->close_errno() == -1);
 }
 
-// Precondition guard for the async-hook characterization. Its [!shouldfail] sibling asserts on the
-// inner's close_errno(), but [!shouldfail] masks any failing assertion -- a harness that never
-// parked the hook or never delivered the error would report green just the same. This untagged
-// (must-pass) test proves the scenario is reached: the cert hook parks mid-handshake and the
-// injected error is delivered once to the waiting read side, and never the write side.
-TEST_CASE("#9 precondition: parked-hook error is delivered read-side", "[SSLReducer]")
-{
-  std::string cert, key;
-  reducer_make_self_signed(cert, key);
-  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
-  reducer_install_parking_cert_hook();
-
-  ReducerFixture fx(/* inbound */ true);
-  fx.attach();
-
-  for (int i = 0; i < 10 && !reducer_hook_fired(); ++i) {
-    fx.wake_sut(false);
-    fx.pump_sut_to_peer();
-    fx.peer()->do_handshake();
-    fx.pump_peer_to_sut();
-  }
-  REQUIRE(reducer_hook_fired());
-  REQUIRE(reducer_hook_vc() == fx.vc());
-  REQUIRE_FALSE(fx.vc()->getSSLHandShakeComplete());
-
-  // On the current tree the VC stays parked and alive across the error+resume, so the fixture-owned
-  // consumer is safe to inspect afterward.
-  fx.inject(VC_EVENT_ERROR, /* write_side */ false);
-  fx.resume_hook(/* error */ false);
-
-  CHECK(reducer_hook_fired());
-  CHECK(signals_contain(fx.consumer()->read_signals, VC_EVENT_ERROR));
-  CHECK(fx.consumer()->write_signals.empty());
-}
-
-// FIX: Phase B steps 7-9 (notification/reclamation split + fail(side,err) + typed PendingWork).
-// A transport error arriving while a cert hook is parked mid-handshake must tear the connection
-// down cleanly: deliver the failure once, to the waiting side, and then reclaim the VC. On the
-// current tree the delivery is already correct -- exactly one VC_EVENT_ERROR reaches the inbound
-// consumer's read side, and never the (absent) write side, so there is no stale or misdirected
-// delivery. The defect is reclamation: the handshake-error path signals the consumer but, because
-// the consumer does not close, never reaches terminal state, so the outer VC is orphaned (never
-// returned to its allocator, and its inner transport is never closed). Resuming the hook afterward
-// is benign here -- the VC stays parked and alive, so this ordering is UAF-free on the current tree.
-// The orphan is observed via the reclamation oracle (mirrors #8): close_errno() == -1 means the SUT
-// destructor closed the inner (outer reclaimed). Pre-fix the inner is never closed at all, so
-// close_errno() stays at the mock's default 0 (closed() is likewise false) and this assertion fails
-// -- reported green by [!shouldfail] until steps 7-9 land, when the VC self-frees on the error.
-TEST_CASE("async-hook: transport error while a cert hook is parked tears down cleanly", "[SSLReducer][!shouldfail]")
+// async-hook: a transport error while a cert hook is parked mid-handshake must tear down cleanly.
+// Consumer-driven: the error reaches the waiting (read) consumer, which closes the VC; the reclaim
+// is held off while the hook is parked (is_invoked_state -- the plugin still owns a live ref) and
+// completes when the plugin reenables (reenable_with_event sees _close_requested and schedules the
+// teardown instead of driving I/O). Exactly one VC_EVENT_ERROR reaches the read side, never the
+// write side, and close_errno() == -1 confirms the reclaim.
+TEST_CASE("async-hook: transport error while a cert hook is parked tears down cleanly", "[SSLReducer]")
 {
   std::string cert, key;
   reducer_make_self_signed(cert, key);
@@ -323,18 +247,18 @@ TEST_CASE("async-hook: transport error while a cert hook is parked tears down cl
 
   const size_t reads_before = fx.consumer()->read_signals.size();
 
-  // Transport error arrives while parked, then the hook resumes. Do not touch fx.vc() past this
-  // point: post-fix the SUT self-frees on the error, so only fixture-owned observers are safe.
+  // Transport error arrives while parked -> the read consumer is signalled and closes (do_io_close);
+  // the reclaim waits on the parked hook. The hook then resumes; reenable_with_event completes the
+  // teardown. Do not touch fx.vc() past pump(): the VC frees.
   fx.inject(VC_EVENT_ERROR, /* write_side */ false);
   fx.resume_hook(/* error */ false);
+  fx.pump();
 
-  // Right-reason: the failure reached the waiting (read) side exactly once, and never the write
-  // side -- no stale or misdirected delivery. This holds pre- and post-fix.
+  // The failure reached the waiting (read) side exactly once, never the write side.
   REQUIRE(fx.consumer()->read_signals.size() == reads_before + 1);
   CHECK(fx.consumer()->read_signals.back() == VC_EVENT_ERROR);
   CHECK(fx.consumer()->write_signals.empty());
 
-  // Primary invariant (fails pre-fix): the VC is reclaimed, so only the destructor closes the inner
-  // (default sentinel -1). Pre-fix it is orphaned -- the inner is never closed -- so this is 0.
+  // The VC is reclaimed, so only the destructor closes the inner (default sentinel -1).
   CHECK(fx.mock()->close_errno() == -1);
 }

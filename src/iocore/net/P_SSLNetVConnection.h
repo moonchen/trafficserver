@@ -128,6 +128,26 @@ private:
   {
     return state == SslState::CLOSED || state == SslState::ERROR;
   }
+  // Consumer-driven teardown latch (master's UnixNetVConnection `closed`). The outer VC is not
+  // NetHandler-managed, so it must physically free itself -- but ONLY when its consumer has
+  // requested the close (do_io_close), or when a terminal event lands on a severed/absent consumer
+  // (the null-cont owner-close). A terminal _sslState gates I/O; it never authorizes the free. Set
+  // once, never reset (the VC frees the moment the gate opens). See _reclaimIfClosed.
+  bool _close_requested = false;
+  // A terminal error was armed out of line (a handshake hook's reenable_with_event(TS_EVENT_ERROR),
+  // e.g. an SNI/rate-limit reject) with no handshake driver on the stack to deliver it. The
+  // scheduled mainEvent dispatch delivers VC_EVENT_ERROR to the waiter EXACTLY ONCE and clears
+  // this; the consumer's do_io_close then drives the free. Separate from _close_requested so a
+  // consumer that has not yet closed (H2 with active streams) is not re-signalled on a later event.
+  bool _fatal_pending = false;
+  // A handshake hook has parked (the driver returned SSL_WAIT_FOR_HOOK): a plugin owns a live
+  // reference and will reenable_with_event into this VC. Set at the park, cleared when the plugin
+  // reenables. It is a stable latch because do_io_close's callHooks(VCONN_CLOSE) advances the hook
+  // FSM to HANDSHAKE_HOOKS_DONE, so is_invoked_state() can no longer witness the outstanding hold;
+  // _reclaimIfClosed holds off on this so a consumer-driven close arriving while the hook is parked
+  // (a transport error/timeout) cannot free the VC out from under the plugin's pending reenable. A
+  // synchronous TSVConnAbort fails the handshake instead of parking, so it never sets this.
+  bool _hook_parked = false;
   // In the graceful close-drain (do_io_close's lingering close): user VIOs are severed and the
   // transport is flushing the final ciphertext before teardown. SHUTDOWN_IN_PROGRESS is reached
   // from exactly one site (do_io_close) and the VC is freed the instant it leaves the state, so
@@ -462,19 +482,20 @@ private:
 
   enum class SignalSide { READ, WRITE };
   // Notification only: deliver `event` to the consumer's VIO on `side` (or, for a severed/
-  // mismatched cont, run the null-cont arm, which sets a terminal _sslState for a terminal
-  // event). It NEVER frees `this`. Reclamation is a separate, explicit step the caller makes on
-  // the same stack immediately after, via _reclaimIfTerminated() -- so a terminal state set
-  // before the notify (step 8's fail()) cannot turn the notify itself into a self-free.
+  // mismatched cont, run the null-cont owner-close arm, which sets a terminal _sslState and the
+  // _close_requested latch for a terminal event). It NEVER frees `this`. Reclamation is a separate,
+  // explicit step the caller makes on the same stack immediately after, via _reclaimIfClosed --
+  // which frees only when the consumer has requested the close (consumer-driven teardown), never
+  // from the terminal state alone.
   void _signal_user(SignalSide side, int event);
-  // The single same-turn reclaim point paired with _signal_user. Frees `this` (returning true)
-  // iff _sslState is terminal and no reentrant frame that still needs `this` alive is on the
-  // stack (recursion == 0 -- covers _signal_user's own notify reentrancy and any OpenSSL
-  // callback frame). Synchronous, never schedule_imm. Correct because nothing frees `this` while
-  // recursion >= 1 (do_io_close's inline free is gated on !recursion; migration on recursion ==
-  // 0), so a deferred close from inside the notify is reclaimed here on unwind. The caller must
-  // touch nothing after this returns true.
-  bool       _reclaimIfTerminated();
+  // The single same-turn reclaim point paired with _signal_user (consumer-driven teardown).
+  // Frees `this` (returning true) iff the consumer requested the close (_close_requested) and no
+  // frame that still needs `this` alive is on the stack: recursion == 0 (own notify reentrancy or
+  // an OpenSSL callback frame), not mid graceful-drain (_isDraining -- the drain owns the free),
+  // and no handshake hook parked (is_invoked_state -- a plugin holds a live ref and will
+  // reenable). NEVER frees from a terminal _sslState alone: master frees on `closed`, not on the
+  // SSL error state. The caller must touch nothing after this returns true.
+  bool       _reclaimIfClosed();
   SignalSide _handshake_fail_side() const;
   // Deliver the user-facing WRITE_COMPLETE synchronously and, if that causes the consumer to
   // reentrantly queue a new write, self-schedule a clean-stack rearm (see the definition and
@@ -491,7 +512,7 @@ private:
   // or its owned _ssl inline: case (1) because an enclosing frame on our own stack still
   // expects `this` to be valid, case (2) because OpenSSL's own C code keeps running after the
   // callback returns and would touch a freed _ssl. do_io_close's inline-free decision and
-  // _reclaimIfTerminated (the reclaim paired with each _signal_user) both gate on recursion == 0
+  // _reclaimIfClosed (the reclaim paired with each _signal_user) both gate on recursion == 0
   // -- never on lerrno or on which specific call triggered the close. See RecursionGuard below;
   // wrap every OpenSSL entry point with one, scoped tightly to just that call.
   int recursion = 0;

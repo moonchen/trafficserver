@@ -323,17 +323,37 @@ ScriptableConsumer::handle(int event, void *data)
     got_open = true;
     return EVENT_CONT;
   }
-  if (event == VC_EVENT_ERROR && h2_mode) {
-    read_signals.push_back(event);
-    // Emulate Http2ClientSession with active streams: assume the VC self-freed, do NOT close it.
-    return EVENT_CONT;
-  }
   if (vio && vio->op == VIO::WRITE) {
     write_signals.push_back(event);
   } else {
     read_signals.push_back(event);
   }
+  // Consumer-driven teardown: close the VC on a terminal event, like the real consumers (HttpSM,
+  // Http2ClientSession, the accept trampoline). h2_mode models an H2 session with active streams:
+  // it marks the close pending (master defers _vc->do_io_close() to destroy() when the last stream
+  // releases) so the test can drive that ordering explicitly via release().
+  if (event == VC_EVENT_ERROR || event == VC_EVENT_EOS || event == VC_EVENT_ACTIVE_TIMEOUT ||
+      event == VC_EVENT_INACTIVITY_TIMEOUT) {
+    if (h2_mode) {
+      pending_close = true;
+    } else if (vc != nullptr) {
+      NetVConnection *v = vc;
+      vc                = nullptr; // a session nulls its netvc after closing it; also blocks a double close
+      v->do_io_close();
+    }
+  }
   return EVENT_CONT;
+}
+
+void
+ScriptableConsumer::release()
+{
+  if (pending_close && vc != nullptr) {
+    NetVConnection *v = vc;
+    vc                = nullptr;
+    v->do_io_close();
+  }
+  pending_close = false;
 }
 
 ReducerFixture::ReducerFixture(bool inbound) : _inbound(inbound)
@@ -388,6 +408,27 @@ ReducerFixture::attach(bool install_read)
       // Consumer attaches its user VIOs so decrypted reads have somewhere to land.
       _vc->do_io_read(_consumer, INT64_MAX, _consumer->read_buf);
     }
+  }
+  // Hand the consumer the VC so it can drive the close on a terminal event (consumer-driven).
+  _consumer->vc = _vc;
+}
+
+void
+ReducerFixture::pump()
+{
+  // Drain the SUT's outbound ciphertext (simulate the transport flushing the close-notify), then
+  // fire the SUT's scheduled dispatch (non-VIO data -> mainEvent's scheduled-dispatch branch) so a
+  // pending close-drain / reclaim completes on a clean stack. Loop until the VC frees (its
+  // destructor closes the mock inner, which mock->closed() witnesses) or we quiesce.
+  for (int i = 0; i < 8 && !_mock->closed(); ++i) {
+    if (IOBufferReader *r = _mock->sut_write_reader(); r != nullptr) {
+      while (r->read_avail() > 0) {
+        r->consume(r->read_avail());
+      }
+    }
+    int dummy = 0;
+    SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+    _vc->handleEvent(EVENT_IMMEDIATE, &dummy);
   }
 }
 
