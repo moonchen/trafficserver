@@ -22,6 +22,9 @@
 
 std::atomic<SniSelector *> SniSelector::_instance = nullptr;
 
+// The VC user-arg index, defined in sni_limiter.cc, used to detach an expired queued VC.
+extern int gVCIdx;
+
 ///////////////////////////////////////////////////////////////////////////////
 // YAML parser for the global YAML configuration (via plugin.config)
 //
@@ -217,8 +220,15 @@ sni_queue_cont(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
     QueueTime now     = std::chrono::system_clock::now(); // Only do this once per limiter
 
     if (owner) { // Don't operate on the aliases
-      // Try to enable some queued VCs (if any) if there are slots available
-      while (limiter->size() > 0 && limiter->reserve() != ReserveStatus::RESERVED) { // Can't be UNLIMITED here
+      // Resume queued VCs while slots are available. Reserve first and only dequeue on
+      // success, so the resumed VC owns the slot it was granted (its VCONN_CLOSE will
+      // release exactly that slot). A failed reserve means we are at the limit; leave the
+      // rest queued.
+      while (limiter->size() > 0) {
+        if (limiter->reserve() != ReserveStatus::RESERVED) { // Can't be UNLIMITED here
+          break;
+        }
+
         auto [vc, contp, start_time]    = limiter->pop();
         std::chrono::milliseconds delay = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
 
@@ -239,6 +249,10 @@ sni_queue_cont(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
 
           (void)contp;
           Dbg(dbg_ctl, "Queued VC is too old (%ldms), erroring out", static_cast<long>(age.count()));
+          // This VC never reserved a slot; detach it (clear the arg and release the selector
+          // lease) so its VCONN_CLOSE does not release a slot it never held.
+          TSUserArgSet(vc, gVCIdx, nullptr);
+          limiter->selector()->release();
           TSVConnReenableEx(vc, TS_EVENT_ERROR);
           limiter->incrementMetric(RATE_LIMITER_METRIC_EXPIRED);
         }
