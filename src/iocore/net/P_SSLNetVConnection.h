@@ -148,6 +148,15 @@ private:
   // (a transport error/timeout) cannot free the VC out from under the plugin's pending reenable. A
   // synchronous TSVConnAbort fails the handshake instead of parking, so it never sets this.
   bool _hook_parked = false;
+  // A verify hook (SSL_VERIFY_SERVER/CLIENT) is running. Such a hook reenabling with TS_EVENT_ERROR
+  // is reporting a certificate verdict, NOT terminating the handshake: whether a failed check stops
+  // the handshake is the verify policy's call, applied by the OpenSSL verify callback's return
+  // (SSLClientUtils: !enforce_mode) -- ENFORCED fails via SSL_ERROR_SSL, PERMISSIVE continues. While
+  // this is set, reenable_with_event routes the error into _verify_hook_failed (read once by
+  // _verify_certificate) instead of the terminal _sslState/_fatal_pending, so a PERMISSIVE override
+  // still completes the handshake instead of being torn down.
+  bool _in_verify_hook     = false;
+  bool _verify_hook_failed = false;
   // In the graceful close-drain (do_io_close's lingering close): user VIOs are severed and the
   // transport is flushing the final ciphertext before teardown. SHUTDOWN_IN_PROGRESS is reached
   // from exactly one site (do_io_close) and the VC is freed the instant it leaves the state, so

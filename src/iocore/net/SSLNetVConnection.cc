@@ -1847,14 +1847,23 @@ SSLNetVConnection::reenable_with_event(int event)
   }
 
   if (event == TS_EVENT_ERROR) {
-    // A hook failed the handshake: record it and keep iterating hooks (the remaining
-    // hooks of the chain must still see their event). The failure reaches the consumer
-    // exactly once, downstream: a synchronous reenable (hook callout mid-SSL_connect/
-    // accept) via the unwinding handshake error path, an asynchronous one via the
-    // scheduled dispatch's _fatal_pending branch in mainEvent. Signalling from here
-    // would let the consumer tear us down while the hook chain is still running.
-    _sslState      = SslState::ERROR;
-    _fatal_pending = true;
+    if (_in_verify_hook) {
+      // A verify hook (SSL_VERIFY_SERVER/CLIENT) reporting a bad certificate. This is a verdict,
+      // not a handshake termination: the verify policy decides (the OpenSSL verify callback returns
+      // !enforce_mode), so ENFORCED fails the handshake via SSL_ERROR_SSL while PERMISSIVE continues.
+      // Record the verdict only; do NOT latch the terminal _sslState/_fatal_pending, or the
+      // isTerminated() teardown paths would abort even a PERMISSIVE handshake that must complete.
+      _verify_hook_failed = true;
+    } else {
+      // A hook failed the handshake: record it and keep iterating hooks (the remaining
+      // hooks of the chain must still see their event). The failure reaches the consumer
+      // exactly once, downstream: a synchronous reenable (hook callout mid-SSL_connect/
+      // accept) via the unwinding handshake error path, an asynchronous one via the
+      // scheduled dispatch's _fatal_pending branch in mainEvent. Signalling from here
+      // would let the consumer tear us down while the hook chain is still running.
+      _sslState      = SslState::ERROR;
+      _fatal_pending = true;
+    }
   }
 
   resume_tls_event();
@@ -2369,17 +2378,23 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
   // We could pass a structure that has both a cert to verify and a NetVC.
   // It would allow us to remove confusing TSSslVerifyCTX and its internal implementation that are only available during a very
   // limited time.
+  // A verify hook reenabling with TS_EVENT_ERROR is reporting a certificate verdict, not a handshake
+  // termination -- enforcement is the verify policy's call, applied by the OpenSSL verify callback's
+  // return (!enforce_mode). While _in_verify_hook is set, reenable_with_event routes that error into
+  // _verify_hook_failed instead of the terminal _sslState/_fatal_pending, so a PERMISSIVE override
+  // still completes the handshake. Report the verdict; enforcement flows through the verify return.
+  _verify_hook_failed = false;
+  _in_verify_hook     = true;
+
   if (get_context() == NET_VCONNECTION_IN) {
     this->callHooks(TS_EVENT_SSL_VERIFY_CLIENT /* , ctx */);
   } else {
     this->callHooks(TS_EVENT_SSL_VERIFY_SERVER /* , ctx */);
   }
 
-  if (_sslState == SslState::ERROR) {
-    return 1;
-  }
+  _in_verify_hook = false;
 
-  return 0;
+  return _verify_hook_failed ? 1 : 0;
 }
 
 ssl_error_t
