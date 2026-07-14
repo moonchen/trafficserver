@@ -104,6 +104,7 @@ public:
   void       set_remote_addr(const sockaddr *addr) override;
   void       set_mptcp_state() override;
   void       mark_as_tunnel_endpoint() override;
+  void       trapWriteBufferEmpty(int event = VC_EVENT_WRITE_READY) override;
 
   // Event handler for relayed transport events and scheduled read drives.
   int mainEvent(int event, void *data);

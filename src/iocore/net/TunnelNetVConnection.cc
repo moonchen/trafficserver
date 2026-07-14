@@ -180,7 +180,11 @@ TunnelNetVConnection::_drive_read()
   }
 
   // Consumer is not actively reading: quiesce the transport and wait.
-  if (_user_read_vio.op != VIO::READ || _user_read_vio.is_disabled() || _user_read_vio.cont == nullptr) {
+  // buffer.writer() is null in the window between hand_off_to() (which points _user_read_vio at the
+  // trampoline with no buffer) and the HTTP layer's first do_io_read(buf); quiesce the transport
+  // until then -- the consumer's do_io_read re-drives via _schedule_read_drive.
+  if (_user_read_vio.op != VIO::READ || _user_read_vio.is_disabled() || _user_read_vio.cont == nullptr ||
+      _user_read_vio.buffer.writer() == nullptr) {
     if (_transport_read_vio != nullptr) {
       _transport_read_vio->disable();
     }
@@ -189,7 +193,12 @@ TunnelNetVConnection::_drive_read()
 
   int64_t navail = _buffered_reader != nullptr ? _buffered_reader->read_avail() : 0;
   int64_t ntodo  = _user_read_vio.ntodo();
-  int64_t nmove  = std::min(navail, ntodo);
+  // HttpTunnel throttles the producer only by withholding the consumer reenable, so bound
+  // the copy by the destination buffer's write_avail() (which honors its high-water mark)
+  // the way UnixNetVConnection::net_read_io does; otherwise a slow consumer lets the buffer
+  // grow without bound. Any bytes left behind stay in _buffered_reader for the next drive.
+  int64_t nspace = _user_read_vio.buffer.writer()->write_avail();
+  int64_t nmove  = std::min({navail, ntodo, nspace});
 
   if (nmove > 0) {
     int64_t moved = _user_read_vio.buffer.writer()->write(_buffered_reader, nmove);
@@ -211,8 +220,11 @@ TunnelNetVConnection::_drive_read()
     return;
   }
 
-  // Keep the transport reading more raw bytes.
-  if (_transport_read_vio != nullptr && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled()) {
+  // Keep the transport reading more raw bytes, but only while the consumer buffer has room.
+  // At high water we leave the transport quiesced; the consumer's reenable() re-drives once
+  // it drains space, matching net_read_io's disable-when-full behavior.
+  if (_transport_read_vio != nullptr && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
+      _user_read_vio.buffer.writer()->write_avail() > 0) {
     _transport_read_vio->reenable();
   }
 }
@@ -364,6 +376,11 @@ TunnelNetVConnection::do_io_close(int alerrno)
   bool close_inline = !_recursion && this->mutex && this->mutex->thread_holding == this_ethread();
   if (close_inline) {
     this->free_thread(this_ethread());
+  } else if (!_recursion) {
+    // Off-mutex, non-nested close (e.g. a plugin TSVConnClose from its own continuation):
+    // nothing else will free us, so defer to a clean stack. The scheduled mainEvent dispatch
+    // frees on _closed; the destructor cancels the event if a signal unwind frees us first.
+    _schedule_read_drive();
   }
 }
 
@@ -523,6 +540,16 @@ int
 TunnelNetVConnection::set_tcp_congestion_control(tcp_congestion_control_side side)
 {
   return _unvc != nullptr ? _unvc->set_tcp_congestion_control(side) : -1;
+}
+
+void
+TunnelNetVConnection::trapWriteBufferEmpty(int event)
+{
+  // The inner transport does the actual writing, so the trap must live on it:
+  // its write path reads its own write_buffer_empty_event.
+  if (_unvc != nullptr) {
+    _unvc->trapWriteBufferEmpty(event);
+  }
 }
 
 void
