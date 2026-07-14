@@ -167,6 +167,19 @@ private:
     return _sslState == SslState::SHUTDOWN_IN_PROGRESS;
   }
 
+  // True while a stack frame or a plugin still needs this VC alive, so it must NOT be freed:
+  // nested in our own notify or an OpenSSL callback frame (recursion), a handshake hook mid
+  // invocation (is_invoked_state), or a hook parked with a live plugin ref that will reenable
+  // (_hook_parked). Every VC free site -- _reclaimIfClosed, do_io_close's inline free, and the
+  // graceful-drain frees -- gates on this so a close arriving mid-hook cannot pull the VC out
+  // from under the plugin's pending reenable. (Orthogonal to _isDraining, which is a separate
+  // "the drain owns the free" gate: the drain frees while this predicate holds off.)
+  bool
+  _freeBlocked() const
+  {
+    return recursion != 0 || is_invoked_state() || _hook_parked;
+  }
+
   // A deferred handshake-time handoff that frees this VC and hands its transport elsewhere. Both
   // arms are decided mid-handshake and executed out of line on a clean mainEvent dispatch (they
   // cannot free this VC inline while a transport read handler still inspects it). Kept as its own
@@ -458,6 +471,17 @@ private:
   MIOBuffer      *_early_data_buf    = nullptr;
   IOBufferReader *_early_data_reader = nullptr;
 #endif
+  // Always-defined: _early_data_reader exists only under TS_HAS_TLS_EARLY_DATA, so the read-drive
+  // gates that consult it must go through this to keep the feature-off build compiling.
+  bool
+  _early_data_pending() const
+  {
+#if TS_HAS_TLS_EARLY_DATA
+    return _early_data_reader != nullptr && _early_data_reader->read_avail() > 0;
+#else
+    return false;
+#endif
+  }
 
   void                _trigger_ssl_read();
   int64_t             _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
