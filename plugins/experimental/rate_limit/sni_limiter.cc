@@ -27,6 +27,12 @@
 // This holds the VC user arg index for the SNI limiters.
 int gVCIdx = -1;
 
+// Serializes the SNI queue/slot transactions between the periodic sweep (sni_queue_cont,
+// which runs on a task thread) and the VCONN_CLOSE handler below (which runs on the net
+// thread). Both mutate the same queue, active-slot counter and selector lease; without a
+// shared lock they interleave and corrupt that state. See sni_queue_cont for the details.
+std::mutex gQueueMutex;
+
 bool
 SniRateLimiter::parseYaml(const YAML::Node &node)
 {
@@ -170,14 +176,22 @@ sni_limit_cont(TSCont contp, TSEvent event, void *edata)
     auto *limiter = static_cast<SniRateLimiter *>(TSUserArgGet(vc, gVCIdx));
 
     if (limiter) {
-      TSUserArgSet(vc, gVCIdx, nullptr);
-      // A connection that is still queued never reserved a slot, so only release one if it
-      // is not in the queue (either it reserved at CLIENT_HELLO or the sweep resumed it into
-      // a reserved slot). Dropping it from the queue also avoids a stale entry.
-      if (!limiter->remove(vc)) {
-        limiter->free();
+      // Serialize against the queue sweep (sni_queue_cont), which runs concurrently on a
+      // task thread. Re-read the arg under the lock: the sweep's expiry path may have
+      // detached this VC (cleared the arg and released the lease) after our unlocked read,
+      // and releasing that lease a second time would delete the selector early.
+      std::lock_guard<std::mutex> lock(gQueueMutex);
+
+      if (TSUserArgGet(vc, gVCIdx) == limiter) {
+        TSUserArgSet(vc, gVCIdx, nullptr);
+        // A connection that is still queued never reserved a slot, so only release one if it
+        // is not in the queue (either it reserved at CLIENT_HELLO or the sweep resumed it into
+        // a reserved slot). Dropping it from the queue also avoids a stale entry.
+        if (!limiter->remove(vc)) {
+          limiter->free();
+        }
+        limiter->selector()->release(); // Release the selector, such that it can be deleted later
       }
-      limiter->selector()->release(); // Release the selector, such that it can be deleted later
     }
     TSVConnReenable(vc);
     break;

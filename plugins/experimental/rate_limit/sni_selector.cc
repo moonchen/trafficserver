@@ -25,6 +25,10 @@ std::atomic<SniSelector *> SniSelector::_instance = nullptr;
 // The VC user-arg index, defined in sni_limiter.cc, used to detach an expired queued VC.
 extern int gVCIdx;
 
+// Shared lock (defined in sni_limiter.cc) serializing the queue/slot transactions below
+// against the net-thread VCONN_CLOSE handler.
+extern std::mutex gQueueMutex;
+
 ///////////////////////////////////////////////////////////////////////////////
 // YAML parser for the global YAML configuration (via plugin.config)
 //
@@ -220,6 +224,12 @@ sni_queue_cont(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
     QueueTime now     = std::chrono::system_clock::now(); // Only do this once per limiter
 
     if (owner) { // Don't operate on the aliases
+      // Hold the shared queue lock across the whole reserve->pop->reenable transaction. A
+      // concurrent VCONN_CLOSE (net thread) could otherwise empty the queue between size()
+      // and pop() (an empty pop would reenable a null VC), free a slot we are about to grant,
+      // or tear down and free a popped VC before we reenable it.
+      std::lock_guard<std::mutex> lock(gQueueMutex);
+
       // Resume queued VCs while slots are available. Reserve first and only dequeue on
       // success, so the resumed VC owns the slot it was granted (its VCONN_CLOSE will
       // release exactly that slot). A failed reserve means we are at the limit; leave the
@@ -229,7 +239,13 @@ sni_queue_cont(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
           break;
         }
 
-        auto [vc, contp, start_time]    = limiter->pop();
+        auto [vc, contp, start_time] = limiter->pop();
+
+        if (nullptr == vc) { // Queue emptied under us; give back the slot we just reserved
+          limiter->free();
+          break;
+        }
+
         std::chrono::milliseconds delay = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
 
         (void)contp; // Ugly, but silences some compilers.
@@ -244,7 +260,12 @@ sni_queue_cont(TSCont cont, TSEvent /* event ATS_UNUSED */, void * /* edata ATS_
 
         while (limiter->size() > 0 && limiter->hasOldEntity(now)) {
           // The oldest object on the queue is too old on the queue, so "kill" it.
-          auto [vc, contp, start_time]  = limiter->pop();
+          auto [vc, contp, start_time] = limiter->pop();
+
+          if (nullptr == vc) { // Queue emptied under us
+            break;
+          }
+
           std::chrono::milliseconds age = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
 
           (void)contp;
