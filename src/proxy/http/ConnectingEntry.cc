@@ -50,7 +50,12 @@ ConnectingEntry::state_http_server_open(int event, void *data)
   switch (event) {
   case NET_EVENT_OPEN: {
     netvc = static_cast<NetVConnection *>(data);
-    // ink_release_assert(_pending_action == nullptr || _pending_action->continuation == vc->get_open_continuation());
+    // For a plain transport, netvc's own recorded open continuation (get_open_continuation()) is what
+    // _pending_action's Action points at. For a layered transport (e.g. an SSL-terminated origin), the raw
+    // connect's Action targets netvc itself, so _pending_action's continuation is netvc rather than whatever
+    // netvc forwards its own completion to.
+    ink_release_assert(_pending_action == nullptr || _pending_action->continuation == netvc->get_open_continuation() ||
+                       _pending_action->continuation == netvc);
     _pending_action = nullptr;
     Dbg(dbg_ctl_http_connect, "ConnectingEntrysetting handler for connection handshake");
     // Just want to get a write-ready event so we know that the connection handshake is complete.
