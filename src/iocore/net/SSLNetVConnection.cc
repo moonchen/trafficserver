@@ -461,10 +461,17 @@ SSLNetVConnection::_releaseHandshakeReader()
   // MIOBuffer::high_water() is then always true and check_add_block() never grows the rbio. Once the
   // transport read fills the first block, write_avail() is 0 forever and the transport read disables
   // on a "full" buffer -- the layered VC reads at most one rbio block (~one DATA frame) of any
-  // response and stalls. Free it once the handshake is established (and no blind tunnel will adopt
-  // it) so the rbio recycles and can stream bodies larger than one block.
-  if (handShakeHolder != nullptr && getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
-      _pending_handoff != PendingHandoff::BLIND_TUNNEL) {
+  // response and stalls, and a handshake flight larger than one block (a big mTLS client-cert
+  // bundle) never completes. Release it as soon as it can no longer be needed so the rbio recycles
+  // and can stream bodies -- and read handshake flights -- larger than one block.
+  //
+  // The outbound face never reads the holder (no ClientHello sniff / blind tunnel / allow-plain on a
+  // connection we deliberately opened as a TLS client), so release it immediately there -- that alone
+  // unpins the rbio before a large/PQ/cross-signed origin cert chain is read. Inbound keeps it until
+  // the handshake is established (and no blind tunnel will adopt it), as before.
+  if (handShakeHolder != nullptr &&
+      (get_context() == NET_VCONNECTION_OUT || (getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
+                                                _pending_handoff != PendingHandoff::BLIND_TUNNEL))) {
     handShakeHolder->dealloc();
     handShakeHolder = nullptr;
   }
