@@ -630,6 +630,12 @@ private:
   // lingering second reader otherwise wedges the rbio and stalls large reads.
   void _releaseHandshakeReader();
 
+  // Inbound-only: release handShakeHolder once the hook FSM has passed the client-hello stage,
+  // mirroring master's update_rbio(!in_client_hello). Call ONLY from the WANT_READ tail of
+  // _trigger_ssl_read (never the pre-handshake-call sites), where the round's SNI/cert hooks
+  // have already run and any tunnel/downgrade is resolved. See the definition.
+  void _commitInboundHandshake();
+
   // The continuation to notify once this VC's own open (connect+handshake) or accept
   // (accept+handshake) completes - see NetVConnection::set_open_continuation().
   Continuation *_open_continuation = nullptr;

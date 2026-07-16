@@ -137,8 +137,14 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
     return;
   }
 
-  // Only set up the bio stuff for the server side
-  this->initialize_handshake_buffers();
+  // The handshake holder is a second reader parked at the head of _read_buf so the inbound
+  // ClientHello can be replayed to a blind tunnel / plain downgrade or stripped of its PROXY
+  // header. The outbound (origin) face never replays anything -- it is the TLS client -- and a
+  // parked reader there would only pin _read_buf and stall large origin flights, so do not create
+  // it. (The rbio/wbio the SSL object reads and writes through are set up below for both faces.)
+  if (get_context() != NET_VCONNECTION_OUT) {
+    this->initialize_handshake_buffers();
+  }
 
   // Hold the BIOs in RAII guards until SSL_set_bio takes ownership: an early
   // return between BIO_new and SSL_set_bio would otherwise leak them.
@@ -454,24 +460,85 @@ void
 SSLNetVConnection::_releaseHandshakeReader()
 {
   // handShakeHolder is a second IOBufferReader on _read_buf, allocated by
-  // initialize_handshake_buffers() for the inbound ClientHello replay / blind-tunnel handoff. On a
-  // normal (TLS-terminated) connection nothing ever consumes it, and it is otherwise only freed at
-  // teardown -- so it stays pinned at the head of _read_buf for the whole data phase. That keeps
-  // _read_buf->max_read_avail() at the full buffer; with _read_buf's water_mark of 0,
-  // MIOBuffer::high_water() is then always true and check_add_block() never grows the rbio. Once the
-  // transport read fills the first block, write_avail() is 0 forever and the transport read disables
-  // on a "full" buffer -- the layered VC reads at most one rbio block (~one DATA frame) of any
-  // response and stalls, and a handshake flight larger than one block (a big mTLS client-cert
-  // bundle) never completes. Release it as soon as it can no longer be needed so the rbio recycles
-  // and can stream bodies -- and read handshake flights -- larger than one block.
+  // initialize_handshake_buffers() for the inbound ClientHello replay / blind-tunnel handoff (only
+  // the inbound face creates one). On a normal (TLS-terminated) connection nothing ever consumes
+  // it, and it is otherwise only freed at teardown -- so it stays pinned at the head of _read_buf
+  // for the whole data phase. That keeps _read_buf->max_read_avail() at the full buffer; with
+  // _read_buf's water_mark of 0, MIOBuffer::high_water() is then always true and check_add_block()
+  // never grows the rbio. Once the transport read fills the first block, write_avail() is 0 forever
+  // and the transport read disables on a "full" buffer -- the layered VC reads at most one rbio
+  // block (~one DATA frame) of any response and stalls, and a handshake flight larger than one
+  // block (a big mTLS client-cert bundle) never completes. Release it as soon as it can no longer
+  // be needed so the rbio recycles and can stream bodies -- and read handshake flights -- larger
+  // than one block.
   //
-  // The outbound face never reads the holder (no ClientHello sniff / blind tunnel / allow-plain on a
-  // connection we deliberately opened as a TLS client), so release it immediately there -- that alone
-  // unpins the rbio before a large/PQ/cross-signed origin cert chain is read. Inbound keeps it until
-  // the handshake is established (and no blind tunnel will adopt it), as before.
+  // This is the established-handshake release; _commitInboundHandshake drops it earlier (once the
+  // hook FSM passes CLIENT_HELLO) for the common no-tunnel case. A FORWARD / PARTIAL_BLIND route
+  // keeps it through the handshake and releases here.
+  if (handShakeHolder != nullptr && getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
+      _pending_handoff != PendingHandoff::BLIND_TUNNEL) {
+    handShakeHolder->dealloc();
+    handShakeHolder = nullptr;
+  }
+}
+
+void
+SSLNetVConnection::_commitInboundHandshake()
+{
+  // Inbound analog of master's update_rbio(!in_client_hello) + free_handshake_buffers()
+  // (upstream net_read_io, SSLNetVConnection.cc:597-604): once the handshake-hook FSM has
+  // advanced past HANDSHAKE_HOOKS_CLIENT_HELLO, ATS has committed to terminating TLS -- no
+  // blind tunnel or plain downgrade can follow -- so the ClientHello no longer needs to be
+  // replayable. Release handShakeHolder here so it stops pinning _read_buf and the single
+  // ciphertext buffer can stream the client's post-ServerHello flight (a large mTLS
+  // client-cert bundle) and, afterwards, response bodies larger than one rbio block. Master
+  // switches SSL to a socket BIO instead; the layered VC has no socket to switch to, so
+  // dropping the second reader is the whole move.
+  //
+  // Call site matters as much as the state: this runs ONLY from the WANT_READ/WANT_ACCEPT
+  // tail of _trigger_ssl_read, after sslStartHandShake() has returned and after the
+  // SSL_RESTART (downgrade), blind-tunnel, terminated, and EVENT_ERROR early-returns. That is
+  // where the round's SNI/cert hooks have already run and any tunnel/downgrade decision is
+  // final -- the same knowledge master's line-604 position encodes. Evaluating the same state
+  // predicate from _releaseHandshakeReader's other call sites (pre-sslStartHandShake, or the
+  // write face) would release a round too early: a resumed parked client-hello hook can leave
+  // the FSM at SNI before this round's SSL_accept runs the servername/cert hooks, one of which
+  // may still TSVConnTunnel -- and _handoffBlindTunnel would then replay a headless stream.
+  //
+  // Three gate conditions -- master's two plus the layered tunnel exclusion:
+  //   - handShakeHolder != nullptr: master's first condition, and idempotent -- null after the
+  //     first release, and _trigger_ssl_read runs every WANT_READ round. Because the holder is
+  //     only created for the inbound face (_make_ssl_connection), a non-null holder already
+  //     implies an inbound VC -- the context is asserted below rather than branched.
+  //   - state != CLIENT_HELLO: master's commit signal -- past the client-hello stage, TLS
+  //     termination is committed and no blind tunnel / plain downgrade can follow.
+  //   - tunnel_type == NONE: unlike master (which switches SSL to a socket BIO and lets the kernel
+  //     hold the raw stream), a FORWARD / PARTIAL_BLIND route terminates TLS here but its tunnel
+  //     still forwards through _read_buf, so the second reader must stay. BLIND is redundant with
+  //     this (it also sets attributes, caught by the blind-tunnel early-return in _trigger_ssl_read),
+  //     but FORWARD / PARTIAL_BLIND are not.
+  //
+  // Everything else that must hold to make the release safe is guaranteed by this call site (past
+  // the SSL_RESTART / blind-tunnel / terminated / EVENT_ERROR early-returns, on a WANT_READ round
+  // where no hook is parked), so it is asserted rather than branched -- a future change that breaks
+  // the sequencing then crashes loudly here instead of silently releasing the holder into a
+  // still-pending tunnel/downgrade.
   if (handShakeHolder != nullptr &&
-      (get_context() == NET_VCONNECTION_OUT || (getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
-                                                _pending_handoff != PendingHandoff::BLIND_TUNNEL))) {
+      get_handshake_hook_state() != TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_CLIENT_HELLO &&
+      get_tunnel_type() == SNIRoutingType::NONE) {
+    // The holder is created only for the inbound face, so a live one here is never outbound.
+    ink_release_assert(get_context() != NET_VCONNECTION_OUT);
+    // A WANT_READ return means no hook is parked (a parked hook returns EVENT_CONT /
+    // SSL_WAIT_FOR_HOOK, a different switch case), so the FSM is never at a *_INVOKE substate --
+    // in particular not CLIENT_HELLO_INVOKE, which the state check above would otherwise admit.
+    ink_release_assert(!is_invoked_state());
+    // A blind tunnel from a cert/servername-hook TSVConnTunnel or tr-pass sets attributes =
+    // BLIND_TUNNEL and returned at the blind-tunnel early-return in _trigger_ssl_read, so it cannot
+    // be pending here (the SNI-route BLIND is already excluded by the tunnel_type gate above).
+    ink_release_assert(attributes != HttpProxyPort::TRANSPORT_BLIND_TUNNEL);
+    // DOWNGRADE_PLAIN returned via SSL_RESTART and BLIND_TUNNEL via the line-541 path; neither
+    // handoff can be pending here.
+    ink_release_assert(_pending_handoff == PendingHandoff::NONE);
     handShakeHolder->dealloc();
     handShakeHolder = nullptr;
   }
@@ -616,6 +683,11 @@ SSLNetVConnection::_trigger_ssl_read()
           return;
         }
       }
+      // The handshake is progressing and waiting for the client's next flight. If the hook FSM
+      // has passed the client-hello stage, TLS termination is committed -- release the
+      // ClientHello holder so the (possibly large) inbound flight streams unpinned. See the
+      // method: this is the only safe call site for the inbound release.
+      _commitInboundHandshake();
       _transport_read_vio->reenable();
       break;
     case SSL_HANDSHAKE_WANT_CONNECT:
@@ -1575,8 +1647,16 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     err = errno;
     SSLVCDebug(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
 
-    if (_read_buf->is_max_read_avail_more_than(0)) {
-      char *buf = _read_buf->buf();
+    // Sniff the first raw byte the client sent to tell a real ClientHello (0x16) from plain
+    // HTTP (allow-plain / tr-pass). Read it through handShakeHolder, whose position IS the byte
+    // that would be replayed to a plain/tunnel successor: _read_buf->buf() returns the write
+    // block's base, which after a stripped PROXY header (consumed from the holder above) is the
+    // header's first byte, not the client's. The holder != nullptr guard also means we never
+    // sniff after _commitInboundHandshake has released it -- once TLS is committed the head
+    // block recycles and buf()[0] would be mid-stream ciphertext, which could spuriously arm a
+    // DOWNGRADE_PLAIN whose executor dereferences the (now null) holder.
+    if (handShakeHolder != nullptr && handShakeHolder->is_read_avail_more_than(0)) {
+      char *buf = handShakeHolder->start();
       if (buf && *buf != SSL_OP_HANDSHAKE) {
         SSLVCDebug(this, "SSL hanshake error with bad HS buffer");
         if (getAllowPlain()) {
@@ -2269,6 +2349,11 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
 void
 SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread *t)
 {
+  // DOWNGRADE_PLAIN is only ever armed by the allow-plain sniff while the holder is present, and
+  // the holder is not released after that (the release gate excludes a pending handoff). If this
+  // fires, the sniff/release ordering has been broken and we are about to hand a null reader to
+  // the plain successor.
+  ink_release_assert(this->handShakeHolder != nullptr);
   Dbg(dbg_ctl_ssl, "allow-plain, handshake buffer ready to read=%" PRId64, this->handShakeHolder->read_avail());
   // Take ownership of the handShake buffer
   _sslState   = SslState::HANDSHAKE_DONE;
