@@ -85,8 +85,14 @@ Connection state
 Two enums in ``P_SSLNetVConnection.h`` track the connection:
 
 * ``SslState`` — ``HANDSHAKING``, ``HANDSHAKE_DONE``, ``SHUTDOWN_IN_PROGRESS``,
-  ``TERMINATED``. ``TERMINATED`` means no further SSL I/O of any kind; the reason
+  ``FATAL_PENDING``, ``TERMINATED``, ``RECLAIMABLE``. ``FATAL_PENDING`` is
+  terminal with an armed handshake failure not yet delivered; delivering that
+  error to the waiter *is* the transition to ``TERMINATED``, so it is signalled
+  exactly once. ``TERMINATED`` means no further SSL I/O of any kind; the reason
   (clean close vs. error) is carried by ``lerrno``, not the state.
+  ``RECLAIMABLE`` additionally authorizes the free: the consumer has closed the
+  VC (or a terminal event found no consumer attached), and the VC frees itself
+  once nothing else blocks it.
 * ``TransportState`` — the state of the inner ``_unvc``: ``TRANSPORT_LIVE``,
   ``TRANSPORT_CLOSED``, ``TRANSPORT_ERROR``.
 
@@ -143,11 +149,17 @@ source. The amount of buffered ciphertext is bounded by
 
 Because the encrypted bytes may still be buffered when ``SSL_write`` returns,
 ``VC_EVENT_WRITE_COMPLETE`` is not delivered until ``_write_buf`` has actually
-drained to the transport, and it is delivered out of line (scheduled, not from
-the current stack). The consumer typically closes the connection from its
-``WRITE_COMPLETE`` handler; signalling inline -- while the inner connection's
-``net_write_io`` is still on the stack and still references ``_write_buf`` -- would
-let that close truncate the response or free a buffer that is still in use.
+drained to the transport; the consumer typically closes the connection from
+its ``WRITE_COMPLETE`` handler, and signalling while ciphertext is still
+buffered would let that close truncate the response. Once the buffer has
+drained, ``_deliverWriteComplete`` signals the consumer synchronously, on the
+current stack -- a scheduled delivery could outlive the consumer it targets
+(pool release, cross-thread migration, or a reattachment of the user VIOs). A
+close from inside the handler is safe: the free is deferred until the signal
+unwinds (see Object lifecycle below). If the handler instead queues a further
+write, its ``reenable`` is undone by the still-unwinding ``net_write_io``
+pass, so that re-arm alone is re-issued from a deferred, self-targeted
+dispatch.
 
 The read path and terminal state
 ================================
