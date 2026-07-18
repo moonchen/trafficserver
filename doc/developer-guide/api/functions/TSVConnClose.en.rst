@@ -32,3 +32,11 @@ Synopsis
 
 Description
 ===========
+
+Close :arg:`connp` normally, indicating the vconnection can destroy itself.
+After this call the user will not be called back by the vconnection again.
+
+:func:`TSVConnClose` must not be called on an inbound TLS connection while its
+TLS handshake is in progress (for example from an SSL handshake hook); |TS|
+rejects that with a fatal assertion. To fail a handshake from an SSL hook, call
+:func:`TSVConnReenableEx` with ``TS_EVENT_ERROR``.

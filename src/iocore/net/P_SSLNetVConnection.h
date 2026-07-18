@@ -209,6 +209,15 @@ public:
     return _sslState == SslState::HANDSHAKE_DONE;
   }
 
+  // True only while the handshake is actually in progress -- false once the VC is
+  // established, draining, or terminated, so a stale close of a post-handshake VC
+  // does not read as mid-handshake.
+  bool
+  getSSLHandShakeInProgress() const
+  {
+    return _sslState == SslState::HANDSHAKING;
+  }
+
   int sslServerHandShakeEvent(int &err);
   int sslClientHandShakeEvent(int &err);
 

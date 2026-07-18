@@ -1,15 +1,14 @@
 /** @file
 
-  Test plugin: abort a TLS handshake from within an SSL hook via TSVConnAbort.
+  Test plugin: fail every TLS handshake from the SSL cert hook.
 
-  A plugin is allowed to fail a handshake from an SSL hook. The documented,
-  reenable-based path (TSVConnReenableEx(vc, TS_EVENT_ERROR)) defers the actual
-  teardown. TSVConnAbort(vc, error), by contrast, calls do_io_close(error)
-  directly. This callback runs synchronously while ATS is still nested inside
-  OpenSSL's SSL_accept() (the cert callback fires mid-ClientHello-processing), so
-  a layered SSLNetVConnection that frees its SSL object inline here destroys it
-  out from under the OpenSSL frame that is still on the stack -- a use-after-free
-  inside libssl. This plugin exists to exercise exactly that path.
+  Failing a handshake from an SSL hook is done with the reenable-based path,
+  TSVConnReenableEx(vc, TS_EVENT_ERROR): the hook flags the error and ATS
+  delivers the failure and tears the connection down on its own schedule,
+  outside the OpenSSL frame the hook was invoked from. (Closing the VC directly
+  from the hook -- TSVConnClose/TSVConnAbort -- is not a supported action and is
+  rejected by the API.) This plugin exercises the supported fail path from
+  TS_SSL_CERT_HOOK, which fires synchronously mid-SSL_accept.
 
   @section license License
 
@@ -31,7 +30,6 @@
  */
 
 #include <ts/ts.h>
-#include <cstdint>
 
 #define PN  "ssl_cert_abort"
 #define PCP "[" PN " Plugin] "
@@ -40,17 +38,12 @@ namespace
 {
 DbgCtl dbg_ctl{PN};
 
-// Nonzero so do_io_close(error) takes the error (lerrno != -1) path -- the one
-// that historically decided to free inline on a heuristic that did not account
-// for being nested in an OpenSSL callback frame.
-constexpr int ABORT_ERRNO = 1;
-
 int
-CB_Cert_Abort(TSCont /* cont ATS_UNUSED */, TSEvent /* event ATS_UNUSED */, void *edata)
+CB_Cert_Fail(TSCont /* cont ATS_UNUSED */, TSEvent /* event ATS_UNUSED */, void *edata)
 {
   TSVConn ssl_vc = static_cast<TSVConn>(edata);
-  Dbg(dbg_ctl, "cert hook: aborting ssl_vc=%p synchronously via TSVConnAbort", ssl_vc);
-  TSVConnAbort(ssl_vc, ABORT_ERRNO);
+  Dbg(dbg_ctl, "cert hook: failing the handshake for ssl_vc=%p via TSVConnReenableEx(TS_EVENT_ERROR)", ssl_vc);
+  TSVConnReenableEx(ssl_vc, TS_EVENT_ERROR);
   return TS_SUCCESS;
 }
 } // namespace
@@ -67,6 +60,6 @@ TSPluginInit(int /* argc ATS_UNUSED */, const char * /* argv ATS_UNUSED */[])
     return;
   }
 
-  TSCont cb = TSContCreate(&CB_Cert_Abort, nullptr);
+  TSCont cb = TSContCreate(&CB_Cert_Fail, nullptr);
   TSHttpHookAdd(TS_SSL_CERT_HOOK, cb);
 }

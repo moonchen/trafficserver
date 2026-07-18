@@ -6012,12 +6012,29 @@ TSVConnWrite(TSVConn connp, TSCont contp, TSIOBufferReader readerp, int64_t nbyt
     vc->do_io_write(reinterpret_cast<INKContInternal *>(contp), nbytes, reinterpret_cast<IOBufferReader *>(readerp)));
 }
 
+// A plugin only ever sees an inbound TLS VC through the SSL handshake hooks, and the
+// supported ways to dispose of it are TSVConnReenable(Ex) and TSVConnTunnel; closing it
+// mid-handshake tears the VC down under the handshake driver and orphans the protocol
+// acceptor. Reject that here, at the only entry point a plugin has. Outbound TLS VCs are
+// exempt: a plugin may own one (TSNetConnect) and legitimately abort it mid-handshake.
+static void
+reject_plugin_close_of_handshaking_tls_vc(VConnection *vc)
+{
+  if (auto *ssl_vc = dynamic_cast<SSLNetVConnection *>(vc); ssl_vc != nullptr &&
+                                                            ssl_vc->get_context() == NetVConnectionContext_t::NET_VCONNECTION_IN &&
+                                                            ssl_vc->getSSLHandShakeInProgress()) {
+    ink_release_assert(!"Plugin tries to close an inbound TLS connection during the handshake; "
+                        "use TSVConnReenableEx(TS_EVENT_ERROR) to fail it");
+  }
+}
+
 void
 TSVConnClose(TSVConn connp)
 {
   sdk_assert(sdk_sanity_check_iocore_structure(connp) == TS_SUCCESS);
 
   VConnection *vc = reinterpret_cast<VConnection *>(connp);
+  reject_plugin_close_of_handshaking_tls_vc(vc);
   vc->do_io_close();
 }
 
@@ -6027,6 +6044,7 @@ TSVConnAbort(TSVConn connp, int error)
   sdk_assert(sdk_sanity_check_iocore_structure(connp) == TS_SUCCESS);
 
   VConnection *vc = reinterpret_cast<VConnection *>(connp);
+  reject_plugin_close_of_handshaking_tls_vc(vc);
   vc->do_io_close(error);
 }
 

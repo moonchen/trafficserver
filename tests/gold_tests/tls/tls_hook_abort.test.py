@@ -1,10 +1,10 @@
 '''
-A plugin may fail a TLS handshake from an SSL hook. When it does so with
-TSVConnAbort (rather than the reenable-based path), the abort's do_io_close runs
-synchronously while ATS is still nested inside OpenSSL's SSL_accept() -- the cert
-hook fires mid-handshake. The layered SSLNetVConnection must not free its SSL
-object inline there (that would be a use-after-free inside libssl); it must defer
-the teardown until the OpenSSL frame has returned. ATS must survive the abort.
+A plugin fails a TLS handshake from the SSL cert hook via the supported path,
+TSVConnReenableEx(vc, TS_EVENT_ERROR). The cert hook fires synchronously while
+ATS is still nested inside OpenSSL's SSL_accept(), so the flagged error must be
+delivered and the connection torn down on a clean stack: no crash, no sanitizer
+report, and the client sees a failed handshake. (Closing the handshake VC
+directly from the hook is not a supported action and is rejected by the API.)
 '''
 #  Licensed to the Apache Software Foundation (ASF) under one
 #  or more contributor license agreements.  See the NOTICE file
@@ -28,7 +28,7 @@ Test.Summary = __doc__
 
 
 class TestTlsHookAbort:
-    '''A synchronous TSVConnAbort from an SSL cert hook must not crash ATS.'''
+    '''Failing a handshake from the cert hook via TSVConnReenableEx(TS_EVENT_ERROR) must be clean.'''
 
     def __init__(self) -> None:
         self._ts = self._configure_trafficserver()
@@ -53,24 +53,32 @@ ssl_multicert:
             })
         ts.Disk.remap_config.AddLine('map / https://127.0.0.1:1/')
 
-        # The plugin aborts every inbound handshake from the cert hook.
+        # On an ASAN build, LSan runs at exit. Suppress the known one-time/shutdown
+        # allocations so the sanitizer exclusion below stays a real leak oracle: an
+        # unsuppressed leak on the hook-failed handshake path (e.g. an orphaned
+        # protocol acceptor) still prints and fails the test.
+        supp = os.path.abspath(os.path.join(Test.TestDirectory, '..', '..', '..', 'ci', 'asan_leak_suppression', 'tls_autest.txt'))
+        ts.Env['ASAN_OPTIONS'] = 'detect_leaks=1:abort_on_error=0:exitcode=0'
+        ts.Env['LSAN_OPTIONS'] = 'suppressions={0}:print_suppressions=0'.format(supp)
+
+        # The plugin fails every inbound handshake from the cert hook.
         Test.PrepareTestPlugin(os.path.join(Test.Variables.AtsTestPluginsDir, 'ssl_cert_abort.so'), ts)
 
         # The plugin must actually fire (otherwise the test is vacuous). The DIAG
         # output lands in traffic.out.
         ts.Disk.traffic_out.Content = Testers.ContainsExpression(
-            "aborting ssl_vc", "the cert hook must run and abort the handshake")
-        # The abort must not crash or trip a sanitizer -- this is the whole point.
+            "failing the handshake", "the cert hook must run and fail the handshake")
+        # The deferred error delivery and teardown must be clean.
         ts.Disk.traffic_out.Content += Testers.ExcludesExpression(
-            "received signal|failed assertion", "ATS must not crash on a mid-handshake TSVConnAbort")
+            "received signal|failed assertion", "ATS must not crash failing a handshake from the cert hook")
         ts.Disk.traffic_out.Content += Testers.ExcludesExpression(
-            "AddressSanitizer|use-after-free|runtime error:", "no memory-safety error on a mid-handshake abort")
+            "AddressSanitizer|use-after-free|runtime error:", "no memory-safety error on the hook-failed handshake path")
         return ts
 
     def run(self) -> None:
-        tr = Test.AddTestRun("Abort several TLS handshakes from the cert hook; ATS must survive")
+        tr = Test.AddTestRun("Fail several TLS handshakes from the cert hook; ATS must stay up and clean")
         tr.Processes.Default.StartBefore(self._ts)
-        # Each handshake is aborted by the plugin, so curl fails -- that is expected.
+        # Each handshake is failed by the plugin, so curl fails -- that is expected.
         # We drive several attempts and assert ATS stays up and clean, not curl's exit.
         tr.MakeCurlCommandMulti(
             (
@@ -78,7 +86,7 @@ ssl_multicert:
                 '{{curl}} -k https://127.0.0.1:{0}; '
                 '{{curl}} -k https://127.0.0.1:{0}').format(self._ts.Variables.ssl_port),
             ts=self._ts)
-        tr.Processes.Default.ReturnCode = Any(0, 35, 56)  # handshake-failure exits vary by curl/TLS lib
+        tr.Processes.Default.ReturnCode = Any(0, 35, 55, 56)  # handshake-failure exits vary by curl/TLS lib and RST timing
         tr.StillRunningAfter = self._ts
 
 

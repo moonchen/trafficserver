@@ -46,6 +46,10 @@ The following actions are valid from these callbacks.
   * Find SSL context by address - :func:`TSSslContextFindByAddr`
   * Determine whether the TSVConn is really representing a SSL connection - :func:`TSVConnIsSsl`
 
+Closing the connection (:func:`TSVConnClose` or :func:`TSVConnAbort`) is not a valid action
+while the handshake is in progress; |TS| rejects it with a fatal assertion. To fail the
+handshake, call :func:`TSVConnReenableEx` with ``TS_EVENT_ERROR``.
+
 TS_VCONN_START_HOOK
 ------------------------
 
