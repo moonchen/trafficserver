@@ -2976,7 +2976,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   if (!this->getSSLHandShakeComplete()) {
     this->_trackFirstHandshake();
 
-    int err, ret;
+    int err = 0, ret;
 
     if (this->get_context() == NET_VCONNECTION_OUT) {
       ret = this->sslStartHandShake(SSL_EVENT_CLIENT, err);
