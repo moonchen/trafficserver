@@ -121,7 +121,6 @@ SSLNetProcessor::connect_re(Continuation *cont, sockaddr const *target, NetVCOpt
   ssl_netvc->set_remote_addr(target);
   ssl_netvc->options = opt;
   ssl_netvc->set_context(NET_VCONNECTION_OUT);
-  ssl_netvc->set_open_continuation(cont);
   ssl_netvc->mutex = cont->mutex;
   // Return this VC's own action, not the inner transport's: a consumer cancel then targets this VC
   // (handled in startEvent) rather than the inner connect, which would orphan this VC -- or crash

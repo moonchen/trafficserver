@@ -631,14 +631,11 @@ private:
   // have already run and any tunnel/downgrade is resolved. See the definition.
   void _commitInboundHandshake();
 
-  // The continuation to notify once this VC's own open (connect+handshake) or accept
-  // (accept+handshake) completes - see NetVConnection::set_open_continuation().
-  Continuation *_open_continuation = nullptr;
-
-  // The cancellable handle an outbound consumer holds (returned by SSLNetProcessor::connect_re).
-  // Cancelling it targets THIS outer VC rather than the inner transport connect, so a cancel
-  // cleans this VC up on open/open-failed (startEvent) instead of orphaning it -- or crashing the
-  // inner's cancelled-before-connectUp teardown. Unused on the inbound (accept) path.
+  // The outbound consumer's handle on this VC's open (returned by SSLNetProcessor::connect_re).
+  // Its continuation is the one to notify on open/open-failed (set_open_continuation delegates
+  // here), and cancelling it targets THIS outer VC rather than the inner transport connect, so a
+  // cancel cleans this VC up in startEvent instead of orphaning it -- or crashing the inner's
+  // cancelled-before-connectUp teardown. Unused on the inbound (accept) path.
   Action _connect_action;
 };
 

@@ -151,6 +151,17 @@ TEST_CASE("#7: cancel-before-open reclaims the outer and closes the inner", "[SS
   SUCCEED("cancel-before-open did not crash");
 }
 
+TEST_CASE("cancel-before-open-failed skips the notify and reclaims the outer", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  fx.attach_cancelled_open_failed();
+
+  // The cancelled consumer must see neither callback; the VC frees itself on this path.
+  CHECK_FALSE(fx.consumer()->got_open);
+  CHECK_FALSE(fx.consumer()->got_open_failed);
+  SUCCEED("cancelled open-failed neither notified nor crashed");
+}
+
 // #5: a handshake timeout must reach the side the consumer is waiting on. The inner transport
 // always times out on its read VIO, but a direct-outbound waiter installs only a do_io_write, so
 // routing by the transport face would drop it. Consumer-driven: the timeout reaches the write

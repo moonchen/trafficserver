@@ -23,6 +23,8 @@
 
 #include "ssl_reducer_harness.h"
 
+#include <cerrno>
+
 #include "../SSLStats.h"
 #include "../P_SSLConfig.h"
 #include "../P_SSLCertLookup.h"
@@ -318,11 +320,16 @@ ScriptableConsumer::~ScriptableConsumer()
 int
 ScriptableConsumer::handle(int event, void *data)
 {
-  VIO *vio = static_cast<VIO *>(data);
   if (event == NET_EVENT_OPEN) {
     got_open = true;
     return EVENT_CONT;
   }
+  if (event == NET_EVENT_OPEN_FAILED) {
+    // data is the (negative) errno, not a VIO -- must not fall through to the VIO branches.
+    got_open_failed = true;
+    return EVENT_CONT;
+  }
+  VIO *vio = static_cast<VIO *>(data);
   if (vio && vio->op == VIO::WRITE) {
     write_signals.push_back(event);
   } else {
@@ -449,6 +456,22 @@ ReducerFixture::attach_cancelled()
 
   SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
   _vc->startEvent(NET_EVENT_OPEN, _mock); // hits the cancelled branch: closes mock, frees outer
+}
+
+void
+ReducerFixture::attach_cancelled_open_failed()
+{
+  _vc        = sslNetVCAllocator.alloc();
+  _vc->mutex = _mutex;
+  _vc->set_context(NET_VCONNECTION_OUT);
+
+  Action *a = _vc->arm_connect_action(_consumer);
+  a->cancel();
+
+  // A failed transport connect delivers the (negative) errno, not a VConnection. The cancelled
+  // consumer must not be notified, and the outer VC must still reclaim itself.
+  SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
+  _vc->startEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(static_cast<intptr_t>(-ECONNREFUSED)));
 }
 
 void

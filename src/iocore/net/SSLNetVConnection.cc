@@ -1281,7 +1281,7 @@ SSLNetVConnection::~SSLNetVConnection()
 
   // clear variables for reuse
   this->mutex.clear();
-  _open_continuation = nullptr;
+  _connect_action = nullptr;
   _user_read_vio.mutex.clear();
   _user_read_vio.cont = nullptr;
   _user_write_vio.mutex.clear();
@@ -3391,12 +3391,12 @@ SSLNetVConnection::startEvent(int event, void *data)
     // matching MUTEX_UNTAKE_LOCK, permanently leaking a lock level on the shared
     // connection mutex and aborting in ink_mutex_destroy at teardown) and holds a
     // ref so the mutex survives if the continuation frees this VC.
-    // The only writer of the SSL VC's _open_continuation is the outbound connect (SSLNetProcessor::
+    // The only writer of the SSL VC's open continuation is the outbound connect (SSLNetProcessor::
     // connect_re), which always supplies a continuation whose mutex is non-null (it sets
     // ssl_netvc->mutex = cont->mutex), so the null-mutex fallback is unreachable.
-    if (_open_continuation) {
-      SCOPED_MUTEX_LOCK(lock, _open_continuation->mutex, this_ethread());
-      _open_continuation->handleEvent(event, this);
+    if (Continuation *open_cont = _connect_action.continuation; open_cont != nullptr) {
+      SCOPED_MUTEX_LOCK(lock, open_cont->mutex, this_ethread());
+      open_cont->handleEvent(event, this);
     }
   } break;
   case NET_EVENT_OPEN_FAILED: {
@@ -3405,7 +3405,7 @@ SSLNetVConnection::startEvent(int event, void *data)
     lerrno  = -res;
     // Skip the notify if the consumer already cancelled -- it does not want the callback.
     if (!_connect_action.cancelled) {
-      _open_continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
+      _connect_action.continuation->handleEvent(NET_EVENT_OPEN_FAILED, reinterpret_cast<void *>(res));
     }
     this->free_thread(thread);
   } break;
@@ -3688,13 +3688,13 @@ SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
 void
 SSLNetVConnection::set_open_continuation(Continuation *a)
 {
-  _open_continuation = a;
+  _connect_action = a;
 }
 
 Continuation *
 SSLNetVConnection::get_open_continuation() const
 {
-  return _open_continuation;
+  return _connect_action.continuation;
 }
 
 void

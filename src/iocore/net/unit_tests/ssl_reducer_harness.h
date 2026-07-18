@@ -206,7 +206,8 @@ public:
 
   std::vector<int> read_signals;
   std::vector<int> write_signals;
-  bool             got_open = false;
+  bool             got_open        = false;
+  bool             got_open_failed = false;
   // Consumer-driven teardown: like HttpSM / Http2ClientSession / the accept trampoline, close the
   // VC on a terminal event. h2_mode models an H2 session with active streams -- it defers the
   // close (see release()) instead of closing inline.
@@ -249,6 +250,7 @@ public:
 
   void attach(bool install_read = true);
   void attach_cancelled();
+  void attach_cancelled_open_failed();
   void drive_handshake();
   void pump_sut_to_peer();
   void pump_peer_to_sut(bool corrupt = false);
