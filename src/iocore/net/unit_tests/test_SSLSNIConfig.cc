@@ -191,4 +191,8 @@ TEST_CASE("SNIConfig reconfigure callback is invoked")
   SNIConfig::set_on_reconfigure_callback(set_result);
   SNIConfig::reconfigure();
   CHECK(result == 42);
+
+  // The callback captures this frame's stack; clear it so a later test that
+  // drives reconfigure() does not fire it after this frame is gone.
+  SNIConfig::set_on_reconfigure_callback(nullptr);
 }
