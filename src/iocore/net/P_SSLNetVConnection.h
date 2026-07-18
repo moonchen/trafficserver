@@ -473,6 +473,13 @@ private:
 #endif
   }
 
+  // True when SSL-side read work exists that no future transport signal will announce: bytes
+  // staged in the rbio, plaintext buffered inside SSL, pending early data, a latched
+  // close_notify, or a terminated transport (EOS/ERROR is persistent state). Any gate deciding
+  // "wait for the transport" vs "re-drive out of line" must use this union -- per-site subsets
+  // are how the read-side stalls happened.
+  bool _ssl_read_pending() const;
+
   void                _trigger_ssl_read();
   int64_t             _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
   void                _make_ssl_connection(SSL_CTX *ctx);

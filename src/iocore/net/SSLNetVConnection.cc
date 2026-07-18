@@ -446,6 +446,16 @@ SSLNetVConnection::_reclaimIfClosed()
   return false;
 }
 
+bool
+SSLNetVConnection::_ssl_read_pending() const
+{
+  if (_ssl == nullptr) {
+    return false;
+  }
+  return miobuffer_has_read_avail(SSL_get_rbio(_ssl.get())) || SSL_pending(_ssl.get()) > 0 || _early_data_pending() ||
+         (SSL_get_shutdown(_ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0 || isTerminated(_transport_state);
+}
+
 // Which side to deliver a handshake failure on: the consumer waiting on the handshake
 // listens with a (zero-byte) read VIO on the pooled/trampoline paths (ConnectingEntry,
 // SSLNextProtocolTrampoline), but the direct outbound connect (HttpSM) attaches only a
@@ -828,10 +838,8 @@ SSLNetVConnection::_trigger_ssl_read()
     // SSL_RECEIVED_SHUTDOWN, so re-drive out of line to let the next read surface the pending EOS.
     // A TLS half-close leaves TCP open (no prompt FIN), so waiting on a transport read would strand
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
-    if (this->_ssl != nullptr && !_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
-        _user_read_vio.ntodo() > 0 && buf.writer() != nullptr && buf.writer()->write_avail() > 0 &&
-        (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get())) || SSL_pending(this->_ssl.get()) > 0 || _early_data_pending() ||
-         (SSL_get_shutdown(this->_ssl.get()) & SSL_RECEIVED_SHUTDOWN))) {
+    if (!_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
+        _user_read_vio.ntodo() > 0 && buf.writer() != nullptr && buf.writer()->write_avail() > 0 && _ssl_read_pending()) {
       _deferred_work_event = this_ethread()->schedule_imm(this);
     } else {
       _transport_read_vio->reenable();
@@ -3479,10 +3487,8 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // in the rbio; servicing the rearm above consumed the shared slot, so a co-pending
       // read drive would be dropped and the buffered response would strand -- the transport read
       // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
-      if (!_deferred_work_pending() && this->_ssl != nullptr && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
-          _user_read_vio.ntodo() > 0 &&
-          (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get())) || SSL_pending(this->_ssl.get()) > 0 || _early_data_pending() ||
-           isTerminated(_transport_state))) {
+      if (!_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
+          _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
         _deferred_work_event = this_ethread()->schedule_imm(this);
       }
       return EVENT_DONE;
@@ -3856,9 +3862,7 @@ SSLNetVConnection::reenable(VIO *vio)
     // not re-enter the consumer that is reenabling us. A terminated transport needs the same
     // drive: EOS/ERROR is a persistent state and the closed transport will never re-signal, so
     // a consumer re-enabling its read must observe it from the drive.
-    if (this->_ssl != nullptr && !_deferred_work_pending() && !_user_read_vio.is_disabled() &&
-        (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get())) || SSL_pending(this->_ssl.get()) > 0 || _early_data_pending() ||
-         isTerminated(_transport_state))) {
+    if (!_deferred_work_pending() && !_user_read_vio.is_disabled() && _ssl_read_pending()) {
       _deferred_work_event = this_ethread()->schedule_imm(this);
     }
   } else if (vio == &_user_write_vio) {
