@@ -1868,13 +1868,7 @@ HttpSM::state_http_server_open(int event, void *data)
     _netvc             = static_cast<NetVConnection *>(data);
     _netvc_read_buffer = new_MIOBuffer(HTTP_SERVER_RESP_HDR_BUFFER_INDEX);
     _netvc_reader      = _netvc_read_buffer->alloc_reader();
-    // For a plain transport, _netvc's own recorded open continuation (get_open_continuation()) is
-    // what pending_action's Action points at. For a layered transport (e.g. an SSL-terminated
-    // origin), the raw connect's Action targets _netvc itself (SSLNetProcessor::connect_re passes
-    // the SSLNetVConnection as the inner connect's continuation), so pending_action's continuation
-    // is _netvc rather than whatever _netvc itself forwards its own completion to.
-    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == _netvc->get_open_continuation() ||
-                       pending_action.get_continuation() == _netvc);
+    ink_release_assert(pending_action.empty() || pending_action.get_continuation() == _netvc->get_open_continuation());
     pending_action = nullptr;
 
     if (this->plugin_tunnel_type == HttpPluginTunnel_t::NONE) {
