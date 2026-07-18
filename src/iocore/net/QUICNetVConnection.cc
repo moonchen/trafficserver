@@ -793,12 +793,6 @@ QUICNetVConnection::getMutexForTLSEvents()
   return this->nh->mutex;
 }
 
-bool
-QUICNetVConnection::_isReadyToTransferData() const
-{
-  return quiche_conn_is_established(this->_quiche_con);
-}
-
 SSL *
 QUICNetVConnection::_get_ssl_object() const
 {

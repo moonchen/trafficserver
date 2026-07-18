@@ -154,7 +154,6 @@ protected:
   QUICPacketHandler           *_packet_handler = nullptr;
 
   // UnixNetVConnection
-  bool _isReadyToTransferData() const override;
 
   // TLSBasicSupport
   SSL             *_get_ssl_object() const override;

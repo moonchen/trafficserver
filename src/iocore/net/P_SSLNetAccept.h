@@ -45,8 +45,7 @@
 // Handles accepting connections.
 //
 struct SSLNetAccept : public NetAccept {
-  NetProcessor *getNetProcessor() const override;
-  NetAccept    *clone() const override;
+  NetAccept *clone() const override;
 
   SSLNetAccept(const NetProcessor::AcceptOptions &opt);
   ~SSLNetAccept() override;

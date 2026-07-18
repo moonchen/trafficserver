@@ -25,12 +25,6 @@ SSLNetAccept::SSLNetAccept(const NetProcessor::AcceptOptions &opt) : NetAccept(o
 
 SSLNetAccept::~SSLNetAccept() {}
 
-NetProcessor *
-SSLNetAccept::getNetProcessor() const
-{
-  return &sslNetProcessor;
-}
-
 NetAccept *
 SSLNetAccept::clone() const
 {

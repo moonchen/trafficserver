@@ -38,13 +38,6 @@
 #define STATE_VIO_OFFSET   ((uintptr_t) & ((NetState *)0)->vio)
 #define STATE_FROM_VIO(_x) ((NetState *)(((char *)(_x)) - STATE_VIO_OFFSET))
 
-constexpr std::size_t state_vio_offset = offsetof(NetState, vio);
-NetState *
-state_from_vio(VIO *vio)
-{
-  return reinterpret_cast<NetState *>(reinterpret_cast<char *>(vio) - state_vio_offset);
-}
-
 // Global
 ClassAllocator<UnixNetVConnection, false> netVCAllocator("netVCAllocator");
 
@@ -603,7 +596,6 @@ UnixNetVConnection::net_read_io(NetHandler *nh)
       return;
     } else {
       if (read_signal_and_update(VC_EVENT_READ_READY, this) != EVENT_CONT) {
-        Dbg(dbg_ctl_iocore_net, "read_from_net - NetVC is freed");
         return;
       }
 
@@ -678,7 +670,6 @@ UnixNetVConnection::net_write_io(NetHandler *nh)
   int signalled = 0;
 
   // signal write ready to allow user to fill the buffer
-  // if (towrite != ntodo && (!buf.writer()->high_water() || towrite == 0)) {
   if (towrite != ntodo && !buf.writer()->high_water()) {
     if (write_signal_and_update(VC_EVENT_WRITE_READY, this) != EVENT_CONT) {
       return;

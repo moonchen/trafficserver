@@ -268,6 +268,8 @@ public:
   // The constructor is public just to avoid compile errors.//
   ////////////////////////////////////////////////////////////
   SSLNetVConnection();
+  // Test-injection constructor: _unvc is private and unit tests (test_HttpUserAgent)
+  // need to attach a mock inner transport at construction.
   explicit SSLNetVConnection(UnixNetVConnection *unvc);
   ~SSLNetVConnection() override;
 
@@ -307,27 +309,15 @@ public:
     allowPlain = val;
   }
 
-  int64_t read_raw_data();
-
-  /** Initialize handshake buffers in which we store TLS handshake data.
+  /** Park a second reader on _read_buf to retain the raw handshake bytes.
    *
-   * Typically, we would configure the SSL object to use the socket directly,
-   * and call SSL_read on the socket. In this way, the OpenSSL machine would
-   * read and parse the stream for us, handshake and all. We cannot, however,
-   * blindly let OpenSSL read off the socket since we may need to replay the
-   * CLIENT_HELLO raw bytes to the origin if we wind up blind tunneling the
-   * connection.  Therefore, for the initial CLIENT_HELLO, we:
-   *
-   * 1. Manually read bytes off the socket via read_raw_data().
-   * 2. Store the bytes in @a handShakeBuffer.
-   * 3. Configure our SSL object to read from a memory buffer populated from @a
-   *    handshakeReader.
-   *
-   * Once the CLIENT_HELLO is parsed, we either configure the SSL object to read
-   * from the socket as normal, or we replay the bytes to the origin via @a
-   * handshakeHolder if we decide to blind tunnel the connection. In the latter
-   * tunnel case, any subsequent bytes are blindly tunneled between the origin
-   * and the client.
+   * The inner transport fills @a _read_buf and the SSL rbio consumes it through
+   * its own advancing reader. @a handShakeHolder is a second reader parked at
+   * byte 0 so the raw CLIENT_HELLO can be replayed to the origin if the
+   * connection becomes a blind tunnel, or handed to the read VIO on an
+   * allow-plain downgrade. While it exists it pins every byte of @a _read_buf,
+   * so it must be released as soon as the connection commits to TLS
+   * termination (see _commitInboundHandshake).
    */
   void
   initialize_handshake_buffers()
@@ -359,9 +349,6 @@ public:
   SSLNetVConnection &operator=(const SSLNetVConnection &) = delete;
 
   NetVConnection *migrateToCurrentThread(Continuation *cont, EThread *t) override;
-
-  bool          protocol_mask_set = false;
-  unsigned long protocol_mask     = 0;
 
   bool
   peer_provided_cert() const override
@@ -470,8 +457,7 @@ private:
 
   // Async TLS related
 #if TS_USE_TLS_ASYNC
-  AsyncTLSEventIO            async_ep{*this};
-  std::vector<OSSL_ASYNC_FD> async_fds{};
+  AsyncTLSEventIO async_ep{*this};
 #endif
 
   // early data related stuff

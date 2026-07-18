@@ -165,7 +165,6 @@ public:
 
   virtual int64_t load_buffer_and_write(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written);
   void            readDisable(NetHandler *nh);
-  void            readSignalError(NetHandler *nh, int err);
   int             readSignalDone(int event, NetHandler *nh);
   int             readSignalAndUpdate(int event);
   void            netActivity();
@@ -217,16 +216,6 @@ public:
   }
 
 protected:
-  virtual bool
-  _isReadyToTransferData() const
-  {
-    return true;
-  }
-  virtual void
-  _beReadyToTransferData()
-  {
-  }
-
   int _readSignalError(NetHandler *nh, int lerrno);
   int _writeSignalError(NetHandler *nh, int lerrno);
 

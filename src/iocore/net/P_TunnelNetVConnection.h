@@ -139,8 +139,7 @@ private:
   int  _recursion          = 0;
 
   // An out-of-line read drive (schedule_imm) is pending; never queue more than one.
-  bool   _read_drive_scheduled = false;
-  Event *_read_drive_event     = nullptr;
+  Event *_read_drive_event = nullptr;
 };
 
 extern ClassAllocator<TunnelNetVConnection> tunnelNetVCAllocator;

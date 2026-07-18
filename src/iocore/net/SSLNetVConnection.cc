@@ -1620,19 +1620,18 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   if (ssl_error == SSL_ERROR_WANT_ASYNC) {
     // Do we need to set up the async eventfd?  Or is it already registered?
     if (async_ep.fd < 0) {
-      size_t         numfds;
-      OSSL_ASYNC_FD *waitfds;
+      size_t numfds;
       // Set up the epoll entry for the signalling
       if (SSL_get_all_async_fds(this->_ssl.get(), nullptr, &numfds) && numfds > 0) {
         // A TLS handshake is a single OpenSSL ASYNC_JOB whose wait-ctx fd is stable across
         // re-suspensions, and standard engines expose exactly one fd; AsyncTLSEventIO/EventIO
-        // tracks a single fd, so register once (gated on async_ep.fd < 0) and reuse it.
-        async_fds.resize(numfds);
-        waitfds = async_fds.data();
-        if (SSL_get_all_async_fds(this->_ssl.get(), waitfds, &numfds) && numfds > 0) {
+        // tracks a single fd, so register once (gated on async_ep.fd < 0) and reuse it. The
+        // registration copies the fd, so the storage need not outlive this block.
+        std::vector<OSSL_ASYNC_FD> waitfds(numfds);
+        if (SSL_get_all_async_fds(this->_ssl.get(), waitfds.data(), &numfds) && numfds > 0) {
           ink_assert(numfds == 1);
           PollDescriptor *pd = get_PollDescriptor(this_ethread());
-          this->async_ep.start(pd, {waitfds, numfds});
+          this->async_ep.start(pd, {waitfds.data(), numfds});
         }
       }
     }
@@ -2383,8 +2382,8 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
 
 /*
  * Replaces the current SSLNetVConnection with a UnixNetVConnection
- * Propagates any data in the SSL handShakeBuffer to be processed
- * by the UnixNetVConnection logic
+ * Propagates any raw handshake bytes retained by handShakeHolder to be
+ * processed by the UnixNetVConnection logic
  */
 UnixNetVConnection *
 SSLNetVConnection::_downgradeToPlain()

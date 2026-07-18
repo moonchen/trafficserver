@@ -49,8 +49,7 @@ TunnelNetVConnection::~TunnelNetVConnection()
   // Cancel any pending out-of-line read drive so it does not fire on freed memory.
   if (_read_drive_event != nullptr) {
     _read_drive_event->cancel();
-    _read_drive_event     = nullptr;
-    _read_drive_scheduled = false;
+    _read_drive_event = nullptr;
   }
 
   if (_is_tunnel_endpoint) {
@@ -161,9 +160,8 @@ TunnelNetVConnection::_signal_write(int event)
 void
 TunnelNetVConnection::_schedule_read_drive()
 {
-  if (!_read_drive_scheduled) {
-    _read_drive_scheduled = true;
-    _read_drive_event     = this_ethread()->schedule_imm(this);
+  if (_read_drive_event == nullptr) {
+    _read_drive_event = this_ethread()->schedule_imm(this);
   }
 }
 
@@ -251,8 +249,7 @@ TunnelNetVConnection::mainEvent(int event, void *data)
 {
   // A scheduled out-of-line read drive arrives with an Event*, not a transport VIO.
   if (data != _transport_read_vio && data != _transport_write_vio) {
-    _read_drive_scheduled = false;
-    _read_drive_event     = nullptr;
+    _read_drive_event = nullptr;
     if (_closed) {
       this->free_thread(this_ethread());
       return EVENT_DONE;
