@@ -232,7 +232,7 @@ TEST_CASE("#8: post-handshake error, H2 session closes and reclaims the VC", "[S
 // async-hook: a transport error while a cert hook is parked mid-handshake must tear down cleanly.
 // Consumer-driven: the error reaches the waiting (read) consumer, which closes the VC; the reclaim
 // is held off while the hook is parked (is_invoked_state -- the plugin still owns a live ref) and
-// completes when the plugin reenables (reenable_with_event sees _close_requested and schedules the
+// completes when the plugin reenables (reenable_with_event sees the RECLAIMABLE state and schedules the
 // teardown instead of driving I/O). Exactly one VC_EVENT_ERROR reaches the read side, never the
 // write side, and close_errno() == -1 confirms the reclaim.
 TEST_CASE("async-hook: transport error while a cert hook is parked tears down cleanly", "[SSLReducer]")

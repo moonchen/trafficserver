@@ -119,22 +119,31 @@ private:
     HANDSHAKE_DONE       = 1, // Handshake complete, ready for application data
     SHUTDOWN_IN_PROGRESS = 2, // Graceful close: draining buffered ciphertext (+ close-notify) to
                               // the transport before teardown. do_io_close's lingering close.
-    TERMINATED = 3            // No further SSL I/O of any kind. The why (clean close vs error)
-                              // lives in lerrno and the per-site Dbg output, not here.
+    FATAL_PENDING = 3,        // Terminal, with an armed handshake reject (a hook's
+                              // reenable_with_event(TS_EVENT_ERROR)) not yet delivered to the
+                              // waiter. Delivery IS the transition to TERMINATED -- exactly once,
+                              // structurally -- so a consumer that has not yet closed (H2 with
+                              // active streams) is never re-signalled by a later event.
+    TERMINATED = 4,           // Terminal: failure delivered, or none to deliver. No further SSL
+                              // I/O; awaiting the consumer's do_io_close to authorize the free.
+                              // The why (clean close vs error) lives in lerrno and the per-site
+                              // Dbg output, not here.
+    RECLAIMABLE = 5           // Terminal + the free is authorized (master's UnixNetVConnection
+                              // `closed` latch): the consumer closed us (do_io_close), or a
+                              // terminal event landed on a severed/absent consumer (the null-cont
+                              // owner-close). The outer VC is not NetHandler-managed, so it frees
+                              // itself the moment _freeBlocked() clears. See _reclaimIfClosed.
   };
   enum SslState _sslState = SslState::HANDSHAKING;
-  // Consumer-driven teardown latch (master's UnixNetVConnection `closed`). The outer VC is not
-  // NetHandler-managed, so it must physically free itself -- but ONLY when its consumer has
-  // requested the close (do_io_close), or when a terminal event lands on a severed/absent consumer
-  // (the null-cont owner-close). A terminal _sslState gates I/O; it never authorizes the free. Set
-  // once, never reset (the VC frees the moment the gate opens). See _reclaimIfClosed.
-  bool _close_requested = false;
-  // A terminal error was armed out of line (a handshake hook's reenable_with_event(TS_EVENT_ERROR),
-  // e.g. an SNI/rate-limit reject) with no handshake driver on the stack to deliver it. The
-  // scheduled mainEvent dispatch delivers VC_EVENT_ERROR to the waiter EXACTLY ONCE and clears
-  // this; the consumer's do_io_close then drives the free. Separate from _close_requested so a
-  // consumer that has not yet closed (H2 with active streams) is not re-signalled on a later event.
-  bool _fatal_pending = false;
+  // The terminal region: no further SSL I/O of any kind. A terminal state gates I/O; only
+  // RECLAIMABLE authorizes the free (consumer-driven teardown). SHUTDOWN_IN_PROGRESS is not
+  // terminal (the drain is still flushing ciphertext) but is entered only from do_io_close,
+  // so it too carries the close authorization.
+  static bool
+  _is_terminal(SslState state)
+  {
+    return state >= SslState::FATAL_PENDING;
+  }
   // A handshake hook has parked (the driver returned SSL_WAIT_FOR_HOOK): a plugin owns a live
   // reference and will reenable_with_event into this VC. Set at the park, cleared when the plugin
   // reenables. It is a stable latch because do_io_close's callHooks(VCONN_CLOSE) advances the hook
@@ -148,7 +157,7 @@ private:
   // the handshake is the verify policy's call, applied by the OpenSSL verify callback's return
   // (SSLClientUtils: !enforce_mode) -- ENFORCED fails via SSL_ERROR_SSL, PERMISSIVE continues. While
   // this is set, reenable_with_event routes the error into _verify_hook_failed (read once by
-  // _verify_certificate) instead of the terminal _sslState/_fatal_pending, so a PERMISSIVE override
+  // _verify_certificate) instead of the terminal FATAL_PENDING state, so a PERMISSIVE override
   // still completes the handshake instead of being torn down.
   bool _in_verify_hook     = false;
   bool _verify_hook_failed = false;
@@ -513,14 +522,14 @@ private:
 
   enum class SignalSide { READ, WRITE };
   // Notification only: deliver `event` to the consumer's VIO on `side` (or, for a severed/
-  // mismatched cont, run the null-cont owner-close arm, which sets a terminal _sslState and the
-  // _close_requested latch for a terminal event). It NEVER frees `this`. Reclamation is a separate,
+  // mismatched cont, run the null-cont owner-close arm, which moves a terminal event straight to
+  // RECLAIMABLE). It NEVER frees `this`. Reclamation is a separate,
   // explicit step the caller makes on the same stack immediately after, via _reclaimIfClosed --
   // which frees only when the consumer has requested the close (consumer-driven teardown), never
   // from the terminal state alone.
   void _signal_user(SignalSide side, int event);
   // The single same-turn reclaim point paired with _signal_user (consumer-driven teardown).
-  // Frees `this` (returning true) iff the consumer requested the close (_close_requested) and no
+  // Frees `this` (returning true) iff the consumer requested the close (RECLAIMABLE) and no
   // frame that still needs `this` alive is on the stack: recursion == 0 (own notify reentrancy or
   // an OpenSSL callback frame), not mid graceful-drain (_isDraining -- the drain owns the free),
   // and no handshake hook parked (is_invoked_state -- a plugin holds a live ref and will
