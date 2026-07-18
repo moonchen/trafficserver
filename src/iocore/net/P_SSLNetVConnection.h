@@ -134,6 +134,77 @@ private:
                               // owner-close). The outer VC is not NetHandler-managed, so it frees
                               // itself the moment _freeBlocked() clears. See _reclaimIfClosed.
   };
+  // Transition table: every store to _sslState, grouped by destination; sites are named by
+  // function. "Guarded" marks a conditional store whose condition is the FROM set; an
+  // unconditional store's FROM is the state reachable at that site. Start state: HANDSHAKING at
+  // construction; the destructor also resets to it, from whatever state the VC was freed in, for
+  // allocator reuse. Terminal region (_is_terminal, below): FATAL_PENDING, TERMINATED,
+  // RECLAIMABLE.
+  //
+  //   HANDSHAKING -> HANDSHAKE_DONE
+  //     - Handshake completion on SSL_ERROR_NONE: sslServerHandShakeEvent /
+  //       sslClientHandShakeEvent. Guarded (== HANDSHAKING): a state moved past HANDSHAKING
+  //       mid-flight -- a hook's reject or a close during SSL_accept/SSL_connect -- outranks
+  //       completion, so the store is skipped.
+  //     - Blind-tunnel marks on a transparent connection: sslStartHandShake (per-IP OPT_TUNNEL,
+  //       first server round) and _lookupContextByName (per-SNI OPT_TUNNEL; guarded
+  //       (== HANDSHAKING) so an armed FATAL_PENDING from an earlier hook in the same flight
+  //       outranks the tunnel).
+  //     - A hook-requested SSL_HOOK_OP_TERMINATE: sslServerHandShakeEvent. (Nothing in the tree
+  //       currently sets that op, so this store is unreached.)
+  //     - The DOWNGRADE_PLAIN executor (_propagateHandShakeBuffer), just before this VC hands its
+  //       buffers to the plain successor and frees itself.
+  //   HANDSHAKING -> FATAL_PENDING
+  //     - The state's only entry: a non-verify handshake hook's reenable_with_event(
+  //       TS_EVENT_ERROR). Guarded (not terminal, not draining): a close that already happened
+  //       outranks the reject. (The guard would also admit HANDSHAKE_DONE, but a handshake hook
+  //       only reenables while the handshake is parked on it.)
+  //   HANDSHAKING -> TERMINATED
+  //     - The write-face handshake driver's EVENT_ERROR (_handle_transport_write_ready), stored
+  //       unconditionally before the failure is signalled, so it also consumes an armed
+  //       FATAL_PENDING. The store re-checks nothing, so an in-hook close during the
+  //       sslStartHandShake call (see the owner-close below) leaves SHUTDOWN_IN_PROGRESS -- or
+  //       RECLAIMABLE, for an abort -- to be overwritten here; the same unwind's owner-close
+  //       then re-enters RECLAIMABLE. (The read face's EVENT_ERROR (_trigger_ssl_read) leaves
+  //       the state in place; the consumer's close or the owner-close below moves it.)
+  //   FATAL_PENDING -> TERMINATED     -- delivery IS this transition, so it happens exactly once
+  //     - On the driver stack once sslStartHandShake has returned (outside any OpenSSL frame):
+  //       _trigger_ssl_read (post-return terminal check, and its EVENT_ERROR case) and
+  //       _handle_transport_write_ready (post-return terminal check; its EVENT_ERROR is the
+  //       unconditional store above).
+  //     - Off-stack, when the hook's reenable was asynchronous: mainEvent's scheduled-dispatch
+  //       FATAL_PENDING branch, or its terminal-state transport-event gate (a transport event
+  //       raced ahead of that dispatch).
+  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS
+  //     - do_io_close arming the graceful close-drain (lerrno == -1, transport wired and not in
+  //       error). A close of an already-failed VC re-enters the drain from inside the terminal
+  //       region (_is_terminal() goes back to false), and it erases an undelivered FATAL_PENDING:
+  //       there is no consumer left to deliver to. The drain still gates all I/O (_isDraining)
+  //       and every exit from it is RECLAIMABLE.
+  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> RECLAIMABLE
+  //     - do_io_close when the drain is not warranted: an abort (lerrno != -1), or the transport
+  //       is absent/broken. (Both do_io_close stores are unconditional; a second close of the
+  //       same VC is not a designed path.)
+  //   {HANDSHAKING, HANDSHAKE_DONE, TERMINATED, SHUTDOWN_IN_PROGRESS} -> RECLAIMABLE
+  //     - The null-cont owner-close (_signal_user): a terminal event (EOS/ERROR/timeout) with no
+  //       live consumer to deliver it to, so nobody will ever close us. The store is
+  //       unconditional -- FROM is whatever state the event was delivered in.
+  //       SHUTDOWN_IN_PROGRESS is reached when a hook nested in a handshake drive closes the VC
+  //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook): the close
+  //       severs the user VIOs and arms the drain, and the drive's unwinding failure signal then
+  //       finds no cont -- a fourth drain exit, which forgoes the flush.
+  //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- each site frees the VC right after the store
+  //     - Drain complete (mainEvent's scheduled dispatch); transport error mid-drain
+  //       (_handle_transport_error); a drain stuck at an idle/active timeout (mainEvent). Each is
+  //       held off while _freeBlocked(), then completed by a later dispatch or the parked hook's
+  //       reenable. (A drain armed by an in-hook close can instead exit through the owner-close
+  //       above, on the unwinding drive's stack.)
+  //
+  // RECLAIMABLE is near-absorbing: no guarded store leaves it, every dispatch that sees it only
+  // reaps, and the one overwrite -- the write-face EVENT_ERROR above -- is undone by its own
+  // unwind. The VC frees itself (running the destructor's reuse reset) once _freeBlocked()
+  // clears. Nothing enters TERMINATED after the handshake: a data-phase failure is signalled to
+  // the consumer, and the state then moves only at its do_io_close or the owner-close.
   enum SslState _sslState = SslState::HANDSHAKING;
   // The terminal region: no further SSL I/O of any kind. A terminal state gates I/O; only
   // RECLAIMABLE authorizes the free (consumer-driven teardown). SHUTDOWN_IN_PROGRESS is not
