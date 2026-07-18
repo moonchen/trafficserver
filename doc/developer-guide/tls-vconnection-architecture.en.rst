@@ -84,12 +84,11 @@ Connection state
 
 Two enums in ``P_SSLNetVConnection.h`` track the connection:
 
-* ``SslState`` — ``INIT``, ``HANDSHAKE_WANTED``, ``HANDSHAKE_IN_PROGRESS``,
-  ``HANDSHAKE_DONE``, ``SHUTDOWN_WANTED``, ``SHUTDOWN_IN_PROGRESS``, ``CLOSED``,
-  ``ERROR``. ``CLOSED`` and ``ERROR`` are terminal (see ``isTerminated``).
-* ``TransportState`` — the state of the inner ``_unvc``: ``TRANSPORT_INIT``,
-  ``TRANSPORT_CONNECTING``, ``TRANSPORT_CONNECTED``, ``TRANSPORT_CLOSED``,
-  ``TRANSPORT_ERROR``.
+* ``SslState`` — ``HANDSHAKING``, ``HANDSHAKE_DONE``, ``SHUTDOWN_IN_PROGRESS``,
+  ``TERMINATED``. ``TERMINATED`` means no further SSL I/O of any kind; the reason
+  (clean close vs. error) is carried by ``lerrno``, not the state.
+* ``TransportState`` — the state of the inner ``_unvc``: ``TRANSPORT_LIVE``,
+  ``TRANSPORT_CLOSED``, ``TRANSPORT_ERROR``.
 
 Event flow
 ==========

@@ -119,15 +119,10 @@ private:
     HANDSHAKE_DONE       = 1, // Handshake complete, ready for application data
     SHUTDOWN_IN_PROGRESS = 2, // Graceful close: draining buffered ciphertext (+ close-notify) to
                               // the transport before teardown. do_io_close's lingering close.
-    CLOSED = 3,               // Clean SSL shutdown complete (close_notify sent/received)
-    ERROR  = 4                // An SSL error occurred (handshake, read/write, or shutdown)
+    TERMINATED = 3            // No further SSL I/O of any kind. The why (clean close vs error)
+                              // lives in lerrno and the per-site Dbg output, not here.
   };
   enum SslState _sslState = SslState::HANDSHAKING;
-  static bool
-  isTerminated(SslState state)
-  {
-    return state == SslState::CLOSED || state == SslState::ERROR;
-  }
   // Consumer-driven teardown latch (master's UnixNetVConnection `closed`). The outer VC is not
   // NetHandler-managed, so it must physically free itself -- but ONLY when its consumer has
   // requested the close (do_io_close), or when a terminal event lands on a severed/absent consumer
