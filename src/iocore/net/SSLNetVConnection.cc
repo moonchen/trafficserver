@@ -612,18 +612,7 @@ SSLNetVConnection::_trigger_ssl_read()
       // layered model we cannot revert this VC to a plain socket (it only has-a
       // transport), so hand the transport off to a dedicated pass-through VC.
       //
-      // Defer the handoff out of line: it frees this VC, and we may be on the stack of a
-      // transport read handler that inspects _sslState after we return. The scheduled
-      // mainEvent dispatch is the one safe place to free inline.
-      _pending_handoff = PendingHandoff::BLIND_TUNNEL;
-      if (_transport_read_vio != nullptr) {
-        // No more SSL-side reads before the handoff; the pass-through VC re-drives the
-        // transport itself, and the buffered bytes remain in _read_buf.
-        _transport_read_vio->disable();
-      }
-      if (!_deferred_work_pending()) {
-        _deferred_work_event = this_ethread()->schedule_imm(this);
-      }
+      _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
       return; // Leave if we are tunneling
     }
 
@@ -1656,16 +1645,9 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
         if (getAllowPlain()) {
           SSLVCDebug(this, "Try plain");
           // The leading bytes are not a ClientHello: convert this connection to a UnixNetVC and
-          // hand the buffered packet to HTTP processing. _downgradeToPlain() frees this VC, and we
-          // are on the handshake read stack that still dereferences `this` after we return, so defer
-          // it out of line to a clean mainEvent dispatch -- the same handoff the blind tunnel uses.
-          _pending_handoff = PendingHandoff::DOWNGRADE_PLAIN;
-          if (_transport_read_vio != nullptr) {
-            _transport_read_vio->disable();
-          }
-          if (!_deferred_work_pending()) {
-            _deferred_work_event = this_ethread()->schedule_imm(this);
-          }
+          // hand the buffered packet to HTTP processing -- the same deferred handoff the blind
+          // tunnel uses.
+          _armPendingHandoff(PendingHandoff::DOWNGRADE_PLAIN);
           return SSL_RESTART;
         } else if (getTransparentPassThrough()) {
           // start a blind tunnel if tr-pass is set and data does not look like ClientHello
@@ -2428,6 +2410,24 @@ SSLNetVConnection::_downgradeToPlain()
  * everything transferred is detached from this VC before do_io_close() so teardown does
  * not free the resources the pass-through VC now owns.
  */
+
+// Arm a deferred transport handoff (blind tunnel / plain downgrade). The handoff itself must run
+// out of line -- it frees this VC, and every arming site is on a stack that still touches `this`
+// after returning -- so park the kind, quiesce SSL-side reads (the successor VC re-drives the
+// transport itself; buffered bytes remain in _read_buf), and schedule the mainEvent dispatch,
+// the one safe place to free inline.
+void
+SSLNetVConnection::_armPendingHandoff(PendingHandoff which)
+{
+  _pending_handoff = which;
+  if (_transport_read_vio != nullptr) {
+    _transport_read_vio->disable();
+  }
+  if (!_deferred_work_pending()) {
+    _deferred_work_event = this_ethread()->schedule_imm(this);
+  }
+}
+
 void
 SSLNetVConnection::_handoffBlindTunnel()
 {
@@ -2986,13 +2986,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     // Mirrors the read-face arming; check for a non-error return first (a failed ClientHello has
     // no tunnel to establish) and defer the handoff out of line, since it frees this VC.
     if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
-      _pending_handoff = PendingHandoff::BLIND_TUNNEL;
-      if (_transport_read_vio != nullptr) {
-        _transport_read_vio->disable();
-      }
-      if (!_deferred_work_pending()) {
-        _deferred_work_event = this_ethread()->schedule_imm(this);
-      }
+      _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
       return EVENT_CONT;
     }
 

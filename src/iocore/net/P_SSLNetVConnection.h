@@ -480,6 +480,7 @@ private:
   UnixNetVConnection *_downgradeToPlain();
   void                _propagateHandShakeBuffer(UnixNetVConnection *target, EThread *t);
   void                _handoffBlindTunnel();
+  void                _armPendingHandoff(PendingHandoff which);
   void                _adoptConsumerMutex(Continuation *c);
 
   int         _ssl_read_from_net(int64_t &ret);
