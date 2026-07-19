@@ -123,16 +123,20 @@ TunnelNetVConnection::hand_off_to(Continuation *accept_cont)
 }
 
 //
-// Event signalling helpers. handleEvent may free this VC (the consumer can call
-// do_io_close from within its handler); the recursion guard defers the actual free
-// until the outermost signal unwinds, mirroring SSLNetVConnection::_signal_user.
+// Deliver `event` to the consumer on `side`. handleEvent may free this VC (the consumer can
+// call do_io_close from within its handler); the recursion guard defers the actual free until
+// the outermost signal unwinds. This fuses in one body what SSLNetVConnection splits into
+// _signal_user + _signalAndReclaim. EVENT_DONE means this VC was freed: the caller must touch
+// nothing afterward.
 //
 int
-TunnelNetVConnection::_signal_read(int event)
+TunnelNetVConnection::_signal_user(SignalSide side, int event)
 {
+  VIO &vio = side == SignalSide::READ ? _user_read_vio : _user_write_vio;
+
   _recursion++;
-  if (_user_read_vio.cont != nullptr && _user_read_vio.mutex == _user_read_vio.cont->mutex) {
-    _user_read_vio.cont->handleEvent(event, &_user_read_vio);
+  if (vio.cont != nullptr && vio.mutex == vio.cont->mutex) {
+    vio.cont->handleEvent(event, &vio);
   }
   if (!--_recursion && _closed) {
     ink_assert(thread == this_ethread());
@@ -142,19 +146,19 @@ TunnelNetVConnection::_signal_read(int event)
   return EVENT_CONT;
 }
 
-int
-TunnelNetVConnection::_signal_write(int event)
+// Which side has a consumer attached to take a connection-level event (error/timeout):
+// read-first, mirroring SSLNetVConnection::_handshake_fail_side. Empty when both sides are
+// severed -- the event has nobody to go to and is dropped.
+std::optional<TunnelNetVConnection::SignalSide>
+TunnelNetVConnection::_active_user_side() const
 {
-  _recursion++;
-  if (_user_write_vio.cont != nullptr && _user_write_vio.mutex == _user_write_vio.cont->mutex) {
-    _user_write_vio.cont->handleEvent(event, &_user_write_vio);
+  if (_user_read_vio.cont != nullptr) {
+    return SignalSide::READ;
   }
-  if (!--_recursion && _closed) {
-    ink_assert(thread == this_ethread());
-    this->free_thread(this_ethread());
-    return EVENT_DONE;
+  if (_user_write_vio.cont != nullptr) {
+    return SignalSide::WRITE;
   }
-  return EVENT_CONT;
+  return std::nullopt;
 }
 
 void
@@ -204,7 +208,7 @@ TunnelNetVConnection::_drive_read()
     _user_read_vio.ndone += moved;
     Dbg(dbg_ctl_ssl_tunnel, "TunnelNetVConnection %p: forwarded %" PRId64 " raw bytes to consumer", this, moved);
     int ev = _user_read_vio.ntodo() <= 0 ? VC_EVENT_READ_COMPLETE : VC_EVENT_READ_READY;
-    if (_signal_read(ev) == EVENT_DONE) {
+    if (_signal_user(SignalSide::READ, ev) == EVENT_DONE) {
       return; // freed during signal
     }
   }
@@ -213,7 +217,7 @@ TunnelNetVConnection::_drive_read()
     // Surface EOS only once everything buffered has been handed to the consumer; if the
     // consumer could not take it all, reenable() reschedules a drive to continue.
     if (_buffered_reader == nullptr || _buffered_reader->read_avail() == 0) {
-      _signal_read(VC_EVENT_EOS);
+      _signal_user(SignalSide::READ, VC_EVENT_EOS);
     }
     return;
   }
@@ -241,7 +245,7 @@ TunnelNetVConnection::_handle_transport_write(int event)
   if (_transport_write_vio != nullptr) {
     _user_write_vio.ndone = _transport_write_vio->ndone;
   }
-  return _signal_write(event);
+  return _signal_user(SignalSide::WRITE, event);
 }
 
 int
@@ -280,18 +284,14 @@ TunnelNetVConnection::mainEvent(int event, void *data)
     if (_unvc != nullptr) {
       this->lerrno = _unvc->lerrno;
     }
-    if (_user_read_vio.cont != nullptr) {
-      _signal_read(VC_EVENT_ERROR);
-    } else if (_user_write_vio.cont != nullptr) {
-      _signal_write(VC_EVENT_ERROR);
+    if (auto side = _active_user_side(); side.has_value()) {
+      _signal_user(*side, VC_EVENT_ERROR);
     }
     return EVENT_DONE;
   case VC_EVENT_ACTIVE_TIMEOUT:
   case VC_EVENT_INACTIVITY_TIMEOUT:
-    if (_user_read_vio.cont != nullptr) {
-      _signal_read(event);
-    } else if (_user_write_vio.cont != nullptr) {
-      _signal_write(event);
+    if (auto side = _active_user_side(); side.has_value()) {
+      _signal_user(*side, event);
     }
     return EVENT_DONE;
   default:

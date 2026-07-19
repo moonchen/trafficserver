@@ -32,6 +32,7 @@
 #include "P_UnixNetVConnection.h"
 
 #include <memory>
+#include <optional>
 
 /** A NetVConnection that forwards raw bytes between an inner transport
  *  (a UnixNetVConnection) and its consumer, performing no TLS.
@@ -112,11 +113,17 @@ public:
   void free_thread(EThread *t);
 
 private:
+  enum class SignalSide { READ, WRITE };
+
   void _drive_read();
   int  _handle_transport_write(int event);
-  int  _signal_read(int event);
-  int  _signal_write(int event);
-  void _schedule_read_drive();
+  // Deliver `event` to the consumer on `side`; EVENT_DONE means this VC was freed (contract
+  // at the definition).
+  int _signal_user(SignalSide side, int event);
+  // Which side has a consumer attached to take a connection-level event (error/timeout):
+  // read-first, mirroring SSLNetVConnection::_handshake_fail_side. Empty when both are severed.
+  std::optional<SignalSide> _active_user_side() const;
+  void                      _schedule_read_drive();
 
   UnixNetVConnection *_unvc = nullptr;
 
