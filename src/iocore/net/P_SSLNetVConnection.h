@@ -715,6 +715,12 @@ private:
   VIO *_transport_read_vio  = nullptr;
   VIO *_transport_write_vio = nullptr;
 
+  // The transport composition seam: arm both transport VIOs on _unvc (definition above
+  // startEvent) and close a transport fd-inline when its NetHandler lock is takable
+  // (definition above the destructor).
+  void        _wireTransportVIOs();
+  static void _closeTransport(UnixNetVConnection *transport);
+
   enum class SignalSide { READ, WRITE };
   // Notification only: deliver `event` to the consumer's VIO on `side` (or, for a severed/
   // mismatched cont, run the null-cont owner-close arm, which moves a terminal event straight to

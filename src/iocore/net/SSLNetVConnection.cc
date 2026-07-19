@@ -1396,6 +1396,28 @@ SSLNetVConnection::free_thread(EThread *t)
   }
 }
 
+// Close a transport VC under its NetHandler's lock when we can take it (same thread, not
+// contended) so UnixNetVConnection::do_io_close closes the fd inline (close_inline requires
+// nh->mutex held). This usually runs outside the NetHandler (a scheduled dispatch), where
+// the fd close would otherwise be deferred to the InactivityCop's next 1-second sweep --
+// holding the socket open up to ~1s after the consumer abandoned the connection (master
+// closes it inline on its signal unwind), which the peer observes (e.g. a connect-retry
+// storm sees different errnos). But the destructor can also run here inside the NetHandler's
+// own dispatch (e.g. a consumer aborting re-entrantly during a transport-driven signal is
+// reclaimed on the signal unwind); there this thread already holds nh->mutex, so the
+// try-lock recurses and the close is still inline. If the lock is unavailable the close
+// still defers to the cop.
+void
+SSLNetVConnection::_closeTransport(UnixNetVConnection *transport)
+{
+  if (transport->nh != nullptr && transport->nh->thread == this_ethread()) {
+    MUTEX_TRY_LOCK(lock, transport->nh->mutex, this_ethread());
+    transport->do_io_close();
+  } else {
+    transport->do_io_close();
+  }
+}
+
 SSLNetVConnection::~SSLNetVConnection()
 {
   // Cancel any pending out-of-line read drive so it does not fire on freed memory.
@@ -1488,20 +1510,7 @@ SSLNetVConnection::~SSLNetVConnection()
   free_handshake_buffers();
 
   if (_unvc != nullptr) {
-    // Close the transport under its NetHandler's lock when we can take it (same thread,
-    // not contended) so UnixNetVConnection::do_io_close closes the fd inline
-    // (close_inline requires nh->mutex held). This teardown usually runs from a
-    // scheduled dispatch outside the NetHandler, where the fd close would otherwise be
-    // deferred to the InactivityCop's next 1-second sweep -- holding the socket open up
-    // to ~1s after the consumer abandoned the connection (master closes it inline on
-    // its signal unwind), which the peer observes (e.g. a connect-retry storm sees
-    // different errnos). If the lock is unavailable the close still defers to the cop.
-    if (_unvc->nh != nullptr && _unvc->nh->thread == this_ethread()) {
-      MUTEX_TRY_LOCK(lock, _unvc->nh->mutex, this_ethread());
-      _unvc->do_io_close();
-    } else {
-      _unvc->do_io_close();
-    }
+    _closeTransport(_unvc);
     _unvc = nullptr;
   }
 }
@@ -2546,7 +2555,7 @@ SSLNetVConnection::set_ca_cert_file(std::string_view file, std::string_view dir)
  * SSLNetVConnection object. The SSL object and both MIOBuffer-backed BIOs are
  * thread-agnostic heap state and travel with us, including any buffered
  * ciphertext; only the transport VIOs (which lived in the now-closed inner VC)
- * must be re-armed, exactly as startEvent does.
+ * must be re-armed (_wireTransportVIOs, exactly as startEvent wires them).
  */
 NetVConnection *
 SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
@@ -2604,9 +2613,7 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
   }
   _unvc = new_unvc;
 
-  _transport_read_vio  = _unvc->do_io_read(this, INT64_MAX, _read_buf.get());
-  _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
-  ink_release_assert(_transport_read_vio != nullptr && _transport_write_vio != nullptr);
+  _wireTransportVIOs();
 
   this->thread = t;
 
@@ -3590,6 +3597,20 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   return EVENT_DONE;
 }
 
+// Arm both transport VIOs on _unvc, pointed at us: the read fills _read_buf (the rbio) and
+// the write drains _write_buf_reader (the wbio). Both are armed for the connection's life
+// (INT64_MAX) and eagerly -- handshake output must flow before the consumer's first
+// do_io_write exists. do_io_read/do_io_write return nullptr only when the transport is
+// already closed, and both callers hold a live one (startEvent's was delivered synchronously
+// on this stack, migrateToCurrentThread's was just migrated), so a null here is a wiring bug.
+void
+SSLNetVConnection::_wireTransportVIOs()
+{
+  _transport_read_vio  = _unvc->do_io_read(this, INT64_MAX, _read_buf.get());
+  _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
+  ink_release_assert(_transport_read_vio != nullptr && _transport_write_vio != nullptr);
+}
+
 int
 SSLNetVConnection::startEvent(int event, void *data)
 {
@@ -3602,30 +3623,18 @@ SSLNetVConnection::startEvent(int event, void *data)
     UnixNetVConnection *unvc = static_cast<UnixNetVConnection *>(data);
     ink_release_assert(unvc != nullptr);
     if (_connect_action.cancelled) {
-      // The outbound consumer cancelled after the transport opened. Close the transport -- inline
-      // under its NetHandler mutex when we can take it, so the fd closes now rather than on the
-      // InactivityCop's next sweep (connectUp already started the cop, so a merely-marked-closed VC
-      // is still reaped, just ~1s later) -- and discard this VC. (_connect_action is unused, never
-      // cancelled, on the accept path.) Mirrors the destructor's _unvc close.
-      if (unvc->nh != nullptr && unvc->nh->thread == this_ethread()) {
-        MUTEX_TRY_LOCK(lock, unvc->nh->mutex, this_ethread());
-        unvc->do_io_close();
-      } else {
-        unvc->do_io_close();
-      }
+      // The outbound consumer cancelled after the transport opened. Close the transport
+      // (connectUp already started the cop, so even a lock-miss deferred close is still reaped,
+      // just ~1s later) and discard this VC. (_connect_action is unused, never cancelled, on
+      // the accept path.)
+      _closeTransport(unvc);
       this->free_thread(thread);
       return EVENT_DONE;
     }
     ink_release_assert(this->_unvc == nullptr); // not wired up yet
     this->_unvc = unvc;
     SET_HANDLER(&SSLNetVConnection::mainEvent);
-    // Once the handshake starts, we will need to be ready to write
-    _transport_read_vio  = _unvc->do_io_read(this, INT64_MAX, _read_buf.get());
-    _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
-    // do_io_read/do_io_write only return nullptr when the VC is already closed, but the inner
-    // unvc was just delivered synchronously via NET_EVENT_OPEN/ACCEPT on this stack and cannot be
-    // closed yet (the reenable() paths make the same calls without a null check).
-    ink_release_assert(_transport_read_vio != nullptr && _transport_write_vio != nullptr);
+    _wireTransportVIOs();
     // This should already be held by whoever requested the connect, so no blocking.
     // Use a scoped lock: it releases on scope exit (the prior MUTEX_TAKE_LOCK had no
     // matching MUTEX_UNTAKE_LOCK, permanently leaking a lock level on the shared
