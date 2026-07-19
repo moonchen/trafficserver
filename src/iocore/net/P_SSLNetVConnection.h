@@ -145,15 +145,15 @@ private:
   // RECLAIMABLE.
   //
   //   HANDSHAKING -> HANDSHAKE_DONE  -- _completeHandshakeIfActive()
-  //     - Handshake completion on SSL_ERROR_NONE: sslServerHandShakeEvent /
-  //       sslClientHandShakeEvent. Guarded (== HANDSHAKING): a state moved past HANDSHAKING
+  //     - Handshake completion on SSL_ERROR_NONE: _completeServerHandshake /
+  //       _completeClientHandshake. Guarded (== HANDSHAKING): a state moved past HANDSHAKING
   //       mid-flight -- a hook's reject or a close during SSL_accept/SSL_connect -- outranks
   //       completion, so the store is skipped.
   //     - Blind-tunnel marks on a transparent connection: _setupServerSSL (per-IP OPT_TUNNEL,
   //       first server round) and _lookupContextByName (per-SNI OPT_TUNNEL; guarded
   //       (== HANDSHAKING) so an armed FATAL_PENDING from an earlier hook in the same flight
   //       outranks the tunnel).
-  //     - A hook-requested SSL_HOOK_OP_TERMINATE: sslServerHandShakeEvent. (Nothing in the tree
+  //     - A hook-requested SSL_HOOK_OP_TERMINATE: _prepareServerHandshake. (Nothing in the tree
   //       currently sets that op, so this store is unreached.)
   //     - The DOWNGRADE_PLAIN executor (_propagateHandShakeBuffer), just before this VC hands its
   //       buffers to the plain successor and frees itself.
@@ -883,6 +883,36 @@ private:
   // permits touching `this` afterwards -- after YIELD or FAILED a delivered signal may already
   // have freed the VC.
   [[nodiscard]] HandshakeDriveOutcome _drive_handshake(TransportFace face);
+
+  // The two role drivers (sslServerHandShakeEvent / sslClientHandShakeEvent) share one visible
+  // phase skeleton: prepare (hook stepping + PROXY-protocol step), enter OpenSSL (_ssl_accept /
+  // _ssl_connect), the inbound-only not-a-ClientHello fallback, then complete-or-classify. Only
+  // genuinely role-free steps live in the shared helpers (_stepPreHandshakeHooks,
+  // _finishHandshakeCommon); each phase body stays with its role. Contracts at the definitions.
+  bool               _stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState pre_state);
+  int                _prepareServerHandshake();
+  int                _prepareClientHandshake();
+  int                _stripInboundProxyProtocol();
+  bool               _stageOutboundProxyProtocol();
+  std::optional<int> _fallbackToPlainOrTunnel();
+  // The negotiated-protocol query result (ALPN preferred over NPN); len == 0 when the peer
+  // selected nothing.
+  struct NegotiatedProtocol {
+    const unsigned char *proto = nullptr;
+    unsigned             len   = 0;
+  };
+  NegotiatedProtocol _finishHandshakeCommon();
+  int                _completeServerHandshake();
+  int                _completeClientHandshake();
+  int                _classifyServerHandshakeError(ssl_error_t ssl_error);
+  int                _classifyClientHandshakeError(ssl_error_t ssl_error, int &err);
+#if TS_USE_TLS_ASYNC
+  void _updateAsyncWaitState(ssl_error_t ssl_error);
+#endif
+#if TS_HAS_TLS_EARLY_DATA
+  // _ssl_accept's early-data drain; see the definition.
+  int _drainEarlyData();
+#endif
 
   // Release the handshake reader (handShakeHolder) once the handshake is established and no
   // blind tunnel will adopt it, so it stops pinning _read_buf. See the definition for why a

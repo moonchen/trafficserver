@@ -85,6 +85,7 @@ using namespace std::literals;
 #define SSL_WAIT_FOR_HOOK          11
 #define SSL_WAIT_FOR_ASYNC         12
 #define SSL_RESTART                13
+#define SSL_WAIT_FOR_PREAMBLE      14
 
 ClassAllocator<SSLNetVConnection, true> sslNetVCAllocator("sslNetVCAllocator");
 
@@ -791,14 +792,24 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // parking, so it never reaches here and its teardown is not blocked.)
     // Key on is_invoked_state(): a hook that reenabled synchronously already cleared
     // _hook_parked and advanced the FSM, so re-latching here would leave a stale hold that
-    // blocks the free forever (a leak now that every free site honors _hook_parked); and the
-    // incomplete outbound PROXY preamble also returns SSL_WAIT_FOR_HOOK without any hook
-    // parked -- it is flushed and re-driven -- so it must not falsely latch either.
+    // blocks the free forever (a leak now that every free site honors _hook_parked); the
+    // patched-OpenSSL cert-load wait (_classifyServerHandshakeError's SNI/cert arm) also
+    // lands here with no hook invoked, so it must not latch either.
     if (is_invoked_state()) {
       _hook_parked = true;
     }
-    // Flush any handshake ciphertext already produced (the PROXY preamble, or a partial
-    // flight) so the transport drains it and re-drives.
+    // Flush any handshake ciphertext already produced (a partial flight) so the transport
+    // drains it and re-drives.
+    _flushStagedCiphertext();
+    return HandshakeDriveOutcome::YIELD;
+
+  case SSL_WAIT_FOR_PREAMBLE:
+    Dbg(dbg_ctl_ssl, "ssl wait for outbound preamble for vc %p", this);
+    // The outbound PROXY preamble is not fully staged yet (_prepareClientHandshake). Unlike
+    // SSL_WAIT_FOR_HOOK no hook is parked and no plugin reenable is coming, so nothing may
+    // latch _hook_parked. Flush what was staged so the transport drains it; the consumer
+    // supplying the rest of the preamble (or the transport write drive) re-enters the
+    // handshake, still in HANDSHAKE_HOOKS_PRE.
     _flushStagedCiphertext();
     return HandshakeDriveOutcome::YIELD;
 
@@ -813,7 +824,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
 
   default:
     // EVENT_CONT: the round paused without a latchable park (the client-hello callback park
-    // latches _hook_parked inside sslServerHandShakeEvent) -- an SNI/cert pause, or a
+    // latches _hook_parked inside _classifyServerHandshakeError) -- an SNI/cert pause, or a
     // patched-OpenSSL lookup wait. Historical face split, preserved: the read face flushes any
     // produced ciphertext and waits for the transport; the write face re-arms its transport
     // write unconditionally.
@@ -1657,19 +1668,107 @@ SSLNetVConnection::_advance_handshake(int &err)
   return sslServerHandShakeEvent(err);
 }
 
-int
-SSLNetVConnection::sslServerHandShakeEvent(int &err)
+// Shared hook-stepping leaf for the two prepare phases: park while a previously invoked hook
+// has not reenabled, else invoke `pre_state`'s chain and park if a hook holds it. True means
+// the driver must return SSL_WAIT_FOR_HOOK; the plugin's reenable_with_event re-drives the
+// round.
+bool
+SSLNetVConnection::_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState pre_state)
 {
   // Continue on if we are in the invoked state.  The hook has not yet reenabled
   if (this->is_invoked_state()) {
-    return SSL_WAIT_FOR_HOOK;
+    return true;
+  }
+  if (this->get_handshake_hook_state() == pre_state) {
+    if (this->invoke_tls_event() == 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The role-free completion steps, run first by both complete phases: the peer-certificate
+// debug dump and the negotiated-protocol query. If it's possible to negotiate both NPN and
+// ALPN, then ALPN is preferred since it is the server's preference; the server preference
+// would not be meaningful if we let the client preference have priority. The query is pure
+// (get0 accessors), so running it ahead of the role-specific completion steps is inert;
+// recording and endpoint selection differ by role and stay in _completeServerHandshake /
+// _completeClientHandshake.
+SSLNetVConnection::NegotiatedProtocol
+SSLNetVConnection::_finishHandshakeCommon()
+{
+  if (dbg_ctl_ssl.on()) {
+#ifdef OPENSSL_IS_OPENSSL3
+    X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
+#else
+    X509 *cert = SSL_get_peer_certificate(this->_ssl.get());
+#endif
+    const bool inbound = get_context() == NET_VCONNECTION_IN;
+
+    DbgPrint(dbg_ctl_ssl, "SSL %s handshake completed successfully", inbound ? "server" : "client");
+    if (cert) {
+      debug_certificate_name(inbound ? "client certificate subject CN is" : "server certificate subject CN is",
+                             X509_get_subject_name(cert));
+      debug_certificate_name(inbound ? "client certificate issuer CN is" : "server certificate issuer CN is",
+                             X509_get_issuer_name(cert));
+      X509_free(cert);
+    }
   }
 
-  // Go do the preaccept hooks
-  if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE) {
-    if (this->invoke_tls_event() == 1) {
-      return SSL_WAIT_FOR_HOOK;
+  NegotiatedProtocol negotiated;
+
+  SSL_get0_alpn_selected(this->_ssl.get(), &negotiated.proto, &negotiated.len);
+  if (negotiated.len == 0) {
+    SSL_get0_next_proto_negotiated(this->_ssl.get(), &negotiated.proto, &negotiated.len);
+  }
+  return negotiated;
+}
+
+// Inbound PROXY-protocol step: strip the header from the raw stream before SSL_accept (and
+// before a possible blind-tunnel replay of the buffered ClientHello). In the layered model the
+// handshake bytes are already buffered in _read_buf and read through independent readers --
+// the rbio that SSL_accept consumes and handShakeHolder for the replay -- so the header,
+// parsed here via a throwaway reader, must be consumed from each of them.
+// (_parse_proxy_protocol self-guards on the version, so it parses at most once.) EVENT_CONT:
+// no header expected, or it was stripped; SSL_HANDSHAKE_WANT_READ: header still incomplete;
+// EVENT_ERROR: malformed.
+int
+SSLNetVConnection::_stripInboundProxyProtocol()
+{
+  if (!this->get_is_proxy_protocol() || this->get_proxy_protocol_version() != ProxyProtocolVersion::UNDEFINED) {
+    return EVENT_CONT;
+  }
+
+  auto    reader = make_resource(this->_read_buf->alloc_reader(), [](IOBufferReader *reader) { reader->dealloc(); });
+  int64_t before = reader->read_avail();
+  int     retval = this->_parse_proxy_protocol(reader.get());
+
+  if (retval < 0) {
+    if (retval == -EAGAIN) {
+      // No data at the moment, hang tight
+      SSLVCDebug(this, "Proxy protocol: need more data");
+      return SSL_HANDSHAKE_WANT_READ;
+    } else {
+      // An error, make us go away
+      SSLVCDebug(this, "Proxy protocol error: _parse_proxy_protocol() returned %d", retval);
+      return EVENT_ERROR;
     }
+  }
+  if (int64_t consumed = before - reader->read_avail(); consumed > 0) {
+    this->handShakeHolder->consume(consumed);
+    miobuffer_consume(SSL_get_rbio(this->_ssl.get()), consumed);
+  }
+  return EVENT_CONT;
+}
+
+// Server prepare phase: pre-accept hooks, a hook-requested conversion, the inbound
+// PROXY-protocol strip, and arming async handshake mode. EVENT_CONT proceeds into SSL_accept;
+// anything else is the round's verdict.
+int
+SSLNetVConnection::_prepareServerHandshake()
+{
+  if (_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE)) {
+    return SSL_WAIT_FOR_HOOK;
   }
 
   // If a blind tunnel was requested in the pre-accept calls, convert.
@@ -1693,31 +1792,8 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   Dbg(dbg_ctl_ssl, "Go on with the handshake state=%s",
       TLSEventSupport::get_ssl_handshake_hook_state_name(this->get_handshake_hook_state()));
 
-  // Strip any PROXY protocol header from the raw stream before SSL_accept (and before a
-  // possible blind-tunnel replay of the buffered ClientHello). In the layered model the
-  // handshake bytes are already buffered in _read_buf and read through independent
-  // readers -- the rbio that SSL_accept consumes and handShakeHolder for the replay -- so
-  // the header, parsed here via a throwaway reader, must be consumed from each of them.
-  // (_parse_proxy_protocol self-guards on the version, so it parses at most once.)
-  if (this->get_is_proxy_protocol() && this->get_proxy_protocol_version() == ProxyProtocolVersion::UNDEFINED) {
-    auto    reader = make_resource(this->_read_buf->alloc_reader(), [](IOBufferReader *reader) { reader->dealloc(); });
-    int64_t before = reader->read_avail();
-    int     retval = this->_parse_proxy_protocol(reader.get());
-    if (retval < 0) {
-      if (retval == -EAGAIN) {
-        // No data at the moment, hang tight
-        SSLVCDebug(this, "Proxy protocol: need more data");
-        return SSL_HANDSHAKE_WANT_READ;
-      } else {
-        // An error, make us go away
-        SSLVCDebug(this, "Proxy protocol error: _parse_proxy_protocol() returned %d", retval);
-        return EVENT_ERROR;
-      }
-    }
-    if (int64_t consumed = before - reader->read_avail(); consumed > 0) {
-      this->handShakeHolder->consume(consumed);
-      miobuffer_consume(SSL_get_rbio(this->_ssl.get()), consumed);
-    }
+  if (int strip = _stripInboundProxyProtocol(); strip != EVENT_CONT) {
+    return strip;
   }
 
   if (this->handShakeHolder != nullptr && !this->handShakeHolder->is_read_avail_more_than(0)) {
@@ -1735,13 +1811,21 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     SSL_set_mode(this->_ssl.get(), SSL_MODE_ASYNC);
   }
 #endif
+  return EVENT_CONT;
+}
 
-  ssl_error_t ssl_error = this->_ssl_accept();
 #if TS_USE_TLS_ASYNC
+// Keep the async-handshake plumbing in step with this round's SSL_accept result: register the
+// engine's wait fd on the first WANT_ASYNC suspension (handle_async_tls_ready resumes off it),
+// and under async mode make sure a WANT_READ leaves the transport read VIO armed.
+void
+SSLNetVConnection::_updateAsyncWaitState(ssl_error_t ssl_error)
+{
   if (ssl_error == SSL_ERROR_WANT_ASYNC) {
     // Do we need to set up the async eventfd?  Or is it already registered?
     if (async_ep.fd < 0) {
       size_t numfds;
+
       // Set up the epoll entry for the signalling
       if (SSL_get_all_async_fds(this->_ssl.get(), nullptr, &numfds) && numfds > 0) {
         // A TLS handshake is a single OpenSSL ASYNC_JOB whose wait-ctx fd is stable across
@@ -1762,119 +1846,110 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       _transport_read_vio->reenable();
     }
   }
+}
 #endif
-  if (ssl_error != SSL_ERROR_NONE) {
-    err = errno;
-    SSLVCDebug(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
 
-    // Sniff the first raw byte the client sent to tell a real ClientHello (0x16) from plain
-    // HTTP (allow-plain / tr-pass). Read it through handShakeHolder, whose position IS the byte
-    // that would be replayed to a plain/tunnel successor: _read_buf->buf() returns the write
-    // block's base, which after a stripped PROXY header (consumed from the holder above) is the
-    // header's first byte, not the client's. The holder != nullptr guard also means we never
-    // sniff after _commitInboundHandshake has released it -- once TLS is committed the head
-    // block recycles and buf()[0] would be mid-stream ciphertext, which could spuriously arm a
-    // DOWNGRADE_PLAIN whose executor dereferences the (now null) holder.
-    if (handShakeHolder != nullptr && handShakeHolder->is_read_avail_more_than(0)) {
-      char *buf = handShakeHolder->start();
-      if (buf && *buf != SSL_OP_HANDSHAKE) {
-        SSLVCDebug(this, "SSL hanshake error with bad HS buffer");
-        if (getAllowPlain()) {
-          SSLVCDebug(this, "Try plain");
-          // The leading bytes are not a ClientHello: convert this connection to a UnixNetVC and
-          // hand the buffered packet to HTTP processing -- the same deferred handoff the blind
-          // tunnel uses.
-          _armPendingHandoff(PendingHandoff::DOWNGRADE_PLAIN);
-          return SSL_RESTART;
-        } else if (getTransparentPassThrough()) {
-          // start a blind tunnel if tr-pass is set and data does not look like ClientHello
-          SSLVCDebug(this, "Data does not look like SSL handshake, starting blind tunnel");
-          this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-          return EVENT_CONT;
-        } else {
-          SSLVCDebug(this, "Give up");
-        }
+// Inbound role fallback, run after a handshake error: sniff the first raw byte the client sent
+// to tell a real ClientHello (0x16) from plain HTTP (allow-plain / tr-pass). Read it through
+// handShakeHolder, whose position IS the byte that would be replayed to a plain/tunnel
+// successor: _read_buf->buf() returns the write block's base, which after a stripped PROXY
+// header (consumed from the holder by _stripInboundProxyProtocol) is the header's first byte,
+// not the client's. The holder != nullptr guard also means we never sniff after
+// _commitInboundHandshake has released it -- once TLS is committed the head block recycles and
+// buf()[0] would be mid-stream ciphertext, which could spuriously arm a DOWNGRADE_PLAIN whose
+// executor dereferences the (now null) holder. Engaged, the value is the driver's verdict
+// (SSL_RESTART for the deferred allow-plain downgrade, EVENT_CONT after flipping to a tr-pass
+// blind tunnel); nullopt leaves the failure to _classifyServerHandshakeError.
+std::optional<int>
+SSLNetVConnection::_fallbackToPlainOrTunnel()
+{
+  if (handShakeHolder != nullptr && handShakeHolder->is_read_avail_more_than(0)) {
+    char *buf = handShakeHolder->start();
+
+    if (buf && *buf != SSL_OP_HANDSHAKE) {
+      SSLVCDebug(this, "SSL hanshake error with bad HS buffer");
+      if (getAllowPlain()) {
+        SSLVCDebug(this, "Try plain");
+        // The leading bytes are not a ClientHello: convert this connection to a UnixNetVC and
+        // hand the buffered packet to HTTP processing -- the same deferred handoff the blind
+        // tunnel uses.
+        _armPendingHandoff(PendingHandoff::DOWNGRADE_PLAIN);
+        return SSL_RESTART;
+      } else if (getTransparentPassThrough()) {
+        // start a blind tunnel if tr-pass is set and data does not look like ClientHello
+        SSLVCDebug(this, "Data does not look like SSL handshake, starting blind tunnel");
+        this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+        return EVENT_CONT;
+      } else {
+        SSLVCDebug(this, "Give up");
       }
     }
   }
+  return std::nullopt;
+}
 
-  switch (ssl_error) {
-  case SSL_ERROR_NONE:
-    if (dbg_ctl_ssl.on()) {
-#ifdef OPENSSL_IS_OPENSSL3
-      X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
-#else
-      X509 *cert = SSL_get_peer_certificate(this->_ssl.get());
-#endif
+// Server complete phase: handshake timing stats, drop the downgrade buffer, endpoint selection
+// off the negotiated protocol (forced to HTTP/1.1 under SNI routing), async-mode teardown.
+int
+SSLNetVConnection::_completeServerHandshake()
+{
+  NegotiatedProtocol negotiated = _finishHandshakeCommon();
 
-      DbgPrint(dbg_ctl_ssl, "SSL server handshake completed successfully");
-      if (cert) {
-        debug_certificate_name("client certificate subject CN is", X509_get_subject_name(cert));
-        debug_certificate_name("client certificate issuer CN is", X509_get_issuer_name(cert));
-        X509_free(cert);
-      }
+  _completeHandshakeIfActive();
+
+  if (this->get_tls_handshake_begin_time()) {
+    this->_record_tls_handshake_end_time();
+    this->_update_end_of_handshake_stats();
+  }
+
+  // We're fully SSL now, so we can throw away the downgrade buffer (the read-path handshake
+  // driver may already have released it once ClientHello/SNI processing was past -- see
+  // _releaseHandshakeReader).
+  if (this->handShakeHolder != nullptr) {
+    this->handShakeHolder->dealloc();
+    this->handShakeHolder = nullptr;
+  }
+
+  if (this->get_tunnel_type() != SNIRoutingType::NONE) {
+    // Foce to use HTTP/1.1 endpoint for SNI Routing
+    if (!this->setSelectedProtocol(reinterpret_cast<const unsigned char *>(IP_PROTO_TAG_HTTP_1_1.data()),
+                                   IP_PROTO_TAG_HTTP_1_1.size())) {
+      return EVENT_ERROR;
     }
+  }
 
-    _completeHandshakeIfActive();
+  increment_ssl_version_metric(SSL_version(this->_ssl.get()));
 
-    if (this->get_tls_handshake_begin_time()) {
-      this->_record_tls_handshake_end_time();
-      this->_update_end_of_handshake_stats();
+  if (negotiated.len) {
+    if (this->get_tunnel_type() == SNIRoutingType::NONE && !this->setSelectedProtocol(negotiated.proto, negotiated.len)) {
+      return EVENT_ERROR;
     }
+    this->set_negotiated_protocol_id({reinterpret_cast<const char *>(negotiated.proto), static_cast<size_t>(negotiated.len)});
 
-    // We're fully SSL now, so we can throw away the downgrade buffer (the read-path handshake
-    // driver may already have released it once ClientHello/SNI processing was past -- see
-    // _releaseHandshakeReader).
-    if (this->handShakeHolder != nullptr) {
-      this->handShakeHolder->dealloc();
-      this->handShakeHolder = nullptr;
-    }
-
-    if (this->get_tunnel_type() != SNIRoutingType::NONE) {
-      // Foce to use HTTP/1.1 endpoint for SNI Routing
-      if (!this->setSelectedProtocol(reinterpret_cast<const unsigned char *>(IP_PROTO_TAG_HTTP_1_1.data()),
-                                     IP_PROTO_TAG_HTTP_1_1.size())) {
-        return EVENT_ERROR;
-      }
-    }
-
-    {
-      const unsigned char *proto = nullptr;
-      unsigned             len   = 0;
-
-      increment_ssl_version_metric(SSL_version(this->_ssl.get()));
-
-      // If it's possible to negotiate both NPN and ALPN, then ALPN
-      // is preferred since it is the server's preference.  The server
-      // preference would not be meaningful if we let the client
-      // preference have priority.
-      SSL_get0_alpn_selected(this->_ssl.get(), &proto, &len);
-      if (len == 0) {
-        SSL_get0_next_proto_negotiated(this->_ssl.get(), &proto, &len);
-      }
-
-      if (len) {
-        if (this->get_tunnel_type() == SNIRoutingType::NONE && !this->setSelectedProtocol(proto, len)) {
-          return EVENT_ERROR;
-        }
-        this->set_negotiated_protocol_id({reinterpret_cast<const char *>(proto), static_cast<size_t>(len)});
-
-        Dbg(dbg_ctl_ssl, "Origin selected next protocol '%.*s'", len, proto);
-      } else {
-        Dbg(dbg_ctl_ssl, "Origin did not select a next protocol");
-      }
-    }
+    Dbg(dbg_ctl_ssl, "Origin selected next protocol '%.*s'", negotiated.len, negotiated.proto);
+  } else {
+    Dbg(dbg_ctl_ssl, "Origin did not select a next protocol");
+  }
 
 #if TS_USE_TLS_ASYNC
-    if (SSLConfigParams::async_handshake_enabled) {
-      SSL_clear_mode(this->_ssl.get(), SSL_MODE_ASYNC);
-      if (async_ep.fd >= 0) {
-        async_ep.stop();
-      }
+  if (SSLConfigParams::async_handshake_enabled) {
+    SSL_clear_mode(this->_ssl.get(), SSL_MODE_ASYNC);
+    if (async_ep.fd >= 0) {
+      async_ep.stop();
     }
+  }
 #endif
-    return EVENT_DONE;
+  return EVENT_DONE;
+}
 
+// Classify a non-NONE SSL_accept result into the driver's verdict. The suspension arms
+// (WANT_CLIENT_HELLO_CB, the patched-OpenSSL SNI/cert waits) return EVENT_CONT or
+// SSL_WAIT_FOR_HOOK without a hook necessarily invoked; everything unrecognized is a failed
+// handshake.
+int
+SSLNetVConnection::_classifyServerHandshakeError(ssl_error_t ssl_error)
+{
+  switch (ssl_error) {
   case SSL_ERROR_WANT_CONNECT:
     return SSL_HANDSHAKE_WANT_CONNECT;
 
@@ -1941,87 +2016,97 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 }
 
 int
-SSLNetVConnection::sslClientHandShakeEvent(int &err)
+SSLNetVConnection::sslServerHandShakeEvent(int &err)
 {
-  ssl_error_t ssl_error;
+  if (int prep = _prepareServerHandshake(); prep != EVENT_CONT) {
+    return prep;
+  }
 
-  ink_assert(TLSBasicSupport::getInstance(this->_ssl.get()) == this);
+  ssl_error_t ssl_error = this->_ssl_accept();
+#if TS_USE_TLS_ASYNC
+  _updateAsyncWaitState(ssl_error);
+#endif
 
+  if (ssl_error == SSL_ERROR_NONE) {
+    return _completeServerHandshake();
+  }
+
+  err = errno;
+  SSLVCDebug(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
+  if (std::optional<int> verdict = _fallbackToPlainOrTunnel(); verdict.has_value()) {
+    return *verdict;
+  }
+  return _classifyServerHandshakeError(ssl_error);
+}
+
+// Outbound PROXY-protocol step. The v1/v2 preamble must reach the origin as cleartext, ahead
+// of the TLS ClientHello. SSL_write would encrypt it, so copy the preamble straight into
+// _write_buf (the transport-bound buffer) before _ssl_connect() appends the ClientHello; the
+// transport then drains [PROXY header][ClientHello...] in order. (Master writes it raw via
+// super::load_buffer_and_write; this is the layered equivalent now that the SSL VC no longer
+// is-a UnixNetVConnection.) False while the consumer's write VIO has not yet supplied the
+// full preamble.
+bool
+SSLNetVConnection::_stageOutboundProxyProtocol()
+{
+  VIO    &vio     = this->_user_write_vio;
+  int64_t towrite = std::min(vio.ntodo(), vio.get_reader()->read_avail());
+
+  if (towrite > 0) {
+    int64_t written = _write_buf->write(vio.get_reader(), towrite);
+    vio.get_reader()->consume(written);
+    vio.ndone += written;
+  }
+  return vio.ntodo() == 0;
+}
+
+// Client prepare phase: stage the outbound PROXY preamble, advance the hook FSM to the
+// outbound chain, run the outbound pre-handshake hooks. EVENT_CONT proceeds into SSL_connect;
+// anything else is the round's verdict.
+int
+SSLNetVConnection::_prepareClientHandshake()
+{
   // Initialize properly for a client connection
   if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE) {
-    if (this->pp_info.version != ProxyProtocolVersion::UNDEFINED) {
-      // Outbound PROXY Protocol. The v1/v2 preamble must reach the origin as cleartext,
-      // ahead of the TLS ClientHello. SSL_write would encrypt it, so copy the preamble
-      // straight into _write_buf (the transport-bound buffer) before _ssl_connect() appends
-      // the ClientHello; the transport then drains [PROXY header][ClientHello...] in order.
-      // (Master writes it raw via super::load_buffer_and_write; this is the layered
-      // equivalent now that the SSL VC no longer is-a UnixNetVConnection.)
-      VIO    &vio     = this->_user_write_vio;
-      int64_t towrite = std::min(vio.ntodo(), vio.get_reader()->read_avail());
-
-      if (towrite > 0) {
-        int64_t written = _write_buf->write(vio.get_reader(), towrite);
-        vio.get_reader()->consume(written);
-        vio.ndone += written;
-      }
-      if (vio.ntodo() != 0) {
-        // Preamble not fully buffered yet; the caller flushes _write_buf, then re-drives
-        // the handshake (still in HANDSHAKE_HOOKS_PRE) to write the remainder.
-        return SSL_WAIT_FOR_HOOK;
-      }
+    if (this->pp_info.version != ProxyProtocolVersion::UNDEFINED && !_stageOutboundProxyProtocol()) {
+      // Preamble not fully buffered yet; the caller flushes _write_buf, then re-drives
+      // the handshake (still in HANDSHAKE_HOOKS_PRE) to stage the remainder.
+      return SSL_WAIT_FOR_PREAMBLE;
     }
 
     this->set_handshake_hook_state(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_OUTBOUND_PRE);
   }
 
   // Do outbound hook processing here
-  // Continue on if we are in the invoked state.  The hook has not yet reenabled
-  if (this->is_invoked_state()) {
+  if (_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_OUTBOUND_PRE)) {
     return SSL_WAIT_FOR_HOOK;
   }
+  return EVENT_CONT;
+}
 
-  // Go do the preaccept hooks
-  if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_OUTBOUND_PRE) {
-    if (this->invoke_tls_event() == 1) {
-      return SSL_WAIT_FOR_HOOK;
-    }
-  }
+// Client complete phase: record the negotiated protocol and mark the handshake done.
+int
+SSLNetVConnection::_completeClientHandshake()
+{
+  NegotiatedProtocol negotiated = _finishHandshakeCommon();
 
-  ssl_error = this->_ssl_connect();
+  // Make note of the negotiated protocol
+  Dbg(dbg_ctl_ssl_alpn, "Negotiated ALPN: %.*s", negotiated.len, negotiated.proto);
+  this->set_negotiated_protocol_id({reinterpret_cast<const char *>(negotiated.proto), static_cast<size_t>(negotiated.len)});
+
+  Metrics::Counter::increment(ssl_rsb.total_success_handshake_count_out);
+
+  _completeHandshakeIfActive();
+  return EVENT_DONE;
+}
+
+// Classify a non-NONE SSL_connect result into the driver's verdict. The break arms
+// (client-hello callback, X509 lookup, connect) fall through to EVENT_CONT: the round paused
+// with no latchable park. `err` is written on the terminal arms only.
+int
+SSLNetVConnection::_classifyClientHandshakeError(ssl_error_t ssl_error, int &err)
+{
   switch (ssl_error) {
-  case SSL_ERROR_NONE:
-    if (dbg_ctl_ssl.on()) {
-#ifdef OPENSSL_IS_OPENSSL3
-      X509 *cert = SSL_get1_peer_certificate(this->_ssl.get());
-#else
-      X509 *cert = SSL_get_peer_certificate(this->_ssl.get());
-#endif
-
-      DbgPrint(dbg_ctl_ssl, "SSL client handshake completed successfully");
-
-      if (cert) {
-        debug_certificate_name("server certificate subject CN is", X509_get_subject_name(cert));
-        debug_certificate_name("server certificate issuer CN is", X509_get_issuer_name(cert));
-        X509_free(cert);
-      }
-    }
-    {
-      unsigned char const *proto = nullptr;
-      unsigned int         len   = 0;
-      // Make note of the negotiated protocol
-      SSL_get0_alpn_selected(this->_ssl.get(), &proto, &len);
-      if (len == 0) {
-        SSL_get0_next_proto_negotiated(this->_ssl.get(), &proto, &len);
-      }
-      Dbg(dbg_ctl_ssl_alpn, "Negotiated ALPN: %.*s", len, proto);
-      this->set_negotiated_protocol_id({reinterpret_cast<const char *>(proto), static_cast<size_t>(len)});
-    }
-
-    Metrics::Counter::increment(ssl_rsb.total_success_handshake_count_out);
-
-    _completeHandshakeIfActive();
-    return EVENT_DONE;
-
   case SSL_ERROR_WANT_WRITE:
     Dbg(dbg_ctl_ssl_error, "SSL_ERROR_WANT_WRITE");
     return SSL_HANDSHAKE_WANT_WRITE;
@@ -2078,6 +2163,23 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
   } break;
   }
   return EVENT_CONT;
+}
+
+int
+SSLNetVConnection::sslClientHandShakeEvent(int &err)
+{
+  ink_assert(TLSBasicSupport::getInstance(this->_ssl.get()) == this);
+
+  if (int prep = _prepareClientHandshake(); prep != EVENT_CONT) {
+    return prep;
+  }
+
+  ssl_error_t ssl_error = this->_ssl_connect();
+
+  if (ssl_error == SSL_ERROR_NONE) {
+    return _completeClientHandshake();
+  }
+  return _classifyClientHandshakeError(ssl_error, err);
 }
 
 void
@@ -2528,8 +2630,8 @@ SSLNetVConnection::_downgradeToPlain()
   UnixNetVConnection *transferred = _unvc;
   _unvc                           = nullptr; // caller/HTTP layer owns the returned VC now
 
-  // do_io_close() frees this SSL VC inline. That is safe here only because the caller
-  // (sslServerHandShakeEvent) defers us to the out-of-line _runDeferredWork dispatch, which
+  // do_io_close() frees this SSL VC inline. That is safe here only because the arming site
+  // (_fallbackToPlainOrTunnel) defers us to the out-of-line _runDeferredWork dispatch, which
   // returns immediately after this returns -- no frame above re-reads `this`.
   do_io_close();
   return transferred;
@@ -2668,6 +2770,114 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
   return _verify_hook_failed ? 1 : 0;
 }
 
+#if TS_HAS_TLS_EARLY_DATA
+// Drain the client's TLS 1.3 early data into _early_data_buf (created on first use; the read
+// drive delivers it ahead of post-handshake plaintext) until OpenSSL reports the early phase
+// finished or an error. A drain that finishes with nothing buffered falls through to a regular
+// SSL_accept so the round still advances the handshake. Returns the raw OpenSSL-style value of
+// the last SSL_accept/SSL_read_early_data/SSL_read call, for the caller's SSL_get_error
+// classification. Runs under _ssl_accept's RecursionGuard.
+int
+SSLNetVConnection::_drainEarlyData()
+{
+  int ret = 0;
+#if HAVE_SSL_READ_EARLY_DATA
+  size_t nread = 0;
+#else
+  ssize_t nread = 0;
+#endif
+
+  while (true) {
+    bool           had_error_on_reading_early_data = false;
+    bool           finished_reading_early_data     = false;
+    IOBufferBlock *block                           = new_IOBufferBlock();
+    block->alloc(BUFFER_SIZE_INDEX_16K);
+
+#if HAVE_SSL_READ_EARLY_DATA
+    ret = SSL_read_early_data(this->_ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K), &nread);
+    if (ret == SSL_READ_EARLY_DATA_ERROR) {
+      had_error_on_reading_early_data = true;
+    } else if (ret == SSL_READ_EARLY_DATA_FINISH) {
+      finished_reading_early_data = true;
+    }
+#else
+    // If SSL_read_early_data is unavailable, it's probably BoringSSL,
+    // and SSL_in_early_data should be available.
+    ret = SSL_accept(this->_ssl.get());
+    if (ret <= 0) {
+      had_error_on_reading_early_data = true;
+    } else {
+      if (SSL_in_early_data(this->_ssl.get())) {
+        ret                         = SSL_read(this->_ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K));
+        finished_reading_early_data = !SSL_in_early_data(this->_ssl.get());
+        if (ret < 0) {
+          nread = 0;
+          if (finished_reading_early_data) {
+            ret = 2; // SSL_READ_EARLY_DATA_FINISH
+          } else {
+            // Don't override ret here.
+            // Keeping the original retrurn value let ATS allow to check the value by SSL_get_error.
+            // That gives a chance to progress handshake process, or shutdown a connection if the error is serious.
+            had_error_on_reading_early_data = true;
+          }
+        } else {
+          nread = ret;
+          if (finished_reading_early_data) {
+            ret = 2; // SSL_READ_EARLY_DATA_FINISH
+          } else {
+            ret = 1; // SSL_READ_EARLY_DATA_SUCCESS
+          }
+        }
+      } else {
+        nread                       = 0;
+        ret                         = 2; // SSL_READ_EARLY_DATA_FINISH
+        finished_reading_early_data = true;
+      }
+    }
+#endif
+
+    if (had_error_on_reading_early_data) {
+      Dbg(dbg_ctl_ssl_early_data, "Error on reading early data: %d", ret);
+      block->free();
+      break;
+    } else {
+      if (nread > 0) {
+        if (this->_early_data_buf == nullptr) {
+          this->_early_data_buf    = new_MIOBuffer(BUFFER_SIZE_INDEX_16K);
+          this->_early_data_reader = this->_early_data_buf->alloc_reader();
+        }
+        block->fill(nread);
+        this->_early_data_buf->append_block(block);
+        this->_increment_early_data_len(nread);
+        Metrics::Counter::increment(ssl_rsb.early_data_received_count);
+
+        if (dbg_ctl_ssl_early_data_show_received.on()) {
+          std::string early_data_str(reinterpret_cast<char *>(block->buf()), nread);
+          DbgPrint(dbg_ctl_ssl_early_data_show_received, "Early data buffer: \n%s", early_data_str.c_str());
+        }
+      } else {
+        block->free();
+      }
+
+      if (finished_reading_early_data) {
+        this->_early_data_finish = true;
+        Dbg(dbg_ctl_ssl_early_data, "SSL_READ_EARLY_DATA_FINISH: size = %lu", nread);
+
+        if (this->_early_data_reader == nullptr || this->_early_data_reader->read_avail() == 0) {
+          Dbg(dbg_ctl_ssl_early_data, "no data in early data buffer");
+          ERR_clear_error();
+          ret = SSL_accept(this->_ssl.get());
+        }
+        break;
+      }
+      Dbg(dbg_ctl_ssl_early_data, "SSL_READ_EARLY_DATA_SUCCESS: size = %lu", nread);
+    }
+  }
+
+  return ret;
+}
+#endif
+
 ssl_error_t
 SSLNetVConnection::_ssl_accept()
 {
@@ -2675,105 +2885,15 @@ SSLNetVConnection::_ssl_accept()
 
   int ret       = 0;
   int ssl_error = SSL_ERROR_NONE;
-  // Covers every SSL_accept()/SSL_read()/SSL_read_early_data() call below: any of them may
-  // synchronously invoke a registered hook (SNI/cert/client-hello), which may itself call back
-  // into us (see the recursion comment in P_SSLNetVConnection.h).
+  // Covers the SSL_accept() calls below and every SSL_accept()/SSL_read()/
+  // SSL_read_early_data() inside _drainEarlyData: any of them may synchronously invoke a
+  // registered hook (SNI/cert/client-hello), which may itself call back into us (see the
+  // recursion comment in P_SSLNetVConnection.h).
   RecursionGuard openssl_guard(recursion);
 
 #if TS_HAS_TLS_EARLY_DATA
   if (!this->_early_data_finish) {
-#if HAVE_SSL_READ_EARLY_DATA
-    size_t nread = 0;
-#else
-    ssize_t nread = 0;
-#endif
-
-    while (true) {
-      bool           had_error_on_reading_early_data = false;
-      bool           finished_reading_early_data     = false;
-      IOBufferBlock *block                           = new_IOBufferBlock();
-      block->alloc(BUFFER_SIZE_INDEX_16K);
-
-#if HAVE_SSL_READ_EARLY_DATA
-      ret = SSL_read_early_data(this->_ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K), &nread);
-      if (ret == SSL_READ_EARLY_DATA_ERROR) {
-        had_error_on_reading_early_data = true;
-      } else if (ret == SSL_READ_EARLY_DATA_FINISH) {
-        finished_reading_early_data = true;
-      }
-#else
-      // If SSL_read_early_data is unavailable, it's probably BoringSSL,
-      // and SSL_in_early_data should be available.
-      ret = SSL_accept(this->_ssl.get());
-      if (ret <= 0) {
-        had_error_on_reading_early_data = true;
-      } else {
-        if (SSL_in_early_data(this->_ssl.get())) {
-          ret                         = SSL_read(this->_ssl.get(), block->buf(), index_to_buffer_size(BUFFER_SIZE_INDEX_16K));
-          finished_reading_early_data = !SSL_in_early_data(this->_ssl.get());
-          if (ret < 0) {
-            nread = 0;
-            if (finished_reading_early_data) {
-              ret = 2; // SSL_READ_EARLY_DATA_FINISH
-            } else {
-              // Don't override ret here.
-              // Keeping the original retrurn value let ATS allow to check the value by SSL_get_error.
-              // That gives a chance to progress handshake process, or shutdown a connection if the error is serious.
-              had_error_on_reading_early_data = true;
-            }
-          } else {
-            nread = ret;
-            if (finished_reading_early_data) {
-              ret = 2; // SSL_READ_EARLY_DATA_FINISH
-            } else {
-              ret = 1; // SSL_READ_EARLY_DATA_SUCCESS
-            }
-          }
-        } else {
-          nread                       = 0;
-          ret                         = 2; // SSL_READ_EARLY_DATA_FINISH
-          finished_reading_early_data = true;
-        }
-      }
-#endif
-
-      if (had_error_on_reading_early_data) {
-        Dbg(dbg_ctl_ssl_early_data, "Error on reading early data: %d", ret);
-        block->free();
-        break;
-      } else {
-        if (nread > 0) {
-          if (this->_early_data_buf == nullptr) {
-            this->_early_data_buf    = new_MIOBuffer(BUFFER_SIZE_INDEX_16K);
-            this->_early_data_reader = this->_early_data_buf->alloc_reader();
-          }
-          block->fill(nread);
-          this->_early_data_buf->append_block(block);
-          this->_increment_early_data_len(nread);
-          Metrics::Counter::increment(ssl_rsb.early_data_received_count);
-
-          if (dbg_ctl_ssl_early_data_show_received.on()) {
-            std::string early_data_str(reinterpret_cast<char *>(block->buf()), nread);
-            DbgPrint(dbg_ctl_ssl_early_data_show_received, "Early data buffer: \n%s", early_data_str.c_str());
-          }
-        } else {
-          block->free();
-        }
-
-        if (finished_reading_early_data) {
-          this->_early_data_finish = true;
-          Dbg(dbg_ctl_ssl_early_data, "SSL_READ_EARLY_DATA_FINISH: size = %lu", nread);
-
-          if (this->_early_data_reader == nullptr || this->_early_data_reader->read_avail() == 0) {
-            Dbg(dbg_ctl_ssl_early_data, "no data in early data buffer");
-            ERR_clear_error();
-            ret = SSL_accept(this->_ssl.get());
-          }
-          break;
-        }
-        Dbg(dbg_ctl_ssl_early_data, "SSL_READ_EARLY_DATA_SUCCESS: size = %lu", nread);
-      }
-    }
+    ret = this->_drainEarlyData();
   } else {
     ret = SSL_accept(this->_ssl.get());
   }
@@ -3533,7 +3653,7 @@ SSLNetVConnection::_runDeferredWork()
     return EVENT_DONE;
   }
   if (_pending_handoff == PendingHandoff::DOWNGRADE_PLAIN) {
-    // We return immediately after (see sslServerHandShakeEvent), so _downgradeToPlain()'s inline
+    // We return immediately after (see _fallbackToPlainOrTunnel), so _downgradeToPlain()'s inline
     // do_io_close() cannot pull `this` out from under a caller still on the handshake read stack.
     _pending_handoff = PendingHandoff::NONE;
     _downgradeToPlain();
