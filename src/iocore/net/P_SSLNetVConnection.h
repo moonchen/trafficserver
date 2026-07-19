@@ -594,20 +594,23 @@ private:
   enum class SignalSide { READ, WRITE };
   // Notification only: deliver `event` to the consumer's VIO on `side` (or, for a severed/
   // mismatched cont, run the null-cont owner-close arm, which moves a terminal event straight to
-  // RECLAIMABLE). It NEVER frees `this`. Reclamation is a separate,
-  // explicit step the caller makes on the same stack immediately after, via _reclaimIfClosed --
-  // which frees only when the consumer has requested the close (consumer-driven teardown), never
-  // from the terminal state alone.
+  // RECLAIMABLE). It NEVER frees `this`. Called only from _signalAndReclaim, which fuses the
+  // paired reclaim onto the same stack.
   void _signal_user(SignalSide side, int event);
-  // The single same-turn reclaim point paired with _signal_user (consumer-driven teardown).
+  // The reclaim half of _signalAndReclaim; called bare only on the no-notify teardown paths
+  // (mainEvent's RECLAIMABLE dispatch and its terminal transport-event gate).
   // Frees `this` (returning true) iff the consumer requested the close (RECLAIMABLE) and no
   // frame that still needs `this` alive is on the stack: recursion == 0 (own notify reentrancy or
   // an OpenSSL callback frame), not mid graceful-drain (_isDraining -- the drain owns the free),
   // and no handshake hook parked (is_invoked_state -- a plugin holds a live ref and will
   // reenable). NEVER frees from a terminal _sslState alone: master frees on `closed`, not on the
   // SSL error state. The caller must touch nothing after this returns true.
-  bool       _reclaimIfClosed();
-  SignalSide _handshake_fail_side() const;
+  bool _reclaimIfClosed();
+  enum class SignalOutcome { ALIVE, RECLAIMED };
+  // The one way to notify the consumer: _signal_user fused with its paired _reclaimIfClosed.
+  // See the contract at the definition; RECLAIMED means `this` was freed -- touch no member.
+  [[nodiscard]] SignalOutcome _signalAndReclaim(SignalSide side, int event);
+  SignalSide                  _handshake_fail_side() const;
   // Deliver the user-facing WRITE_COMPLETE synchronously and, if that causes the consumer to
   // reentrantly queue a new write, self-schedule a clean-stack rearm (see the definition and
   // _write_rearm_pending).
@@ -623,7 +626,7 @@ private:
   // or its owned _ssl inline: case (1) because an enclosing frame on our own stack still
   // expects `this` to be valid, case (2) because OpenSSL's own C code keeps running after the
   // callback returns and would touch a freed _ssl. do_io_close's inline-free decision and
-  // _reclaimIfClosed (the reclaim paired with each _signal_user) both gate on recursion == 0
+  // _reclaimIfClosed (the reclaim half of every _signalAndReclaim) both gate on recursion == 0
   // -- never on lerrno or on which specific call triggered the close. See RecursionGuard below;
   // wrap every OpenSSL entry point with one, scoped tightly to just that call.
   int recursion = 0;
