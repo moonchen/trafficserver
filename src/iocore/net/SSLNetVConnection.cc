@@ -649,6 +649,19 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     return HandshakeDriveOutcome::YIELD;
   }
 
+  // An in-hook abort during this round's _advance_handshake (TSVConnAbort from a hook on a
+  // plugin-owned outbound VC -- or any in-hook close that could not arm the drain) authorized
+  // the reclaim. The close severed the user VIOs, so no outcome of this round has a waiter,
+  // and because the OpenSSL frame blocked the free (recursion), do_io_close's DEFER plan
+  // already scheduled the dispatch whose RECLAIMABLE rung completes it. Yield to that
+  // dispatch: signalling from here would find the null cont and the owner-close would free
+  // the VC on this unwinding drive's stack, under the inner-transport frames that dispatched
+  // it. (An in-hook close whose drain WAS armed is _is_draining() instead -- the EVENT_ERROR
+  // arm's own yield below handles it, flushing the staged alert.)
+  if (_sslState == SslState::RECLAIMABLE) {
+    return HandshakeDriveOutcome::YIELD;
+  }
+
   // A hook may have synchronously flagged an error (reenable_with_event(TS_EVENT_ERROR),
   // called from within a hook still nested mid SSL_accept()/SSL_connect()) without the
   // handshake call itself returning an outright error this round -- e.g. SSL_HANDSHAKE_WANT_READ,

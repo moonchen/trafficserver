@@ -101,14 +101,15 @@ reducer_cert_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
   return 0;
 }
 
-bool             g_verify_close_armed = false;
-bool             g_verify_close_fired = false;
-INKContInternal *g_verify_close_cont  = nullptr; // process-global closing verify hook; held so it stays reachable
+bool             g_verify_close_armed  = false;
+bool             g_verify_close_fired  = false;
+int              g_verify_close_lerrno = -1;      // -1 = graceful close (drain); anything else = abort
+INKContInternal *g_verify_close_cont   = nullptr; // process-global closing verify hook; held so it stays reachable
 
 // One-shot verify-server hook (see the header). Runs nested inside the failing SSL_connect frame:
-// the in-hook do_io_close severs the user VIOs and arms the graceful close-drain, and the ERROR
-// reenable records the verify verdict (_verify_hook_failed) that makes the ENFORCED policy fail
-// SSL_connect on this very round.
+// the in-hook do_io_close severs the user VIOs and arms the graceful close-drain (lerrno -1) or
+// authorizes the reclaim (an abort lerrno), and the ERROR reenable records the verify verdict
+// (_verify_hook_failed) that makes the ENFORCED policy fail SSL_connect on this very round.
 int
 reducer_closing_verify_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
 {
@@ -116,7 +117,7 @@ reducer_closing_verify_hook_cb(TSCont /* contp */, TSEvent /* event */, void *ed
   if (g_verify_close_armed) {
     g_verify_close_armed = false; // one-shot: close only the armed handshake
     g_verify_close_fired = true;
-    vc->do_io_close();
+    vc->do_io_close(g_verify_close_lerrno);
     vc->reenable_with_event(TS_EVENT_ERROR);
     return 0;
   }
@@ -144,10 +145,11 @@ reducer_install_parking_cert_hook()
 }
 
 void
-reducer_install_closing_verify_hook()
+reducer_install_closing_verify_hook(int lerrno)
 {
-  g_verify_close_fired = false;
-  g_verify_close_armed = true; // arm the next outbound verify to close in-hook
+  g_verify_close_fired  = false;
+  g_verify_close_lerrno = lerrno;
+  g_verify_close_armed  = true; // arm the next outbound verify to close in-hook
   if (g_verify_close_cont == nullptr) {
     // Register once for the whole process (same rationale and construction as the parking cert
     // hook above: the hook chain is global and append-only, and TSContCreate lives in a library

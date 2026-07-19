@@ -394,3 +394,52 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
   CHECK(fx.mock()->closed());
   CHECK(fx.mock()->close_errno() == -1);
 }
+
+// in-hook abort: the abort flavor of the case above (TSVConnAbort instead of TSVConnClose). An
+// abort arms no drain -- do_io_close(EIO) authorizes the reclaim (RECLAIMABLE) and, because the
+// OpenSSL frame blocks the free, defers it to the scheduled dispatch. The failing round must
+// yield to that authorized reclaim the same way it yields to an armed drain: signalling the
+// failure would find the severed VIOs' null cont, and the owner-close would free the VC on this
+// very drive stack, under the live inner-transport frames that dispatched it.
+TEST_CASE("in-hook abort during SSL_connect: the failing round yields to the deferred reclaim", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  reducer_install_closing_verify_hook(EIO); // abort, not close: no drain is armed
+  fx.attach();
+  fx.vc()->options.verifyServerPolicy     = YamlSNIConfig::Policy::ENFORCED;
+  fx.vc()->options.verifyServerProperties = YamlSNIConfig::Property::NONE;
+
+  auto move_peer_bytes_quietly = [&fx]() {
+    char buf[16384];
+    int  n;
+    while ((n = BIO_read(fx.peer()->wbio(), buf, sizeof(buf))) > 0) {
+      fx.mock()->sut_read_buf()->write(buf, n);
+    }
+  };
+
+  fx.wake_sut(/* write_side */ true); // ClientHello into _write_buf
+  fx.pump_sut_to_peer();
+  fx.peer()->do_handshake(); // server flight into the peer wbio
+  move_peer_bytes_quietly();
+  REQUIRE(fx.mock()->sut_read_buf()->max_read_avail() > 0);
+
+  // WRITE-face drive: SSL_connect consumes the flight, the verify hook aborts in-hook (reclaim
+  // authorized, free deferred) and fails the verify, and the round unwinds.
+  fx.wake_sut(/* write_side */ true);
+  REQUIRE(reducer_closing_verify_hook_fired());
+
+  // The deferred dispatch owns the free: the VC must still be alive past the failing round.
+  // Without the drive's yield, the round signals the failure into the severed VIOs' null cont
+  // and the owner-close frees the VC on this unwinding stack (the destructor closes the mock).
+  REQUIRE_FALSE(fx.mock()->closed());
+
+  // The in-hook abort severed the consumer: no signal may reach it.
+  CHECK(fx.consumer()->read_signals.empty());
+  CHECK(fx.consumer()->write_signals.empty());
+
+  // The scheduled dispatch completes the reclaim on a clean stack; the SUT destructor closes the
+  // inner (default sentinel -1, the harness's reclaim oracle).
+  fx.pump();
+  CHECK(fx.mock()->closed());
+  CHECK(fx.mock()->close_errno() == -1);
+}
