@@ -675,8 +675,8 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // staged in _write_buf. Yield to the drain instead. The flush is load-bearing -- the
     // close-time reenable ran before the alert existed -- and the drain's own exits
     // (_run_deferred_work's drain rung, transport error, drain timeout) authorize the reclaim
-    // on a clean stack. No armed reject is skipped here: _begin_graceful_shutdown erased any
-    // FATAL_PENDING when the drain was armed.
+    // from a later dispatch, off this failing drive's stack. No armed reject is skipped here:
+    // _begin_graceful_shutdown erased any FATAL_PENDING when the drain was armed.
     if (_is_draining()) {
       _flush_staged_ciphertext();
       return HandshakeDriveOutcome::YIELD;

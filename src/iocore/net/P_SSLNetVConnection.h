@@ -194,11 +194,12 @@ private:
   //       unwinding drive's failure signal then finds no cont).
   //       SHUTDOWN_IN_PROGRESS is reached when a hook nested in a handshake drive closes the VC
   //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook) and the
-  //       unwinding round then finds the transport read already ended: the handshake bytes can
-  //       never arrive, so the failure signal finds no cont and forgoes the flush -- a fourth
-  //       drain exit, for a peer that is already gone. (A handshake ERROR on such a round does
-  //       not exit here: the EVENT_ERROR arm's _is_draining() early-exit yields to the drain,
-  //       which flushes the fatal alert the failing round staged in _write_buf.)
+  //       unwinding round then abandons the WANT_READ wait: the transport read already ended
+  //       (the handshake bytes can never arrive) or the handshake timeout has expired. The
+  //       failure signal finds no cont and forgoes the flush -- a fourth drain exit. (A
+  //       handshake ERROR on such a round does not exit here: the EVENT_ERROR arm's
+  //       _is_draining() early-exit yields to the drain, which flushes the fatal alert the
+  //       failing round staged in _write_buf.)
   //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- _authorize_reclaim(); each site frees the VC right after it
   //     - Drain complete (_run_deferred_work); transport error mid-drain
   //       (_handle_transport_error); a drain stuck at an idle/active timeout (mainEvent). Each is
