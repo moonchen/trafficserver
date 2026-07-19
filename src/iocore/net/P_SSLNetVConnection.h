@@ -172,9 +172,9 @@ private:
   //       _trigger_ssl_read (post-return terminal check, and its EVENT_ERROR case) and
   //       _handle_transport_write_ready (post-return terminal check; its EVENT_ERROR is the
   //       unconditional store above).
-  //     - Off-stack, when the hook's reenable was asynchronous: mainEvent's scheduled-dispatch
-  //       FATAL_PENDING branch, or its terminal-state transport-event gate (a transport event
-  //       raced ahead of that dispatch).
+  //     - Off-stack, when the hook's reenable was asynchronous: _runDeferredWork's FATAL_PENDING
+  //       rung, or mainEvent's terminal-state transport-event gate (a transport event raced
+  //       ahead of that dispatch).
   //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS
   //     - do_io_close arming the graceful close-drain (lerrno == -1, transport wired and not in
   //       error). A close of an already-failed VC re-enters the drain from inside the terminal
@@ -194,7 +194,7 @@ private:
   //       severs the user VIOs and arms the drain, and the drive's unwinding failure signal then
   //       finds no cont -- a fourth drain exit, which forgoes the flush.
   //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- each site frees the VC right after the store
-  //     - Drain complete (mainEvent's scheduled dispatch); transport error mid-drain
+  //     - Drain complete (_runDeferredWork); transport error mid-drain
   //       (_handle_transport_error); a drain stuck at an idle/active timeout (mainEvent). Each is
   //       held off while _freeBlocked(), then completed by a later dispatch or the parked hook's
   //       reenable. (A drain armed by an in-hook close can instead exit through the owner-close
@@ -256,8 +256,8 @@ private:
   }
 
   // A deferred handshake-time handoff that frees this VC and hands its transport elsewhere. Both
-  // arms are decided mid-handshake and executed out of line on a clean mainEvent dispatch (they
-  // cannot free this VC inline while a transport read handler still inspects it). Kept as its own
+  // arms are decided mid-handshake and executed out of line on a clean _runDeferredWork dispatch
+  // (they cannot free this VC inline while a transport read handler still inspects it). Kept as its own
   // small axis rather than folded into SslState: the blind-tunnel arm can be armed while the SSL
   // state is still HANDSHAKE_DONE (the OPT_TUNNEL path), so it must not overwrite that value.
   enum class PendingHandoff {
@@ -598,7 +598,7 @@ private:
   // paired reclaim onto the same stack.
   void _signal_user(SignalSide side, int event);
   // The reclaim half of _signalAndReclaim; called bare only on the no-notify teardown paths
-  // (mainEvent's RECLAIMABLE dispatch and its terminal transport-event gate).
+  // (_runDeferredWork's RECLAIMABLE rung and mainEvent's terminal transport-event gate).
   // Frees `this` (returning true) iff the consumer requested the close (RECLAIMABLE) and no
   // frame that still needs `this` alive is on the stack: recursion == 0 (own notify reentrancy or
   // an OpenSSL callback frame), not mid graceful-drain (_isDraining -- the drain owns the free),
@@ -672,12 +672,12 @@ private:
   TransportState _transport_state = TransportState::TRANSPORT_LIVE;
   // The pending self-targeted deferred-work event (schedule_imm), or nullptr when none is
   // outstanding -- we never queue more than one. This one slot multiplexes several purposes --
-  // the rbio read-drive (do_io_read / _handle_transport_eos / mainEvent), blind-tunnel handoff,
+  // the rbio read-drive (do_io_read / _handle_transport_eos / _runDeferredWork), blind-tunnel handoff,
   // downgrade-to-plain, async-hook handshake resumption, and the write-rearm follow-up
   // (_scheduleWriteRearm) -- all of them self-targeted (re-invoke this VC's own mainEvent, never
   // a consumer), so none carry the receiver-liveness risk deferred consumer-facing signals do.
-  // See mainEvent's scheduled-dispatch branch for the dispatch-time disambiguation among these
-  // purposes. Held as a pointer (not a bool) so it can be cancelled if this VC is freed, its
+  // See _runDeferredWork for the dispatch-time disambiguation among these purposes.
+  // Held as a pointer (not a bool) so it can be cancelled if this VC is freed, its
   // mutex changes (_adoptConsumerMutex), or it migrates threads before the event fires (otherwise
   // the stale event would run on freed memory, under the wrong lock, or on the wrong thread).
   Event *_deferred_work_event = nullptr;
@@ -688,12 +688,14 @@ private:
   }
   // The one arming point for _deferred_work_event; see the contract at the definition.
   void _scheduleDeferredWork(EThread *t);
+  // The dispatch for the slot (tier 2 of mainEvent's demux); precedence ladder at the definition.
+  int _runDeferredWork();
   // Set when a consumer reentrantly queues a new write from its (synchronously-delivered)
   // WRITE_COMPLETE handler while we're nested inside the inner transport's net_write_io. That
   // reentrant reenable() is doomed on this stack -- net_write_io's own still-executing tail
   // finds _write_buf empty (demand-driven encryption hasn't run yet) and disables the write,
   // undoing it. This flag arms a self-targeted, clean-stack re-issue of that reenable() once
-  // net_write_io's current pass has fully unwound. See _deliverWriteComplete / mainEvent.
+  // net_write_io's current pass has fully unwound. See _deliverWriteComplete / _runDeferredWork.
   bool _write_rearm_pending = false;
   static bool
   isTerminated(TransportState state)

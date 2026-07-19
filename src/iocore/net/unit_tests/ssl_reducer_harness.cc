@@ -373,8 +373,24 @@ ReducerFixture::ReducerFixture(bool inbound) : _inbound(inbound)
   _peer = new BarePeer(/* server */ !_inbound, _cert, _key);
 }
 
+// Drop every event still queued on this thread, undelivered. Used at fixture teardown for
+// cross-test isolation; the only scheduler in these tests is the fixture's own SUT.
+static void
+discard_pending_events()
+{
+  EThread *t = this_ethread();
+  t->EventQueueExternal.dequeue_external();
+  while (Event *e = t->EventQueueExternal.dequeue_local()) {
+    t->free_event(e);
+  }
+}
+
 ReducerFixture::~ReducerFixture()
 {
+  // Free (without dispatching) any event this test left in the thread's queue: the queue is
+  // shared across tests, and a straggler delivered by a later test's pump() would fire into
+  // this test's freed mock/consumer.
+  discard_pending_events();
   delete _peer;
   delete _consumer;
   delete _mock;
@@ -420,22 +436,43 @@ ReducerFixture::attach(bool install_read)
   _consumer->vc = _vc;
 }
 
+// Deliver the events queued on this thread the way EThread::process_event would; the harness
+// thread never runs its own event loop, so anything scheduled on it (the SUT's schedule_imm
+// dispatches) sits in its external queue until delivered here. Passing the genuine Event* as
+// data matters: mainEvent accepts only the armed _deferred_work_event as scheduled work. Lock
+// through e->mutex, not the continuation -- the Ptr keeps the mutex alive even if a prior
+// event's dispatch freed the continuation and left this one cancelled.
+static void
+run_pending_events()
+{
+  EThread *t = this_ethread();
+  t->EventQueueExternal.dequeue_external();
+  while (Event *e = t->EventQueueExternal.dequeue_local()) {
+    ink_release_assert(e->timeout_at == 0 && e->period == 0); // only schedule_imm is used here
+    if (!e->cancelled) {
+      SCOPED_MUTEX_LOCK(lock, e->mutex, t);
+      if (!e->cancelled) {
+        e->continuation->handleEvent(e->callback_event, e);
+      }
+    }
+    t->free_event(e);
+  }
+}
+
 void
 ReducerFixture::pump()
 {
   // Drain the SUT's outbound ciphertext (simulate the transport flushing the close-notify), then
-  // fire the SUT's scheduled dispatch (non-VIO data -> mainEvent's scheduled-dispatch branch) so a
-  // pending close-drain / reclaim completes on a clean stack. Loop until the VC frees (its
-  // destructor closes the mock inner, which mock->closed() witnesses) or we quiesce.
+  // deliver the SUT's scheduled dispatch so a pending close-drain / reclaim completes on a clean
+  // stack. Loop until the VC frees (its destructor closes the mock inner, which mock->closed()
+  // witnesses) or we quiesce.
   for (int i = 0; i < 8 && !_mock->closed(); ++i) {
     if (IOBufferReader *r = _mock->sut_write_reader(); r != nullptr) {
       while (r->read_avail() > 0) {
         r->consume(r->read_avail());
       }
     }
-    int dummy = 0;
-    SCOPED_MUTEX_LOCK(lock, _vc->mutex, this_ethread());
-    _vc->handleEvent(EVENT_IMMEDIATE, &dummy);
+    run_pending_events();
   }
 }
 

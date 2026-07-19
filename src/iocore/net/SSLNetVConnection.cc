@@ -648,7 +648,7 @@ SSLNetVConnection::_trigger_ssl_read()
     // if the hook didn't force a fatal alert. None of the switch branches below check
     // _sslState, so routed through anything but the `case EVENT_ERROR` branch, a hook-flagged
     // error would otherwise be silently dropped here and only caught later by the scheduled
-    // fallback (mainEvent's terminated-state branch). sslStartHandShake() has already returned, so
+    // fallback (_runDeferredWork's FATAL_PENDING rung). sslStartHandShake() has already returned, so
     // we are unconditionally outside any OpenSSL frame here -- always safe to deliver
     // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
     // more specific `err` to report.
@@ -1215,7 +1215,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
     // Not safe to free inline. If we're nested in _signal_user's own reentrancy, its unwind's
     // _reclaimIfClosed will free us first and the destructor will harmlessly cancel this scheduled
     // dispatch. If we're nested in an OpenSSL frame instead, nothing else will free us -- the
-    // scheduled dispatch's RECLAIMABLE branch does it once that frame has returned.
+    // scheduled dispatch's RECLAIMABLE rung does it once that frame has returned.
     _scheduleDeferredWork(t);
   }
 }
@@ -1984,7 +1984,7 @@ SSLNetVConnection::reenable_with_event(int event)
       // hooks of the chain must still see their event). The failure reaches the consumer
       // exactly once, downstream -- delivery IS the FATAL_PENDING -> TERMINATED transition:
       // a synchronous reenable (hook callout mid-SSL_connect/accept) via the unwinding
-      // handshake error path, an asynchronous one via the scheduled dispatch in mainEvent.
+      // handshake error path, an asynchronous one via the scheduled dispatch (_runDeferredWork).
       // Signalling from here would let the consumer tear us down while the hook chain is
       // still running. A close that already happened outranks the reject (a late reject
       // from a parked hook's queue, e.g. rate_limit, after the waiter closed): arming would
@@ -2010,7 +2010,7 @@ SSLNetVConnection::reenable_with_event(int event)
   // no fresh socket data (e.g. a delayed cert/SNI/client-hello hook fires after
   // the ClientHello was already read). Schedule an out-of-line read-drive to
   // re-invoke the handshake, mirroring master's readReschedule()/net_read_io()
-  // pass. Use the home thread: a plugin may reenable from any thread. mainEvent
+  // pass. Use the home thread: a plugin may reenable from any thread. _runDeferredWork
   // tears the VC down here if the reenable carried an error (terminated state).
   if (!getSSLHandShakeComplete()) {
     _scheduleDeferredWork(this->thread);
@@ -2326,7 +2326,7 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
     _deferred_work_event = nullptr;
   }
   // Any write-rearm armed for the outgoing thread's net_write_io pass is meaningless on the
-  // new thread; the fire-time re-validation in mainEvent would likely reject it anyway (the
+  // new thread; the fire-time re-validation in _runDeferredWork would likely reject it anyway (the
   // pool's do_io_write leaves the write VIO disabled), but clear it explicitly rather than
   // relying on that incidentally.
   _write_rearm_pending = false;
@@ -2420,8 +2420,8 @@ SSLNetVConnection::_downgradeToPlain()
   _unvc                           = nullptr; // caller/HTTP layer owns the returned VC now
 
   // do_io_close() frees this SSL VC inline. That is safe here only because the caller
-  // (sslServerHandShakeEvent) defers us to the out-of-line mainEvent dispatch, which returns
-  // EVENT_DONE immediately after this returns -- no frame above re-reads `this`.
+  // (sslServerHandShakeEvent) defers us to the out-of-line _runDeferredWork dispatch, which
+  // returns immediately after this returns -- no frame above re-reads `this`.
   do_io_close();
   return transferred;
 }
@@ -2444,8 +2444,8 @@ SSLNetVConnection::_downgradeToPlain()
 // Arm a deferred transport handoff (blind tunnel / plain downgrade). The handoff itself must run
 // out of line -- it frees this VC, and every arming site is on a stack that still touches `this`
 // after returning -- so park the kind, quiesce SSL-side reads (the successor VC re-drives the
-// transport itself; buffered bytes remain in _read_buf), and schedule the mainEvent dispatch,
-// the one safe place to free inline.
+// transport itself; buffered bytes remain in _read_buf), and schedule the deferred dispatch
+// (_runDeferredWork), the one safe place to free inline.
 void
 SSLNetVConnection::_armPendingHandoff(PendingHandoff which)
 {
@@ -3041,7 +3041,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       _transport_write_vio->reenable();
     } else if (ret == SSL_WAIT_FOR_ASYNC) {
       // Handshake suspended on the server private-key async op. The async wait-fd resume
-      // (handle_async_tls_ready -> mainEvent -> _trigger_ssl_read) re-drives the handshake.
+      // (handle_async_tls_ready -> _runDeferredWork -> _trigger_ssl_read) re-drives the handshake.
       // Flush any handshake ciphertext already produced into _write_buf -- a true
       // reenable-with-bytes, so it respects the write-backpressure invariant -- but do not
       // reenable on an empty buffer, which would spin. Symmetric with the read-side path.
@@ -3270,10 +3270,10 @@ SSLNetVConnection::_deliverWriteComplete()
 // The one arming point for _deferred_work_event (see its declaration for what the slot
 // multiplexes): every schedule of the slot routes through here, so the never-more-than-one
 // discipline holds by construction. Arming is idempotent because the slot carries no purpose --
-// mainEvent's scheduled-dispatch branch re-derives what to run from VC state at fire time, so a
-// purpose armed while a dispatch is already outstanding rides that dispatch instead of queueing
-// a second event. (It is the dispatch, not the arming, that keeps co-pending purposes from
-// stranding -- see the write-rearm branch re-scheduling the read drive it displaced.)
+// _runDeferredWork re-derives what to run from VC state at fire time, so a purpose armed while
+// a dispatch is already outstanding rides that dispatch instead of queueing a second event.
+// (It is the dispatch, not the arming, that keeps co-pending purposes from stranding -- see the
+// write-rearm rung re-scheduling the read drive it displaced.)
 // `t` is the thread the dispatch must run on: callers already on the VC's thread under its
 // mutex pass this_ethread(); the two handshake-resumption entry points that may be driven from
 // a foreign thread (reenable_with_event -- a plugin may reenable from any thread -- and
@@ -3444,85 +3444,100 @@ SSLNetVConnection::startEvent(int event, void *data)
   return EVENT_CONT;
 }
 
+// The deferred-work dispatch (tier 2 of mainEvent's demux). The slot carries no purpose (see
+// _scheduleDeferredWork), so what to run is re-derived from VC state, in strict precedence:
+//
+//   drain > reclaim > fatal > handoff > write-rearm > read-drive
+//
+// Consumer-driven teardown outranks delivery, and delivery outranks progress: once the consumer
+// has closed us (draining / RECLAIMABLE) nothing may signal or hand off, and an armed fatal
+// error outranks a pending handoff so a tunnel_route action cannot swallow a later reject. At
+// most one rung runs per dispatch; a rung whose work displaces another re-arms the slot (see the
+// write-rearm rung). This dispatch runs on a clean stack (only the event loop above); arming
+// sites defer work here precisely because it may free this VC while their own stack still
+// touches it. Every rung that can free it places the freeing call in tail position, touching no
+// member after it.
+int
+SSLNetVConnection::_runDeferredWork()
+{
+  if (_isDraining()) {
+    // Close-drain teardown deferred out of the inner transport's net_write_io. If the buffer
+    // has drained, free on this clean stack; otherwise the drain is still in flight (the
+    // transport reschedules itself), so wait for the next dispatch. A parked hook still holds a
+    // live ref (_freeBlocked): hold off and let its reenable's read-drive complete the free.
+    if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_freeBlocked()) {
+      _sslState = SslState::RECLAIMABLE;
+      this->free_thread(this_ethread());
+    }
+    return EVENT_DONE;
+  }
+  if (_sslState == SslState::RECLAIMABLE) {
+    _reclaimIfClosed();
+    return EVENT_DONE;
+  }
+
+  // An armed fatal error (a handshake hook's reenable_with_event(TS_EVENT_ERROR), e.g. an
+  // SNI/rate-limit reject) has no handshake driver on the stack to deliver it -- only this
+  // scheduled dispatch. Delivery is the transition to TERMINATED, so it happens EXACTLY ONCE
+  // (the consumer's do_io_close then drives the free); a severed/absent consumer hits
+  // _signal_user's null-cont owner-close.
+  if (_sslState == SslState::FATAL_PENDING) {
+    _sslState = SslState::TERMINATED;
+    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    return EVENT_DONE;
+  }
+
+  if (_pending_handoff == PendingHandoff::BLIND_TUNNEL) {
+    _pending_handoff = PendingHandoff::NONE;
+    _handoffBlindTunnel();
+    return EVENT_DONE;
+  }
+  if (_pending_handoff == PendingHandoff::DOWNGRADE_PLAIN) {
+    // We return immediately after (see sslServerHandShakeEvent), so _downgradeToPlain()'s inline
+    // do_io_close() cannot pull `this` out from under a caller still on the handshake read stack.
+    _pending_handoff = PendingHandoff::NONE;
+    _downgradeToPlain();
+    return EVENT_DONE;
+  }
+  if (_write_rearm_pending) {
+    // Re-issue the transport-write reenable() that a reentrant do_io_write() (from inside
+    // _deliverWriteComplete's synchronous WRITE_COMPLETE handler) made while nested inside
+    // net_write_io -- that reenable() was doomed there (see _deliverWriteComplete). We are
+    // now on a clean stack, off net_write_io, so this reenable() actually takes effect.
+    // Re-validate the write VIO here rather than trusting it's still what it was when this
+    // was armed: the consumer may have closed, redirected, or disabled it in the interim.
+    _write_rearm_pending = false;
+    if (!_is_terminal(_sslState) && _transport_state != TransportState::TRANSPORT_ERROR && _user_write_vio.op == VIO::WRITE &&
+        !_user_write_vio.is_disabled() && _user_write_vio.ntodo() > 0) {
+      ink_assert(_transport_write_vio != nullptr && _transport_write_vio->op == VIO::WRITE);
+      _transport_write_vio->reenable();
+    }
+    // The write-rearm and the rbio read-drive share the single _deferred_work_event slot
+    // (both arrive through this dispatch). On a keep-alive origin VC the
+    // request-body write-rearm can fire while the response is already buffered as ciphertext
+    // in the rbio; servicing the rearm above consumed the shared slot, so a co-pending
+    // read drive would be dropped and the buffered response would strand -- the transport read
+    // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
+    if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
+      _scheduleDeferredWork(this_ethread());
+    }
+    return EVENT_DONE;
+  }
+  // Default rung: the rbio read-drive (deliver buffered plaintext/EOS, or resume the handshake).
+  _trigger_ssl_read();
+  return EVENT_DONE;
+}
+
 int
 SSLNetVConnection::mainEvent(int event, void *data)
 {
-  // A scheduled wakeup (schedule_imm from do_io_read / _handle_transport_eos to
-  // drive a read after the transport already closed) arrives with an Event*, not
-  // one of our transport VIOs. Handle it out of line, where freeing this VC is safe.
-  if (data != _transport_read_vio && data != _transport_write_vio) {
+  // Tier 1 of the demux: a deferred-work dispatch arrives as the armed _deferred_work_event --
+  // the only self-targeted schedule (see _scheduleDeferredWork). Anything else must be one of
+  // our two transport VIOs, release-asserted below.
+  if (_deferred_work_event != nullptr && data == _deferred_work_event) {
+    ink_release_assert(event == EVENT_IMMEDIATE);
     _deferred_work_event = nullptr; // this event is now firing
-
-    // Consumer-driven teardown outranks everything: if the consumer closed us (or a close-drain
-    // is finishing), complete the free -- never signal, never hand off.
-    if (_isDraining()) {
-      // Close-drain teardown deferred out of the inner transport's net_write_io. If the buffer
-      // has drained, free on this clean stack; otherwise the drain is still in flight (the
-      // transport reschedules itself), so wait for the next dispatch. A parked hook still holds a
-      // live ref (_freeBlocked): hold off and let its reenable's read-drive complete the free.
-      if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_freeBlocked()) {
-        _sslState = SslState::RECLAIMABLE;
-        this->free_thread(this_ethread());
-      }
-      return EVENT_DONE;
-    }
-    if (_sslState == SslState::RECLAIMABLE) {
-      _reclaimIfClosed();
-      return EVENT_DONE;
-    }
-
-    // An armed fatal error (a handshake hook's reenable_with_event(TS_EVENT_ERROR), e.g. an
-    // SNI/rate-limit reject) has no handshake driver on the stack to deliver it -- only this
-    // scheduled dispatch. Delivery is the transition to TERMINATED, so it happens EXACTLY ONCE
-    // (the consumer's do_io_close then drives the free); a severed/absent consumer hits
-    // _signal_user's null-cont owner-close. This outranks a pending handoff so a tunnel_route
-    // action cannot swallow a later reject.
-    if (_sslState == SslState::FATAL_PENDING) {
-      _sslState = SslState::TERMINATED;
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-      return EVENT_DONE;
-    }
-
-    if (_pending_handoff == PendingHandoff::BLIND_TUNNEL) {
-      // Safe place to free this VC inline: we return EVENT_DONE immediately after.
-      _pending_handoff = PendingHandoff::NONE;
-      _handoffBlindTunnel();
-      return EVENT_DONE;
-    }
-    if (_pending_handoff == PendingHandoff::DOWNGRADE_PLAIN) {
-      // Safe place to free this VC inline (see sslServerHandShakeEvent): we return EVENT_DONE
-      // immediately after, so _downgradeToPlain()'s inline do_io_close() cannot pull `this` out
-      // from under a caller still on the handshake read stack.
-      _pending_handoff = PendingHandoff::NONE;
-      _downgradeToPlain();
-      return EVENT_DONE;
-    }
-    if (_write_rearm_pending) {
-      // Re-issue the transport-write reenable() that a reentrant do_io_write() (from inside
-      // _deliverWriteComplete's synchronous WRITE_COMPLETE handler) made while nested inside
-      // net_write_io -- that reenable() was doomed there (see _deliverWriteComplete). We are
-      // now on a clean stack, off net_write_io, so this reenable() actually takes effect.
-      // Re-validate the write VIO here rather than trusting it's still what it was when this
-      // was armed: the consumer may have closed, redirected, or disabled it in the interim.
-      _write_rearm_pending = false;
-      if (!_is_terminal(_sslState) && _transport_state != TransportState::TRANSPORT_ERROR && _user_write_vio.op == VIO::WRITE &&
-          !_user_write_vio.is_disabled() && _user_write_vio.ntodo() > 0) {
-        ink_assert(_transport_write_vio != nullptr && _transport_write_vio->op == VIO::WRITE);
-        _transport_write_vio->reenable();
-      }
-      // The write-rearm and the rbio read-drive share the single _deferred_work_event slot
-      // (both dispatch through this scheduled-event branch). On a keep-alive origin VC the
-      // request-body write-rearm can fire while the response is already buffered as ciphertext
-      // in the rbio; servicing the rearm above consumed the shared slot, so a co-pending
-      // read drive would be dropped and the buffered response would strand -- the transport read
-      // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
-      if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
-        _scheduleDeferredWork(this_ethread());
-      }
-      return EVENT_DONE;
-    }
-    _trigger_ssl_read();
-    return EVENT_DONE;
+    return _runDeferredWork();
   }
 
   VIO *transport_vio = static_cast<VIO *>(data);
@@ -4027,7 +4042,7 @@ SSLNetVConnection::handle_async_tls_ready()
   // (reenable_with_event), the peer's handshake bytes were already consumed into the SSL
   // read BIO, so reenabling the transport read VIO alone would not re-drive
   // SSL_do_handshake(). Schedule an out-of-line read-drive to re-enter the handshake
-  // (mainEvent -> _trigger_ssl_read -> _ssl_accept), which resumes the suspended job.
+  // (_runDeferredWork -> _trigger_ssl_read -> _ssl_accept), which resumes the suspended job.
   if (!getSSLHandShakeComplete()) {
     _scheduleDeferredWork(this->thread);
   }
