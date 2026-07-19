@@ -543,9 +543,9 @@ SSLNetVConnection::_commitInboundHandshake()
   // switches SSL to a socket BIO instead; the layered VC has no socket to switch to, so
   // dropping the second reader is the whole move.
   //
-  // Call site matters as much as the state: this runs ONLY from the WANT_READ/WANT_ACCEPT
-  // tail of _trigger_ssl_read, after sslStartHandShake() has returned and after the
-  // SSL_RESTART (downgrade), blind-tunnel, terminated, and EVENT_ERROR early-returns. That is
+  // Call site matters as much as the state: this runs ONLY from the read-face
+  // WANT_READ/WANT_ACCEPT arm of _drive_handshake, after sslStartHandShake() has returned and
+  // after the SSL_RESTART (downgrade), blind-tunnel, terminated, and EVENT_ERROR early-returns. That is
   // where the round's SNI/cert hooks have already run and any tunnel/downgrade decision is
   // final -- the same knowledge master's line-604 position encodes. Evaluating the same state
   // predicate from _releaseHandshakeReader's other call sites (pre-sslStartHandShake, or the
@@ -555,7 +555,7 @@ SSLNetVConnection::_commitInboundHandshake()
   //
   // Three gate conditions -- master's two plus the layered tunnel exclusion:
   //   - handShakeHolder != nullptr: master's first condition, and idempotent -- null after the
-  //     first release, and _trigger_ssl_read runs every WANT_READ round. Because the holder is
+  //     first release, and the read-face driver re-runs this every WANT_READ round. Because the holder is
   //     only created for the inbound face (_make_ssl_connection), a non-null holder already
   //     implies an inbound VC -- the context is asserted below rather than branched.
   //   - state != CLIENT_HELLO: master's commit signal -- past the client-hello stage, TLS
@@ -563,7 +563,7 @@ SSLNetVConnection::_commitInboundHandshake()
   //   - tunnel_type == NONE: unlike master (which switches SSL to a socket BIO and lets the kernel
   //     hold the raw stream), a FORWARD / PARTIAL_BLIND route terminates TLS here but its tunnel
   //     still forwards through _read_buf, so the second reader must stay. BLIND is redundant with
-  //     this (it also sets attributes, caught by the blind-tunnel early-return in _trigger_ssl_read),
+  //     this (it also sets attributes, caught by the blind-tunnel early-return in _drive_handshake),
   //     but FORWARD / PARTIAL_BLIND are not.
   //
   // Everything else that must hold to make the release safe is guaranteed by this call site (past
@@ -581,7 +581,7 @@ SSLNetVConnection::_commitInboundHandshake()
     // in particular not CLIENT_HELLO_INVOKE, which the state check above would otherwise admit.
     ink_release_assert(!is_invoked_state());
     // A blind tunnel from a cert/servername-hook TSVConnTunnel or tr-pass sets attributes =
-    // BLIND_TUNNEL and returned at the blind-tunnel early-return in _trigger_ssl_read, so it cannot
+    // BLIND_TUNNEL and returned at the blind-tunnel early-return in _drive_handshake, so it cannot
     // be pending here (the SNI-route BLIND is already excluded by the tunnel_type gate above).
     ink_release_assert(attributes != HttpProxyPort::TRANSPORT_BLIND_TUNNEL);
     // DOWNGRADE_PLAIN returned via SSL_RESTART and BLIND_TUNNEL via the line-541 path; neither
@@ -589,6 +589,248 @@ SSLNetVConnection::_commitInboundHandshake()
     ink_release_assert(_pending_handoff == PendingHandoff::NONE);
     handShakeHolder->dealloc();
     handShakeHolder = nullptr;
+  }
+}
+
+// The one handshake driver: both transport faces advance the same handshake through this
+// function. Handshake records arrive as transport READ events, but a fresh accept's socket is
+// writable before its ClientHello is announced, so any round can also be driven from the write
+// face. Whichever face drives, the consumer side an outcome is delivered on is derived from the
+// waiter's shape (_handshake_fail_side / _handshake_done_side / the completion arms below),
+// never from the driving face. Where the two faces still behave differently, the difference is
+// an explicit `face ==` arm below.
+//
+// Caller contract: only DATA_READY permits touching `this` afterwards (the read face continues
+// into post-handshake data delivery). After YIELD or FAILED a delivered signal may have freed
+// this VC (a consumer's in-handler close, or the null-cont owner-close) -- the caller must
+// unwind without touching any member.
+SSLNetVConnection::HandshakeDriveOutcome
+SSLNetVConnection::_drive_handshake(TransportFace face)
+{
+  this->_trackFirstHandshake();
+
+  int err = 0;
+  int ret;
+
+  if (get_context() == NET_VCONNECTION_OUT) {
+    ret = sslStartHandShake(SSL_EVENT_CLIENT, err);
+  } else {
+    ret = sslStartHandShake(SSL_EVENT_SERVER, err);
+  }
+
+  if (ret == SSL_RESTART) {
+    // The leading bytes were not a ClientHello and allow-plain applies: the VC migrated -- the
+    // deferred DOWNGRADE_PLAIN handoff is armed and events resume on the successor VC, so just
+    // give up and go home. (The write face historically fell into its catch-all write reenable
+    // here instead of recognizing the restart; preserved.)
+    Dbg(dbg_ctl_ssl, "Restart for allow plain");
+    if (face == TransportFace::WRITE) {
+      _transport_write_vio->reenable();
+    }
+    return HandshakeDriveOutcome::YIELD;
+  }
+
+  // If we have flipped to blind tunnel, don't read ahead. The SNI callback selected a blind
+  // tunnel_route (or a transparent per-IP OPT_TUNNEL flipped before _make_ssl_connection), so
+  // we must NOT terminate TLS: the buffered ClientHello (and everything after it) is forwarded
+  // raw to the origin so the client's handshake completes against the origin's certificate. In
+  // the layered model we cannot revert this VC to a plain socket (it only has-a transport), so
+  // hand the transport off to a dedicated pass-through VC -- deferred, since the handoff frees
+  // this VC. Both faces must arm it: a fresh transparent accept is writable before the
+  // ClientHello arrives, so its OPT_TUNNEL decision can surface on a WRITE_READY drive, and
+  // skipping the arming there would leave the later read drive to hit _trigger_ssl_read's
+  // TRANSPORT_BLIND_TUNNEL assert. Check for a non-error return first: if TLS has already
+  // failed with the CLIENT_HELLO, there is no need to continue toward the origin with the
+  // blind tunnel.
+  if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+    _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
+    return HandshakeDriveOutcome::YIELD;
+  }
+
+  // A hook may have synchronously flagged an error (reenable_with_event(TS_EVENT_ERROR),
+  // called from within a hook still nested mid SSL_accept()/SSL_connect()) without the
+  // handshake call itself returning an outright error this round -- e.g. SSL_HANDSHAKE_WANT_READ,
+  // if the hook didn't force a fatal alert. None of the switch branches below check
+  // _sslState, so routed through anything but the `case EVENT_ERROR` branch, a hook-flagged
+  // error would otherwise be silently dropped here and only caught later by the scheduled
+  // fallback (_runDeferredWork's FATAL_PENDING rung). sslStartHandShake() has already returned, so
+  // we are unconditionally outside any OpenSSL frame here -- always safe to deliver
+  // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
+  // more specific `err` to report.
+  if (ret != EVENT_ERROR && _is_terminal(_sslState)) {
+    _consumeFatalFailure();
+    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    return HandshakeDriveOutcome::FAILED;
+  }
+
+  switch (ret) {
+  case EVENT_ERROR:
+    lerrno = err;
+    // Set the state before signalling: the fused reclaim may free this VC, so the member write
+    // must happen first. The stores differ by face, historically: the write face latches
+    // TERMINATED unconditionally (_failHandshake -- the terminated state also lets a
+    // consumer-less delivery owner-close), while the read face only consumes an already-armed
+    // reject and otherwise leaves the state for the consumer's close to move.
+    if (face == TransportFace::WRITE) {
+      _failHandshake();
+    } else {
+      _consumeFatalFailure();
+    }
+    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    return HandshakeDriveOutcome::FAILED;
+
+  case SSL_HANDSHAKE_WANT_READ:
+  case SSL_HANDSHAKE_WANT_ACCEPT:
+    // The handshake needs more peer bytes. Transport death and the handshake timeout are
+    // policed on read-face rounds only: the transport EOS/ERROR handlers record
+    // _transport_state and re-drive the read face (their scheduled read drive lands here), so
+    // that is where a dead transport surfaces; a write-face round just re-arms the read below
+    // and lets the next read drive judge.
+    if (face == TransportFace::READ) {
+      // If the transport is already gone the bytes can never arrive. Master surfaced the
+      // socket error straight through SSL's BIO as a handshake EVENT_ERROR, but the layered
+      // rbio decouples SSL from the socket: the failure lands as a separate transport
+      // EOS/ERROR event while SSL only sees an empty rbio (WANT_READ). Waiting would strand
+      // the consumer until its connect/inactivity timeout (misreported as ETIMEDOUT) -- and a
+      // ConnectingEntry is never told at all. A connection that dies mid-handshake is a
+      // connect ERROR (EPIPE for a bare FIN, matching master's EOS-during-connect
+      // classification; a transport error keeps its real errno).
+      if (_transport_read_ended()) {
+        if (_transport_state == TransportState::READ_EOS || lerrno == 0) {
+          lerrno = EPIPE;
+        }
+        (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+        return HandshakeDriveOutcome::FAILED;
+      }
+      if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
+        double handshake_time = (static_cast<double>(ink_get_hrtime() - this->get_tls_handshake_begin_time()) / 1000000000);
+        Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, took %.3f seconds, configured handshake_timer: %d", this, handshake_time,
+            SSLConfigParams::ssl_handshake_timeout_in);
+        if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
+          Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, expired, release the connection", this);
+          lerrno = ETIMEDOUT;
+          (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+          return HandshakeDriveOutcome::FAILED;
+        }
+      }
+      // The handshake is progressing and waiting for the client's next flight. If the hook FSM
+      // has passed the client-hello stage, TLS termination is committed -- release the
+      // ClientHello holder so the (possibly large) inbound flight streams unpinned. See the
+      // method: this is the only safe call site for the inbound release.
+      _commitInboundHandshake();
+    }
+    _transport_read_vio->reenable();
+    if (face == TransportFace::READ && _write_buf_reader->read_avail() > 0) {
+      // The round produced ciphertext to send (our flight answering this one). Read-face rounds
+      // flush it here; write-face rounds never did -- the transport write drive that invoked
+      // them drains _write_buf on its own.
+      _transport_write_vio->reenable();
+    }
+    return HandshakeDriveOutcome::YIELD;
+
+  case SSL_HANDSHAKE_WANT_CONNECT:
+    // The SSL object is given only MIOBuffer BIOs; the inner transport owns the connect, so
+    // the SSL stack can never be in a connecting state. (Master attached a socket BIO here,
+    // which the layered VC eliminates.)
+    ink_release_assert(!"handshake WANT_CONNECT: no socket BIO is attached to the SSL object");
+    return HandshakeDriveOutcome::YIELD;
+
+  case SSL_HANDSHAKE_WANT_WRITE:
+    // The MIOBuffer wbio always absorbs the full handshake flight, so the SSL stack can never
+    // ask to retry a write (mirrors the post-handshake assert in _encrypt_data_for_transport).
+    // Both properties are the SSL object's, not a face's, so these hold for either driver.
+    ink_release_assert(!"handshake WANT_WRITE: the MIOBuffer wbio must never refuse a write");
+    return HandshakeDriveOutcome::YIELD;
+
+  case EVENT_DONE:
+    if (face == TransportFace::WRITE) {
+      // If this was driven by a zero length read, signal complete when the handshake is
+      // complete. Otherwise set up for continuing read operations.
+      if (_user_write_vio.ntodo() <= 0) {
+        // Read side is on purpose (the historical write-face completion contract, pinned by
+        // the write-face-first reducer case).
+        (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
+      }
+      return HandshakeDriveOutcome::YIELD;
+    }
+    Dbg(dbg_ctl_ssl, "ssl handshake EVENT_DONE vc %p ntodo=%" PRId64, this, _user_read_vio.ntodo());
+    // Wake whoever is waiting on handshake completion (_handshake_done_side says who listens
+    // where): the zero-byte read probe takes READ_COMPLETE.
+    if (auto side = _handshake_done_side(); side == SignalSide::READ) {
+      if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE) == SignalOutcome::RECLAIMED) {
+        return HandshakeDriveOutcome::YIELD;
+      }
+    } else if (side == SignalSide::WRITE && _write_buf_reader->read_avail() == 0) {
+      // Write-only waiter with an empty wbio: a full TLS-1.2 handshake completes on this
+      // transport READ pass with the client's final flight already flushed, so no wbio bytes
+      // remain to re-arm the write face and drive its WRITE_READY (the flush below and the
+      // transport write drive). TLS-1.3 and TLS-1.2 resumption complete with the client
+      // flight still in the wbio and stay on that flush path. Deliver the write-side wakeup
+      // directly so the connect does not strand to its timeout.
+      if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
+        return HandshakeDriveOutcome::YIELD;
+      }
+    }
+    if (_write_buf_reader->read_avail() > 0) {
+      // handshake produced bytes to write
+      _transport_write_vio->reenable();
+    }
+    if (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get()))) {
+      // There is data in the read buffer, so continue reading
+      Dbg(dbg_ctl_ssl, "data in read buffer after handshake for vc %p, continuing to read", this);
+      return HandshakeDriveOutcome::DATA_READY;
+    }
+    return HandshakeDriveOutcome::YIELD;
+
+  case SSL_WAIT_FOR_HOOK:
+    Dbg(dbg_ctl_ssl, "ssl wait for hook for vc %p", this);
+    // A handshake hook has genuinely parked: the driver returned here because the plugin owns
+    // control and will reenable_with_event later. Record it so a consumer-driven close arriving
+    // while it is parked (a transport error/timeout to the trampoline) does not free the VC out
+    // from under the plugin's pending reenable -- do_io_close's callHooks(VCONN_CLOSE) advances
+    // the hook FSM to DONE, so is_invoked_state() alone can no longer witness the hold. Cleared
+    // in reenable_with_event. (A synchronous TSVConnAbort fails the handshake instead of
+    // parking, so it never reaches here and its teardown is not blocked.)
+    // Key on is_invoked_state(): a hook that reenabled synchronously already cleared
+    // _hook_parked and advanced the FSM, so re-latching here would leave a stale hold that
+    // blocks the free forever (a leak now that every free site honors _hook_parked); and the
+    // incomplete outbound PROXY preamble also returns SSL_WAIT_FOR_HOOK without any hook
+    // parked -- it is flushed and re-driven -- so it must not falsely latch either.
+    if (is_invoked_state()) {
+      _hook_parked = true;
+    }
+    // Flush any handshake ciphertext already produced (the PROXY preamble, or a partial
+    // flight) so the transport drains it and re-drives; do not reenable on an empty buffer,
+    // which spins.
+    if (_write_buf_reader->read_avail() > 0) {
+      _transport_write_vio->reenable();
+    }
+    return HandshakeDriveOutcome::YIELD;
+
+  case SSL_WAIT_FOR_ASYNC:
+    Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
+    // Handshake suspended on the server private-key async op. The async wait-fd resume
+    // (handle_async_tls_ready -> _runDeferredWork -> _trigger_ssl_read) re-drives the
+    // handshake. Flush any handshake ciphertext already produced into _write_buf -- a true
+    // reenable-with-bytes, so it respects the write-backpressure invariant -- but do not
+    // reenable on an empty buffer, which would spin.
+    if (_write_buf_reader->read_avail() > 0) {
+      _transport_write_vio->reenable();
+    }
+    return HandshakeDriveOutcome::YIELD;
+
+  default:
+    // EVENT_CONT: the round paused without a latchable park (the client-hello callback park
+    // latches _hook_parked inside sslServerHandShakeEvent) -- an SNI/cert pause, or a
+    // patched-OpenSSL lookup wait. Historical face split, preserved: the read face flushes any
+    // produced ciphertext and waits for the transport; the write face re-arms its transport
+    // write unconditionally.
+    if (face == TransportFace::WRITE) {
+      _transport_write_vio->reenable();
+    } else if (_write_buf_reader->read_avail() > 0) {
+      _transport_write_vio->reenable();
+    }
+    return HandshakeDriveOutcome::YIELD;
   }
 }
 
@@ -630,163 +872,15 @@ SSLNetVConnection::_trigger_ssl_read()
   // completes; ConnectingEntry's zero-byte do_io_read masks this on the pooled path). Gating
   // first would silently disable the transport read with the ServerHello stranded in the
   // rbio and freeze the handshake until an external timeout. The user-VIO gate governs
-  // post-handshake data delivery only; the write face orders its handshake block the same
-  // way (_handle_transport_write_ready).
+  // post-handshake data delivery only; the write face gates the same way before its
+  // user-write handling (_handle_transport_write_ready).
   if (!getSSLHandShakeComplete()) {
-    this->_trackFirstHandshake();
-
-    int err = 0;
-
-    if (get_context() == NET_VCONNECTION_OUT) {
-      ret = sslStartHandShake(SSL_EVENT_CLIENT, err);
-    } else {
-      ret = sslStartHandShake(SSL_EVENT_SERVER, err);
-    }
-    if (ret == SSL_RESTART) {
-      // VC migrated into a new object
-      // Just give up and go home. Events should trigger on the new vc
-      Dbg(dbg_ctl_ssl, "Restart for allow plain");
+    if (_drive_handshake(TransportFace::READ) != HandshakeDriveOutcome::DATA_READY) {
+      // The drive may have freed this VC (a delivered signal's consumer close); touch nothing.
       return;
     }
-    // If we have flipped to blind tunnel, don't read ahead. We check for a
-    // non-error return first, though, because if TLS has already failed with
-    // the CLIENT_HELLO, then there is no need to continue toward the origin
-    // with the blind tunnel.
-    if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
-      // The SNI callback selected a blind tunnel_route, so we must NOT terminate TLS:
-      // the buffered ClientHello (and everything after it) is forwarded raw to the origin
-      // so the client's handshake completes against the origin's certificate. In the
-      // layered model we cannot revert this VC to a plain socket (it only has-a
-      // transport), so hand the transport off to a dedicated pass-through VC.
-      //
-      _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
-      return; // Leave if we are tunneling
-    }
-
-    // A hook may have synchronously flagged an error (reenable_with_event(TS_EVENT_ERROR),
-    // called from within a hook still nested mid SSL_accept()/SSL_connect()) without the
-    // handshake call itself returning an outright error this round -- e.g. SSL_HANDSHAKE_WANT_READ,
-    // if the hook didn't force a fatal alert. None of the switch branches below check
-    // _sslState, so routed through anything but the `case EVENT_ERROR` branch, a hook-flagged
-    // error would otherwise be silently dropped here and only caught later by the scheduled
-    // fallback (_runDeferredWork's FATAL_PENDING rung). sslStartHandShake() has already returned, so
-    // we are unconditionally outside any OpenSSL frame here -- always safe to deliver
-    // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
-    // more specific `err` to report.
-    if (ret != EVENT_ERROR && _is_terminal(_sslState)) {
-      _consumeFatalFailure();
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-      return;
-    }
-
-    switch (ret) {
-    case EVENT_ERROR:
-      lerrno = err;
-      _consumeFatalFailure();
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-      return;
-    case SSL_HANDSHAKE_WANT_READ:
-    case SSL_HANDSHAKE_WANT_ACCEPT:
-      // The handshake needs more peer bytes; if the transport is already gone they can
-      // never arrive. Master surfaced the socket error straight through SSL's BIO as a
-      // handshake EVENT_ERROR, but the layered rbio decouples SSL from the socket: the
-      // failure lands as a separate transport EOS/ERROR event (recorded in
-      // _transport_state by its handler, whose scheduled read drive brings us here) while
-      // SSL only sees an empty rbio (WANT_READ). Waiting would strand the consumer until
-      // its connect/inactivity timeout (misreported as ETIMEDOUT) -- and a ConnectingEntry
-      // is never told at all. A connection that dies mid-handshake is a connect ERROR
-      // (EPIPE for a bare FIN, matching master's EOS-during-connect classification; a
-      // transport error keeps its real errno).
-      if (_transport_read_ended()) {
-        if (_transport_state == TransportState::READ_EOS || lerrno == 0) {
-          lerrno = EPIPE;
-        }
-        (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-        return;
-      }
-      if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
-        double handshake_time = (static_cast<double>(ink_get_hrtime() - this->get_tls_handshake_begin_time()) / 1000000000);
-        Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, took %.3f seconds, configured handshake_timer: %d", this, handshake_time,
-            SSLConfigParams::ssl_handshake_timeout_in);
-        if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
-          Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, expired, release the connection", this);
-          lerrno = ETIMEDOUT;
-          (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-          return;
-        }
-      }
-      // The handshake is progressing and waiting for the client's next flight. If the hook FSM
-      // has passed the client-hello stage, TLS termination is committed -- release the
-      // ClientHello holder so the (possibly large) inbound flight streams unpinned. See the
-      // method: this is the only safe call site for the inbound release.
-      _commitInboundHandshake();
-      _transport_read_vio->reenable();
-      break;
-    case SSL_HANDSHAKE_WANT_CONNECT:
-      // The SSL object is given only MIOBuffer BIOs; the inner transport owns the connect, so
-      // the SSL stack can never be in a connecting state. (Master attached a socket BIO here,
-      // which the layered VC eliminates.)
-      ink_release_assert(!"handshake WANT_CONNECT: no socket BIO is attached to the SSL object");
-      break;
-    case SSL_HANDSHAKE_WANT_WRITE:
-      // The MIOBuffer wbio always absorbs the full handshake flight, so the SSL stack can never
-      // ask to retry a write (mirrors the post-handshake assert in _encrypt_data_for_transport).
-      ink_release_assert(!"handshake WANT_WRITE: the MIOBuffer wbio must never refuse a write");
-      break;
-    case EVENT_DONE:
-      Dbg(dbg_ctl_ssl, "ssl handshake EVENT_DONE vc %p ntodo=%" PRId64, this, _user_read_vio.ntodo());
-      // Wake whoever is waiting on handshake completion (_handshake_done_side says who listens
-      // where): the zero-byte read probe takes READ_COMPLETE.
-      if (auto side = _handshake_done_side(); side == SignalSide::READ) {
-        if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE) == SignalOutcome::RECLAIMED) {
-          return;
-        }
-      } else if (side == SignalSide::WRITE && _write_buf_reader->read_avail() == 0) {
-        // Write-only waiter with an empty wbio: a full TLS-1.2 handshake completes on this
-        // transport READ pass with the client's final flight already flushed, so no wbio bytes
-        // remain to re-arm the write face and drive its WRITE_READY (the flush below and in
-        // _handle_transport_write_ready). TLS-1.3 and TLS-1.2 resumption complete with the
-        // client flight still in the wbio and stay on that flush path. Deliver the write-side
-        // wakeup directly so the connect does not strand to its timeout.
-        if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
-          return;
-        }
-      }
-      break;
-    case SSL_WAIT_FOR_HOOK:
-      Dbg(dbg_ctl_ssl, "ssl wait for hook for vc %p", this);
-      // A handshake hook has genuinely parked: the driver returned here because the plugin owns
-      // control and will reenable_with_event later. Record it so a consumer-driven close arriving
-      // while it is parked (a transport error/timeout to the trampoline) does not free the VC out
-      // from under the plugin's pending reenable -- do_io_close's callHooks(VCONN_CLOSE) advances
-      // the hook FSM to DONE, so is_invoked_state() alone can no longer witness the hold. Cleared
-      // in reenable_with_event. (A synchronous TSVConnAbort fails the handshake instead of parking,
-      // so it never reaches here and its teardown is not blocked.)
-      // Key on is_invoked_state(): a hook that reenabled synchronously already cleared _hook_parked
-      // and advanced the FSM, so re-latching here would leave a stale hold that blocks the free
-      // forever (a leak now that every free site honors _hook_parked).
-      if (is_invoked_state()) {
-        _hook_parked = true;
-      }
-      break;
-    case SSL_WAIT_FOR_ASYNC:
-      Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
-      break;
-    default:
-      break;
-    }
-
-    if (_write_buf_reader->read_avail() > 0) {
-      // handshake produced bytes to write
-      _transport_write_vio->reenable();
-    }
-
-    if (ret == EVENT_DONE && miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get()))) {
-      // There is data in the read buffer, so continue reading
-      Dbg(dbg_ctl_ssl, "data in read buffer after handshake for vc %p, continuing to read", this);
-    } else {
-      return;
-    }
+    // The handshake completed on this drive with ciphertext already buffered in the rbio:
+    // fall through into post-handshake data delivery.
   }
 
   // If it is not enabled, lower its priority.  This allows
@@ -2989,85 +3083,9 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   }
 
   if (!this->getSSLHandShakeComplete()) {
-    this->_trackFirstHandshake();
-
-    int err = 0, ret;
-
-    if (this->get_context() == NET_VCONNECTION_OUT) {
-      ret = this->sslStartHandShake(SSL_EVENT_CLIENT, err);
-    } else {
-      ret = this->sslStartHandShake(SSL_EVENT_SERVER, err);
-    }
-
-    // If the handshake flipped to a blind tunnel, hand the transport off rather than falling
-    // through to WRITE_COMPLETE: a transparent per-IP OPT_TUNNEL returns EVENT_DONE from
-    // sslStartHandShake before _make_ssl_connection, and the first transport event may be this
-    // WRITE_READY (a fresh accept is writable before the ClientHello). Without arming the handoff
-    // here, the later read drive hits the TRANSPORT_BLIND_TUNNEL assert in _trigger_ssl_read.
-    // Mirrors the read-face arming; check for a non-error return first (a failed ClientHello has
-    // no tunnel to establish) and defer the handoff out of line, since it frees this VC.
-    if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
-      _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
-      return EVENT_CONT;
-    }
-
-    if (ret == EVENT_ERROR) {
-      lerrno = err;
-      // Set the state before signalling: the fused reclaim may free this VC, so the
-      // member write must happen first (and the terminated state also lets
-      // _reclaimIfClosed free us).
-      _failHandshake();
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-      return EVENT_DONE;
-    } else if (_is_terminal(_sslState)) {
-      // A hook may have synchronously flagged an error mid SSL_accept()/SSL_connect() without
-      // the handshake call itself returning EVENT_ERROR this round (e.g. SSL_HANDSHAKE_WANT_READ).
-      // sslStartHandShake() has already returned, so we're unconditionally outside any OpenSSL
-      // frame here -- always safe to deliver synchronously. See the read-side twin of this
-      // check in _trigger_ssl_read for the full rationale.
-      _consumeFatalFailure();
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
-      return EVENT_DONE;
-    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
-      _transport_read_vio->reenable();
-    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
-      _transport_write_vio->reenable();
-    } else if (ret == SSL_WAIT_FOR_ASYNC) {
-      // Handshake suspended on the server private-key async op. The async wait-fd resume
-      // (handle_async_tls_ready -> _runDeferredWork -> _trigger_ssl_read) re-drives the handshake.
-      // Flush any handshake ciphertext already produced into _write_buf -- a true
-      // reenable-with-bytes, so it respects the write-backpressure invariant -- but do not
-      // reenable on an empty buffer, which would spin. Symmetric with the read-side path.
-      if (_write_buf_reader->read_avail() > 0) {
-        _transport_write_vio->reenable();
-      }
-    } else if (ret == SSL_WAIT_FOR_HOOK) {
-      // A handshake hook parked on this write-face drive. Latch the parked-hook hold so a
-      // consumer-driven close cannot free the VC before the plugin reenables (the read-face
-      // driver's SSL_WAIT_FOR_HOOK case does the same). Key on is_invoked_state(): the outbound
-      // PROXY-preamble also returns SSL_WAIT_FOR_HOOK here but is NOT a hook park -- it is flushed
-      // and re-driven -- so it must not falsely latch.
-      if (is_invoked_state()) {
-        _hook_parked = true;
-      }
-      // Flush any handshake ciphertext already produced (the PROXY preamble, or a partial flight)
-      // so the transport drains it and re-drives; do not reenable on an empty buffer, which spins.
-      if (_write_buf_reader->read_avail() > 0) {
-        _transport_write_vio->reenable();
-      }
-    } else if (ret == EVENT_DONE) {
-      // If this was driven by a zero length read, signal complete when
-      // the handshake is complete. Otherwise set up for continuing read
-      // operations.
-      if (_user_write_vio.ntodo() <= 0) {
-        // Read side is on purpose
-        (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
-      }
-    } else {
-      _transport_write_vio->reenable();
-    }
-
-    return EVENT_CONT;
+    // The write face never proceeds into data delivery off a handshake drive: post-handshake
+    // encryption starts when the consumer's write VIO drives it.
+    return _drive_handshake(TransportFace::WRITE) == HandshakeDriveOutcome::FAILED ? EVENT_DONE : EVENT_CONT;
   }
 
   // The handshake is complete, but the consumer may not have issued a

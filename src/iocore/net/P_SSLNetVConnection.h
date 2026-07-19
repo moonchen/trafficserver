@@ -163,18 +163,17 @@ private:
   //       outranks the reject. (The guard would also admit HANDSHAKE_DONE, but a handshake hook
   //       only reenables while the handshake is parked on it.)
   //   HANDSHAKING -> TERMINATED  -- _failHandshake()
-  //     - The write-face handshake driver's EVENT_ERROR (_handle_transport_write_ready), stored
+  //     - The write-face EVENT_ERROR arm of _drive_handshake, stored
   //       unconditionally before the failure is signalled, so it also consumes an armed
   //       FATAL_PENDING. The store re-checks nothing, so an in-hook close during the
   //       sslStartHandShake call (see the owner-close below) leaves SHUTDOWN_IN_PROGRESS -- or
   //       RECLAIMABLE, for an abort -- to be overwritten here; the same unwind's owner-close
-  //       then re-enters RECLAIMABLE. (The read face's EVENT_ERROR (_trigger_ssl_read) leaves
+  //       then re-enters RECLAIMABLE. (The read-face EVENT_ERROR arm leaves
   //       the state in place; the consumer's close or the owner-close below moves it.)
   //   FATAL_PENDING -> TERMINATED  -- _consumeFatalFailure(): delivery IS this transition, exactly once
   //     - On the driver stack once sslStartHandShake has returned (outside any OpenSSL frame):
-  //       _trigger_ssl_read (post-return terminal check, and its EVENT_ERROR case) and
-  //       _handle_transport_write_ready (post-return terminal check; its EVENT_ERROR is the
-  //       unconditional store above).
+  //       _drive_handshake's post-return terminal check (either face) and its read-face
+  //       EVENT_ERROR arm (the write face's EVENT_ERROR is the unconditional store above).
   //     - Off-stack, when the hook's reenable was asynchronous: _runDeferredWork's FATAL_PENDING
   //       rung, or mainEvent's terminal-state transport-event gate (a transport event raced
   //       ahead of that dispatch).
@@ -830,15 +829,31 @@ private:
   int _handle_transport_error(VIO *vio, int err);
   int _parse_proxy_protocol(IOBufferReader *reader);
 
+  // Which transport face is driving a handshake round. Handshake records arrive as transport
+  // READ events, but a fresh accept's socket is writable before its ClientHello is announced,
+  // so any round -- including the first -- can also be driven from the transport write face.
+  enum class TransportFace { READ, WRITE };
+  enum class HandshakeDriveOutcome {
+    DATA_READY, // handshake completed on this drive with decryptable input already buffered:
+                // the read face continues into post-handshake data delivery (`this` is alive)
+    YIELD,      // round over: waiting on peer bytes / a parked hook / async, or a deferred
+                // handoff was armed
+    FAILED,     // a handshake failure was signalled to the waiter
+  };
+  // The one handshake driver, shared by both faces; contract at the definition. Only DATA_READY
+  // permits touching `this` afterwards -- after YIELD or FAILED a delivered signal may already
+  // have freed the VC.
+  [[nodiscard]] HandshakeDriveOutcome _drive_handshake(TransportFace face);
+
   // Release the handshake reader (handShakeHolder) once the handshake is established and no
   // blind tunnel will adopt it, so it stops pinning _read_buf. See the definition for why a
   // lingering second reader otherwise wedges the rbio and stalls large reads.
   void _releaseHandshakeReader();
 
   // Inbound-only: release handShakeHolder once the hook FSM has passed the client-hello stage,
-  // mirroring master's update_rbio(!in_client_hello). Call ONLY from the WANT_READ tail of
-  // _trigger_ssl_read (never the pre-handshake-call sites), where the round's SNI/cert hooks
-  // have already run and any tunnel/downgrade is resolved. See the definition.
+  // mirroring master's update_rbio(!in_client_hello). Call ONLY from the read-face WANT_READ
+  // arm of _drive_handshake (never the pre-handshake-call sites), where the round's SNI/cert
+  // hooks have already run and any tunnel/downgrade is resolved. See the definition.
   void _commitInboundHandshake();
 
   // The outbound consumer's handle on this VC's open (returned by SSLNetProcessor::connect_re).
