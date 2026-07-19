@@ -86,9 +86,8 @@ struct SSLCertLookup;
 class Event;
 
 enum class SslVConnOp {
-  SSL_HOOK_OP_DEFAULT,  ///< Null / initialization value. Do normal processing.
-  SSL_HOOK_OP_TUNNEL,   ///< Switch to blind tunnel
-  SSL_HOOK_OP_TERMINATE ///< Termination connection / transaction.
+  SSL_HOOK_OP_DEFAULT, ///< Null / initialization value. Do normal processing.
+  SSL_HOOK_OP_TUNNEL   ///< Switch to blind tunnel
 };
 
 //////////////////////////////////////////////////////////////////
@@ -153,8 +152,6 @@ private:
   //       first server round) and _lookupContextByName (per-SNI OPT_TUNNEL; guarded
   //       (== HANDSHAKING) so an armed FATAL_PENDING from an earlier hook in the same flight
   //       outranks the tunnel).
-  //     - A hook-requested SSL_HOOK_OP_TERMINATE: _prepare_server_handshake. (Nothing in the tree
-  //       currently sets that op, so this store is unreached.)
   //     - The DOWNGRADE_PLAIN executor (_propagate_handshake_buffer), just before this VC hands its
   //       buffers to the plain successor and frees itself.
   //   HANDSHAKING -> FATAL_PENDING  -- _arm_fatal_failure()
@@ -230,8 +227,8 @@ private:
   // these (the destructor's allocator-reuse reset aside), so the transition table above is
   // verifiable against these bodies rather than against every assignment in the class.
 
-  // Handshake completion, and the marks that stand in for it (the blind-tunnel marks, a
-  // hook-requested TERMINATE, the downgrade executor): HANDSHAKING -> HANDSHAKE_DONE, guarded.
+  // Handshake completion, and the marks that stand in for it (the blind-tunnel marks and
+  // the downgrade executor): HANDSHAKING -> HANDSHAKE_DONE, guarded.
   // Completion must not exit the terminal region or the close-drain: an in-flight close
   // (RECLAIMABLE / SHUTDOWN_IN_PROGRESS -- e.g. a TSVConnClose from a verify hook on a
   // plugin-owned outbound VC) or an armed reject (FATAL_PENDING) outranks it, so the store is
