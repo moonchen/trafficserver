@@ -178,15 +178,15 @@ private:
   //       rung, or mainEvent's terminal-state transport-event gate (a transport event raced
   //       ahead of that dispatch).
   //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS  -- _beginGracefulShutdown()
-  //     - do_io_close arming the graceful close-drain (lerrno == -1, transport wired and not in
-  //       error). A close of an already-failed VC re-enters the drain from inside the terminal
-  //       region (_is_terminal() goes back to false), and it erases an undelivered FATAL_PENDING:
-  //       there is no consumer left to deliver to. The drain still gates all I/O (_isDraining)
-  //       and every exit from it is RECLAIMABLE.
+  //     - do_io_close's DRAIN plan (_applyClosePlan; selected when lerrno == -1, transport wired
+  //       and not in error). A close of an already-failed VC re-enters the drain from inside the
+  //       terminal region (_is_terminal() goes back to false), and it erases an undelivered
+  //       FATAL_PENDING: there is no consumer left to deliver to. The drain still gates all I/O
+  //       (_isDraining) and every exit from it is RECLAIMABLE.
   //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> RECLAIMABLE  -- _authorizeReclaim()
-  //     - do_io_close when the drain is not warranted: an abort (lerrno != -1), or the transport
-  //       is absent/broken. (Both do_io_close transitions are unconditional; a second close of
-  //       the same VC is not a designed path.)
+  //     - do_io_close's RECLAIM_NOW/DEFER plans (_applyClosePlan): the drain is not warranted --
+  //       an abort (lerrno != -1), or the transport is absent/broken. (Both do_io_close
+  //       transitions are unconditional; a second close of the same VC is not a designed path.)
   //   {HANDSHAKING, HANDSHAKE_DONE, TERMINATED, SHUTDOWN_IN_PROGRESS, RECLAIMABLE} -> RECLAIMABLE  -- _authorizeReclaim()
   //     - The null-cont owner-close (_signal_user): a terminal event (EOS/ERROR/timeout) with no
   //       live consumer to deliver it to, so nobody will ever close us. The transition is
@@ -278,11 +278,11 @@ private:
     _sslState = SslState::TERMINATED;
   }
 
-  // do_io_close arming the graceful close-drain: -> SHUTDOWN_IN_PROGRESS (== draining, see
-  // _isDraining). Legal from anywhere except the drain itself and RECLAIMABLE (a second close
-  // of the same VC is not a designed path); entering from FATAL_PENDING/TERMINATED is normal --
-  // the close of an already-failed VC erases an undelivered reject, since no consumer is left
-  // to deliver it to.
+  // do_io_close arming the graceful close-drain (_applyClosePlan's DRAIN arm): ->
+  // SHUTDOWN_IN_PROGRESS (== draining, see _isDraining). Legal from anywhere except the drain
+  // itself and RECLAIMABLE (a second close of the same VC is not a designed path); entering
+  // from FATAL_PENDING/TERMINATED is normal -- the close of an already-failed VC erases an
+  // undelivered reject, since no consumer is left to deliver it to.
   void
   _beginGracefulShutdown()
   {
@@ -301,8 +301,9 @@ private:
   }
   // A handshake hook has parked (the driver returned SSL_WAIT_FOR_HOOK): a plugin owns a live
   // reference and will reenable_with_event into this VC. Set at the park, cleared when the plugin
-  // reenables. It is a stable latch because do_io_close's callHooks(VCONN_CLOSE) advances the hook
-  // FSM to HANDSHAKE_HOOKS_DONE, so is_invoked_state() can no longer witness the outstanding hold;
+  // reenables. It is a stable latch because do_io_close's close hook (_runTlsCloseHooks's
+  // callHooks(VCONN_CLOSE)) advances the hook FSM to HANDSHAKE_HOOKS_DONE, so is_invoked_state()
+  // can no longer witness the outstanding hold;
   // _reclaimIfClosed holds off on this so a consumer-driven close arriving while the hook is parked
   // (a transport error/timeout) cannot free the VC out from under the plugin's pending reenable. A
   // synchronous TSVConnAbort fails the handshake instead of parking, so it never sets this.
@@ -749,6 +750,25 @@ private:
   int _completeWriteWhenDrained();
   // Re-arm the transport write iff ciphertext is staged; see the definition.
   void _flushStagedCiphertext();
+
+  // do_io_close's ordered close pipeline: encrypt the final plaintext, sever the user VIOs,
+  // run the TLS close hooks, queue the close-notify (or arm a quiet shutdown), then take
+  // exactly one of the three exits below. Selection (_selectClosePlan, side-effect-free) is
+  // split from application (_applyClosePlan) so which exit a close takes is checkable against
+  // one body. Contracts at the definitions, above do_io_close.
+  enum class ClosePlan {
+    DRAIN,       // graceful: defer teardown until the transport has flushed the staged
+                 // ciphertext (+ close-notify); every drain exit is RECLAIMABLE
+    RECLAIM_NOW, // free the VC inline, on this stack
+    DEFER,       // free authorized but not safe on this stack; completed at the blocking
+                 // frame's unwind or _runDeferredWork's RECLAIMABLE rung
+  };
+  void      _encryptFinalPlaintext(int lerrno);
+  void      _detachConsumerVios();
+  void      _runTlsCloseHooks();
+  void      _queueCloseNotifyOrQuietShutdown();
+  ClosePlan _selectClosePlan(int lerrno, EThread *t) const;
+  void      _applyClosePlan(ClosePlan plan, int lerrno, EThread *t);
 
   // Re-entrancy depth covering two distinct hazards with the same fix: (1) _signal_user's own
   // synchronous re-entrancy (a consumer's handler drives more work on this same VC before

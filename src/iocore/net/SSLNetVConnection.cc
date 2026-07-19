@@ -786,9 +786,9 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // A handshake hook has genuinely parked: the driver returned here because the plugin owns
     // control and will reenable_with_event later. Record it so a consumer-driven close arriving
     // while it is parked (a transport error/timeout to the trampoline) does not free the VC out
-    // from under the plugin's pending reenable -- do_io_close's callHooks(VCONN_CLOSE) advances
-    // the hook FSM to DONE, so is_invoked_state() alone can no longer witness the hold. Cleared
-    // in reenable_with_event. (A synchronous TSVConnAbort fails the handshake instead of
+    // from under the plugin's pending reenable -- do_io_close's close hook (_runTlsCloseHooks)
+    // advances the hook FSM to DONE, so is_invoked_state() alone can no longer witness the
+    // hold. Cleared in reenable_with_event. (A synchronous TSVConnAbort fails the handshake instead of
     // parking, so it never reaches here and its teardown is not blocked.)
     // Key on is_invoked_state(): a hook that reenabled synchronously already cleared
     // _hook_parked and advanced the FSM, so re-latching here would leave a stale hold that
@@ -1031,7 +1031,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
 // the wbio (_write_buf) until `towrite`, the record-size policy, or the ciphertext water mark
 // stops it, and returns the whole outcome as one EncryptBatch. The caller advances
 // _user_write_vio.ndone by plaintext_consumed (`buf` is not always the user write VIO's --
-// see do_io_close's final-plaintext encrypt).
+// see _encryptFinalPlaintext).
 SSLNetVConnection::EncryptBatch
 SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf)
 {
@@ -1203,15 +1203,17 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc) : SSLNetVConnecti
   _unvc = unvc;
 }
 
+// A consumer may close right after queuing a final plaintext write (e.g. an HTTP/2 GOAWAY
+// frame) via do_io_write()+reenable(), without waiting for WRITE_COMPLETE. The graceful-close
+// drain (ClosePlan::DRAIN) only looks at already-encrypted ciphertext, and the VIO sever
+// (_detachConsumerVios) discards the plaintext, so that final write would otherwise be silently
+// dropped. Encrypt it now, synchronously and without signalling the consumer, before the sever
+// and before _queueCloseNotifyOrQuietShutdown (SSL_write() is invalid once SSL_shutdown() has
+// run). Only a graceful close (lerrno == -1) of an established session with a write in flight
+// and a usable transport has anything to save.
 void
-SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
+SSLNetVConnection::_encryptFinalPlaintext(int lerrno)
 {
-  // A consumer may close right after queuing a final plaintext write (e.g. an HTTP/2 GOAWAY
-  // frame) via do_io_write()+reenable(), without waiting for WRITE_COMPLETE. The graceful-close
-  // drain below only looks at already-encrypted ciphertext, and the VIO sever just below discards
-  // the plaintext, so that final write would otherwise be silently dropped. Encrypt it now,
-  // synchronously and without signalling the consumer, before the sever and SSL_shutdown() below
-  // (SSL_write() is invalid once SSL_shutdown() has run).
   if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable() &&
       getSSLHandShakeComplete() && _user_write_active()) {
     MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
@@ -1222,13 +1224,17 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
       }
     }
   }
+}
 
-  // The consumer has detached: sever the user VIOs first, so no signal delivered after
-  // this point -- the unwinding handshake error path, a terminated-state mainEvent
-  // dispatch, a transport event during the close drain -- can reach a continuation that
-  // may already be freed (the deferred close-drain below returns with the VC still
-  // live). The transport VC does the same (UnixNetVConnection::do_io_close sets
-  // op = NONE); _signal_user's null-cont branch absorbs the late signals.
+// The consumer has detached: sever the user VIOs before any later close step, so no signal
+// delivered after this point -- the unwinding handshake error path, a terminated-state
+// mainEvent dispatch, a transport event during the close drain -- can reach a continuation
+// that may already be freed (ClosePlan::DRAIN returns with the VC still live). The transport
+// VC does the same (UnixNetVConnection::do_io_close sets op = NONE); _signal_user's null-cont
+// branch absorbs the late signals.
+void
+SSLNetVConnection::_detachConsumerVios()
+{
   _user_read_vio.cont    = nullptr;
   _user_read_vio.op      = VIO::NONE;
   _user_read_vio.nbytes  = 0;
@@ -1236,65 +1242,108 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   _user_write_vio.op     = VIO::NONE;
   _user_write_vio.nbytes = 0;
   _write_rearm_pending   = false; // no consumer left to rearm for
+}
 
-  if (this->_ssl.get() != nullptr) {
-    if (get_context() == NET_VCONNECTION_OUT) {
-      callHooks(TS_EVENT_VCONN_OUTBOUND_CLOSE);
-    } else {
-      callHooks(TS_EVENT_VCONN_CLOSE);
-    }
+// Deliver the TLS close hook for this VC's direction. Pitfall: callHooks advances the hook FSM
+// to HANDSHAKE_HOOKS_DONE, so after this point is_invoked_state() can no longer witness a
+// parked handshake hook -- that hold survives only in _hook_parked (see its declaration).
+void
+SSLNetVConnection::_runTlsCloseHooks()
+{
+  if (get_context() == NET_VCONNECTION_OUT) {
+    callHooks(TS_EVENT_VCONN_OUTBOUND_CLOSE);
+  } else {
+    callHooks(TS_EVENT_VCONN_CLOSE);
+  }
+}
 
-    if (getSSLHandShakeComplete()) {
-      int shutdown_mode = SSL_get_shutdown(this->_ssl.get());
-      Dbg(dbg_ctl_ssl_shutdown, "previous shutdown state 0x%x", shutdown_mode);
-      int new_shutdown_mode = shutdown_mode | SSL_RECEIVED_SHUTDOWN;
+// Queue the close-notify into the wbio -- SSL_shutdown() only stages ciphertext in _write_buf;
+// nothing reaches the wire until the transport flushes it (ClosePlan::DRAIN's reenable) -- or,
+// when the transport cannot take bytes, arm OpenSSL's quiet shutdown instead.
+void
+SSLNetVConnection::_queueCloseNotifyOrQuietShutdown()
+{
+  int shutdown_mode = SSL_get_shutdown(this->_ssl.get());
+  Dbg(dbg_ctl_ssl_shutdown, "previous shutdown state 0x%x", shutdown_mode);
+  int new_shutdown_mode = shutdown_mode | SSL_RECEIVED_SHUTDOWN;
 
-      if (new_shutdown_mode != shutdown_mode) {
-        // We do not need to sit around and wait for the client's close-notify if
-        // they have not already sent it.  We will still be standards compliant
-        Dbg(dbg_ctl_ssl_shutdown, "new SSL_set_shutdown 0x%x", new_shutdown_mode);
-        SSL_set_shutdown(this->_ssl.get(), new_shutdown_mode);
-      }
-
-      // Send the close-notify unless the transport is broken. A peer that merely
-      // half-closed its write side (READ_EOS, set when the inner unvc fires
-      // VC_EVENT_EOS) still has its read side open and expects the close-notify to
-      // shut the TLS session down cleanly; skipping it leaves the peer's SSL_read at
-      // an unexpected EOF, which (if it has shutdown(SHUT_WR)) makes it emit an alert
-      // onto a closed write side -> EPIPE. Only a truly broken transport skips it.
-      bool do_shutdown = _transport_write_usable();
-
-      if (do_shutdown) {
-        // Send the close-notify. May synchronously invoke a registered hook (session-ticket),
-        // which may itself call back into us.
-        int ret;
-        {
-          RecursionGuard openssl_guard(recursion);
-          ret = SSL_shutdown(this->_ssl.get());
-        }
-        Dbg(dbg_ctl_ssl_shutdown, "SSL_shutdown %s", (ret) ? "success" : "failed");
-      } else {
-        // Request a quiet shutdown to OpenSSL
-        SSL_set_quiet_shutdown(this->_ssl.get(), 1);
-        SSL_set_shutdown(this->_ssl.get(), SSL_RECEIVED_SHUTDOWN | SSL_SENT_SHUTDOWN);
-        Dbg(dbg_ctl_ssl_shutdown, "Enable quiet shutdown");
-      }
-    }
+  if (new_shutdown_mode != shutdown_mode) {
+    // We do not need to sit around and wait for the client's close-notify if
+    // they have not already sent it.  We will still be standards compliant
+    Dbg(dbg_ctl_ssl_shutdown, "new SSL_set_shutdown 0x%x", new_shutdown_mode);
+    SSL_set_shutdown(this->_ssl.get(), new_shutdown_mode);
   }
 
-  EThread *t = this_ethread();
+  // Send the close-notify unless the transport is broken. A peer that merely
+  // half-closed its write side (READ_EOS, set when the inner unvc fires
+  // VC_EVENT_EOS) still has its read side open and expects the close-notify to
+  // shut the TLS session down cleanly; skipping it leaves the peer's SSL_read at
+  // an unexpected EOF, which (if it has shutdown(SHUT_WR)) makes it emit an alert
+  // onto a closed write side -> EPIPE. Only a truly broken transport skips it.
+  bool do_shutdown = _transport_write_usable();
 
+  if (do_shutdown) {
+    // Send the close-notify. May synchronously invoke a registered hook (session-ticket),
+    // which may itself call back into us.
+    int ret;
+    {
+      RecursionGuard openssl_guard(recursion);
+      ret = SSL_shutdown(this->_ssl.get());
+    }
+    Dbg(dbg_ctl_ssl_shutdown, "SSL_shutdown %s", (ret) ? "success" : "failed");
+  } else {
+    // Request a quiet shutdown to OpenSSL
+    SSL_set_quiet_shutdown(this->_ssl.get(), 1);
+    SSL_set_shutdown(this->_ssl.get(), SSL_RECEIVED_SHUTDOWN | SSL_SENT_SHUTDOWN);
+    Dbg(dbg_ctl_ssl_shutdown, "Enable quiet shutdown");
+  }
+}
+
+// Which of the three close exits this close takes. Selection only -- no side effects -- so
+// "which exit does a given close take" is checkable against this one body; _applyClosePlan
+// executes the choice.
+SSLNetVConnection::ClosePlan
+SSLNetVConnection::_selectClosePlan(int lerrno, EThread *t) const
+{
   // Graceful close of a layered (TLS-terminated) connection. The consumer typically closes
   // us re-entrantly from its WRITE_COMPLETE handler, which runs on the inner transport's
   // net_write_io stack. That net_write_io keeps running to its tail after this returns
   // (write_signal_and_update ignores handler return values), dereferencing _write_buf's
-  // reader; and SSL_shutdown above may have queued a close-notify still to flush. Freeing
-  // this VC (and that reader) inline here -- directly, or via _signal_user's
+  // reader; and _queueCloseNotifyOrQuietShutdown may have queued a close-notify still to
+  // flush. Freeing this VC (and that reader) inline -- directly, or via _signal_user's
   // terminated-state teardown -- would crash that live net_write_io. So defer teardown to a
   // clean stack and let the transport flush any close-notify first. The peer may have
   // half-closed its write side (READ_EOS) while still reading our response; only a
   // truly broken transport (TRANSPORT_ERROR) skips the drain and tears down inline.
   if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable()) {
+    return ClosePlan::DRAIN;
+  }
+
+  // Whether it's safe to free this VC right now, rather than on `lerrno` (which only ever
+  // reflects why the caller is closing us, not whether it's safe to act). _freeBlocked() covers
+  // the hazards that make an inline free unsafe: still nested in _signal_user's own call to a
+  // consumer (its unwind will free us instead -- see _applyClosePlan's DEFER arm) or inside an
+  // OpenSSL callback frame (e.g. a plugin calling TSVConnAbort(vc, error) from an SSL hook mid
+  // SSL_accept()/SSL_connect()) that must not have its _ssl freed out from under it (recursion),
+  // a hook mid invocation (is_invoked_state), or a hook parked with a live plugin ref
+  // (_hook_parked) -- a TSVConnAbort/close arriving while a hook is parked must not free the VC
+  // before the plugin's reenable. When blocked, DEFER's scheduled dispatch completes the free
+  // via _reclaimIfClosed once the frame unwinds / the plugin reenables.
+  if (!_freeBlocked() && this->mutex->thread_holding == t) {
+    return ClosePlan::RECLAIM_NOW;
+  }
+  return ClosePlan::DEFER;
+}
+
+// Execute the chosen exit. DRAIN leaves the VC alive in the close-drain (every drain exit is
+// RECLAIMABLE; see the transition table). RECLAIM_NOW and DEFER authorize the reclaim first:
+// the consumer's close is what authorizes the physical free (consumer-driven teardown; see
+// _reclaimIfClosed) -- whether the free happens inline here, on a reclaim unwind, or at a
+// deferred dispatch, it happens because of the close, not an error state.
+void
+SSLNetVConnection::_applyClosePlan(ClosePlan plan, int lerrno, EThread *t)
+{
+  if (plan == ClosePlan::DRAIN) {
     _beginGracefulShutdown();
     if (_write_buf_reader && _write_buf_reader->read_avail() > 0) {
       Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: draining %" PRId64 " buffered bytes before close vc %p",
@@ -1305,25 +1354,10 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
     return;
   }
 
-  // Whether it's safe to free this VC right now, rather than on `lerrno` (which only ever
-  // reflects why the caller is closing us, not whether it's safe to act). _freeBlocked() covers
-  // the hazards that make an inline free unsafe: still nested in _signal_user's own call to a
-  // consumer (its unwind will free us instead -- see below) or inside an OpenSSL callback frame
-  // (e.g. a plugin calling TSVConnAbort(vc, error) from an SSL hook mid SSL_accept()/
-  // SSL_connect()) that must not have its _ssl freed out from under it (recursion), a hook mid
-  // invocation (is_invoked_state), or a hook parked with a live plugin ref (_hook_parked) -- a
-  // TSVConnAbort/close arriving while a hook is parked must not free the VC before the plugin's
-  // reenable. When blocked, the deferred dispatch below completes the free via _reclaimIfClosed
-  // once the frame unwinds / the plugin reenables.
-  bool close_inline = !_freeBlocked() && this->mutex->thread_holding == t;
-
   Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: terminating (%s).", lerrno == -1 ? "close" : "abort");
-  // The consumer's close is what authorizes the physical free (consumer-driven teardown; see
-  // _reclaimIfClosed). Whether the free happens inline here, on a reclaim unwind, or at a
-  // deferred dispatch, it happens because of THIS call, not an error state.
   _authorizeReclaim();
 
-  if (close_inline) {
+  if (plan == ClosePlan::RECLAIM_NOW) {
     this->free_thread(t);
   } else {
     // Not safe to free inline. If we're nested in _signal_user's own reentrancy, its unwind's
@@ -1332,6 +1366,24 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
     // scheduled dispatch's RECLAIMABLE rung does it once that frame has returned.
     _scheduleDeferredWork(t);
   }
+}
+
+void
+SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
+{
+  _encryptFinalPlaintext(lerrno);
+  _detachConsumerVios();
+
+  if (this->_ssl.get() != nullptr) {
+    _runTlsCloseHooks();
+    if (getSSLHandShakeComplete()) {
+      _queueCloseNotifyOrQuietShutdown();
+    }
+  }
+
+  EThread *t = this_ethread();
+
+  _applyClosePlan(_selectClosePlan(lerrno, t), lerrno, t);
 }
 
 void
