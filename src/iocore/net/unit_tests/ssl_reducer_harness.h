@@ -183,6 +183,14 @@ public:
   {
     return _close_errno;
   }
+  // How many times the SUT reenabled the transport write VIO. reenable() moves no bytes (the
+  // fixture pumps explicitly), so this counter is the only witness that the SUT asked the
+  // transport to flush -- e.g. _flush_staged_ciphertext's reenable on the drain-yield path.
+  int
+  write_reenables() const
+  {
+    return _write_reenables;
+  }
   void
   set_test_fd(int fd)
   {
@@ -196,6 +204,7 @@ private:
   IOBufferReader *_sut_write_reader = nullptr;
   bool            _closed           = false;
   int             _close_errno      = 0;
+  int             _write_reenables  = 0;
   SOCKET          _test_fd          = NO_FD;
 };
 

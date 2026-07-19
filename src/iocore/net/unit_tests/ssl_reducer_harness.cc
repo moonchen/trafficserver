@@ -335,9 +335,13 @@ MockTransportVC::do_io_shutdown(ShutdownHowTo_t /* howto */)
 }
 
 void
-MockTransportVC::reenable(VIO * /* vio */)
+MockTransportVC::reenable(VIO *vio)
 {
-  // No auto-pump: the fixture drives ciphertext movement explicitly for determinism.
+  // No auto-pump: the fixture drives ciphertext movement explicitly for determinism. Record
+  // write-side reenables so tests can assert the SUT requested a flush at all.
+  if (vio == &_write_vio) {
+    ++_write_reenables;
+  }
 }
 
 void

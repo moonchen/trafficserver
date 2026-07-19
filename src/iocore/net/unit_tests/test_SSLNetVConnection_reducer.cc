@@ -366,16 +366,23 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
 
   // WRITE-face drive: SSL_connect consumes the flight, the verify hook closes in-hook (drain
   // armed) and fails the verify, and the round unwinds into the EVENT_ERROR arm.
+  const int reenables_before = fx.mock()->write_reenables();
   fx.wake_sut(/* write_side */ true);
   REQUIRE(reducer_closing_verify_hook_fired());
 
   // The drain owns teardown: the VC must still be alive past the failing round, with the fatal
-  // alert staged for the transport to flush. Today the arm tears down inline instead -- the
-  // null-cont owner-close frees the VC on this very stack, the destructor closes the mock, and
-  // the staged alert is destroyed unflushed -- so this REQUIRE is the red witness (and gates the
-  // reader access below, which would be a use-after-free once the VC has been freed).
+  // alert staged for the transport to flush. Without the arm's drain-yield it tears down inline
+  // instead -- the null-cont owner-close frees the VC on this very stack, the destructor closes
+  // the mock, and the staged alert is destroyed unflushed -- so this REQUIRE is the regression
+  // witness (and gates the reader access below, which would be a use-after-free once the VC has
+  // been freed).
   REQUIRE_FALSE(fx.mock()->closed());
   CHECK(fx.mock()->sut_write_reader()->read_avail() > 0);
+  // The yield alone is not enough: the close-time reenable ran before the alert existed, so the
+  // arm itself must ask the transport to flush (_flush_staged_ciphertext). The staged bytes
+  // above cannot witness that -- the mock moves nothing on reenable and pump() drains
+  // unconditionally -- so the recorded reenable is the flush's only witness.
+  CHECK(fx.mock()->write_reenables() > reenables_before);
 
   // The in-hook close severed the consumer: no signal may reach it.
   CHECK(fx.consumer()->read_signals.empty());
