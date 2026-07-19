@@ -1331,7 +1331,7 @@ SSLNetVConnection::_queue_close_notify_or_quiet_shutdown()
 // "which exit does a given close take" is checkable against this one body; _apply_close_plan
 // executes the choice.
 SSLNetVConnection::ClosePlan
-SSLNetVConnection::_select_close_plan(int lerrno, EThread *t) const
+SSLNetVConnection::_select_close_plan(int lerrno, EThread *t, bool free_blocked_at_entry) const
 {
   // Graceful close of a layered (TLS-terminated) connection. The consumer typically closes
   // us re-entrantly from its WRITE_COMPLETE handler, which runs on the inner transport's
@@ -1357,7 +1357,12 @@ SSLNetVConnection::_select_close_plan(int lerrno, EThread *t) const
   // (_hook_parked) -- a TSVConnAbort/close arriving while a hook is parked must not free the VC
   // before the plugin's reenable. When blocked, DEFER's scheduled dispatch completes the free
   // via _reclaim_if_closed once the frame unwinds / the plugin reenables.
-  if (!_free_blocked() && this->mutex->thread_holding == t) {
+  //
+  // free_blocked_at_entry is the same predicate captured at do_io_close entry: the close hook
+  // that ran in between advances the hook FSM to HANDSHAKE_HOOKS_DONE, so a hook we are nested
+  // inside RIGHT NOW -- an outbound-start hook's TSVConnAbort, invoked inline on the drive
+  // stack outside any OpenSSL frame -- is no longer witnessed by is_invoked_state() here.
+  if (!free_blocked_at_entry && !_free_blocked() && this->mutex->thread_holding == t) {
     return ClosePlan::RECLAIM_NOW;
   }
   return ClosePlan::DEFER;
@@ -1399,6 +1404,11 @@ SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
+  // Captured before _run_tls_close_hooks: the close hook advances the hook FSM to
+  // HANDSHAKE_HOOKS_DONE, destroying is_invoked_state()'s witness of a hook this close may be
+  // nested inside (the same pitfall _hook_parked documents for the parked window).
+  const bool free_blocked_at_entry = _free_blocked();
+
   _encrypt_final_plaintext(lerrno);
   _detach_consumer_vios();
 
@@ -1411,7 +1421,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 
   EThread *t = this_ethread();
 
-  _apply_close_plan(_select_close_plan(lerrno, t), lerrno, t);
+  _apply_close_plan(_select_close_plan(lerrno, t, free_blocked_at_entry), lerrno, t);
 }
 
 void

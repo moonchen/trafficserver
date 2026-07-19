@@ -777,7 +777,7 @@ private:
   void      _detach_consumer_vios();
   void      _run_tls_close_hooks();
   void      _queue_close_notify_or_quiet_shutdown();
-  ClosePlan _select_close_plan(int lerrno, EThread *t) const;
+  ClosePlan _select_close_plan(int lerrno, EThread *t, bool free_blocked_at_entry) const;
   void      _apply_close_plan(ClosePlan plan, int lerrno, EThread *t);
 
   // Re-entrancy depth covering two distinct hazards with the same fix: (1) _signal_user's own

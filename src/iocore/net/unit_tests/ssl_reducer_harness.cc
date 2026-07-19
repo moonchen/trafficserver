@@ -124,6 +124,26 @@ reducer_closing_verify_hook_cb(TSCont /* contp */, TSEvent /* event */, void *ed
   vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
   return 0;
 }
+
+bool             g_ob_start_abort_armed = false;
+bool             g_ob_start_abort_fired = false;
+INKContInternal *g_ob_start_abort_cont  = nullptr; // process-global outbound-start hook; held so it stays reachable
+
+// One-shot outbound-start hook (see the header). Runs inline on the drive stack, outside any
+// OpenSSL frame; the armed invocation aborts the VC and returns without reenabling.
+int
+reducer_ob_start_abort_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
+{
+  auto *vc = static_cast<SSLNetVConnection *>(edata);
+  if (g_ob_start_abort_armed) {
+    g_ob_start_abort_armed = false; // one-shot: abort only the armed handshake
+    g_ob_start_abort_fired = true;
+    vc->do_io_close(EIO);
+    return 0; // an aborted VC is dead to the plugin: no reenable
+  }
+  vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
+  return 0;
+}
 } // namespace
 
 void
@@ -163,6 +183,24 @@ bool
 reducer_closing_verify_hook_fired()
 {
   return g_verify_close_fired;
+}
+
+void
+reducer_install_outbound_start_abort_hook()
+{
+  g_ob_start_abort_fired = false;
+  g_ob_start_abort_armed = true; // arm the next outbound handshake's start hook to abort in-hook
+  if (g_ob_start_abort_cont == nullptr) {
+    // Register once for the whole process (same rationale and construction as the hooks above).
+    g_ob_start_abort_cont = new INKContInternal(reducer_ob_start_abort_hook_cb, reinterpret_cast<TSMutex>(new_ProxyMutex()));
+    SSLAPIHooks::instance()->append(TSSslHookInternalID{TS_VCONN_OUTBOUND_START_HOOK}, g_ob_start_abort_cont);
+  }
+}
+
+bool
+reducer_outbound_start_abort_hook_fired()
+{
+  return g_ob_start_abort_fired;
 }
 
 bool
@@ -491,7 +529,7 @@ ReducerFixture::attach(bool install_read)
 // data matters: mainEvent accepts only the armed _deferred_work_event as scheduled work. Lock
 // through e->mutex, not the continuation -- the Ptr keeps the mutex alive even if a prior
 // event's dispatch freed the continuation and left this one cancelled.
-static void
+void
 run_pending_events()
 {
   EThread *t = this_ethread();

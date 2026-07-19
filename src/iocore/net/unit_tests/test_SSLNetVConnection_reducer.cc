@@ -358,7 +358,14 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
     }
   };
 
-  fx.wake_sut(/* write_side */ true); // ClientHello into _write_buf
+  // Drive until the ClientHello is staged: a sibling case may have left the process-global
+  // outbound-start hook registered, whose pass-through defers the first SSL_connect round to a
+  // scheduled re-drive.
+  for (int i = 0; i < 10 && fx.mock()->sut_write_reader()->read_avail() == 0; ++i) {
+    fx.wake_sut(/* write_side */ true);
+    run_pending_events();
+  }
+  REQUIRE(fx.mock()->sut_write_reader()->read_avail() > 0);
   fx.pump_sut_to_peer();
   fx.peer()->do_handshake(); // server flight (ServerHello..Certificate..) into the peer wbio
   move_peer_bytes_quietly();
@@ -417,7 +424,14 @@ TEST_CASE("in-hook abort during SSL_connect: the failing round yields to the def
     }
   };
 
-  fx.wake_sut(/* write_side */ true); // ClientHello into _write_buf
+  // Drive until the ClientHello is staged: a sibling case may have left the process-global
+  // outbound-start hook registered, whose pass-through defers the first SSL_connect round to a
+  // scheduled re-drive.
+  for (int i = 0; i < 10 && fx.mock()->sut_write_reader()->read_avail() == 0; ++i) {
+    fx.wake_sut(/* write_side */ true);
+    run_pending_events();
+  }
+  REQUIRE(fx.mock()->sut_write_reader()->read_avail() > 0);
   fx.pump_sut_to_peer();
   fx.peer()->do_handshake(); // server flight into the peer wbio
   move_peer_bytes_quietly();
@@ -431,6 +445,38 @@ TEST_CASE("in-hook abort during SSL_connect: the failing round yields to the def
   // The deferred dispatch owns the free: the VC must still be alive past the failing round.
   // Without the drive's yield, the round signals the failure into the severed VIOs' null cont
   // and the owner-close frees the VC on this unwinding stack (the destructor closes the mock).
+  REQUIRE_FALSE(fx.mock()->closed());
+
+  // The in-hook abort severed the consumer: no signal may reach it.
+  CHECK(fx.consumer()->read_signals.empty());
+  CHECK(fx.consumer()->write_signals.empty());
+
+  // The scheduled dispatch completes the reclaim on a clean stack; the SUT destructor closes the
+  // inner (default sentinel -1, the harness's reclaim oracle).
+  fx.pump();
+  CHECK(fx.mock()->closed());
+  CHECK(fx.mock()->close_errno() == -1);
+}
+
+// in-hook abort from an outbound-start hook: unlike the verify flavor above, this hook runs on
+// the drive stack OUTSIDE any OpenSSL frame -- invoke_tls_event invokes it inline before the
+// first SSL_connect round. At do_io_close time the frames below are witnessed only by
+// is_invoked_state(), and do_io_close's own close hook advances the hook FSM to
+// HANDSHAKE_HOOKS_DONE before the close plan is selected -- so without an entry-time snapshot
+// the plan sees nothing blocking the free and reclaims inline, running the destructor under the
+// hook's own invocation frames.
+TEST_CASE("in-hook abort from an outbound-start hook: the free defers past the invoking drive", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  reducer_install_outbound_start_abort_hook();
+  fx.attach();
+
+  // First drive: the outbound-start hook is invoked inline and aborts the VC in-hook.
+  fx.wake_sut(/* write_side */ true);
+  REQUIRE(reducer_outbound_start_abort_hook_fired());
+
+  // The free must have deferred: freeing inline under the hook would run the destructor (which
+  // closes the mock) beneath the still-unwinding invoke_tls_event frames.
   REQUIRE_FALSE(fx.mock()->closed());
 
   // The in-hook abort severed the consumer: no signal may reach it.

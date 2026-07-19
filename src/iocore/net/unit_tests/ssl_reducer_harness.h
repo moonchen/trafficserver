@@ -55,6 +55,19 @@ SSLNetVConnection *reducer_hook_vc();
 void reducer_install_closing_verify_hook(int lerrno = -1);
 bool reducer_closing_verify_hook_fired();
 
+// Appends a process-global, one-shot outbound-start hook: on the next armed outbound handshake
+// it aborts the VC from inside the hook (do_io_close(EIO)) and returns without reenabling --
+// the plugin considers the VC gone. Unlike the verify hook, this one runs OUTSIDE any OpenSSL
+// frame: invoke_tls_event invokes it inline on the drive stack before the first SSL_connect
+// round. Disarmed it passes every later outbound handshake through untouched.
+void reducer_install_outbound_start_abort_hook();
+bool reducer_outbound_start_abort_hook_fired();
+
+// Deliver the events queued on the harness thread (the SUT's schedule_imm dispatches). Tests
+// need this mid-scenario when a step's work was deferred -- e.g. a registered outbound-start
+// hook defers the first SSL_connect round to a scheduled re-drive.
+void run_pending_events();
+
 class BarePeer
 {
 public:
