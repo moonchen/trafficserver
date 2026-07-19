@@ -229,6 +229,63 @@ TEST_CASE("#8: post-handshake error, H2 session closes and reclaims the VC", "[S
   CHECK(fx.mock()->close_errno() == -1);
 }
 
+// The write face can be the FIRST driver of an in-progress handshake: a fresh accept's socket is
+// writable before its bytes are delivered, so a transport WRITE_READY can reach the SUT while the
+// ClientHello sits unannounced in the read buffer. Drive the whole inbound handshake through
+// write-face wakes only (peer bytes are moved without read-face events) to pin the write-face
+// driver's arms: it must consume the buffered ClientHello, emit the server flight, and on the
+// completing round deliver the cross-side VC_EVENT_WRITE_COMPLETE through the read VIO (no user
+// write VIO is attached, so its ntodo() is 0) exactly once.
+TEST_CASE("write-face-first: WRITE_READY drives the in-progress inbound handshake", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.attach();
+
+  // Move peer ciphertext into the SUT's read buffer WITHOUT delivering a read-face event.
+  auto move_peer_bytes_quietly = [&fx]() {
+    char buf[16384];
+    int  n;
+    while ((n = BIO_read(fx.peer()->wbio(), buf, sizeof(buf))) > 0) {
+      fx.mock()->sut_read_buf()->write(buf, n);
+    }
+  };
+
+  fx.peer()->do_handshake(); // the client emits its ClientHello
+  move_peer_bytes_quietly();
+  REQUIRE(fx.mock()->sut_read_buf()->max_read_avail() > 0);
+
+  // First drive is a write-face wake: it must advance the handshake off the buffered bytes.
+  REQUIRE_FALSE(fx.vc()->getSSLHandShakeComplete());
+  fx.wake_sut(/* write_side */ true);
+  REQUIRE(fx.mock()->sut_write_reader()->read_avail() > 0); // the server flight was produced
+
+  // Finish the handshake, still via write-face wakes only.
+  for (int i = 0; i < 20 && !(fx.vc()->getSSLHandShakeComplete() && fx.peer()->handshake_done()); ++i) {
+    fx.pump_sut_to_peer();
+    fx.peer()->do_handshake();
+    move_peer_bytes_quietly();
+    fx.wake_sut(/* write_side */ true);
+  }
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+  REQUIRE(fx.peer()->handshake_done());
+
+  CHECK(std::count(fx.consumer()->read_signals.begin(), fx.consumer()->read_signals.end(), VC_EVENT_WRITE_COMPLETE) == 1);
+  CHECK(fx.consumer()->write_signals.empty());
+
+  // The established VC still moves data through the normal read path.
+  const char *msg = "ping";
+  REQUIRE(fx.peer()->write_app(msg, 4) == 4);
+  fx.pump_peer_to_sut();
+  REQUIRE(fx.consumer()->read_reader->read_avail() >= 4);
+  char got[8] = {0};
+  fx.consumer()->read_reader->memcpy(got, 4);
+  CHECK(std::string(got, 4) == "ping");
+}
+
 // async-hook: a transport error while a cert hook is parked mid-handshake must tear down cleanly.
 // Consumer-driven: the error reaches the waiting (read) consumer, which closes the VC; the reclaim
 // is held off while the hook is parked (is_invoked_state -- the plugin still owns a live ref) and
