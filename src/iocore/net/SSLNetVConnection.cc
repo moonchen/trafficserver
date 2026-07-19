@@ -680,7 +680,6 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
 
   switch (ret) {
   case EVENT_ERROR:
-    lerrno = err;
     // An in-hook close during this round's _advance_handshake (TSVConnClose from a verify hook
     // on a plugin-owned outbound VC) armed the graceful drain and severed the user VIOs: the
     // failure has no waiter, and signalling it would exit the drain through _signal_user's
@@ -694,6 +693,9 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       _flush_staged_ciphertext();
       return HandshakeDriveOutcome::YIELD;
     }
+    // Past the yield: the failure is ours to report. (Storing lerrno above the gate would
+    // clobber the close's -1 on the drain path for nothing -- nobody reads it there.)
+    lerrno = err;
     // Set the state before signalling: the fused reclaim may free this VC, so the member write
     // must happen first. The stores differ by face, historically: the write face latches
     // TERMINATED (_fail_handshake -- the terminated state also lets a consumer-less delivery
