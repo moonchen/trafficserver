@@ -686,6 +686,8 @@ private:
   {
     return _deferred_work_event != nullptr;
   }
+  // The one arming point for _deferred_work_event; see the contract at the definition.
+  void _scheduleDeferredWork(EThread *t);
   // Set when a consumer reentrantly queues a new write from its (synchronously-delivered)
   // WRITE_COMPLETE handler while we're nested inside the inner transport's net_write_io. That
   // reentrant reenable() is doomed on this stack -- net_write_io's own still-executing tail

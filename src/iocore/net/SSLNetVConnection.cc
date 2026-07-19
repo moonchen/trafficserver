@@ -851,7 +851,7 @@ SSLNetVConnection::_trigger_ssl_read()
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
     if (!_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
         _user_read_vio.ntodo() > 0 && buf.writer() != nullptr && buf.writer()->write_avail() > 0 && _ssl_read_pending()) {
-      _deferred_work_event = this_ethread()->schedule_imm(this);
+      _scheduleDeferredWork(this_ethread());
     } else {
       _transport_read_vio->reenable();
     }
@@ -1187,9 +1187,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
           _write_buf_reader->read_avail(), this);
       _transport_write_vio->reenable();
     }
-    if (!_deferred_work_pending()) {
-      _deferred_work_event = t->schedule_imm(this);
-    }
+    _scheduleDeferredWork(t);
     return;
   }
 
@@ -1213,12 +1211,12 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 
   if (close_inline) {
     this->free_thread(t);
-  } else if (!_deferred_work_pending()) {
+  } else {
     // Not safe to free inline. If we're nested in _signal_user's own reentrancy, its unwind's
     // _reclaimIfClosed will free us first and the destructor will harmlessly cancel this scheduled
     // dispatch. If we're nested in an OpenSSL frame instead, nothing else will free us -- the
     // scheduled dispatch's RECLAIMABLE branch does it once that frame has returned.
-    _deferred_work_event = t->schedule_imm(this);
+    _scheduleDeferredWork(t);
   }
 }
 
@@ -2014,8 +2012,8 @@ SSLNetVConnection::reenable_with_event(int event)
   // re-invoke the handshake, mirroring master's readReschedule()/net_read_io()
   // pass. Use the home thread: a plugin may reenable from any thread. mainEvent
   // tears the VC down here if the reenable carried an error (terminated state).
-  if (!getSSLHandShakeComplete() && !_deferred_work_pending()) {
-    _deferred_work_event = this->thread->schedule_imm(this);
+  if (!getSSLHandShakeComplete()) {
+    _scheduleDeferredWork(this->thread);
   }
 
   _transport_read_vio->reenable();
@@ -2455,9 +2453,7 @@ SSLNetVConnection::_armPendingHandoff(PendingHandoff which)
   if (_transport_read_vio != nullptr) {
     _transport_read_vio->disable();
   }
-  if (!_deferred_work_pending()) {
-    _deferred_work_event = this_ethread()->schedule_imm(this);
-  }
+  _scheduleDeferredWork(this_ethread());
 }
 
 void
@@ -2990,9 +2986,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // keeps net_write_io going to its tail, where it dereferences _write_buf's reader.
       // Freeing this VC now would deallocate that reader underneath the live net_write_io
       // (the FORWARD-tunnel crash). A scheduled dispatch frees it on a clean stack.
-      if (!_deferred_work_pending()) {
-        _deferred_work_event = this_ethread()->schedule_imm(this);
-      }
+      _scheduleDeferredWork(this_ethread());
       return EVENT_DONE;
     }
     _transport_write_vio->reenable();
@@ -3273,13 +3267,30 @@ SSLNetVConnection::_deliverWriteComplete()
   return EVENT_DONE;
 }
 
+// The one arming point for _deferred_work_event (see its declaration for what the slot
+// multiplexes): every schedule of the slot routes through here, so the never-more-than-one
+// discipline holds by construction. Arming is idempotent because the slot carries no purpose --
+// mainEvent's scheduled-dispatch branch re-derives what to run from VC state at fire time, so a
+// purpose armed while a dispatch is already outstanding rides that dispatch instead of queueing
+// a second event. (It is the dispatch, not the arming, that keeps co-pending purposes from
+// stranding -- see the write-rearm branch re-scheduling the read drive it displaced.)
+// `t` is the thread the dispatch must run on: callers already on the VC's thread under its
+// mutex pass this_ethread(); the two handshake-resumption entry points that may be driven from
+// a foreign thread (reenable_with_event -- a plugin may reenable from any thread -- and
+// handle_async_tls_ready) pass this->thread, the home thread.
+void
+SSLNetVConnection::_scheduleDeferredWork(EThread *t)
+{
+  if (!_deferred_work_pending()) {
+    _deferred_work_event = t->schedule_imm(this);
+  }
+}
+
 void
 SSLNetVConnection::_scheduleWriteRearm()
 {
   _write_rearm_pending = true;
-  if (!_deferred_work_pending()) {
-    _deferred_work_event = this_ethread()->schedule_imm(this);
-  }
+  _scheduleDeferredWork(this_ethread());
 }
 
 int
@@ -3293,8 +3304,8 @@ SSLNetVConnection::_handle_transport_eos(VIO *vio)
   // inner transport's read path is still on the stack. Skip while closing: the
   // consumer is gone and we are only flushing our write side (the peer may have
   // half-closed its write while still reading our response).
-  if (!_isDraining() && !_is_terminal(_sslState) && !_deferred_work_pending()) {
-    _deferred_work_event = this_ethread()->schedule_imm(this);
+  if (!_isDraining() && !_is_terminal(_sslState)) {
+    _scheduleDeferredWork(this_ethread());
   }
   return EVENT_DONE;
 }
@@ -3359,8 +3370,8 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   // cannot surface a transport error itself. Out of line so we do not free this VC
   // while the inner transport's read/write path is still on the stack (mirrors
   // _handle_transport_eos).
-  if (!_is_terminal(_sslState) && !_deferred_work_pending()) {
-    _deferred_work_event = this_ethread()->schedule_imm(this);
+  if (!_is_terminal(_sslState)) {
+    _scheduleDeferredWork(this_ethread());
   }
   return EVENT_DONE;
 }
@@ -3505,9 +3516,8 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // in the rbio; servicing the rearm above consumed the shared slot, so a co-pending
       // read drive would be dropped and the buffered response would strand -- the transport read
       // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
-      if (!_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
-          _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
-        _deferred_work_event = this_ethread()->schedule_imm(this);
+      if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
+        _scheduleDeferredWork(this_ethread());
       }
       return EVENT_DONE;
     }
@@ -3633,7 +3643,8 @@ SSLNetVConnection::_adoptConsumerMutex(Continuation *c)
   // so it does not dispatch this VC's mainEvent holding the wrong lock.
   if (_deferred_work_event != nullptr) {
     _deferred_work_event->cancel();
-    _deferred_work_event = this_ethread()->schedule_imm(this);
+    _deferred_work_event = nullptr;
+    _scheduleDeferredWork(this_ethread());
   }
 }
 
@@ -3665,8 +3676,8 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
     // further transport read event will arrive to drive it. This also surfaces EOS
     // when the transport is already closed. Out of line so we don't re-enter the
     // caller and free this VC underneath it.
-    if (nbytes != 0 && !_deferred_work_pending()) {
-      _deferred_work_event = this_ethread()->schedule_imm(this);
+    if (nbytes != 0) {
+      _scheduleDeferredWork(this_ethread());
     }
   } else {
     // User wants to stop reading
@@ -3883,8 +3894,8 @@ SSLNetVConnection::reenable(VIO *vio)
     // not re-enter the consumer that is reenabling us. A terminated transport needs the same
     // drive: EOS/ERROR is a persistent state and the closed transport will never re-signal, so
     // a consumer re-enabling its read must observe it from the drive.
-    if (!_deferred_work_pending() && !_user_read_vio.is_disabled() && _ssl_read_pending()) {
-      _deferred_work_event = this_ethread()->schedule_imm(this);
+    if (!_user_read_vio.is_disabled() && _ssl_read_pending()) {
+      _scheduleDeferredWork(this_ethread());
     }
   } else if (vio == &_user_write_vio) {
     // Reenable write.
@@ -4017,8 +4028,8 @@ SSLNetVConnection::handle_async_tls_ready()
   // read BIO, so reenabling the transport read VIO alone would not re-drive
   // SSL_do_handshake(). Schedule an out-of-line read-drive to re-enter the handshake
   // (mainEvent -> _trigger_ssl_read -> _ssl_accept), which resumes the suspended job.
-  if (!getSSLHandShakeComplete() && !_deferred_work_pending()) {
-    _deferred_work_event = this->thread->schedule_imm(this);
+  if (!getSSLHandShakeComplete()) {
+    _scheduleDeferredWork(this->thread);
   }
 }
 #endif
