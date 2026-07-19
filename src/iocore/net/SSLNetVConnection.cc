@@ -652,12 +652,15 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   // An in-hook abort during this round's _advance_handshake (TSVConnAbort from a hook on a
   // plugin-owned outbound VC -- or any in-hook close that could not arm the drain) authorized
   // the reclaim. The close severed the user VIOs, so no outcome of this round has a waiter,
-  // and because the OpenSSL frame blocked the free (recursion), do_io_close's DEFER plan
-  // already scheduled the dispatch whose RECLAIMABLE rung completes it. Yield to that
-  // dispatch: signalling from here would find the null cont and the owner-close would free
-  // the VC on this unwinding drive's stack, under the inner-transport frames that dispatched
-  // it. (An in-hook close whose drain WAS armed is _is_draining() instead -- the EVENT_ERROR
-  // arm's own yield below handles it, flushing the staged alert.)
+  // and because a frame below still needed the VC (_free_blocked() at close entry: the
+  // OpenSSL frame's recursion guard, or the hook invocation the entry snapshot witnesses),
+  // do_io_close's DEFER plan already scheduled the dispatch whose RECLAIMABLE rung completes
+  // it. Yield to that dispatch: signalling from here would find the null cont and the
+  // owner-close would free the VC on this unwinding drive's stack, under the inner-transport
+  // frames that dispatched it. (An in-hook close whose drain WAS armed is _is_draining()
+  // instead -- the EVENT_ERROR arm's own yield below handles it, flushing the staged alert.
+  // The two early-returns above, SSL_RESTART and the blind tunnel, are inbound-only
+  // situations an in-hook close cannot reach.)
   if (_sslState == SslState::RECLAIMABLE) {
     return HandshakeDriveOutcome::YIELD;
   }
@@ -684,8 +687,9 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // on a plugin-owned outbound VC) armed the graceful drain and severed the user VIOs: the
     // failure has no waiter, and signalling it would exit the drain through _signal_user's
     // null-cont owner-close, destroying the fatal alert the failing SSL_accept/SSL_connect
-    // staged in _write_buf. Yield to the drain instead. The flush is load-bearing -- the
-    // close-time reenable ran before the alert existed -- and the drain's own exits
+    // staged in _write_buf. Yield to the drain instead. The flush is load-bearing -- at close
+    // time the alert did not exist, so the close's own drain reenable (guarded on staged
+    // bytes) was skipped -- and the drain's own exits
     // (_run_deferred_work's drain rung, transport error, drain timeout) authorize the reclaim
     // from a later dispatch, off this failing drive's stack. No armed reject is skipped here:
     // _begin_graceful_shutdown erased any FATAL_PENDING when the drain was armed.
@@ -693,8 +697,9 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       _flush_staged_ciphertext();
       return HandshakeDriveOutcome::YIELD;
     }
-    // Past the yield: the failure is ours to report. (Storing lerrno above the gate would
-    // clobber the close's -1 on the drain path for nothing -- nobody reads it there.)
+    // Past the yield: the failure is ours to report. (Above the gate the store would just be
+    // dead: the drain path never reads lerrno again -- and the close itself leaves the member
+    // untouched; do_io_close's parameter shadows it.)
     lerrno = err;
     // Set the state before signalling: the fused reclaim may free this VC, so the member write
     // must happen first. The stores differ by face, historically: the write face latches

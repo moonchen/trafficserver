@@ -371,6 +371,11 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
   move_peer_bytes_quietly();
   REQUIRE(fx.mock()->sut_read_buf()->max_read_avail() > 0);
 
+  // The reenable witness below is delta-based, so pin its premise: _write_buf is empty going
+  // into the failing wake, which keeps the close's own drain reenable (guarded on staged
+  // bytes) skipped -- any reenable recorded during the wake is the arm's flush.
+  REQUIRE(fx.mock()->sut_write_reader()->read_avail() == 0);
+
   // WRITE-face drive: SSL_connect consumes the flight, the verify hook closes in-hook (drain
   // armed) and fails the verify, and the round unwinds into the EVENT_ERROR arm.
   const int reenables_before = fx.mock()->write_reenables();
@@ -385,10 +390,11 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
   // been freed).
   REQUIRE_FALSE(fx.mock()->closed());
   CHECK(fx.mock()->sut_write_reader()->read_avail() > 0);
-  // The yield alone is not enough: the close-time reenable ran before the alert existed, so the
-  // arm itself must ask the transport to flush (_flush_staged_ciphertext). The staged bytes
-  // above cannot witness that -- the mock moves nothing on reenable and pump() drains
-  // unconditionally -- so the recorded reenable is the flush's only witness.
+  // The yield alone is not enough: at close time the alert did not exist, so the close's own
+  // drain reenable was skipped and the arm itself must ask the transport to flush
+  // (_flush_staged_ciphertext). The staged bytes above cannot witness that -- the mock moves
+  // nothing on reenable and pump() drains unconditionally -- so the recorded reenable is the
+  // flush's only witness.
   CHECK(fx.mock()->write_reenables() > reenables_before);
 
   // The in-hook close severed the consumer: no signal may reach it.
@@ -407,7 +413,9 @@ TEST_CASE("in-hook close during SSL_connect: the failing round yields to the clo
 // OpenSSL frame blocks the free, defers it to the scheduled dispatch. The failing round must
 // yield to that authorized reclaim the same way it yields to an armed drain: signalling the
 // failure would find the severed VIOs' null cont, and the owner-close would free the VC on this
-// very drive stack, under the live inner-transport frames that dispatched it.
+// very drive stack, under the live inner-transport frames that dispatched it. (No assertion
+// pins this round to the EVENT_ERROR arm -- the reclaim yield sits above the switch -- so the
+// ENFORCED-verify plumbing that makes the round fail is anchored by the sibling close case.)
 TEST_CASE("in-hook abort during SSL_connect: the failing round yields to the deferred reclaim", "[SSLReducer]")
 {
   ReducerFixture fx(/* inbound */ false);

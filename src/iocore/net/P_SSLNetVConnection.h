@@ -162,8 +162,8 @@ private:
   //   HANDSHAKING -> TERMINATED  -- _fail_handshake()
   //     - The write-face EVENT_ERROR arm of _drive_handshake, stored before the failure is
   //       signalled, so it also consumes an armed FATAL_PENDING. It never sees an in-hook
-  //       close's state: the drive yields to an authorized reclaim (RECLAIMABLE) before any
-  //       post-round processing, and the arm yields to an armed close-drain (_is_draining())
+  //       close's state: the drive yields to an authorized reclaim (RECLAIMABLE) before the
+  //       post-round arms that signal or re-arm, and the arm yields to an armed close-drain (_is_draining())
   //       before either face's store or signal -- in both cases the close severed the user
   //       VIOs, so the failure has no waiter, and the drain flavor must flush the fatal alert
   //       the failing round staged in _write_buf. (The read-face EVENT_ERROR arm leaves the
@@ -190,7 +190,7 @@ private:
   //       live consumer to deliver it to, so nobody will ever close us. The transition is
   //       unconditional -- FROM is whatever state the event was delivered in (a RECLAIMABLE
   //       self-loop stays legal, though the handshake drive no longer signals there: it yields
-  //       to an authorized reclaim before any post-round processing).
+  //       to an authorized reclaim before the post-round arms that signal or re-arm).
   //       SHUTDOWN_IN_PROGRESS is reached when a hook nested in a handshake drive closes the VC
   //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook) and the
   //       unwinding round then abandons the WANT_READ wait: the transport read already ended
@@ -271,8 +271,8 @@ private:
 
   // The write-face handshake driver's EVENT_ERROR: entry to TERMINATED, made before the
   // failure is signalled, so it also consumes an armed FATAL_PENDING. Never called once the
-  // consumer has closed us: the drive yields to an authorized reclaim (RECLAIMABLE) before any
-  // post-round processing, and the EVENT_ERROR arm yields to an armed close-drain before
+  // consumer has closed us: the drive yields to an authorized reclaim (RECLAIMABLE) before
+  // the post-round arms that signal or re-arm, and the EVENT_ERROR arm yields to an armed close-drain before
   // either face's store, preserving SHUTDOWN_IN_PROGRESS for the drain's alert flush. The
   // assert keeps RECLAIMABLE absorbing.
   void
@@ -296,8 +296,10 @@ private:
 
   // Authorize the free: -> RECLAIMABLE (master's `closed` latch). Every source state is legal,
   // so there is no source assert: do_io_close/abort can arrive in any phase, the drain exits
-  // enter from SHUTDOWN_IN_PROGRESS, and the null-cont owner-close self-loops from RECLAIMABLE
-  // itself. The physical free still gates on _free_blocked() (see _reclaim_if_closed).
+  // enter from SHUTDOWN_IN_PROGRESS, and the null-cont owner-close may legally self-loop from
+  // RECLAIMABLE (no remaining site is known to signal there: the drive yields to an authorized
+  // reclaim, and mainEvent's terminal gate reaps without signalling). The physical free still
+  // gates on _free_blocked() (see _reclaim_if_closed).
   void
   _authorize_reclaim()
   {
