@@ -46,6 +46,14 @@ void               reducer_install_parking_cert_hook();
 bool               reducer_hook_fired();
 SSLNetVConnection *reducer_hook_vc();
 
+// Appends a process-global, one-shot verify-server hook: on the next armed outbound handshake it
+// closes the VC from inside the hook (do_io_close nested mid-SSL_connect, arming the graceful
+// close-drain) and fails the verify verdict (reenable_with_event(TS_EVENT_ERROR)), so an ENFORCED
+// verify policy fails the same round's SSL_connect. Then it disarms itself; disarmed it passes
+// every later handshake through untouched.
+void reducer_install_closing_verify_hook();
+bool reducer_closing_verify_hook_fired();
+
 class BarePeer
 {
 public:

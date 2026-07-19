@@ -100,6 +100,29 @@ reducer_cert_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
   vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
   return 0;
 }
+
+bool             g_verify_close_armed = false;
+bool             g_verify_close_fired = false;
+INKContInternal *g_verify_close_cont  = nullptr; // process-global closing verify hook; held so it stays reachable
+
+// One-shot verify-server hook (see the header). Runs nested inside the failing SSL_connect frame:
+// the in-hook do_io_close severs the user VIOs and arms the graceful close-drain, and the ERROR
+// reenable records the verify verdict (_verify_hook_failed) that makes the ENFORCED policy fail
+// SSL_connect on this very round.
+int
+reducer_closing_verify_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
+{
+  auto *vc = static_cast<SSLNetVConnection *>(edata);
+  if (g_verify_close_armed) {
+    g_verify_close_armed = false; // one-shot: close only the armed handshake
+    g_verify_close_fired = true;
+    vc->do_io_close();
+    vc->reenable_with_event(TS_EVENT_ERROR);
+    return 0;
+  }
+  vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
+  return 0;
+}
 } // namespace
 
 void
@@ -118,6 +141,26 @@ reducer_install_parking_cert_hook()
     g_hook_cont = new INKContInternal(reducer_cert_hook_cb, reinterpret_cast<TSMutex>(new_ProxyMutex()));
     SSLAPIHooks::instance()->append(TSSslHookInternalID{TS_SSL_CERT_HOOK}, g_hook_cont);
   }
+}
+
+void
+reducer_install_closing_verify_hook()
+{
+  g_verify_close_fired = false;
+  g_verify_close_armed = true; // arm the next outbound verify to close in-hook
+  if (g_verify_close_cont == nullptr) {
+    // Register once for the whole process (same rationale and construction as the parking cert
+    // hook above: the hook chain is global and append-only, and TSContCreate lives in a library
+    // test_net does not link).
+    g_verify_close_cont = new INKContInternal(reducer_closing_verify_hook_cb, reinterpret_cast<TSMutex>(new_ProxyMutex()));
+    SSLAPIHooks::instance()->append(TSSslHookInternalID{TS_SSL_VERIFY_SERVER_HOOK}, g_verify_close_cont);
+  }
+}
+
+bool
+reducer_closing_verify_hook_fired()
+{
+  return g_verify_close_fired;
 }
 
 bool

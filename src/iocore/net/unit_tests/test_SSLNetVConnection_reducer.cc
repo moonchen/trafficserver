@@ -330,3 +330,60 @@ TEST_CASE("async-hook: transport error while a cert hook is parked tears down cl
   // The VC is reclaimed, so only the destructor closes the inner (default sentinel -1).
   CHECK(fx.mock()->close_errno() == -1);
 }
+
+// in-hook close: a plugin may close an outbound VC it owns from a verify-server hook, which runs
+// nested inside SSL_connect. The close arms the graceful close-drain (severed VIOs,
+// SHUTDOWN_IN_PROGRESS); the hook's ERROR verdict under an ENFORCED policy then fails the same
+// round's SSL_connect, which stages the fatal TLS alert (e.g. unknown_ca) in the layered wbio.
+// The failing round's EVENT_ERROR arm must yield to the armed drain so the transport flushes
+// that alert (peer sees a definite handshake-failure alert, then FIN -- master's wire behavior,
+// and the refactor's own behavior on its normal failure path). It must not tear the VC down on
+// the unwinding drive stack, which destroys the staged alert unflushed and leaves the peer with
+// a bare FIN.
+TEST_CASE("in-hook close during SSL_connect: the failing round yields to the close-drain", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  reducer_install_closing_verify_hook();
+  fx.attach();
+  fx.vc()->options.verifyServerPolicy     = YamlSNIConfig::Policy::ENFORCED;
+  fx.vc()->options.verifyServerProperties = YamlSNIConfig::Property::NONE;
+
+  // Move peer ciphertext into the SUT's read buffer WITHOUT a read-face event, so a write-face
+  // wake finds the server flight already buffered (the write-face-first interleaving above).
+  auto move_peer_bytes_quietly = [&fx]() {
+    char buf[16384];
+    int  n;
+    while ((n = BIO_read(fx.peer()->wbio(), buf, sizeof(buf))) > 0) {
+      fx.mock()->sut_read_buf()->write(buf, n);
+    }
+  };
+
+  fx.wake_sut(/* write_side */ true); // ClientHello into _write_buf
+  fx.pump_sut_to_peer();
+  fx.peer()->do_handshake(); // server flight (ServerHello..Certificate..) into the peer wbio
+  move_peer_bytes_quietly();
+  REQUIRE(fx.mock()->sut_read_buf()->max_read_avail() > 0);
+
+  // WRITE-face drive: SSL_connect consumes the flight, the verify hook closes in-hook (drain
+  // armed) and fails the verify, and the round unwinds into the EVENT_ERROR arm.
+  fx.wake_sut(/* write_side */ true);
+  REQUIRE(reducer_closing_verify_hook_fired());
+
+  // The drain owns teardown: the VC must still be alive past the failing round, with the fatal
+  // alert staged for the transport to flush. Today the arm tears down inline instead -- the
+  // null-cont owner-close frees the VC on this very stack, the destructor closes the mock, and
+  // the staged alert is destroyed unflushed -- so this REQUIRE is the red witness (and gates the
+  // reader access below, which would be a use-after-free once the VC has been freed).
+  REQUIRE_FALSE(fx.mock()->closed());
+  CHECK(fx.mock()->sut_write_reader()->read_avail() > 0);
+
+  // The in-hook close severed the consumer: no signal may reach it.
+  CHECK(fx.consumer()->read_signals.empty());
+  CHECK(fx.consumer()->write_signals.empty());
+
+  // The transport flush + deferred dispatch complete the drain; the reclaim comes from the SUT
+  // destructor (default sentinel -1, the harness's reclaim oracle).
+  fx.pump();
+  CHECK(fx.mock()->closed());
+  CHECK(fx.mock()->close_errno() == -1);
+}

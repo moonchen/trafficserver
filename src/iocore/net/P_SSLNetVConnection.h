@@ -163,13 +163,15 @@ private:
   //       outranks the reject. (The guard would also admit HANDSHAKE_DONE, but a handshake hook
   //       only reenables while the handshake is parked on it.)
   //   HANDSHAKING -> TERMINATED  -- _fail_handshake()
-  //     - The write-face EVENT_ERROR arm of _drive_handshake, stored
-  //       unconditionally before the failure is signalled, so it also consumes an armed
-  //       FATAL_PENDING. The store re-checks nothing, so an in-hook close during the
-  //       _advance_handshake call (see the owner-close below) leaves SHUTDOWN_IN_PROGRESS -- or
-  //       RECLAIMABLE, for an abort -- to be overwritten here; the same unwind's owner-close
-  //       then re-enters RECLAIMABLE. (The read-face EVENT_ERROR arm leaves
-  //       the state in place; the consumer's close or the owner-close below moves it.)
+  //     - The write-face EVENT_ERROR arm of _drive_handshake, stored before the failure is
+  //       signalled, so it also consumes an armed FATAL_PENDING. The arm yields to an armed
+  //       close-drain before either face's store or signal (its _is_draining() early-exit: an
+  //       in-hook close during the _advance_handshake call severed the user VIOs, so the
+  //       failure has no waiter, and the drain must flush the fatal alert the failing round
+  //       staged in _write_buf). Past that gate the store re-checks nothing, so RECLAIMABLE --
+  //       an in-hook abort -- is overwritten here, and the same unwind's owner-close then
+  //       re-enters RECLAIMABLE. (The read-face EVENT_ERROR arm leaves the state in place;
+  //       the consumer's close or the owner-close below moves it.)
   //   FATAL_PENDING -> TERMINATED  -- _consume_fatal_failure(): delivery IS this transition, exactly once
   //     - On the driver stack once _advance_handshake has returned (outside any OpenSSL frame):
   //       _drive_handshake's post-return terminal check (either face) and its read-face
@@ -194,9 +196,12 @@ private:
   //       self-loop from RECLAIMABLE (an in-hook close already authorized the reclaim, and the
   //       unwinding drive's failure signal then finds no cont).
   //       SHUTDOWN_IN_PROGRESS is reached when a hook nested in a handshake drive closes the VC
-  //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook): the close
-  //       severs the user VIOs and arms the drain, and the drive's unwinding failure signal then
-  //       finds no cont -- a fourth drain exit, which forgoes the flush.
+  //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook) and the
+  //       unwinding round then finds the transport read already ended: the handshake bytes can
+  //       never arrive, so the failure signal finds no cont and forgoes the flush -- a fourth
+  //       drain exit, for a peer that is already gone. (A handshake ERROR on such a round does
+  //       not exit here: the EVENT_ERROR arm's _is_draining() early-exit yields to the drain,
+  //       which flushes the fatal alert the failing round staged in _write_buf.)
   //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- _authorize_reclaim(); each site frees the VC right after it
   //     - Drain complete (_run_deferred_work); transport error mid-drain
   //       (_handle_transport_error); a drain stuck at an idle/active timeout (mainEvent). Each is
@@ -268,10 +273,11 @@ private:
   }
 
   // The write-face handshake driver's EVENT_ERROR: unconditional entry to TERMINATED, made
-  // before the failure is signalled, so it also consumes an armed FATAL_PENDING. Deliberately
-  // re-checks nothing: an in-hook close during the _advance_handshake call leaves
-  // SHUTDOWN_IN_PROGRESS -- or RECLAIMABLE, for an abort -- to be overwritten here; the same
-  // unwind's owner-close then re-enters RECLAIMABLE.
+  // before the failure is signalled, so it also consumes an armed FATAL_PENDING. Never called
+  // while draining: the EVENT_ERROR arm yields to an armed close-drain before either face's
+  // store, preserving SHUTDOWN_IN_PROGRESS for the drain's alert flush. Deliberately re-checks
+  // nothing else: an in-hook abort during the _advance_handshake call leaves RECLAIMABLE to be
+  // overwritten here; the same unwind's owner-close then re-enters RECLAIMABLE.
   void
   _fail_handshake()
   {
@@ -889,8 +895,9 @@ private:
   enum class HandshakeDriveOutcome {
     DATA_READY, // handshake completed on this drive with decryptable input already buffered:
                 // the read face continues into post-handshake data delivery (`this` is alive)
-    YIELD,      // round over: waiting on peer bytes / a parked hook / async, or a deferred
-                // handoff was armed
+    YIELD,      // round over: waiting on peer bytes / a parked hook / async, a deferred
+                // handoff was armed, or a failing round yielded to an armed close-drain
+                // (the drain flushes the staged alert and owns the teardown)
     FAILED,     // a handshake failure was signalled to the waiter
   };
   // One-time SSL-object build + configuration, split out of the per-round _advance_handshake

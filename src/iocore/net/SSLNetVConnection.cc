@@ -668,11 +668,24 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   switch (ret) {
   case EVENT_ERROR:
     lerrno = err;
+    // An in-hook close during this round's _advance_handshake (TSVConnClose from a verify hook
+    // on a plugin-owned outbound VC) armed the graceful drain and severed the user VIOs: the
+    // failure has no waiter, and signalling it would exit the drain through _signal_user's
+    // null-cont owner-close, destroying the fatal alert the failing SSL_accept/SSL_connect
+    // staged in _write_buf. Yield to the drain instead. The flush is load-bearing -- the
+    // close-time reenable ran before the alert existed -- and the drain's own exits
+    // (_run_deferred_work's drain rung, transport error, drain timeout) authorize the reclaim
+    // on a clean stack. No armed reject is skipped here: _begin_graceful_shutdown erased any
+    // FATAL_PENDING when the drain was armed.
+    if (_is_draining()) {
+      _flush_staged_ciphertext();
+      return HandshakeDriveOutcome::YIELD;
+    }
     // Set the state before signalling: the fused reclaim may free this VC, so the member write
     // must happen first. The stores differ by face, historically: the write face latches
-    // TERMINATED unconditionally (_fail_handshake -- the terminated state also lets a
-    // consumer-less delivery owner-close), while the read face only consumes an already-armed
-    // reject and otherwise leaves the state for the consumer's close to move.
+    // TERMINATED (_fail_handshake -- the terminated state also lets a consumer-less delivery
+    // owner-close), while the read face only consumes an already-armed reject and otherwise
+    // leaves the state for the consumer's close to move.
     if (face == TransportFace::WRITE) {
       _fail_handshake();
     } else {
