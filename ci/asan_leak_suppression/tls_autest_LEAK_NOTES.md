@@ -38,7 +38,7 @@ Date: 2026-06-03. Branch `tls-refactor-wip` @ c8398b7464. Merge-base with mainli
   lifecycle is sound: `~SSLNetVConnection` (SSLNetVConnection.cc:1017, `_ssl=nullptr` ->
   `SSL_free`) is reached from every terminal path via `free_thread`, and frees `_ssl`,
   the layered rbio/wbio BIOs, `_read_buf`/`_write_buf`, the handshake reader, and `_unvc`
-  exactly once. Reparenting branches (`_downgradeToPlain`, `_handoffBlindTunnel`) release
+  exactly once. Reparenting branches (`_downgrade_to_plain`, `_handoff_blind_tunnel`) release
   the handed-off buffer/transport before close. Mainline at the merge-base freed SSL
   identically (only on close); the refactor merely moved `SSL_free` into the `unique_ptr`
   deleter. Control: the basic `tls` test (40 inbound POSTs completed before stop) leaks

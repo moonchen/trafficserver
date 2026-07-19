@@ -1,7 +1,7 @@
 '''
 Repro for TLS-refactor finding #3: a fully-idle partial TLS handshake does not
 honor proxy.config.ssl.handshake_timeout_in (the timer install in
-sslStartHandShake is dead code because _trackFirstHandshake pre-records the
+sslStartHandShake is dead code because _track_first_handshake pre-records the
 begin timestamp).
 '''
 #  Licensed to the Apache Software Foundation (ASF) under one

@@ -126,7 +126,7 @@ TunnelNetVConnection::hand_off_to(Continuation *accept_cont)
 // Deliver `event` to the consumer on `side`. handleEvent may free this VC (the consumer can
 // call do_io_close from within its handler); the recursion guard defers the actual free until
 // the outermost signal unwinds. This fuses in one body what SSLNetVConnection splits into
-// _signal_user + _signalAndReclaim. EVENT_DONE means this VC was freed: the caller must touch
+// _signal_user + _signal_and_reclaim. EVENT_DONE means this VC was freed: the caller must touch
 // nothing afterward.
 //
 int

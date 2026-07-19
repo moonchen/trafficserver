@@ -51,10 +51,10 @@ namespace
 {
 // Bring up the SSL runtime the SUT's handshake needs but unit_test_main does not install:
 //   * SSLInitializeLibrary() reserves the per-SSL ex_data indices (ssl_vc_index and every
-//     TLS*Support index). Without it _bindSSLObject binds to index -1 and getInstance(_ssl)
+//     TLS*Support index). Without it _bind_ssl_object binds to index -1 and getInstance(_ssl)
 //     returns null, tripping sslClientHandShakeEvent's identity assert. Idempotent.
 //   * SNIConfig::startup() loads the SNI config the outbound handshake driver always consults
-//     (_setupClientSSL). A missing sni.yaml loads an empty, no-op config.
+//     (_setup_client_ssl). A missing sni.yaml loads an empty, no-op config.
 //   * SSLInitializeStatistics() registers the ssl_rsb counters the handshake increments; without
 //     it Metrics::Counter::increment aborts on an unregistered id. It skips its cert-dependent
 //     cipher/group enumeration when no certificate config is loaded, so it is safe here.

@@ -154,7 +154,7 @@ Because the encrypted bytes may still be buffered when ``SSL_write`` returns,
 drained to the transport; the consumer typically closes the connection from
 its ``WRITE_COMPLETE`` handler, and signalling while ciphertext is still
 buffered would let that close truncate the response. Once the buffer has
-drained, ``_deliverWriteComplete`` signals the consumer synchronously, on the
+drained, ``_deliver_write_complete`` signals the consumer synchronously, on the
 current stack -- a scheduled delivery could outlive the consumer it targets
 (pool release, cross-thread migration, or a reattachment of the user VIOs). A
 close from inside the handler is safe: the free is deferred until the signal

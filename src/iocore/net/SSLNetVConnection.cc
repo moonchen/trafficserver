@@ -175,11 +175,11 @@ SSLNetVConnection::_make_ssl_connection(SSL_CTX *ctx)
 
   this->_ssl = std::move(temp_ssl);
 
-  this->_bindSSLObject();
+  this->_bind_ssl_object();
 }
 
 void
-SSLNetVConnection::_bindSSLObject()
+SSLNetVConnection::_bind_ssl_object()
 {
   SSLNetVCAttach(this->_ssl.get(), this);
   TLSBasicSupport::bind(this->_ssl.get(), this);
@@ -390,7 +390,7 @@ SSLNetVConnection::_parse_proxy_protocol(IOBufferReader *reader)
 }
 
 //
-// Notify the consumer of an event. Notification only -- called solely from _signalAndReclaim,
+// Notify the consumer of an event. Notification only -- called solely from _signal_and_reclaim,
 // which fuses the paired reclaim.
 //
 void
@@ -413,10 +413,10 @@ SSLNetVConnection::_signal_user(SignalSide side, int event)
       // A terminal event with no live consumer to hand it to: the consumer is gone (severed by a
       // prior do_io_close) or never attached, so nobody will call do_io_close to drive the free.
       // Own the close here -- master's read_signal_and_update sets `closed = 1` in exactly this
-      // case (UnixNetVConnection.cc). _signalAndReclaim's fused reclaim then reaps this VC on
+      // case (UnixNetVConnection.cc). _signal_and_reclaim's fused reclaim then reaps this VC on
       // the unwind.
       Dbg(dbg_ctl_inactivity_cop, "%s event %d: null vio cont, closing vc %p", side_str, event, this);
-      _authorizeReclaim();
+      _authorize_reclaim();
       break;
     default:
       // A delivery aimed at a consumer that's already gone (severed cont, or a mutex that no
@@ -432,7 +432,7 @@ SSLNetVConnection::_signal_user(SignalSide side, int event)
   --recursion;
 }
 
-// Consumer-driven teardown reclaim: the reclaim half of _signalAndReclaim, called bare only on
+// Consumer-driven teardown reclaim: the reclaim half of _signal_and_reclaim, called bare only on
 // the no-notify teardown paths. The outer VC frees ONLY when its
 // consumer has requested the close (RECLAIMABLE, entered by do_io_close or the null-cont
 // owner-close) -- never merely because the SSL state went terminal. A terminal _sslState gates
@@ -440,13 +440,13 @@ SSLNetVConnection::_signal_user(SignalSide side, int event)
 // not on SSL_HANDSHAKE_ERROR). The physical free lives here rather than in the NetHandler because
 // the layered outer VC is not NetHandler-managed. Deferred while a frame still needs `this`:
 // recursion > 0 (our own notify reentrancy or an OpenSSL callback frame), a graceful drain in
-// flight (_isDraining -- the drain machinery owns that free), or a handshake hook parked
+// flight (_is_draining -- the drain machinery owns that free), or a handshake hook parked
 // (is_invoked_state -- the plugin holds a live ref and will reenable). Returns true when it
 // reclaimed; the caller must touch nothing afterward.
 bool
-SSLNetVConnection::_reclaimIfClosed()
+SSLNetVConnection::_reclaim_if_closed()
 {
-  if (_sslState == SslState::RECLAIMABLE && !_freeBlocked()) {
+  if (_sslState == SslState::RECLAIMABLE && !_free_blocked()) {
     /* BZ  31932 */
     ink_assert(thread == this_ethread());
     this->free_thread(this_ethread());
@@ -456,19 +456,19 @@ SSLNetVConnection::_reclaimIfClosed()
 }
 
 // The single choke point for notifying the consumer: every _signal_user is fused with its paired
-// _reclaimIfClosed here, on the same stack, so no call site can deliver an event and forget the
+// _reclaim_if_closed here, on the same stack, so no call site can deliver an event and forget the
 // reclaim. The reclaim runs only after _signal_user's recursion increment has unwound, so a
 // do_io_close the consumer made from inside its handler is honored on this very call rather than
 // deferred. If the event is terminal and the consumer is severed/absent, _signal_user's null-cont
 // owner-close arms RECLAIMABLE and the fused reclaim frees `this` right here. RECLAIMED means
 // `this` (and everything it owns) is gone: the caller must touch no member and unwind
 // immediately. Callers that unwind immediately on either outcome may (void)-discard the result.
-// Teardown paths that must not notify keep calling _reclaimIfClosed directly.
+// Teardown paths that must not notify keep calling _reclaim_if_closed directly.
 SSLNetVConnection::SignalOutcome
-SSLNetVConnection::_signalAndReclaim(SignalSide side, int event)
+SSLNetVConnection::_signal_and_reclaim(SignalSide side, int event)
 {
   _signal_user(side, event);
-  return _reclaimIfClosed() ? SignalOutcome::RECLAIMED : SignalOutcome::ALIVE;
+  return _reclaim_if_closed() ? SignalOutcome::RECLAIMED : SignalOutcome::ALIVE;
 }
 
 bool
@@ -513,7 +513,7 @@ SSLNetVConnection::_handshake_done_side() const
 }
 
 void
-SSLNetVConnection::_releaseHandshakeReader()
+SSLNetVConnection::_release_handshake_reader()
 {
   // handShakeHolder is a second IOBufferReader on _read_buf, allocated by
   // initialize_handshake_buffers() for the inbound ClientHello replay / blind-tunnel handoff (only
@@ -528,7 +528,7 @@ SSLNetVConnection::_releaseHandshakeReader()
   // be needed so the rbio recycles and can stream bodies -- and read handshake flights -- larger
   // than one block.
   //
-  // This is the established-handshake release; _commitInboundHandshake drops it earlier (once the
+  // This is the established-handshake release; _commit_inbound_handshake drops it earlier (once the
   // hook FSM passes CLIENT_HELLO) for the common no-tunnel case. A FORWARD / PARTIAL_BLIND route
   // keeps it through the handshake and releases here.
   if (handShakeHolder != nullptr && getSSLHandShakeComplete() && get_tunnel_type() != SNIRoutingType::BLIND &&
@@ -539,7 +539,7 @@ SSLNetVConnection::_releaseHandshakeReader()
 }
 
 void
-SSLNetVConnection::_commitInboundHandshake()
+SSLNetVConnection::_commit_inbound_handshake()
 {
   // Inbound analog of master's update_rbio(!in_client_hello) + free_handshake_buffers()
   // (upstream net_read_io, SSLNetVConnection.cc:597-604): once the handshake-hook FSM has
@@ -556,10 +556,10 @@ SSLNetVConnection::_commitInboundHandshake()
   // after the SSL_RESTART (downgrade), blind-tunnel, terminated, and EVENT_ERROR early-returns. That is
   // where the round's SNI/cert hooks have already run and any tunnel/downgrade decision is
   // final -- the same knowledge master's line-604 position encodes. Evaluating the same state
-  // predicate from _releaseHandshakeReader's other call sites (pre-_advance_handshake, or the
+  // predicate from _release_handshake_reader's other call sites (pre-_advance_handshake, or the
   // write face) would release a round too early: a resumed parked client-hello hook can leave
   // the FSM at SNI before this round's SSL_accept runs the servername/cert hooks, one of which
-  // may still TSVConnTunnel -- and _handoffBlindTunnel would then replay a headless stream.
+  // may still TSVConnTunnel -- and _handoff_blind_tunnel would then replay a headless stream.
   //
   // Three gate conditions -- master's two plus the layered tunnel exclusion:
   //   - handShakeHolder != nullptr: master's first condition, and idempotent -- null after the
@@ -615,7 +615,7 @@ SSLNetVConnection::_commitInboundHandshake()
 SSLNetVConnection::HandshakeDriveOutcome
 SSLNetVConnection::_drive_handshake(TransportFace face)
 {
-  this->_trackFirstHandshake();
+  this->_track_first_handshake();
 
   int err = 0;
   int ret = _advance_handshake(err);
@@ -645,7 +645,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   // failed with the CLIENT_HELLO, there is no need to continue toward the origin with the
   // blind tunnel.
   if (ret != EVENT_ERROR && this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
-    _armPendingHandoff(PendingHandoff::BLIND_TUNNEL);
+    _arm_pending_handoff(PendingHandoff::BLIND_TUNNEL);
     return HandshakeDriveOutcome::YIELD;
   }
 
@@ -655,13 +655,13 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   // if the hook didn't force a fatal alert. None of the switch branches below check
   // _sslState, so routed through anything but the `case EVENT_ERROR` branch, a hook-flagged
   // error would otherwise be silently dropped here and only caught later by the scheduled
-  // fallback (_runDeferredWork's FATAL_PENDING rung). _advance_handshake() has already returned, so
+  // fallback (_run_deferred_work's FATAL_PENDING rung). _advance_handshake() has already returned, so
   // we are unconditionally outside any OpenSSL frame here -- always safe to deliver
   // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
   // more specific `err` to report.
   if (ret != EVENT_ERROR && _is_terminal(_sslState)) {
-    _consumeFatalFailure();
-    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    _consume_fatal_failure();
+    (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     return HandshakeDriveOutcome::FAILED;
   }
 
@@ -670,15 +670,15 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     lerrno = err;
     // Set the state before signalling: the fused reclaim may free this VC, so the member write
     // must happen first. The stores differ by face, historically: the write face latches
-    // TERMINATED unconditionally (_failHandshake -- the terminated state also lets a
+    // TERMINATED unconditionally (_fail_handshake -- the terminated state also lets a
     // consumer-less delivery owner-close), while the read face only consumes an already-armed
     // reject and otherwise leaves the state for the consumer's close to move.
     if (face == TransportFace::WRITE) {
-      _failHandshake();
+      _fail_handshake();
     } else {
-      _consumeFatalFailure();
+      _consume_fatal_failure();
     }
-    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     return HandshakeDriveOutcome::FAILED;
 
   case SSL_HANDSHAKE_WANT_READ:
@@ -701,7 +701,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
         if (_transport_state == TransportState::READ_EOS || lerrno == 0) {
           lerrno = EPIPE;
         }
-        (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+        (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
         return HandshakeDriveOutcome::FAILED;
       }
       if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
@@ -711,7 +711,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
         if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
           Dbg(dbg_ctl_ssl, "ssl handshake for vc %p, expired, release the connection", this);
           lerrno = ETIMEDOUT;
-          (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+          (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
           return HandshakeDriveOutcome::FAILED;
         }
       }
@@ -719,14 +719,14 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       // has passed the client-hello stage, TLS termination is committed -- release the
       // ClientHello holder so the (possibly large) inbound flight streams unpinned. See the
       // method: this is the only safe call site for the inbound release.
-      _commitInboundHandshake();
+      _commit_inbound_handshake();
     }
     _transport_read_vio->reenable();
     if (face == TransportFace::READ) {
       // The round produced ciphertext to send (our flight answering this one). Read-face rounds
       // flush it here; write-face rounds never did -- the transport write drive that invoked
       // them drains _write_buf on its own.
-      _flushStagedCiphertext();
+      _flush_staged_ciphertext();
     }
     return HandshakeDriveOutcome::YIELD;
 
@@ -751,7 +751,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       if (_user_write_vio.ntodo() <= 0) {
         // Read side is on purpose (the historical write-face completion contract, pinned by
         // the write-face-first reducer case).
-        (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
+        (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_WRITE_COMPLETE);
       }
       return HandshakeDriveOutcome::YIELD;
     }
@@ -759,7 +759,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // Wake whoever is waiting on handshake completion (_handshake_done_side says who listens
     // where): the zero-byte read probe takes READ_COMPLETE.
     if (auto side = _handshake_done_side(); side == SignalSide::READ) {
-      if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE) == SignalOutcome::RECLAIMED) {
+      if (_signal_and_reclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE) == SignalOutcome::RECLAIMED) {
         return HandshakeDriveOutcome::YIELD;
       }
     } else if (side == SignalSide::WRITE && _write_buf_reader->read_avail() == 0) {
@@ -769,11 +769,11 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       // transport write drive). TLS-1.3 and TLS-1.2 resumption complete with the client
       // flight still in the wbio and stay on that flush path. Deliver the write-side wakeup
       // directly so the connect does not strand to its timeout.
-      if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
+      if (_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
         return HandshakeDriveOutcome::YIELD;
       }
     }
-    _flushStagedCiphertext();
+    _flush_staged_ciphertext();
     if (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get()))) {
       // There is data in the read buffer, so continue reading
       Dbg(dbg_ctl_ssl, "data in read buffer after handshake for vc %p, continuing to read", this);
@@ -786,52 +786,52 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // A handshake hook has genuinely parked: the driver returned here because the plugin owns
     // control and will reenable_with_event later. Record it so a consumer-driven close arriving
     // while it is parked (a transport error/timeout to the trampoline) does not free the VC out
-    // from under the plugin's pending reenable -- do_io_close's close hook (_runTlsCloseHooks)
+    // from under the plugin's pending reenable -- do_io_close's close hook (_run_tls_close_hooks)
     // advances the hook FSM to DONE, so is_invoked_state() alone can no longer witness the
     // hold. Cleared in reenable_with_event. (A synchronous TSVConnAbort fails the handshake instead of
     // parking, so it never reaches here and its teardown is not blocked.)
     // Key on is_invoked_state(): a hook that reenabled synchronously already cleared
     // _hook_parked and advanced the FSM, so re-latching here would leave a stale hold that
     // blocks the free forever (a leak now that every free site honors _hook_parked); the
-    // patched-OpenSSL cert-load wait (_classifyServerHandshakeError's SNI/cert arm) also
+    // patched-OpenSSL cert-load wait (_classify_server_handshake_error's SNI/cert arm) also
     // lands here with no hook invoked, so it must not latch either.
     if (is_invoked_state()) {
       _hook_parked = true;
     }
     // Flush any handshake ciphertext already produced (a partial flight) so the transport
     // drains it and re-drives.
-    _flushStagedCiphertext();
+    _flush_staged_ciphertext();
     return HandshakeDriveOutcome::YIELD;
 
   case SSL_WAIT_FOR_PREAMBLE:
     Dbg(dbg_ctl_ssl, "ssl wait for outbound preamble for vc %p", this);
-    // The outbound PROXY preamble is not fully staged yet (_prepareClientHandshake). Unlike
+    // The outbound PROXY preamble is not fully staged yet (_prepare_client_handshake). Unlike
     // SSL_WAIT_FOR_HOOK no hook is parked and no plugin reenable is coming, so nothing may
     // latch _hook_parked. Flush what was staged so the transport drains it; the consumer
     // supplying the rest of the preamble (or the transport write drive) re-enters the
     // handshake, still in HANDSHAKE_HOOKS_PRE.
-    _flushStagedCiphertext();
+    _flush_staged_ciphertext();
     return HandshakeDriveOutcome::YIELD;
 
   case SSL_WAIT_FOR_ASYNC:
     Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
     // Handshake suspended on the server private-key async op. The async wait-fd resume
-    // (handle_async_tls_ready -> _runDeferredWork -> _drive_ssl_read) re-drives the
+    // (handle_async_tls_ready -> _run_deferred_work -> _drive_ssl_read) re-drives the
     // handshake. Flush any handshake ciphertext already produced into _write_buf -- a true
     // reenable-with-bytes, so it respects the write-backpressure invariant.
-    _flushStagedCiphertext();
+    _flush_staged_ciphertext();
     return HandshakeDriveOutcome::YIELD;
 
   default:
     // EVENT_CONT: the round paused without a latchable park (the client-hello callback park
-    // latches _hook_parked inside _classifyServerHandshakeError) -- an SNI/cert pause, or a
+    // latches _hook_parked inside _classify_server_handshake_error) -- an SNI/cert pause, or a
     // patched-OpenSSL lookup wait. Historical face split, preserved: the read face flushes any
     // produced ciphertext and waits for the transport; the write face re-arms its transport
     // write unconditionally.
     if (face == TransportFace::WRITE) {
       _transport_write_vio->reenable();
     } else {
-      _flushStagedCiphertext();
+      _flush_staged_ciphertext();
     }
     return HandshakeDriveOutcome::YIELD;
   }
@@ -844,7 +844,7 @@ SSLNetVConnection::_drive_ssl_read()
 {
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _drive_ssl_read called", this);
   ink_release_assert(HttpProxyPort::TRANSPORT_BLIND_TUNNEL != this->attributes);
-  _releaseHandshakeReader();
+  _release_handshake_reader();
 
   // Lock the user read VIO's mutex when a consumer has attached (so we can signal it safely);
   // otherwise -- the outbound handshake reads the ServerHello before any consumer calls
@@ -860,7 +860,7 @@ SSLNetVConnection::_drive_ssl_read()
   // If the key renegotiation failed it's over, just signal the error and finish.
   if (sslClientRenegotiationAbort == true) {
     lerrno = -ENET_SSL_FAILED;
-    (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_ERROR);
     Dbg(dbg_ctl_ssl, "client renegotiation setting read signal error");
     return;
   }
@@ -916,21 +916,21 @@ SSLNetVConnection::_drive_ssl_read()
   // write face idle nothing else re-arms it -- the peer would wait forever for bytes stranded
   // in the wbio (a renegotiating client hangs instead of receiving the prompt refusal master
   // sent). Flush them before the delivery below signals the user, which may free this VC.
-  _flushStagedCiphertext();
+  _flush_staged_ciphertext();
 
-  _deliverReadResult(batch);
+  _deliver_read_result(batch);
 }
 
-// The read-face delivery mirror of _deliverWriteComplete: route the pump batch's outcome to
+// The read-face delivery mirror of _deliver_write_complete: route the pump batch's outcome to
 // the consumer -- READ_READY for delivered bytes, then the terminal/would-block arms. Any
 // delivered signal may free `this` (the fused reclaim, or a consumer's in-handler close), so
 // the caller must invoke this in tail position and touch nothing afterwards.
 void
-SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
+SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
 {
   if (batch.bytes > 0) {
     if (batch.event == SSL_READ_WOULD_BLOCK || batch.event == SSL_READ_READY) {
-      if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_READY) == SignalOutcome::RECLAIMED) {
+      if (_signal_and_reclaim(SignalSide::READ, VC_EVENT_READ_READY) == SignalOutcome::RECLAIMED) {
         Dbg(dbg_ctl_ssl, "read signal reclaimed the vc");
         return;
       }
@@ -959,7 +959,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
     if (!_deferred_work_pending() && _read_drive_warranted() && _user_read_vio.buffer.writer() != nullptr &&
         _user_read_vio.buffer.writer()->write_avail() > 0) {
-      _scheduleDeferredWork(this_ethread());
+      _schedule_deferred_work(this_ethread());
     } else {
       _transport_read_vio->reenable();
     }
@@ -985,10 +985,10 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
       // this path so a consumer that attaches or re-enables later still observes it.
       if (_transport_state == TransportState::TRANSPORT_ERROR) {
         Dbg(dbg_ctl_ssl, "read would block but transport errored - signalling ERROR vc %p", this);
-        (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_ERROR);
+        (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_ERROR);
       } else {
         Dbg(dbg_ctl_ssl, "read would block but transport closed - signalling EOS vc %p", this);
-        (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_EOS);
+        (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_EOS);
       }
     } else {
       _transport_read_vio->reenable();
@@ -1000,7 +1000,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
     // close the connection if we have SSL_READ_EOS, this is the return value from
     // _decrypt_data_from_transport() if we get an SSL_ERROR_ZERO_RETURN from SSL_get_error()
     // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
-    (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_EOS);
+    (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_EOS);
 
     if (batch.bytes > 0) {
       Dbg(dbg_ctl_ssl, "read finished - EOS");
@@ -1010,7 +1010,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
     break;
   case SSL_READ_COMPLETE:
     Dbg(dbg_ctl_ssl, "read finished - signal done");
-    (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE);
+    (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE);
     break;
   case SSL_READ_ERROR:
     Dbg(dbg_ctl_ssl, "read finished - read error");
@@ -1022,7 +1022,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
     // SSL-layer error (batch.error == 0) to -ENET_SSL_FAILED so HttpSM/ConnectingEntry does not
     // read lerrno == 0 as "no error" (master _readSignalError parity).
     this->lerrno = batch.error ? batch.error : -ENET_SSL_FAILED;
-    (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_ERROR);
     break;
   }
 }
@@ -1031,7 +1031,7 @@ SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
 // the wbio (_write_buf) until `towrite`, the record-size policy, or the ciphertext water mark
 // stops it, and returns the whole outcome as one EncryptBatch. The caller advances
 // _user_write_vio.ndone by plaintext_consumed (`buf` is not always the user write VIO's --
-// see _encryptFinalPlaintext).
+// see _encrypt_final_plaintext).
 SSLNetVConnection::EncryptBatch
 SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf)
 {
@@ -1206,13 +1206,13 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc) : SSLNetVConnecti
 // A consumer may close right after queuing a final plaintext write (e.g. an HTTP/2 GOAWAY
 // frame) via do_io_write()+reenable(), without waiting for WRITE_COMPLETE. The graceful-close
 // drain (ClosePlan::DRAIN) only looks at already-encrypted ciphertext, and the VIO sever
-// (_detachConsumerVios) discards the plaintext, so that final write would otherwise be silently
+// (_detach_consumer_vios) discards the plaintext, so that final write would otherwise be silently
 // dropped. Encrypt it now, synchronously and without signalling the consumer, before the sever
-// and before _queueCloseNotifyOrQuietShutdown (SSL_write() is invalid once SSL_shutdown() has
+// and before _queue_close_notify_or_quiet_shutdown (SSL_write() is invalid once SSL_shutdown() has
 // run). Only a graceful close (lerrno == -1) of an established session with a write in flight
 // and a usable transport has anything to save.
 void
-SSLNetVConnection::_encryptFinalPlaintext(int lerrno)
+SSLNetVConnection::_encrypt_final_plaintext(int lerrno)
 {
   if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable() &&
       getSSLHandShakeComplete() && _user_write_active()) {
@@ -1233,7 +1233,7 @@ SSLNetVConnection::_encryptFinalPlaintext(int lerrno)
 // VC does the same (UnixNetVConnection::do_io_close sets op = NONE); _signal_user's null-cont
 // branch absorbs the late signals.
 void
-SSLNetVConnection::_detachConsumerVios()
+SSLNetVConnection::_detach_consumer_vios()
 {
   _user_read_vio.cont    = nullptr;
   _user_read_vio.op      = VIO::NONE;
@@ -1248,7 +1248,7 @@ SSLNetVConnection::_detachConsumerVios()
 // to HANDSHAKE_HOOKS_DONE, so after this point is_invoked_state() can no longer witness a
 // parked handshake hook -- that hold survives only in _hook_parked (see its declaration).
 void
-SSLNetVConnection::_runTlsCloseHooks()
+SSLNetVConnection::_run_tls_close_hooks()
 {
   if (get_context() == NET_VCONNECTION_OUT) {
     callHooks(TS_EVENT_VCONN_OUTBOUND_CLOSE);
@@ -1261,7 +1261,7 @@ SSLNetVConnection::_runTlsCloseHooks()
 // nothing reaches the wire until the transport flushes it (ClosePlan::DRAIN's reenable) -- or,
 // when the transport cannot take bytes, arm OpenSSL's quiet shutdown instead.
 void
-SSLNetVConnection::_queueCloseNotifyOrQuietShutdown()
+SSLNetVConnection::_queue_close_notify_or_quiet_shutdown()
 {
   int shutdown_mode = SSL_get_shutdown(this->_ssl.get());
   Dbg(dbg_ctl_ssl_shutdown, "previous shutdown state 0x%x", shutdown_mode);
@@ -1300,16 +1300,16 @@ SSLNetVConnection::_queueCloseNotifyOrQuietShutdown()
 }
 
 // Which of the three close exits this close takes. Selection only -- no side effects -- so
-// "which exit does a given close take" is checkable against this one body; _applyClosePlan
+// "which exit does a given close take" is checkable against this one body; _apply_close_plan
 // executes the choice.
 SSLNetVConnection::ClosePlan
-SSLNetVConnection::_selectClosePlan(int lerrno, EThread *t) const
+SSLNetVConnection::_select_close_plan(int lerrno, EThread *t) const
 {
   // Graceful close of a layered (TLS-terminated) connection. The consumer typically closes
   // us re-entrantly from its WRITE_COMPLETE handler, which runs on the inner transport's
   // net_write_io stack. That net_write_io keeps running to its tail after this returns
   // (write_signal_and_update ignores handler return values), dereferencing _write_buf's
-  // reader; and _queueCloseNotifyOrQuietShutdown may have queued a close-notify still to
+  // reader; and _queue_close_notify_or_quiet_shutdown may have queued a close-notify still to
   // flush. Freeing this VC (and that reader) inline -- directly, or via _signal_user's
   // terminated-state teardown -- would crash that live net_write_io. So defer teardown to a
   // clean stack and let the transport flush any close-notify first. The peer may have
@@ -1320,16 +1320,16 @@ SSLNetVConnection::_selectClosePlan(int lerrno, EThread *t) const
   }
 
   // Whether it's safe to free this VC right now, rather than on `lerrno` (which only ever
-  // reflects why the caller is closing us, not whether it's safe to act). _freeBlocked() covers
+  // reflects why the caller is closing us, not whether it's safe to act). _free_blocked() covers
   // the hazards that make an inline free unsafe: still nested in _signal_user's own call to a
-  // consumer (its unwind will free us instead -- see _applyClosePlan's DEFER arm) or inside an
+  // consumer (its unwind will free us instead -- see _apply_close_plan's DEFER arm) or inside an
   // OpenSSL callback frame (e.g. a plugin calling TSVConnAbort(vc, error) from an SSL hook mid
   // SSL_accept()/SSL_connect()) that must not have its _ssl freed out from under it (recursion),
   // a hook mid invocation (is_invoked_state), or a hook parked with a live plugin ref
   // (_hook_parked) -- a TSVConnAbort/close arriving while a hook is parked must not free the VC
   // before the plugin's reenable. When blocked, DEFER's scheduled dispatch completes the free
-  // via _reclaimIfClosed once the frame unwinds / the plugin reenables.
-  if (!_freeBlocked() && this->mutex->thread_holding == t) {
+  // via _reclaim_if_closed once the frame unwinds / the plugin reenables.
+  if (!_free_blocked() && this->mutex->thread_holding == t) {
     return ClosePlan::RECLAIM_NOW;
   }
   return ClosePlan::DEFER;
@@ -1338,52 +1338,52 @@ SSLNetVConnection::_selectClosePlan(int lerrno, EThread *t) const
 // Execute the chosen exit. DRAIN leaves the VC alive in the close-drain (every drain exit is
 // RECLAIMABLE; see the transition table). RECLAIM_NOW and DEFER authorize the reclaim first:
 // the consumer's close is what authorizes the physical free (consumer-driven teardown; see
-// _reclaimIfClosed) -- whether the free happens inline here, on a reclaim unwind, or at a
+// _reclaim_if_closed) -- whether the free happens inline here, on a reclaim unwind, or at a
 // deferred dispatch, it happens because of the close, not an error state.
 void
-SSLNetVConnection::_applyClosePlan(ClosePlan plan, int lerrno, EThread *t)
+SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
 {
   if (plan == ClosePlan::DRAIN) {
-    _beginGracefulShutdown();
+    _begin_graceful_shutdown();
     if (_write_buf_reader && _write_buf_reader->read_avail() > 0) {
       Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: draining %" PRId64 " buffered bytes before close vc %p",
           _write_buf_reader->read_avail(), this);
       _transport_write_vio->reenable();
     }
-    _scheduleDeferredWork(t);
+    _schedule_deferred_work(t);
     return;
   }
 
   Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: terminating (%s).", lerrno == -1 ? "close" : "abort");
-  _authorizeReclaim();
+  _authorize_reclaim();
 
   if (plan == ClosePlan::RECLAIM_NOW) {
     this->free_thread(t);
   } else {
     // Not safe to free inline. If we're nested in _signal_user's own reentrancy, its unwind's
-    // _reclaimIfClosed will free us first and the destructor will harmlessly cancel this scheduled
+    // _reclaim_if_closed will free us first and the destructor will harmlessly cancel this scheduled
     // dispatch. If we're nested in an OpenSSL frame instead, nothing else will free us -- the
     // scheduled dispatch's RECLAIMABLE rung does it once that frame has returned.
-    _scheduleDeferredWork(t);
+    _schedule_deferred_work(t);
   }
 }
 
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
-  _encryptFinalPlaintext(lerrno);
-  _detachConsumerVios();
+  _encrypt_final_plaintext(lerrno);
+  _detach_consumer_vios();
 
   if (this->_ssl.get() != nullptr) {
-    _runTlsCloseHooks();
+    _run_tls_close_hooks();
     if (getSSLHandShakeComplete()) {
-      _queueCloseNotifyOrQuietShutdown();
+      _queue_close_notify_or_quiet_shutdown();
     }
   }
 
   EThread *t = this_ethread();
 
-  _applyClosePlan(_selectClosePlan(lerrno, t), lerrno, t);
+  _apply_close_plan(_select_close_plan(lerrno, t), lerrno, t);
 }
 
 void
@@ -1408,7 +1408,7 @@ SSLNetVConnection::free_thread(EThread *t)
 // try-lock recurses and the close is still inline. If the lock is unavailable the close
 // still defers to the cop.
 void
-SSLNetVConnection::_closeTransport(UnixNetVConnection *transport)
+SSLNetVConnection::_close_transport(UnixNetVConnection *transport)
 {
   if (transport->nh != nullptr && transport->nh->thread == this_ethread()) {
     MUTEX_TRY_LOCK(lock, transport->nh->mutex, this_ethread());
@@ -1510,7 +1510,7 @@ SSLNetVConnection::~SSLNetVConnection()
   free_handshake_buffers();
 
   if (_unvc != nullptr) {
-    _closeTransport(_unvc);
+    _close_transport(_unvc);
     _unvc = nullptr;
   }
 }
@@ -1520,7 +1520,7 @@ SSLNetVConnection::~SSLNetVConnection()
 // with a live _ssl, EVENT_DONE when a transparent per-IP OPT_TUNNEL converts the connection to
 // a blind tunnel instead (no SSL object is built), or EVENT_ERROR.
 int
-SSLNetVConnection::_setupServerSSL()
+SSLNetVConnection::_setup_server_ssl()
 {
   ink_assert(this->_ssl.get() == nullptr);
 
@@ -1553,7 +1553,7 @@ SSLNetVConnection::_setupServerSSL()
   if (cc && SSLCertContextOption::OPT_TUNNEL == cc->opt) {
     if (this->is_transparent) {
       this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-      _completeHandshakeIfActive();
+      _complete_handshake_if_active();
       this->_ssl = nullptr;
       return EVENT_DONE;
     } else {
@@ -1577,7 +1577,7 @@ SSLNetVConnection::_setupServerSSL()
 // _advance_handshake call site, asserted here). Returns EVENT_CONT with a live _ssl, or
 // EVENT_ERROR.
 int
-SSLNetVConnection::_setupClientSSL()
+SSLNetVConnection::_setup_client_ssl()
 {
   ink_assert(this->_ssl.get() == nullptr);
 
@@ -1710,11 +1710,11 @@ SSLNetVConnection::_advance_handshake(int &err)
     return EVENT_ERROR;
   }
   // The handshake begin time and its inactivity timeout are recorded/installed together in
-  // _trackFirstHandshake(), which every caller runs before reaching here.
+  // _track_first_handshake(), which every caller runs before reaching here.
   ink_assert(get_context() == NET_VCONNECTION_IN || get_context() == NET_VCONNECTION_OUT);
   if (get_context() == NET_VCONNECTION_OUT) {
     if (this->_ssl.get() == nullptr) {
-      if (int setup = _setupClientSSL(); setup != EVENT_CONT) {
+      if (int setup = _setup_client_ssl(); setup != EVENT_CONT) {
         return setup;
       }
     }
@@ -1722,7 +1722,7 @@ SSLNetVConnection::_advance_handshake(int &err)
   }
 
   if (this->_ssl.get() == nullptr) {
-    if (int setup = _setupServerSSL(); setup != EVENT_CONT) {
+    if (int setup = _setup_server_ssl(); setup != EVENT_CONT) {
       return setup;
     }
   }
@@ -1734,7 +1734,7 @@ SSLNetVConnection::_advance_handshake(int &err)
 // the driver must return SSL_WAIT_FOR_HOOK; the plugin's reenable_with_event re-drives the
 // round.
 bool
-SSLNetVConnection::_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState pre_state)
+SSLNetVConnection::_step_pre_handshake_hooks(TLSEventSupport::SSLHandshakeHookState pre_state)
 {
   // Continue on if we are in the invoked state.  The hook has not yet reenabled
   if (this->is_invoked_state()) {
@@ -1753,10 +1753,10 @@ SSLNetVConnection::_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState
 // ALPN, then ALPN is preferred since it is the server's preference; the server preference
 // would not be meaningful if we let the client preference have priority. The query is pure
 // (get0 accessors), so running it ahead of the role-specific completion steps is inert;
-// recording and endpoint selection differ by role and stay in _completeServerHandshake /
-// _completeClientHandshake.
+// recording and endpoint selection differ by role and stay in _complete_server_handshake /
+// _complete_client_handshake.
 SSLNetVConnection::NegotiatedProtocol
-SSLNetVConnection::_finishHandshakeCommon()
+SSLNetVConnection::_finish_handshake_common()
 {
   if (dbg_ctl_ssl.on()) {
 #ifdef OPENSSL_IS_OPENSSL3
@@ -1794,7 +1794,7 @@ SSLNetVConnection::_finishHandshakeCommon()
 // no header expected, or it was stripped; SSL_HANDSHAKE_WANT_READ: header still incomplete;
 // EVENT_ERROR: malformed.
 int
-SSLNetVConnection::_stripInboundProxyProtocol()
+SSLNetVConnection::_strip_inbound_proxy_protocol()
 {
   if (!this->get_is_proxy_protocol() || this->get_proxy_protocol_version() != ProxyProtocolVersion::UNDEFINED) {
     return EVENT_CONT;
@@ -1826,9 +1826,9 @@ SSLNetVConnection::_stripInboundProxyProtocol()
 // PROXY-protocol strip, and arming async handshake mode. EVENT_CONT proceeds into SSL_accept;
 // anything else is the round's verdict.
 int
-SSLNetVConnection::_prepareServerHandshake()
+SSLNetVConnection::_prepare_server_handshake()
 {
-  if (_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE)) {
+  if (_step_pre_handshake_hooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE)) {
     return SSL_WAIT_FOR_HOOK;
   }
 
@@ -1846,14 +1846,14 @@ SSLNetVConnection::_prepareServerHandshake()
     // over the buffered handshake packets to the O.S.
     return EVENT_DONE;
   } else if (SslVConnOp::SSL_HOOK_OP_TERMINATE == hookOpRequested) {
-    _completeHandshakeIfActive();
+    _complete_handshake_if_active();
     return EVENT_DONE;
   }
 
   Dbg(dbg_ctl_ssl, "Go on with the handshake state=%s",
       TLSEventSupport::get_ssl_handshake_hook_state_name(this->get_handshake_hook_state()));
 
-  if (int strip = _stripInboundProxyProtocol(); strip != EVENT_CONT) {
+  if (int strip = _strip_inbound_proxy_protocol(); strip != EVENT_CONT) {
     return strip;
   }
 
@@ -1880,7 +1880,7 @@ SSLNetVConnection::_prepareServerHandshake()
 // engine's wait fd on the first WANT_ASYNC suspension (handle_async_tls_ready resumes off it),
 // and under async mode make sure a WANT_READ leaves the transport read VIO armed.
 void
-SSLNetVConnection::_updateAsyncWaitState(ssl_error_t ssl_error)
+SSLNetVConnection::_update_async_wait_state(ssl_error_t ssl_error)
 {
   if (ssl_error == SSL_ERROR_WANT_ASYNC) {
     // Do we need to set up the async eventfd?  Or is it already registered?
@@ -1914,15 +1914,15 @@ SSLNetVConnection::_updateAsyncWaitState(ssl_error_t ssl_error)
 // to tell a real ClientHello (0x16) from plain HTTP (allow-plain / tr-pass). Read it through
 // handShakeHolder, whose position IS the byte that would be replayed to a plain/tunnel
 // successor: _read_buf->buf() returns the write block's base, which after a stripped PROXY
-// header (consumed from the holder by _stripInboundProxyProtocol) is the header's first byte,
+// header (consumed from the holder by _strip_inbound_proxy_protocol) is the header's first byte,
 // not the client's. The holder != nullptr guard also means we never sniff after
-// _commitInboundHandshake has released it -- once TLS is committed the head block recycles and
+// _commit_inbound_handshake has released it -- once TLS is committed the head block recycles and
 // buf()[0] would be mid-stream ciphertext, which could spuriously arm a DOWNGRADE_PLAIN whose
 // executor dereferences the (now null) holder. Engaged, the value is the driver's verdict
 // (SSL_RESTART for the deferred allow-plain downgrade, EVENT_CONT after flipping to a tr-pass
-// blind tunnel); nullopt leaves the failure to _classifyServerHandshakeError.
+// blind tunnel); nullopt leaves the failure to _classify_server_handshake_error.
 std::optional<int>
-SSLNetVConnection::_fallbackToPlainOrTunnel()
+SSLNetVConnection::_fallback_to_plain_or_tunnel()
 {
   if (handShakeHolder != nullptr && handShakeHolder->is_read_avail_more_than(0)) {
     char *buf = handShakeHolder->start();
@@ -1934,7 +1934,7 @@ SSLNetVConnection::_fallbackToPlainOrTunnel()
         // The leading bytes are not a ClientHello: convert this connection to a UnixNetVC and
         // hand the buffered packet to HTTP processing -- the same deferred handoff the blind
         // tunnel uses.
-        _armPendingHandoff(PendingHandoff::DOWNGRADE_PLAIN);
+        _arm_pending_handoff(PendingHandoff::DOWNGRADE_PLAIN);
         return SSL_RESTART;
       } else if (getTransparentPassThrough()) {
         // start a blind tunnel if tr-pass is set and data does not look like ClientHello
@@ -1952,11 +1952,11 @@ SSLNetVConnection::_fallbackToPlainOrTunnel()
 // Server complete phase: handshake timing stats, drop the downgrade buffer, endpoint selection
 // off the negotiated protocol (forced to HTTP/1.1 under SNI routing), async-mode teardown.
 int
-SSLNetVConnection::_completeServerHandshake()
+SSLNetVConnection::_complete_server_handshake()
 {
-  NegotiatedProtocol negotiated = _finishHandshakeCommon();
+  NegotiatedProtocol negotiated = _finish_handshake_common();
 
-  _completeHandshakeIfActive();
+  _complete_handshake_if_active();
 
   if (this->get_tls_handshake_begin_time()) {
     this->_record_tls_handshake_end_time();
@@ -1965,7 +1965,7 @@ SSLNetVConnection::_completeServerHandshake()
 
   // We're fully SSL now, so we can throw away the downgrade buffer (the read-path handshake
   // driver may already have released it once ClientHello/SNI processing was past -- see
-  // _releaseHandshakeReader).
+  // _release_handshake_reader).
   if (this->handShakeHolder != nullptr) {
     this->handShakeHolder->dealloc();
     this->handShakeHolder = nullptr;
@@ -2008,7 +2008,7 @@ SSLNetVConnection::_completeServerHandshake()
 // SSL_WAIT_FOR_HOOK without a hook necessarily invoked; everything unrecognized is a failed
 // handshake.
 int
-SSLNetVConnection::_classifyServerHandshakeError(ssl_error_t ssl_error)
+SSLNetVConnection::_classify_server_handshake_error(ssl_error_t ssl_error)
 {
   switch (ssl_error) {
   case SSL_ERROR_WANT_CONNECT:
@@ -2079,25 +2079,25 @@ SSLNetVConnection::_classifyServerHandshakeError(ssl_error_t ssl_error)
 int
 SSLNetVConnection::sslServerHandShakeEvent(int &err)
 {
-  if (int prep = _prepareServerHandshake(); prep != EVENT_CONT) {
+  if (int prep = _prepare_server_handshake(); prep != EVENT_CONT) {
     return prep;
   }
 
   ssl_error_t ssl_error = this->_ssl_accept();
 #if TS_USE_TLS_ASYNC
-  _updateAsyncWaitState(ssl_error);
+  _update_async_wait_state(ssl_error);
 #endif
 
   if (ssl_error == SSL_ERROR_NONE) {
-    return _completeServerHandshake();
+    return _complete_server_handshake();
   }
 
   err = errno;
   SSLVCDebug(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
-  if (std::optional<int> verdict = _fallbackToPlainOrTunnel(); verdict.has_value()) {
+  if (std::optional<int> verdict = _fallback_to_plain_or_tunnel(); verdict.has_value()) {
     return *verdict;
   }
-  return _classifyServerHandshakeError(ssl_error);
+  return _classify_server_handshake_error(ssl_error);
 }
 
 // Outbound PROXY-protocol step. The v1/v2 preamble must reach the origin as cleartext, ahead
@@ -2108,7 +2108,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 // is-a UnixNetVConnection.) False while the consumer's write VIO has not yet supplied the
 // full preamble.
 bool
-SSLNetVConnection::_stageOutboundProxyProtocol()
+SSLNetVConnection::_stage_outbound_proxy_protocol()
 {
   VIO    &vio     = this->_user_write_vio;
   int64_t towrite = std::min(vio.ntodo(), vio.get_reader()->read_avail());
@@ -2125,11 +2125,11 @@ SSLNetVConnection::_stageOutboundProxyProtocol()
 // outbound chain, run the outbound pre-handshake hooks. EVENT_CONT proceeds into SSL_connect;
 // anything else is the round's verdict.
 int
-SSLNetVConnection::_prepareClientHandshake()
+SSLNetVConnection::_prepare_client_handshake()
 {
   // Initialize properly for a client connection
   if (this->get_handshake_hook_state() == TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_PRE) {
-    if (this->pp_info.version != ProxyProtocolVersion::UNDEFINED && !_stageOutboundProxyProtocol()) {
+    if (this->pp_info.version != ProxyProtocolVersion::UNDEFINED && !_stage_outbound_proxy_protocol()) {
       // Preamble not fully buffered yet; the caller flushes _write_buf, then re-drives
       // the handshake (still in HANDSHAKE_HOOKS_PRE) to stage the remainder.
       return SSL_WAIT_FOR_PREAMBLE;
@@ -2139,7 +2139,7 @@ SSLNetVConnection::_prepareClientHandshake()
   }
 
   // Do outbound hook processing here
-  if (_stepPreHandshakeHooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_OUTBOUND_PRE)) {
+  if (_step_pre_handshake_hooks(TLSEventSupport::SSLHandshakeHookState::HANDSHAKE_HOOKS_OUTBOUND_PRE)) {
     return SSL_WAIT_FOR_HOOK;
   }
   return EVENT_CONT;
@@ -2147,9 +2147,9 @@ SSLNetVConnection::_prepareClientHandshake()
 
 // Client complete phase: record the negotiated protocol and mark the handshake done.
 int
-SSLNetVConnection::_completeClientHandshake()
+SSLNetVConnection::_complete_client_handshake()
 {
-  NegotiatedProtocol negotiated = _finishHandshakeCommon();
+  NegotiatedProtocol negotiated = _finish_handshake_common();
 
   // Make note of the negotiated protocol
   Dbg(dbg_ctl_ssl_alpn, "Negotiated ALPN: %.*s", negotiated.len, negotiated.proto);
@@ -2157,7 +2157,7 @@ SSLNetVConnection::_completeClientHandshake()
 
   Metrics::Counter::increment(ssl_rsb.total_success_handshake_count_out);
 
-  _completeHandshakeIfActive();
+  _complete_handshake_if_active();
   return EVENT_DONE;
 }
 
@@ -2165,7 +2165,7 @@ SSLNetVConnection::_completeClientHandshake()
 // (client-hello callback, X509 lookup, connect) fall through to EVENT_CONT: the round paused
 // with no latchable park. `err` is written on the terminal arms only.
 int
-SSLNetVConnection::_classifyClientHandshakeError(ssl_error_t ssl_error, int &err)
+SSLNetVConnection::_classify_client_handshake_error(ssl_error_t ssl_error, int &err)
 {
   switch (ssl_error) {
   case SSL_ERROR_WANT_WRITE:
@@ -2231,16 +2231,16 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 {
   ink_assert(TLSBasicSupport::getInstance(this->_ssl.get()) == this);
 
-  if (int prep = _prepareClientHandshake(); prep != EVENT_CONT) {
+  if (int prep = _prepare_client_handshake(); prep != EVENT_CONT) {
     return prep;
   }
 
   ssl_error_t ssl_error = this->_ssl_connect();
 
   if (ssl_error == SSL_ERROR_NONE) {
-    return _completeClientHandshake();
+    return _complete_client_handshake();
   }
-  return _classifyClientHandshakeError(ssl_error, err);
+  return _classify_client_handshake_error(ssl_error, err);
 }
 
 void
@@ -2261,11 +2261,11 @@ SSLNetVConnection::reenable_with_event(int event)
     } else {
       // A hook failed the handshake: arm the reject and keep iterating hooks (the remaining
       // hooks of the chain must still see their event). The failure reaches the consumer
-      // exactly once, downstream (_consumeFatalFailure): a synchronous reenable (hook callout
+      // exactly once, downstream (_consume_fatal_failure): a synchronous reenable (hook callout
       // mid-SSL_connect/accept) via the unwinding handshake error path, an asynchronous one
-      // via the scheduled dispatch (_runDeferredWork). Signalling from here would let the
+      // via the scheduled dispatch (_run_deferred_work). Signalling from here would let the
       // consumer tear us down while the hook chain is still running.
-      _armFatalFailure();
+      _arm_fatal_failure();
     }
   }
 
@@ -2284,10 +2284,10 @@ SSLNetVConnection::reenable_with_event(int event)
   // no fresh socket data (e.g. a delayed cert/SNI/client-hello hook fires after
   // the ClientHello was already read). Schedule an out-of-line read-drive to
   // re-invoke the handshake, mirroring master's readReschedule()/net_read_io()
-  // pass. Use the home thread: a plugin may reenable from any thread. _runDeferredWork
+  // pass. Use the home thread: a plugin may reenable from any thread. _run_deferred_work
   // tears the VC down here if the reenable carried an error (terminated state).
   if (!getSSLHandShakeComplete()) {
-    _scheduleDeferredWork(this->thread);
+    _schedule_deferred_work(this->thread);
   }
 
   _transport_read_vio->reenable();
@@ -2475,9 +2475,9 @@ SSLNetVConnection::_lookupContextByName(const std::string &servername, SSLCertCo
   if (cc && ctx && SSLCertContextOption::OPT_TUNNEL == cc->opt && this->get_is_transparent()) {
     this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
     // A CLIENT_HELLO/SERVERNAME hook may have rejected earlier in this same SSL_accept flight
-    // (FATAL_PENDING). The reject outranks the tunnel (_completeHandshakeIfActive's guard): the
+    // (FATAL_PENDING). The reject outranks the tunnel (_complete_handshake_if_active's guard): the
     // dispatch delivers it instead of handing the rejected client a blind tunnel.
-    _completeHandshakeIfActive();
+    _complete_handshake_if_active();
     return nullptr;
   } else {
     return ctx;
@@ -2547,7 +2547,7 @@ SSLNetVConnection::set_ca_cert_file(std::string_view file, std::string_view dir)
  *
  * If the pooled connection already lives on the acquiring thread, reuse it in
  * place; the acquiring consumer's later do_io_read/do_io_write re-homes the VC's
- * mutex onto that consumer (see _adoptConsumerMutex).
+ * mutex onto that consumer (see _adopt_consumer_mutex).
  *
  * Otherwise migrate. The layered TLS VC owns no fd/epoll/NetHandler state of its
  * own -- all of that lives in the inner transport (_unvc) -- so we move the
@@ -2555,7 +2555,7 @@ SSLNetVConnection::set_ca_cert_file(std::string_view file, std::string_view dir)
  * SSLNetVConnection object. The SSL object and both MIOBuffer-backed BIOs are
  * thread-agnostic heap state and travel with us, including any buffered
  * ciphertext; only the transport VIOs (which lived in the now-closed inner VC)
- * must be re-armed (_wireTransportVIOs, exactly as startEvent wires them).
+ * must be re-armed (_wire_transport_vios, exactly as startEvent wires them).
  */
 NetVConnection *
 SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
@@ -2598,7 +2598,7 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
     _deferred_work_event = nullptr;
   }
   // Any write-rearm armed for the outgoing thread's net_write_io pass is meaningless on the
-  // new thread; the fire-time re-validation in _runDeferredWork would likely reject it anyway (the
+  // new thread; the fire-time re-validation in _run_deferred_work would likely reject it anyway (the
   // pool's do_io_write leaves the write VIO disabled), but clear it explicitly rather than
   // relying on that incidentally.
   _write_rearm_pending = false;
@@ -2613,7 +2613,7 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
   }
   _unvc = new_unvc;
 
-  _wireTransportVIOs();
+  _wire_transport_vios();
 
   this->thread = t;
 
@@ -2623,7 +2623,7 @@ SSLNetVConnection::migrateToCurrentThread(Continuation * /* cont */, EThread *t)
 }
 
 void
-SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread *t)
+SSLNetVConnection::_propagate_handshake_buffer(UnixNetVConnection *target, EThread *t)
 {
   // DOWNGRADE_PLAIN is only ever armed by the allow-plain sniff while the holder is present, and
   // the holder is not released after that (the release gate excludes a pending handoff). If this
@@ -2631,7 +2631,7 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
   // the plain successor.
   ink_release_assert(this->handShakeHolder != nullptr);
   Dbg(dbg_ctl_ssl, "allow-plain, handshake buffer ready to read=%" PRId64, this->handShakeHolder->read_avail());
-  _completeHandshakeIfActive();
+  _complete_handshake_if_active();
   // Take ownership of the handShake buffer
   NetState *s = &target->read;
   s->vio.set_writer(this->_read_buf.get());
@@ -2663,7 +2663,7 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
  * processed by the UnixNetVConnection logic
  */
 UnixNetVConnection *
-SSLNetVConnection::_downgradeToPlain()
+SSLNetVConnection::_downgrade_to_plain()
 {
   EThread    *t         = this_ethread();
   NetHandler *client_nh = get_NetHandler(t);
@@ -2679,10 +2679,10 @@ SSLNetVConnection::_downgradeToPlain()
     }
     _unvc->options = this->options;
     Dbg(dbg_ctl_ssl, "Move to unixvc for allow-plain");
-    _propagateHandShakeBuffer(_unvc, t);
+    _propagate_handshake_buffer(_unvc, t);
   }
 
-  // The transport VC was just handed to the HTTP layer by _propagateHandShakeBuffer.
+  // The transport VC was just handed to the HTTP layer by _propagate_handshake_buffer.
   // Detach it before closing this SSL VC: do_io_close() can free this VC inline, and
   // ~SSLNetVConnection() closes _unvc -- which would tear down the connection we are
   // returning. Null it first so the destructor leaves the handed-off transport alone.
@@ -2690,7 +2690,7 @@ SSLNetVConnection::_downgradeToPlain()
   _unvc                           = nullptr; // caller/HTTP layer owns the returned VC now
 
   // do_io_close() frees this SSL VC inline. That is safe here only because the arming site
-  // (_fallbackToPlainOrTunnel) defers us to the out-of-line _runDeferredWork dispatch, which
+  // (_fallback_to_plain_or_tunnel) defers us to the out-of-line _run_deferred_work dispatch, which
   // returns immediately after this returns -- no frame above re-reads `this`.
   do_io_close();
   return transferred;
@@ -2706,7 +2706,7 @@ SSLNetVConnection::_downgradeToPlain()
  * ClientHello (_read_buf) and its reader (handShakeHolder) to a TunnelNetVConnection,
  * copy the tunnel route, then hand the new VC up the accept chain and tear this one down.
  *
- * Mirrors the _downgradeToPlain / _propagateHandShakeBuffer ownership discipline:
+ * Mirrors the _downgrade_to_plain / _propagate_handshake_buffer ownership discipline:
  * everything transferred is detached from this VC before do_io_close() so teardown does
  * not free the resources the pass-through VC now owns.
  */
@@ -2715,19 +2715,19 @@ SSLNetVConnection::_downgradeToPlain()
 // out of line -- it frees this VC, and every arming site is on a stack that still touches `this`
 // after returning -- so park the kind, quiesce SSL-side reads (the successor VC re-drives the
 // transport itself; buffered bytes remain in _read_buf), and schedule the deferred dispatch
-// (_runDeferredWork), the one safe place to free inline.
+// (_run_deferred_work), the one safe place to free inline.
 void
-SSLNetVConnection::_armPendingHandoff(PendingHandoff which)
+SSLNetVConnection::_arm_pending_handoff(PendingHandoff which)
 {
   _pending_handoff = which;
   if (_transport_read_vio != nullptr) {
     _transport_read_vio->disable();
   }
-  _scheduleDeferredWork(this_ethread());
+  _schedule_deferred_work(this_ethread());
 }
 
 void
-SSLNetVConnection::_handoffBlindTunnel()
+SSLNetVConnection::_handoff_blind_tunnel()
 {
   ink_release_assert(_unvc != nullptr);
   ink_release_assert(this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL);
@@ -2837,7 +2837,7 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
 // the last SSL_accept/SSL_read_early_data/SSL_read call, for the caller's SSL_get_error
 // classification. Runs under _ssl_accept's RecursionGuard.
 int
-SSLNetVConnection::_drainEarlyData()
+SSLNetVConnection::_drain_early_data()
 {
   int ret = 0;
 #if HAVE_SSL_READ_EARLY_DATA
@@ -2945,14 +2945,14 @@ SSLNetVConnection::_ssl_accept()
   int ret       = 0;
   int ssl_error = SSL_ERROR_NONE;
   // Covers the SSL_accept() calls below and every SSL_accept()/SSL_read()/
-  // SSL_read_early_data() inside _drainEarlyData: any of them may synchronously invoke a
+  // SSL_read_early_data() inside _drain_early_data: any of them may synchronously invoke a
   // registered hook (SNI/cert/client-hello), which may itself call back into us (see the
   // recursion comment in P_SSLNetVConnection.h).
   RecursionGuard openssl_guard(recursion);
 
 #if TS_HAS_TLS_EARLY_DATA
   if (!this->_early_data_finish) {
-    ret = this->_drainEarlyData();
+    ret = this->_drain_early_data();
   } else {
     ret = SSL_accept(this->_ssl.get());
   }
@@ -3229,7 +3229,7 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
   ink_release_assert(vio == _transport_read_vio);
 
   // mainEvent owns the terminated/draining gate (it early-returns on a terminal _sslState,
-  // and short-circuits reads while _isDraining(), before dispatching here), so no redundant entry
+  // and short-circuits reads while _is_draining(), before dispatching here), so no redundant entry
   // check is needed.
   if (_transport_read_ended()) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: transport closed, but we have data to read", this);
@@ -3262,9 +3262,9 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   ink_assert(vio->buffer.reader() == _write_buf_reader.get());
 
   Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Handling transport write ready (VIO: %p)", this, vio);
-  _releaseHandshakeReader();
+  _release_handshake_reader();
 
-  if (_isDraining()) {
+  if (_is_draining()) {
     // Lingering close: flush the remaining ciphertext (response + close-notify), then
     // tear down. read_avail()==0 means it has all been handed to the socket.
     if (!_write_buf_reader || _write_buf_reader->read_avail() == 0) {
@@ -3274,7 +3274,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // keeps net_write_io going to its tail, where it dereferences _write_buf's reader.
       // Freeing this VC now would deallocate that reader underneath the live net_write_io
       // (the FORWARD-tunnel crash). A scheduled dispatch frees it on a clean stack.
-      _scheduleDeferredWork(this_ethread());
+      _schedule_deferred_work(this_ethread());
       return EVENT_DONE;
     }
     _transport_write_vio->reenable();
@@ -3335,7 +3335,7 @@ SSLNetVConnection::_drive_ssl_write()
   // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
   // SSL transport is unable to send.
   if (towrite != ntodo && !_write_buf->high_water()) {
-    if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
+    if (_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
       // User closed connection in the handler
       return EVENT_DONE;
     }
@@ -3354,7 +3354,7 @@ SSLNetVConnection::_drive_ssl_write()
   if (ntodo <= 0) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO ntodo <= 0, read_avail=%" PRId64, this,
         _write_buf_reader->read_avail());
-    return _completeWriteWhenDrained();
+    return _complete_write_when_drained();
   }
 
   const EncryptBatch batch = _encrypt_data_for_transport(ntodo, _user_write_vio.buffer);
@@ -3392,7 +3392,7 @@ SSLNetVConnection::_drive_ssl_write()
         "service an in-write renegotiation/post-handshake read, closing",
         this, batch.needs);
     this->lerrno = EIO;
-    (void)_signalAndReclaim(SignalSide::WRITE, VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_ERROR);
     return EVENT_DONE;
   }
 
@@ -3404,7 +3404,7 @@ SSLNetVConnection::_drive_ssl_write()
     // NOTE: lerrno is set to a generic EIO; a more specific mapping from batch.error / the SSL
     // error would propagate to HttpSM::set_connect_fail() but is not currently distinguished.
     this->lerrno = EIO;
-    (void)_signalAndReclaim(SignalSide::WRITE, VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_ERROR);
     return EVENT_DONE;
   }
 
@@ -3425,7 +3425,7 @@ SSLNetVConnection::_drive_ssl_write()
   if (_user_write_vio.ntodo() <= 0) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: all plaintext encrypted, read_avail=%" PRId64, this,
         _write_buf_reader->read_avail());
-    return _completeWriteWhenDrained();
+    return _complete_write_when_drained();
   } else {
     return EVENT_CONT;
   }
@@ -3437,14 +3437,14 @@ SSLNetVConnection::_drive_ssl_write()
 // until the buffer drains; the transport's next WRITE_READY re-enters the write drive and
 // completion is delivered then.
 int
-SSLNetVConnection::_completeWriteWhenDrained()
+SSLNetVConnection::_complete_write_when_drained()
 {
   if (_write_buf_reader->read_avail() > 0) {
     _transport_write_vio->reenable();
     return EVENT_CONT;
   }
   // Plaintext done and ciphertext fully drained: deliver WRITE_COMPLETE now.
-  return _deliverWriteComplete();
+  return _deliver_write_complete();
 }
 
 // Deliver the user-facing WRITE_COMPLETE synchronously -- deferring it (as earlier revisions
@@ -3465,13 +3465,13 @@ SSLNetVConnection::_completeWriteWhenDrained()
 // dispatch once this net_write_io pass has fully unwound -- self-targeted, so it carries none
 // of the receiver-liveness risk deferring the signal would.
 int
-SSLNetVConnection::_deliverWriteComplete()
+SSLNetVConnection::_deliver_write_complete()
 {
-  if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE) == SignalOutcome::RECLAIMED) {
+  if (_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE) == SignalOutcome::RECLAIMED) {
     return EVENT_DONE; // consumer closed/freed us from its handler
   }
   if (!_is_terminal(_sslState) && _transport_write_usable() && _user_write_active()) {
-    _scheduleWriteRearm();
+    _schedule_write_rearm();
   }
   return EVENT_DONE;
 }
@@ -3482,7 +3482,7 @@ SSLNetVConnection::_deliverWriteComplete()
 // (handshake flights, SSL_read's own protocol output) comes through here; the close/shutdown
 // drains keep their own guarded reenables (they also null-check the VIOs and log).
 void
-SSLNetVConnection::_flushStagedCiphertext()
+SSLNetVConnection::_flush_staged_ciphertext()
 {
   if (_write_buf_reader->read_avail() > 0) {
     _transport_write_vio->reenable();
@@ -3492,7 +3492,7 @@ SSLNetVConnection::_flushStagedCiphertext()
 // The one arming point for _deferred_work_event (see its declaration for what the slot
 // multiplexes): every schedule of the slot routes through here, so the never-more-than-one
 // discipline holds by construction. Arming is idempotent because the slot carries no purpose --
-// _runDeferredWork re-derives what to run from VC state at fire time, so a purpose armed while
+// _run_deferred_work re-derives what to run from VC state at fire time, so a purpose armed while
 // a dispatch is already outstanding rides that dispatch instead of queueing a second event.
 // (It is the dispatch, not the arming, that keeps co-pending purposes from stranding -- see the
 // write-rearm rung re-scheduling the read drive it displaced.)
@@ -3501,7 +3501,7 @@ SSLNetVConnection::_flushStagedCiphertext()
 // a foreign thread (reenable_with_event -- a plugin may reenable from any thread -- and
 // handle_async_tls_ready) pass this->thread, the home thread.
 void
-SSLNetVConnection::_scheduleDeferredWork(EThread *t)
+SSLNetVConnection::_schedule_deferred_work(EThread *t)
 {
   if (!_deferred_work_pending()) {
     _deferred_work_event = t->schedule_imm(this);
@@ -3509,10 +3509,10 @@ SSLNetVConnection::_scheduleDeferredWork(EThread *t)
 }
 
 void
-SSLNetVConnection::_scheduleWriteRearm()
+SSLNetVConnection::_schedule_write_rearm()
 {
   _write_rearm_pending = true;
-  _scheduleDeferredWork(this_ethread());
+  _schedule_deferred_work(this_ethread());
 }
 
 int
@@ -3526,8 +3526,8 @@ SSLNetVConnection::_handle_transport_eos(VIO *vio)
   // inner transport's read path is still on the stack. Skip while closing: the
   // consumer is gone and we are only flushing our write side (the peer may have
   // half-closed its write while still reading our response).
-  if (!_isDraining() && !_is_terminal(_sslState)) {
-    _scheduleDeferredWork(this_ethread());
+  if (!_is_draining() && !_is_terminal(_sslState)) {
+    _schedule_deferred_work(this_ethread());
   }
   return EVENT_DONE;
 }
@@ -3544,12 +3544,12 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   _transport_state = TransportState::TRANSPORT_ERROR;
   lerrno           = err;
   // If we were lingering to flush a response, the transport is now broken; abandon
-  // the drain and tear down -- unless a hook is still parked (_freeBlocked), in which case the
+  // the drain and tear down -- unless a hook is still parked (_free_blocked), in which case the
   // plugin holds a live ref and will reenable; defer the free to that reenable's read-drive
   // rather than freeing the VC out from under it.
-  if (_isDraining()) {
-    if (!_freeBlocked()) {
-      _authorizeReclaim();
+  if (_is_draining()) {
+    if (!_free_blocked()) {
+      _authorize_reclaim();
       this->free_thread(this_ethread());
     }
     return EVENT_DONE;
@@ -3567,7 +3567,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
     if (lerrno == 0) {
       lerrno = EPIPE;
     }
-    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     return EVENT_DONE;
   }
   // Surface the failure to an active write face directly. The read drive below only reaches a
@@ -3582,7 +3582,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
     if (lerrno == 0) {
       lerrno = EPIPE;
     }
-    if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_ERROR) == SignalOutcome::RECLAIMED) {
+    if (_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_ERROR) == SignalOutcome::RECLAIMED) {
       return EVENT_DONE;
     }
   }
@@ -3592,7 +3592,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   // while the inner transport's read/write path is still on the stack (mirrors
   // _handle_transport_eos).
   if (!_is_terminal(_sslState)) {
-    _scheduleDeferredWork(this_ethread());
+    _schedule_deferred_work(this_ethread());
   }
   return EVENT_DONE;
 }
@@ -3604,7 +3604,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
 // already closed, and both callers hold a live one (startEvent's was delivered synchronously
 // on this stack, migrateToCurrentThread's was just migrated), so a null here is a wiring bug.
 void
-SSLNetVConnection::_wireTransportVIOs()
+SSLNetVConnection::_wire_transport_vios()
 {
   _transport_read_vio  = _unvc->do_io_read(this, INT64_MAX, _read_buf.get());
   _transport_write_vio = _unvc->do_io_write(this, INT64_MAX, _write_buf_reader.get(), false);
@@ -3627,14 +3627,14 @@ SSLNetVConnection::startEvent(int event, void *data)
       // (connectUp already started the cop, so even a lock-miss deferred close is still reaped,
       // just ~1s later) and discard this VC. (_connect_action is unused, never cancelled, on
       // the accept path.)
-      _closeTransport(unvc);
+      _close_transport(unvc);
       this->free_thread(thread);
       return EVENT_DONE;
     }
     ink_release_assert(this->_unvc == nullptr); // not wired up yet
     this->_unvc = unvc;
     SET_HANDLER(&SSLNetVConnection::mainEvent);
-    _wireTransportVIOs();
+    _wire_transport_vios();
     // This should already be held by whoever requested the connect, so no blocking.
     // Use a scoped lock: it releases on scope exit (the prior MUTEX_TAKE_LOCK had no
     // matching MUTEX_UNTAKE_LOCK, permanently leaking a lock level on the shared
@@ -3668,7 +3668,7 @@ SSLNetVConnection::startEvent(int event, void *data)
 }
 
 // The deferred-work dispatch (tier 2 of mainEvent's demux). The slot carries no purpose (see
-// _scheduleDeferredWork), so what to run is re-derived from VC state, in strict precedence:
+// _schedule_deferred_work), so what to run is re-derived from VC state, in strict precedence:
 //
 //   drain > reclaim > fatal > handoff > write-rearm > read-drive
 //
@@ -3681,21 +3681,21 @@ SSLNetVConnection::startEvent(int event, void *data)
 // touches it. Every rung that can free it places the freeing call in tail position, touching no
 // member after it.
 int
-SSLNetVConnection::_runDeferredWork()
+SSLNetVConnection::_run_deferred_work()
 {
-  if (_isDraining()) {
+  if (_is_draining()) {
     // Close-drain teardown deferred out of the inner transport's net_write_io. If the buffer
     // has drained, free on this clean stack; otherwise the drain is still in flight (the
     // transport reschedules itself), so wait for the next dispatch. A parked hook still holds a
-    // live ref (_freeBlocked): hold off and let its reenable's read-drive complete the free.
-    if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_freeBlocked()) {
-      _authorizeReclaim();
+    // live ref (_free_blocked): hold off and let its reenable's read-drive complete the free.
+    if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_free_blocked()) {
+      _authorize_reclaim();
       this->free_thread(this_ethread());
     }
     return EVENT_DONE;
   }
   if (_sslState == SslState::RECLAIMABLE) {
-    _reclaimIfClosed();
+    _reclaim_if_closed();
     return EVENT_DONE;
   }
 
@@ -3703,27 +3703,27 @@ SSLNetVConnection::_runDeferredWork()
   // SNI/rate-limit reject) has no handshake driver on the stack to deliver it -- only this
   // scheduled dispatch. The consumer's do_io_close then drives the free; a severed/absent
   // consumer hits _signal_user's null-cont owner-close.
-  if (_consumeFatalFailure()) {
-    (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+  if (_consume_fatal_failure()) {
+    (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     return EVENT_DONE;
   }
 
   if (_pending_handoff == PendingHandoff::BLIND_TUNNEL) {
     _pending_handoff = PendingHandoff::NONE;
-    _handoffBlindTunnel();
+    _handoff_blind_tunnel();
     return EVENT_DONE;
   }
   if (_pending_handoff == PendingHandoff::DOWNGRADE_PLAIN) {
-    // We return immediately after (see _fallbackToPlainOrTunnel), so _downgradeToPlain()'s inline
+    // We return immediately after (see _fallback_to_plain_or_tunnel), so _downgrade_to_plain()'s inline
     // do_io_close() cannot pull `this` out from under a caller still on the handshake read stack.
     _pending_handoff = PendingHandoff::NONE;
-    _downgradeToPlain();
+    _downgrade_to_plain();
     return EVENT_DONE;
   }
   if (_write_rearm_pending) {
     // Re-issue the transport-write reenable() that a reentrant do_io_write() (from inside
-    // _deliverWriteComplete's synchronous WRITE_COMPLETE handler) made while nested inside
-    // net_write_io -- that reenable() was doomed there (see _deliverWriteComplete). We are
+    // _deliver_write_complete's synchronous WRITE_COMPLETE handler) made while nested inside
+    // net_write_io -- that reenable() was doomed there (see _deliver_write_complete). We are
     // now on a clean stack, off net_write_io, so this reenable() actually takes effect.
     // Re-validate the write VIO here rather than trusting it's still what it was when this
     // was armed: the consumer may have closed, redirected, or disabled it in the interim.
@@ -3739,7 +3739,7 @@ SSLNetVConnection::_runDeferredWork()
     // read drive would be dropped and the buffered response would strand -- the transport read
     // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
     if (_read_drive_warranted()) {
-      _scheduleDeferredWork(this_ethread());
+      _schedule_deferred_work(this_ethread());
     }
     return EVENT_DONE;
   }
@@ -3752,12 +3752,12 @@ int
 SSLNetVConnection::mainEvent(int event, void *data)
 {
   // Tier 1 of the demux: a deferred-work dispatch arrives as the armed _deferred_work_event --
-  // the only self-targeted schedule (see _scheduleDeferredWork). Anything else must be one of
+  // the only self-targeted schedule (see _schedule_deferred_work). Anything else must be one of
   // our two transport VIOs, release-asserted below.
   if (_deferred_work_event != nullptr && data == _deferred_work_event) {
     ink_release_assert(event == EVENT_IMMEDIATE);
     _deferred_work_event = nullptr; // this event is now firing
-    return _runDeferredWork();
+    return _run_deferred_work();
   }
 
   VIO *transport_vio = static_cast<VIO *>(data);
@@ -3770,11 +3770,11 @@ SSLNetVConnection::mainEvent(int event, void *data)
     // (an async reenable_with_event(TS_EVENT_ERROR) raced this event ahead of the scheduled
     // dispatch), deliver it to the waiter so the consumer can close us; otherwise the error was
     // already delivered and the consumer owns the teardown -- do not re-signal. Either way,
-    // reap if the consumer has since closed (_reclaimIfClosed is a no-op until it has).
-    if (_consumeFatalFailure()) {
-      (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
+    // reap if the consumer has since closed (_reclaim_if_closed is a no-op until it has).
+    if (_consume_fatal_failure()) {
+      (void)_signal_and_reclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     } else {
-      _reclaimIfClosed();
+      _reclaim_if_closed();
     }
     return EVENT_DONE;
   }
@@ -3783,17 +3783,17 @@ SSLNetVConnection::mainEvent(int event, void *data)
   // which is not yet "terminated"). Once the consumer has closed us it has detached and may
   // already be freed, so a transport event arriving mid-drain must NOT be routed to its (now
   // dangling) continuation in _user_*_vio. The write path keeps flushing the drain and EOS/ERROR
-  // tear down in their helpers (they all check _isDraining()), but an idle timeout and a
+  // tear down in their helpers (they all check _is_draining()), but an idle timeout and a
   // consumer-less read would otherwise reach _signal_user -- handle them here.
-  if (_isDraining()) {
+  if (_is_draining()) {
     switch (event) {
     case VC_EVENT_INACTIVITY_TIMEOUT:
     case VC_EVENT_ACTIVE_TIMEOUT:
       // The drain is stuck (idle); abandon it and tear down, mirroring _handle_transport_error --
-      // unless a hook is still parked (_freeBlocked), where the plugin holds a live ref and will
+      // unless a hook is still parked (_free_blocked), where the plugin holds a live ref and will
       // reenable; defer the free to that reenable rather than freeing under the plugin.
-      if (!_freeBlocked()) {
-        _authorizeReclaim();
+      if (!_free_blocked()) {
+        _authorize_reclaim();
         this->free_thread(this_ethread());
         return EVENT_DONE;
       }
@@ -3822,19 +3822,19 @@ SSLNetVConnection::mainEvent(int event, void *data)
   case VC_EVENT_ACTIVE_TIMEOUT:
     if (!getSSLHandShakeComplete()) {
       // A timeout before the handshake completes is the handshake timeout expiring (installed in
-      // _trackFirstHandshake). The inner transport always times out on its read VIO, but the
+      // _track_first_handshake). The inner transport always times out on its read VIO, but the
       // waiter may be write-side -- a direct outbound connect installs only a do_io_write -- so
       // route to the waiter (_handshake_fail_side), not the transport face; otherwise the write
       // waiter is never told and HttpSM is left dangling (#5). Master tries read then write
       // (UnixNetVConnection.cc timeout dispatch).
       Dbg(dbg_ctl_ssl, "ssl handshake for vc %p expired, release the connection", this);
-      return _signalAndReclaim(_handshake_fail_side(), event) == SignalOutcome::RECLAIMED ? EVENT_DONE : EVENT_CONT;
+      return _signal_and_reclaim(_handshake_fail_side(), event) == SignalOutcome::RECLAIMED ? EVENT_DONE : EVENT_CONT;
     }
     // Propagate a post-handshake (idle/active) timeout to the consumer so it tears the connection
     // down, routed to whichever side's transport VIO timed out. Without this the SSL VC would
     // ignore transport timeouts (idle connections would never close) and log a spurious
     // "Unexpected event" warning.
-    return _signalAndReclaim(transport_vio == _transport_write_vio ? SignalSide::WRITE : SignalSide::READ, event) ==
+    return _signal_and_reclaim(transport_vio == _transport_write_vio ? SignalSide::WRITE : SignalSide::READ, event) ==
                SignalOutcome::RECLAIMED ?
              EVENT_DONE :
              EVENT_CONT;
@@ -3856,7 +3856,7 @@ SSLNetVConnection::mainEvent(int event, void *data)
 // continuation IS the consumer.) Cross-thread reuse is handled earlier by migration, so this is a
 // same-thread mutex adoption; it is a no-op once the mutexes already coincide.
 void
-SSLNetVConnection::_adoptConsumerMutex(Continuation *c)
+SSLNetVConnection::_adopt_consumer_mutex(Continuation *c)
 {
   if (c == nullptr || c->mutex == nullptr || c->mutex == this->mutex) {
     return;
@@ -3877,7 +3877,7 @@ SSLNetVConnection::_adoptConsumerMutex(Continuation *c)
   if (_deferred_work_event != nullptr) {
     _deferred_work_event->cancel();
     _deferred_work_event = nullptr;
-    _scheduleDeferredWork(this_ethread());
+    _schedule_deferred_work(this_ethread());
   }
 }
 
@@ -3898,7 +3898,7 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
   if (buf) {
     // User wants to start a read
     _user_read_vio.set_writer(buf);
-    _adoptConsumerMutex(c);
+    _adopt_consumer_mutex(c);
     if (!_transport_read_ended()) {
       // Ask the transport for more socket data.
       _user_read_vio.reenable();
@@ -3910,7 +3910,7 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
     // when the transport is already closed. Out of line so we don't re-enter the
     // caller and free this VC underneath it.
     if (nbytes != 0) {
-      _scheduleDeferredWork(this_ethread());
+      _schedule_deferred_work(this_ethread());
     }
   } else {
     // User wants to stop reading
@@ -3937,7 +3937,7 @@ SSLNetVConnection::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *
   if (reader) {
     ink_assert(!owner);
     _user_write_vio.set_reader(reader);
-    _adoptConsumerMutex(c);
+    _adopt_consumer_mutex(c);
     _user_write_vio.reenable();
   } else {
     _user_write_vio.disable();
@@ -4126,7 +4126,7 @@ SSLNetVConnection::reenable(VIO *vio)
     // drive: EOS/ERROR is a persistent state and the closed transport will never re-signal, so
     // a consumer re-enabling its read must observe it from the drive.
     if (!_user_read_vio.is_disabled() && _ssl_read_pending()) {
-      _scheduleDeferredWork(this_ethread());
+      _schedule_deferred_work(this_ethread());
     }
   } else if (vio == &_user_write_vio) {
     // Reenable write.
@@ -4147,8 +4147,8 @@ SSLNetVConnection::reenable(VIO *vio)
     // the transport's net_write_io (e.g. a consumer issuing a follow-up write from
     // its synchronously-delivered WRITE_COMPLETE handler), that same net_write_io's
     // tail disables the write before the demand-driven WRITE_READY can fire, and the
-    // write stalls. _deliverWriteComplete handles that case by re-issuing this same
-    // reenable() from a clean, self-targeted dispatch (_scheduleWriteRearm) once
+    // write stalls. _deliver_write_complete handles that case by re-issuing this same
+    // reenable() from a clean, self-targeted dispatch (_schedule_write_rearm) once
     // net_write_io's current pass has unwound -- see its definition for the full
     // trace. This reenable() itself doesn't need to know which case it's in.
     // Symmetric with the read side: both transport VIOs are created atomically in startEvent
@@ -4199,7 +4199,7 @@ SSLNetVConnection::get_data(int id, void *data)
     // master's separate `closed` state -- not merely that the SSL state went terminal, which under
     // consumer-driven teardown can hold on a still-open, not-yet-closed VC (e.g. H2 with active
     // streams after an error).
-    *ptr.n = (_sslState == SslState::RECLAIMABLE || _isDraining()) ? 1 : 0;
+    *ptr.n = (_sslState == SslState::RECLAIMABLE || _is_draining()) ? 1 : 0;
     return true;
   default:
     return false;
@@ -4258,15 +4258,15 @@ SSLNetVConnection::handle_async_tls_ready()
   // (reenable_with_event), the peer's handshake bytes were already consumed into the SSL
   // read BIO, so reenabling the transport read VIO alone would not re-drive
   // SSL_do_handshake(). Schedule an out-of-line read-drive to re-enter the handshake
-  // (_runDeferredWork -> _drive_ssl_read -> _ssl_accept), which resumes the suspended job.
+  // (_run_deferred_work -> _drive_ssl_read -> _ssl_accept), which resumes the suspended job.
   if (!getSSLHandShakeComplete()) {
-    _scheduleDeferredWork(this->thread);
+    _schedule_deferred_work(this->thread);
   }
 }
 #endif
 
 void
-SSLNetVConnection::_trackFirstHandshake()
+SSLNetVConnection::_track_first_handshake()
 {
   bool is_first = this->get_tls_handshake_begin_time() == 0;
   if (is_first) {
