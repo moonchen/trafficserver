@@ -54,7 +54,7 @@ namespace
 //     TLS*Support index). Without it _bindSSLObject binds to index -1 and getInstance(_ssl)
 //     returns null, tripping sslClientHandShakeEvent's identity assert. Idempotent.
 //   * SNIConfig::startup() loads the SNI config the outbound handshake driver always consults
-//     (sslStartHandShake's client path). A missing sni.yaml loads an empty, no-op config.
+//     (_setupClientSSL). A missing sni.yaml loads an empty, no-op config.
 //   * SSLInitializeStatistics() registers the ssl_rsb counters the handshake increments; without
 //     it Metrics::Counter::increment aborts on an unregistered id. It skips its cert-dependent
 //     cipher/group enumeration when no certificate config is loaded, so it is safe here.

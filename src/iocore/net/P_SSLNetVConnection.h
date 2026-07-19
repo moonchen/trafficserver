@@ -149,7 +149,7 @@ private:
   //       sslClientHandShakeEvent. Guarded (== HANDSHAKING): a state moved past HANDSHAKING
   //       mid-flight -- a hook's reject or a close during SSL_accept/SSL_connect -- outranks
   //       completion, so the store is skipped.
-  //     - Blind-tunnel marks on a transparent connection: sslStartHandShake (per-IP OPT_TUNNEL,
+  //     - Blind-tunnel marks on a transparent connection: _setupServerSSL (per-IP OPT_TUNNEL,
   //       first server round) and _lookupContextByName (per-SNI OPT_TUNNEL; guarded
   //       (== HANDSHAKING) so an armed FATAL_PENDING from an earlier hook in the same flight
   //       outranks the tunnel).
@@ -166,12 +166,12 @@ private:
   //     - The write-face EVENT_ERROR arm of _drive_handshake, stored
   //       unconditionally before the failure is signalled, so it also consumes an armed
   //       FATAL_PENDING. The store re-checks nothing, so an in-hook close during the
-  //       sslStartHandShake call (see the owner-close below) leaves SHUTDOWN_IN_PROGRESS -- or
+  //       _advance_handshake call (see the owner-close below) leaves SHUTDOWN_IN_PROGRESS -- or
   //       RECLAIMABLE, for an abort -- to be overwritten here; the same unwind's owner-close
   //       then re-enters RECLAIMABLE. (The read-face EVENT_ERROR arm leaves
   //       the state in place; the consumer's close or the owner-close below moves it.)
   //   FATAL_PENDING -> TERMINATED  -- _consumeFatalFailure(): delivery IS this transition, exactly once
-  //     - On the driver stack once sslStartHandShake has returned (outside any OpenSSL frame):
+  //     - On the driver stack once _advance_handshake has returned (outside any OpenSSL frame):
   //       _drive_handshake's post-return terminal check (either face) and its read-face
   //       EVENT_ERROR arm (the write face's EVENT_ERROR is the unconditional store above).
   //     - Off-stack, when the hook's reenable was asynchronous: _runDeferredWork's FATAL_PENDING
@@ -269,7 +269,7 @@ private:
 
   // The write-face handshake driver's EVENT_ERROR: unconditional entry to TERMINATED, made
   // before the failure is signalled, so it also consumes an armed FATAL_PENDING. Deliberately
-  // re-checks nothing: an in-hook close during the sslStartHandShake call leaves
+  // re-checks nothing: an in-hook close during the _advance_handshake call leaves
   // SHUTDOWN_IN_PROGRESS -- or RECLAIMABLE, for an abort -- to be overwritten here; the same
   // unwind's owner-close then re-enters RECLAIMABLE.
   void
@@ -354,7 +354,6 @@ private:
   void _trackFirstHandshake();
 
 public:
-  int  sslStartHandShake(int event, int &err);
   void free_thread(EThread *t);
   UnixNetVConnection *
   getUnixNetVC() const
@@ -868,6 +867,18 @@ private:
                 // handoff was armed
     FAILED,     // a handshake failure was signalled to the waiter
   };
+  // One-time SSL-object build + configuration, split out of the per-round _advance_handshake
+  // and guarded there by _ssl == nullptr so re-driven rounds never rebuild a live handshake's
+  // SSL object. Both return EVENT_CONT with a live _ssl on success, or EVENT_ERROR; the server
+  // setup also returns EVENT_DONE when a transparent per-IP OPT_TUNNEL converts the connection
+  // to a blind tunnel instead of building an SSL object.
+  int _setupServerSSL();
+  int _setupClientSSL();
+  // One per-round handshake advance, dispatching to the role's driver (sslServerHandShakeEvent
+  // / sslClientHandShakeEvent). The role is derived from the stored VC context -- set exactly
+  // once at accept/connect wiring before any drive can run, asserted at the definition -- not
+  // from a caller-passed direction.
+  int _advance_handshake(int &err);
   // The one handshake driver, shared by both faces; contract at the definition. Only DATA_READY
   // permits touching `this` afterwards -- after YIELD or FAILED a delivered signal may already
   // have freed the VC.

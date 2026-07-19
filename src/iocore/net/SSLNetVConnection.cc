@@ -551,11 +551,11 @@ SSLNetVConnection::_commitInboundHandshake()
   // dropping the second reader is the whole move.
   //
   // Call site matters as much as the state: this runs ONLY from the read-face
-  // WANT_READ/WANT_ACCEPT arm of _drive_handshake, after sslStartHandShake() has returned and
+  // WANT_READ/WANT_ACCEPT arm of _drive_handshake, after _advance_handshake() has returned and
   // after the SSL_RESTART (downgrade), blind-tunnel, terminated, and EVENT_ERROR early-returns. That is
   // where the round's SNI/cert hooks have already run and any tunnel/downgrade decision is
   // final -- the same knowledge master's line-604 position encodes. Evaluating the same state
-  // predicate from _releaseHandshakeReader's other call sites (pre-sslStartHandShake, or the
+  // predicate from _releaseHandshakeReader's other call sites (pre-_advance_handshake, or the
   // write face) would release a round too early: a resumed parked client-hello hook can leave
   // the FSM at SNI before this round's SSL_accept runs the servername/cert hooks, one of which
   // may still TSVConnTunnel -- and _handoffBlindTunnel would then replay a headless stream.
@@ -617,13 +617,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   this->_trackFirstHandshake();
 
   int err = 0;
-  int ret;
-
-  if (get_context() == NET_VCONNECTION_OUT) {
-    ret = sslStartHandShake(SSL_EVENT_CLIENT, err);
-  } else {
-    ret = sslStartHandShake(SSL_EVENT_SERVER, err);
-  }
+  int ret = _advance_handshake(err);
 
   if (ret == SSL_RESTART) {
     // The leading bytes were not a ClientHello and allow-plain applies: the VC migrated -- the
@@ -660,7 +654,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   // if the hook didn't force a fatal alert. None of the switch branches below check
   // _sslState, so routed through anything but the `case EVENT_ERROR` branch, a hook-flagged
   // error would otherwise be silently dropped here and only caught later by the scheduled
-  // fallback (_runDeferredWork's FATAL_PENDING rung). sslStartHandShake() has already returned, so
+  // fallback (_runDeferredWork's FATAL_PENDING rung). _advance_handshake() has already returned, so
   // we are unconditionally outside any OpenSSL frame here -- always safe to deliver
   // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
   // more specific `err` to report.
@@ -1449,8 +1443,195 @@ SSLNetVConnection::~SSLNetVConnection()
   }
 }
 
+// One-time build + configuration of the inbound SSL object; runs only on the round that finds
+// no _ssl yet (guarded at the _advance_handshake call site, asserted here). Returns EVENT_CONT
+// with a live _ssl, EVENT_DONE when a transparent per-IP OPT_TUNNEL converts the connection to
+// a blind tunnel instead (no SSL object is built), or EVENT_ERROR.
 int
-SSLNetVConnection::sslStartHandShake(int event, int &err)
+SSLNetVConnection::_setupServerSSL()
+{
+  ink_assert(this->_ssl.get() == nullptr);
+
+  SSLCertificateConfig::scoped_config lookup;
+  IpEndpoint                          dst;
+  int                                 namelen = sizeof(dst);
+  if (0 != safe_getsockname(this->get_socket(), &dst.sa, &namelen)) {
+    Dbg(dbg_ctl_ssl, "Failed to get dest ip, errno = [%d]", errno);
+    return EVENT_ERROR;
+  }
+  SSLCertContext *cc = lookup->find(dst);
+  if (dbg_ctl_ssl.on()) {
+    IpEndpoint          src;
+    ip_port_text_buffer ipb1, ipb2;
+    int                 ip_len = sizeof(src);
+
+    if (0 != safe_getpeername(this->get_socket(), &src.sa, &ip_len)) {
+      DbgPrint(dbg_ctl_ssl, "Failed to get src ip, errno = [%d]", errno);
+      return EVENT_ERROR;
+    }
+    ats_ip_nptop(&dst, ipb1, sizeof(ipb1));
+    ats_ip_nptop(&src, ipb2, sizeof(ipb2));
+    DbgPrint(dbg_ctl_ssl, "IP context is %p for [%s] -> [%s], default context %p", cc, ipb2, ipb1, lookup->defaultContext());
+  }
+
+  // Escape if this is marked to be a tunnel.
+  // No data has been read at this point, so we can go
+  // directly into blind tunnel mode
+
+  if (cc && SSLCertContextOption::OPT_TUNNEL == cc->opt) {
+    if (this->is_transparent) {
+      this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+      _completeHandshakeIfActive();
+      this->_ssl = nullptr;
+      return EVENT_DONE;
+    } else {
+      hookOpRequested = SslVConnOp::SSL_HOOK_OP_TUNNEL;
+    }
+  }
+
+  // Attach the default SSL_CTX to this SSL session. The default context is never going to be able
+  // to negotiate a SSL session, but it's enough to trampoline us into the SNI callback where we
+  // can select the right server certificate.
+  this->_make_ssl_connection(lookup->defaultContext());
+  if (this->_ssl.get() == nullptr) {
+    SSLErrorVC(this, "failed to create SSL server session");
+    return EVENT_ERROR;
+  }
+  return EVENT_CONT;
+}
+
+// One-time build + configuration of the outbound SSL object (context selection, client cert,
+// verify policy, SNI, ALPN); runs only on the round that finds no _ssl yet (guarded at the
+// _advance_handshake call site, asserted here). Returns EVENT_CONT with a live _ssl, or
+// EVENT_ERROR.
+int
+SSLNetVConnection::_setupClientSSL()
+{
+  ink_assert(this->_ssl.get() == nullptr);
+
+  SSLConfig::scoped_config params;
+  char                     buff[INET6_ADDRSTRLEN];
+
+  SNIConfig::scoped_config sniParam;
+  const char              *serverKey = this->options.sni_servername;
+  if (!serverKey) {
+    ats_ip_ntop(this->get_remote_addr(), buff, INET6_ADDRSTRLEN);
+    serverKey = buff;
+  }
+  auto           nps       = sniParam->get_property_config(serverKey);
+  shared_SSL_CTX sharedCTX = nullptr;
+  SSL_CTX       *clientCTX = nullptr;
+  std::string    caCertPathStorage;
+  const char    *caCertPath = resolve_client_ca_cert_path(params, options.ssl_client_ca_cert_path, caCertPathStorage);
+
+  // First Look to see if there are override parameters
+  Dbg(dbg_ctl_ssl, "Checking for outbound client cert override [%p]", options.ssl_client_cert_name.get());
+  if (options.ssl_client_cert_name) {
+    std::string certFilePath;
+    std::string keyFilePath;
+    std::string caCertFilePath;
+    // Enable override to explicitly disable the client certificate. That is, don't fill
+    // in any of the cert paths if the cert file name is empty or "NULL".
+    if (*options.ssl_client_cert_name != '\0' && 0 != strcasecmp("NULL", options.ssl_client_cert_name)) {
+      certFilePath = Layout::get()->relative_to(params->clientCertPathOnly, options.ssl_client_cert_name.get());
+      if (options.ssl_client_private_key_name) {
+        keyFilePath = Layout::get()->relative_to(params->clientKeyPathOnly, options.ssl_client_private_key_name);
+      }
+      if (options.ssl_client_ca_cert_name) {
+        caCertFilePath = Layout::get()->relative_to(caCertPath, options.ssl_client_ca_cert_name);
+      }
+      Dbg(dbg_ctl_ssl, "Using outbound client cert `%s'", options.ssl_client_cert_name.get());
+    } else {
+      Dbg(dbg_ctl_ssl, "Clearing outbound client cert");
+    }
+    sharedCTX = params->getCTX(certFilePath, keyFilePath,
+                               caCertFilePath.empty() ? params->clientCACertFilename : caCertFilePath.c_str(), caCertPath);
+  } else if (options.ssl_client_ca_cert_name || options.ssl_client_ca_cert_path) {
+    std::string caCertFilePath;
+    if (options.ssl_client_ca_cert_name) {
+      caCertFilePath = Layout::get()->relative_to(caCertPath, options.ssl_client_ca_cert_name);
+    }
+    sharedCTX = params->getCTX(params->clientCertPath, params->clientKeyPath,
+                               caCertFilePath.empty() ? params->clientCACertFilename : caCertFilePath.c_str(), caCertPath);
+  } else if (nps && !nps->client_cert_file.empty()) {
+    // If no overrides available, try the available nextHopProperty by reading from context mappings
+    sharedCTX = params->getCTX(nps->client_cert_file, nps->client_key_file, params->clientCACertFilename, params->clientCACertPath);
+  } else { // Just stay with the values passed down from the SM for verify
+    clientCTX = params->client_ctx.get();
+  }
+
+  if (sharedCTX) {
+    clientCTX = sharedCTX.get();
+  }
+
+  if (options.verifyServerPolicy != YamlSNIConfig::Policy::UNSET) {
+    // Stay with conf-override version as the highest priority
+  } else if (nps && nps->verify_server_policy != YamlSNIConfig::Policy::UNSET) {
+    options.verifyServerPolicy = nps->verify_server_policy;
+  } else {
+    options.verifyServerPolicy = params->verifyServerPolicy;
+  }
+
+  if (options.verifyServerProperties != YamlSNIConfig::Property::UNSET) {
+    // Stay with conf-override version as the highest priority
+  } else if (nps && nps->verify_server_properties != YamlSNIConfig::Property::UNSET) {
+    options.verifyServerProperties = nps->verify_server_properties;
+  } else {
+    options.verifyServerProperties = params->verifyServerProperties;
+  }
+
+  if (!clientCTX) {
+    SSLErrorVC(this, "failed to create SSL client session");
+    return EVENT_ERROR;
+  }
+
+  this->_make_ssl_connection(clientCTX);
+  if (this->_ssl.get() == nullptr) {
+    SSLErrorVC(this, "failed to create SSL client session");
+    return EVENT_ERROR;
+  }
+
+  // If it is negative, we are consciously not setting ALPN (e.g. for private server sessions)
+  if (options.alpn_protocols_array_size >= 0) {
+    if (options.alpn_protocols_array_size > 0) {
+      SSL_set_alpn_protos(this->_ssl.get(), options.alpn_protocols_array, options.alpn_protocols_array_size);
+    } else if (params->alpn_protocols_array_size > 0) {
+      // Set the ALPN protocols we are requesting.
+      SSL_set_alpn_protos(this->_ssl.get(), params->alpn_protocols_array, params->alpn_protocols_array_size);
+    }
+  }
+
+  SSL_set_verify(this->_ssl.get(), SSL_VERIFY_PEER, verify_callback);
+
+  // SNI
+  ats_scoped_str &tlsext_host_name = this->options.sni_hostname ? this->options.sni_hostname : this->options.sni_servername;
+  if (tlsext_host_name) {
+    if (this->set_sni_server_name(this->_ssl.get(), tlsext_host_name)) {
+      Dbg(dbg_ctl_ssl, "using SNI name '%s' for client handshake", tlsext_host_name.get());
+    } else {
+      Dbg(dbg_ctl_ssl_error, "failed to set SNI name '%s' for client handshake", tlsext_host_name.get());
+      Metrics::Counter::increment(ssl_rsb.sni_name_set_failure);
+    }
+  }
+
+  // ALPN
+  if (!this->options.alpn_protos.empty()) {
+    if (int res = SSL_set_alpn_protos(this->_ssl.get(), reinterpret_cast<const uint8_t *>(this->options.alpn_protos.data()),
+                                      this->options.alpn_protos.size());
+        res != 0) {
+      Dbg(dbg_ctl_ssl_error, "failed to set ALPN '%.*s' for client handshake", static_cast<int>(this->options.alpn_protos.size()),
+          this->options.alpn_protos.data());
+    }
+  }
+  return EVENT_CONT;
+}
+
+// Advance the handshake by one round: build the SSL object first on the round that has none,
+// then dispatch to the role's driver (sslServerHandShakeEvent / sslClientHandShakeEvent). The
+// role is the stored VC context, set exactly once at accept/connect wiring before any drive
+// can run -- asserted here so an unset context cannot silently take a role.
+int
+SSLNetVConnection::_advance_handshake(int &err)
 {
   if (TSSystemState::is_ssl_handshaking_stopped()) {
     Dbg(dbg_ctl_ssl, "Stopping handshake due to server shutting down.");
@@ -1458,186 +1639,22 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
   }
   // The handshake begin time and its inactivity timeout are recorded/installed together in
   // _trackFirstHandshake(), which every caller runs before reaching here.
-  SSLConfig::scoped_config params;
-  switch (event) {
-  case SSL_EVENT_SERVER:
+  ink_assert(get_context() == NET_VCONNECTION_IN || get_context() == NET_VCONNECTION_OUT);
+  if (get_context() == NET_VCONNECTION_OUT) {
     if (this->_ssl.get() == nullptr) {
-      SSLCertificateConfig::scoped_config lookup;
-      IpEndpoint                          dst;
-      int                                 namelen = sizeof(dst);
-      if (0 != safe_getsockname(this->get_socket(), &dst.sa, &namelen)) {
-        Dbg(dbg_ctl_ssl, "Failed to get dest ip, errno = [%d]", errno);
-        return EVENT_ERROR;
-      }
-      SSLCertContext *cc = lookup->find(dst);
-      if (dbg_ctl_ssl.on()) {
-        IpEndpoint          src;
-        ip_port_text_buffer ipb1, ipb2;
-        int                 ip_len = sizeof(src);
-
-        if (0 != safe_getpeername(this->get_socket(), &src.sa, &ip_len)) {
-          DbgPrint(dbg_ctl_ssl, "Failed to get src ip, errno = [%d]", errno);
-          return EVENT_ERROR;
-        }
-        ats_ip_nptop(&dst, ipb1, sizeof(ipb1));
-        ats_ip_nptop(&src, ipb2, sizeof(ipb2));
-        DbgPrint(dbg_ctl_ssl, "IP context is %p for [%s] -> [%s], default context %p", cc, ipb2, ipb1, lookup->defaultContext());
-      }
-
-      // Escape if this is marked to be a tunnel.
-      // No data has been read at this point, so we can go
-      // directly into blind tunnel mode
-
-      if (cc && SSLCertContextOption::OPT_TUNNEL == cc->opt) {
-        if (this->is_transparent) {
-          this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-          _completeHandshakeIfActive();
-          this->_ssl = nullptr;
-          return EVENT_DONE;
-        } else {
-          hookOpRequested = SslVConnOp::SSL_HOOK_OP_TUNNEL;
-        }
-      }
-
-      // Attach the default SSL_CTX to this SSL session. The default context is never going to be able
-      // to negotiate a SSL session, but it's enough to trampoline us into the SNI callback where we
-      // can select the right server certificate.
-      this->_make_ssl_connection(lookup->defaultContext());
-    }
-
-    if (this->_ssl.get() == nullptr) {
-      SSLErrorVC(this, "failed to create SSL server session");
-      return EVENT_ERROR;
-    }
-    return sslServerHandShakeEvent(err);
-
-  case SSL_EVENT_CLIENT:
-
-    char buff[INET6_ADDRSTRLEN];
-
-    if (this->_ssl.get() == nullptr) {
-      // Making the check here instead of later, so we only
-      // do this setting immediately after we create the SSL object
-      SNIConfig::scoped_config sniParam;
-      const char              *serverKey = this->options.sni_servername;
-      if (!serverKey) {
-        ats_ip_ntop(this->get_remote_addr(), buff, INET6_ADDRSTRLEN);
-        serverKey = buff;
-      }
-      auto           nps       = sniParam->get_property_config(serverKey);
-      shared_SSL_CTX sharedCTX = nullptr;
-      SSL_CTX       *clientCTX = nullptr;
-      std::string    caCertPathStorage;
-      const char    *caCertPath = resolve_client_ca_cert_path(params, options.ssl_client_ca_cert_path, caCertPathStorage);
-
-      // First Look to see if there are override parameters
-      Dbg(dbg_ctl_ssl, "Checking for outbound client cert override [%p]", options.ssl_client_cert_name.get());
-      if (options.ssl_client_cert_name) {
-        std::string certFilePath;
-        std::string keyFilePath;
-        std::string caCertFilePath;
-        // Enable override to explicitly disable the client certificate. That is, don't fill
-        // in any of the cert paths if the cert file name is empty or "NULL".
-        if (*options.ssl_client_cert_name != '\0' && 0 != strcasecmp("NULL", options.ssl_client_cert_name)) {
-          certFilePath = Layout::get()->relative_to(params->clientCertPathOnly, options.ssl_client_cert_name.get());
-          if (options.ssl_client_private_key_name) {
-            keyFilePath = Layout::get()->relative_to(params->clientKeyPathOnly, options.ssl_client_private_key_name);
-          }
-          if (options.ssl_client_ca_cert_name) {
-            caCertFilePath = Layout::get()->relative_to(caCertPath, options.ssl_client_ca_cert_name);
-          }
-          Dbg(dbg_ctl_ssl, "Using outbound client cert `%s'", options.ssl_client_cert_name.get());
-        } else {
-          Dbg(dbg_ctl_ssl, "Clearing outbound client cert");
-        }
-        sharedCTX = params->getCTX(certFilePath, keyFilePath,
-                                   caCertFilePath.empty() ? params->clientCACertFilename : caCertFilePath.c_str(), caCertPath);
-      } else if (options.ssl_client_ca_cert_name || options.ssl_client_ca_cert_path) {
-        std::string caCertFilePath;
-        if (options.ssl_client_ca_cert_name) {
-          caCertFilePath = Layout::get()->relative_to(caCertPath, options.ssl_client_ca_cert_name);
-        }
-        sharedCTX = params->getCTX(params->clientCertPath, params->clientKeyPath,
-                                   caCertFilePath.empty() ? params->clientCACertFilename : caCertFilePath.c_str(), caCertPath);
-      } else if (nps && !nps->client_cert_file.empty()) {
-        // If no overrides available, try the available nextHopProperty by reading from context mappings
-        sharedCTX =
-          params->getCTX(nps->client_cert_file, nps->client_key_file, params->clientCACertFilename, params->clientCACertPath);
-      } else { // Just stay with the values passed down from the SM for verify
-        clientCTX = params->client_ctx.get();
-      }
-
-      if (sharedCTX) {
-        clientCTX = sharedCTX.get();
-      }
-
-      if (options.verifyServerPolicy != YamlSNIConfig::Policy::UNSET) {
-        // Stay with conf-override version as the highest priority
-      } else if (nps && nps->verify_server_policy != YamlSNIConfig::Policy::UNSET) {
-        options.verifyServerPolicy = nps->verify_server_policy;
-      } else {
-        options.verifyServerPolicy = params->verifyServerPolicy;
-      }
-
-      if (options.verifyServerProperties != YamlSNIConfig::Property::UNSET) {
-        // Stay with conf-override version as the highest priority
-      } else if (nps && nps->verify_server_properties != YamlSNIConfig::Property::UNSET) {
-        options.verifyServerProperties = nps->verify_server_properties;
-      } else {
-        options.verifyServerProperties = params->verifyServerProperties;
-      }
-
-      if (!clientCTX) {
-        SSLErrorVC(this, "failed to create SSL client session");
-        return EVENT_ERROR;
-      }
-
-      this->_make_ssl_connection(clientCTX);
-      if (this->_ssl.get() == nullptr) {
-        SSLErrorVC(this, "failed to create SSL client session");
-        return EVENT_ERROR;
-      }
-
-      // If it is negative, we are consciously not setting ALPN (e.g. for private server sessions)
-      if (options.alpn_protocols_array_size >= 0) {
-        if (options.alpn_protocols_array_size > 0) {
-          SSL_set_alpn_protos(this->_ssl.get(), options.alpn_protocols_array, options.alpn_protocols_array_size);
-        } else if (params->alpn_protocols_array_size > 0) {
-          // Set the ALPN protocols we are requesting.
-          SSL_set_alpn_protos(this->_ssl.get(), params->alpn_protocols_array, params->alpn_protocols_array_size);
-        }
-      }
-
-      SSL_set_verify(this->_ssl.get(), SSL_VERIFY_PEER, verify_callback);
-
-      // SNI
-      ats_scoped_str &tlsext_host_name = this->options.sni_hostname ? this->options.sni_hostname : this->options.sni_servername;
-      if (tlsext_host_name) {
-        if (this->set_sni_server_name(this->_ssl.get(), tlsext_host_name)) {
-          Dbg(dbg_ctl_ssl, "using SNI name '%s' for client handshake", tlsext_host_name.get());
-        } else {
-          Dbg(dbg_ctl_ssl_error, "failed to set SNI name '%s' for client handshake", tlsext_host_name.get());
-          Metrics::Counter::increment(ssl_rsb.sni_name_set_failure);
-        }
-      }
-
-      // ALPN
-      if (!this->options.alpn_protos.empty()) {
-        if (int res = SSL_set_alpn_protos(this->_ssl.get(), reinterpret_cast<const uint8_t *>(this->options.alpn_protos.data()),
-                                          this->options.alpn_protos.size());
-            res != 0) {
-          Dbg(dbg_ctl_ssl_error, "failed to set ALPN '%.*s' for client handshake",
-              static_cast<int>(this->options.alpn_protos.size()), this->options.alpn_protos.data());
-        }
+      if (int setup = _setupClientSSL(); setup != EVENT_CONT) {
+        return setup;
       }
     }
-
     return sslClientHandShakeEvent(err);
-
-  default:
-    ink_assert(0);
-    return EVENT_ERROR;
   }
+
+  if (this->_ssl.get() == nullptr) {
+    if (int setup = _setupServerSSL(); setup != EVENT_CONT) {
+      return setup;
+    }
+  }
+  return sslServerHandShakeEvent(err);
 }
 
 int
