@@ -408,7 +408,7 @@ SSLNetVConnection::_signal_user(SignalSide side, int event)
       // case (UnixNetVConnection.cc). _signalAndReclaim's fused reclaim then reaps this VC on
       // the unwind.
       Dbg(dbg_ctl_inactivity_cop, "%s event %d: null vio cont, closing vc %p", side_str, event, this);
-      _sslState = SslState::RECLAIMABLE;
+      _authorizeReclaim();
       break;
     default:
       // A delivery aimed at a consumer that's already gone (severed cont, or a mutex that no
@@ -470,7 +470,7 @@ SSLNetVConnection::_ssl_read_pending() const
     return false;
   }
   return miobuffer_has_read_avail(SSL_get_rbio(_ssl.get())) || SSL_pending(_ssl.get()) > 0 || _early_data_pending() ||
-         (SSL_get_shutdown(_ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0 || isTerminated(_transport_state);
+         (SSL_get_shutdown(_ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0 || _transport_read_ended();
 }
 
 // Which side to deliver a handshake failure on: the consumer waiting on the handshake
@@ -481,6 +481,27 @@ SSLNetVConnection::SignalSide
 SSLNetVConnection::_handshake_fail_side() const
 {
   return _user_read_vio.op == VIO::READ ? SignalSide::READ : SignalSide::WRITE;
+}
+
+// The completion mirror of _handshake_fail_side: which side is waiting on handshake
+// completion. The pooled/trampoline waiters (ConnectingEntry, SSLNextProtocolTrampoline) park
+// a zero-byte read VIO and take READ_COMPLETE; the direct outbound connect (HttpSM) attaches
+// only a 1-byte do_io_write, no read VIO, and takes WRITE_READY as "handshake done". Empty
+// when nobody waits on completion itself: a read VIO with real bytes wanted is data delivery,
+// which the normal read path serves.
+std::optional<SSLNetVConnection::SignalSide>
+SSLNetVConnection::_handshake_done_side() const
+{
+  if (_user_read_vio.op == VIO::READ) {
+    if (!_user_read_vio.is_disabled() && _user_read_vio.ntodo() <= 0) {
+      return SignalSide::READ;
+    }
+    return std::nullopt;
+  }
+  if (_user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled()) {
+    return SignalSide::WRITE;
+  }
+  return std::nullopt;
 }
 
 void
@@ -653,9 +674,7 @@ SSLNetVConnection::_trigger_ssl_read()
     // synchronously. Skip this when `ret == EVENT_ERROR`: the switch's own case below has the
     // more specific `err` to report.
     if (ret != EVENT_ERROR && _is_terminal(_sslState)) {
-      if (_sslState == SslState::FATAL_PENDING) {
-        _sslState = SslState::TERMINATED; // this synchronous delivery is the exactly-once
-      }
+      _consumeFatalFailure();
       (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
       return;
     }
@@ -663,9 +682,7 @@ SSLNetVConnection::_trigger_ssl_read()
     switch (ret) {
     case EVENT_ERROR:
       lerrno = err;
-      if (_sslState == SslState::FATAL_PENDING) {
-        _sslState = SslState::TERMINATED; // this delivery consumes the armed reject too
-      }
+      _consumeFatalFailure();
       (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
       return;
     case SSL_HANDSHAKE_WANT_READ:
@@ -680,8 +697,8 @@ SSLNetVConnection::_trigger_ssl_read()
       // is never told at all. A connection that dies mid-handshake is a connect ERROR
       // (EPIPE for a bare FIN, matching master's EOS-during-connect classification; a
       // transport error keeps its real errno).
-      if (isTerminated(_transport_state)) {
-        if (_transport_state == TransportState::TRANSPORT_CLOSED || lerrno == 0) {
+      if (_transport_read_ended()) {
+        if (_transport_state == TransportState::READ_EOS || lerrno == 0) {
           lerrno = EPIPE;
         }
         (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
@@ -718,22 +735,19 @@ SSLNetVConnection::_trigger_ssl_read()
       break;
     case EVENT_DONE:
       Dbg(dbg_ctl_ssl, "ssl handshake EVENT_DONE vc %p ntodo=%" PRId64, this, _user_read_vio.ntodo());
-      // If this was driven by a zero length read (e.g. ConnectingEntry's handshake-completion
-      // probe), signal complete when the handshake is complete.
-      if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() <= 0) {
+      // Wake whoever is waiting on handshake completion (_handshake_done_side says who listens
+      // where): the zero-byte read probe takes READ_COMPLETE.
+      if (auto side = _handshake_done_side(); side == SignalSide::READ) {
         if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE) == SignalOutcome::RECLAIMED) {
           return;
         }
-      } else if (_user_read_vio.op != VIO::READ && _user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled() &&
-                 _write_buf_reader->read_avail() == 0) {
-        // Write-only waiter with an empty wbio: the outbound direct connect (HttpSM) attaches only a
-        // 1-byte do_io_write and treats WRITE_READY as "handshake done", with no read VIO to signal.
-        // A full TLS-1.2 handshake completes on this transport READ pass with the client's final
-        // flight already flushed, so no wbio bytes remain to re-arm the write face and drive its
-        // WRITE_READY (the flush below and in _handle_transport_write_ready). TLS-1.3 and TLS-1.2
-        // resumption complete with the client flight still in the wbio and stay on that flush path;
-        // the pooled ConnectingEntry probe uses a read VIO and is signalled above. Deliver the
-        // write-side wakeup directly so the connect does not strand to its timeout.
+      } else if (side == SignalSide::WRITE && _write_buf_reader->read_avail() == 0) {
+        // Write-only waiter with an empty wbio: a full TLS-1.2 handshake completes on this
+        // transport READ pass with the client's final flight already flushed, so no wbio bytes
+        // remain to re-arm the write face and drive its WRITE_READY (the flush below and in
+        // _handle_transport_write_ready). TLS-1.3 and TLS-1.2 resumption complete with the
+        // client flight still in the wbio and stay on that flush path. Deliver the write-side
+        // wakeup directly so the connect does not strand to its timeout.
         if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
           return;
         }
@@ -849,8 +863,7 @@ SSLNetVConnection::_trigger_ssl_read()
     // SSL_RECEIVED_SHUTDOWN, so re-drive out of line to let the next read surface the pending EOS.
     // A TLS half-close leaves TCP open (no prompt FIN), so waiting on a transport read would strand
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
-    if (!_deferred_work_pending() && _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() &&
-        _user_read_vio.ntodo() > 0 && buf.writer() != nullptr && buf.writer()->write_avail() > 0 && _ssl_read_pending()) {
+    if (!_deferred_work_pending() && _read_drive_warranted() && buf.writer() != nullptr && buf.writer()->write_avail() > 0) {
       _scheduleDeferredWork(this_ethread());
     } else {
       _transport_read_vio->reenable();
@@ -862,7 +875,7 @@ SSLNetVConnection::_trigger_ssl_read()
     Dbg(dbg_ctl_ssl, "read finished - would block - need write");
     break;
   case SSL_READ_WOULD_BLOCK:
-    if (isTerminated(_transport_state)) {
+    if (_transport_read_ended()) {
       // The transport is gone (FIN or error) and the rbio is drained: no more bytes will
       // ever arrive, so surface the close to the enabled reader now -- master re-reads the
       // socket EOF on every enabled read pass and delivers EOS the same way. Distinguish a
@@ -1095,9 +1108,8 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   // the plaintext, so that final write would otherwise be silently dropped. Encrypt it now,
   // synchronously and without signalling the consumer, before the sever and SSL_shutdown() below
   // (SSL_write() is invalid once SSL_shutdown() has run).
-  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_state != TransportState::TRANSPORT_ERROR &&
-      getSSLHandShakeComplete() && _user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled() &&
-      _user_write_vio.ntodo() > 0) {
+  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable() &&
+      getSSLHandShakeComplete() && _user_write_active()) {
     MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
     if (lock.is_locked()) {
       int64_t total_plaintext_written = 0;
@@ -1143,12 +1155,12 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
       }
 
       // Send the close-notify unless the transport is broken. A peer that merely
-      // half-closed its write side (TRANSPORT_CLOSED, set when the inner unvc fires
+      // half-closed its write side (READ_EOS, set when the inner unvc fires
       // VC_EVENT_EOS) still has its read side open and expects the close-notify to
       // shut the TLS session down cleanly; skipping it leaves the peer's SSL_read at
       // an unexpected EOF, which (if it has shutdown(SHUT_WR)) makes it emit an alert
       // onto a closed write side -> EPIPE. Only a truly broken transport skips it.
-      bool do_shutdown = _transport_state != TransportState::TRANSPORT_ERROR;
+      bool do_shutdown = _transport_write_usable();
 
       if (do_shutdown) {
         // Send the close-notify. May synchronously invoke a registered hook (session-ticket),
@@ -1178,10 +1190,10 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   // this VC (and that reader) inline here -- directly, or via _signal_user's
   // terminated-state teardown -- would crash that live net_write_io. So defer teardown to a
   // clean stack and let the transport flush any close-notify first. The peer may have
-  // half-closed its write side (TRANSPORT_CLOSED) while still reading our response; only a
+  // half-closed its write side (READ_EOS) while still reading our response; only a
   // truly broken transport (TRANSPORT_ERROR) skips the drain and tears down inline.
-  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_state != TransportState::TRANSPORT_ERROR) {
-    _sslState = SslState::SHUTDOWN_IN_PROGRESS; // == draining; see _isDraining()
+  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable()) {
+    _beginGracefulShutdown();
     if (_write_buf_reader && _write_buf_reader->read_avail() > 0) {
       Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: draining %" PRId64 " buffered bytes before close vc %p",
           _write_buf_reader->read_avail(), this);
@@ -1207,7 +1219,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   // The consumer's close is what authorizes the physical free (consumer-driven teardown; see
   // _reclaimIfClosed). Whether the free happens inline here, on a reclaim unwind, or at a
   // deferred dispatch, it happens because of THIS call, not an error state.
-  _sslState = SslState::RECLAIMABLE;
+  _authorizeReclaim();
 
   if (close_inline) {
     this->free_thread(t);
@@ -1382,8 +1394,8 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       if (cc && SSLCertContextOption::OPT_TUNNEL == cc->opt) {
         if (this->is_transparent) {
           this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
-          _sslState        = SslState::HANDSHAKE_DONE;
-          this->_ssl       = nullptr;
+          _completeHandshakeIfActive();
+          this->_ssl = nullptr;
           return EVENT_DONE;
         } else {
           hookOpRequested = SslVConnOp::SSL_HOOK_OP_TUNNEL;
@@ -1560,7 +1572,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     // over the buffered handshake packets to the O.S.
     return EVENT_DONE;
   } else if (SslVConnOp::SSL_HOOK_OP_TERMINATE == hookOpRequested) {
-    _sslState = SslState::HANDSHAKE_DONE;
+    _completeHandshakeIfActive();
     return EVENT_DONE;
   }
 
@@ -1689,12 +1701,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       }
     }
 
-    // Forward stores must not exit the terminal region: an in-flight close (RECLAIMABLE /
-    // SHUTDOWN_IN_PROGRESS) or an armed reject (FATAL_PENDING) outranks completion -- the
-    // separate booleans this enum absorbed used to survive this store.
-    if (_sslState == SslState::HANDSHAKING) {
-      _sslState = SslState::HANDSHAKE_DONE;
-    }
+    _completeHandshakeIfActive();
 
     if (this->get_tls_handshake_begin_time()) {
       this->_record_tls_handshake_end_time();
@@ -1898,12 +1905,7 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 
     Metrics::Counter::increment(ssl_rsb.total_success_handshake_count_out);
 
-    // See the inbound completion store: a close from a verify hook (legal on a plugin-owned
-    // outbound VC) has already moved the state past HANDSHAKING; completing must not erase
-    // the close authorization or nothing would ever free the VC.
-    if (_sslState == SslState::HANDSHAKING) {
-      _sslState = SslState::HANDSHAKE_DONE;
-    }
+    _completeHandshakeIfActive();
     return EVENT_DONE;
 
   case SSL_ERROR_WANT_WRITE:
@@ -1980,18 +1982,13 @@ SSLNetVConnection::reenable_with_event(int event)
       // terminated-state teardown paths would abort even a PERMISSIVE handshake that must complete.
       _verify_hook_failed = true;
     } else {
-      // A hook failed the handshake: record it and keep iterating hooks (the remaining
+      // A hook failed the handshake: arm the reject and keep iterating hooks (the remaining
       // hooks of the chain must still see their event). The failure reaches the consumer
-      // exactly once, downstream -- delivery IS the FATAL_PENDING -> TERMINATED transition:
-      // a synchronous reenable (hook callout mid-SSL_connect/accept) via the unwinding
-      // handshake error path, an asynchronous one via the scheduled dispatch (_runDeferredWork).
-      // Signalling from here would let the consumer tear us down while the hook chain is
-      // still running. A close that already happened outranks the reject (a late reject
-      // from a parked hook's queue, e.g. rate_limit, after the waiter closed): arming would
-      // erase the close authorization and there is no consumer left to deliver to.
-      if (!_is_terminal(_sslState) && !_isDraining()) {
-        _sslState = SslState::FATAL_PENDING;
-      }
+      // exactly once, downstream (_consumeFatalFailure): a synchronous reenable (hook callout
+      // mid-SSL_connect/accept) via the unwinding handshake error path, an asynchronous one
+      // via the scheduled dispatch (_runDeferredWork). Signalling from here would let the
+      // consumer tear us down while the hook chain is still running.
+      _armFatalFailure();
     }
   }
 
@@ -2201,11 +2198,9 @@ SSLNetVConnection::_lookupContextByName(const std::string &servername, SSLCertCo
   if (cc && ctx && SSLCertContextOption::OPT_TUNNEL == cc->opt && this->get_is_transparent()) {
     this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
     // A CLIENT_HELLO/SERVERNAME hook may have rejected earlier in this same SSL_accept flight
-    // (FATAL_PENDING). The reject outranks the tunnel: leave the state alone so the dispatch
-    // delivers it instead of handing the rejected client a blind tunnel.
-    if (_sslState == SslState::HANDSHAKING) {
-      _sslState = SslState::HANDSHAKE_DONE;
-    }
+    // (FATAL_PENDING). The reject outranks the tunnel (_completeHandshakeIfActive's guard): the
+    // dispatch delivers it instead of handing the rejected client a blind tunnel.
+    _completeHandshakeIfActive();
     return nullptr;
   } else {
     return ctx;
@@ -2361,8 +2356,8 @@ SSLNetVConnection::_propagateHandShakeBuffer(UnixNetVConnection *target, EThread
   // the plain successor.
   ink_release_assert(this->handShakeHolder != nullptr);
   Dbg(dbg_ctl_ssl, "allow-plain, handshake buffer ready to read=%" PRId64, this->handShakeHolder->read_avail());
+  _completeHandshakeIfActive();
   // Take ownership of the handShake buffer
-  _sslState   = SslState::HANDSHAKE_DONE;
   NetState *s = &target->read;
   s->vio.set_writer(this->_read_buf.get());
   s->vio.set_reader(this->handShakeHolder);
@@ -2943,7 +2938,7 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
   // mainEvent owns the terminated/draining gate (it early-returns on a terminal _sslState,
   // and short-circuits reads while _isDraining(), before dispatching here), so no redundant entry
   // check is needed.
-  if (isTerminated(_transport_state)) {
+  if (_transport_read_ended()) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: transport closed, but we have data to read", this);
   }
 
@@ -3021,7 +3016,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // Set the state before signalling: the fused reclaim may free this VC, so the
       // member write must happen first (and the terminated state also lets
       // _reclaimIfClosed free us).
-      _sslState = SslState::TERMINATED;
+      _failHandshake();
       (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
       return EVENT_DONE;
     } else if (_is_terminal(_sslState)) {
@@ -3030,9 +3025,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
       // sslStartHandShake() has already returned, so we're unconditionally outside any OpenSSL
       // frame here -- always safe to deliver synchronously. See the read-side twin of this
       // check in _trigger_ssl_read for the full rationale.
-      if (_sslState == SslState::FATAL_PENDING) {
-        _sslState = SslState::TERMINATED; // this synchronous delivery is the exactly-once
-      }
+      _consumeFatalFailure();
       (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
       return EVENT_DONE;
     } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
@@ -3093,10 +3086,9 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     return EVENT_CONT;
   }
 
-  // Only a broken transport (TRANSPORT_ERROR) blocks the write here. TRANSPORT_CLOSED
-  // means the peer half-closed its write side (FIN); its read side is still open and
-  // waiting for our response, so we must keep encrypting and flushing it.
-  if (_is_terminal(_sslState) || _transport_state == TransportState::TRANSPORT_ERROR) {
+  // Only a broken transport blocks the write here: after a peer half-close (READ_EOS) its
+  // read side is still open and waiting for our response, so keep encrypting and flushing.
+  if (_is_terminal(_sslState) || !_transport_write_usable()) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: terminated, ignoring write ready", this);
     _transport_write_vio->disable();
     return EVENT_DONE;
@@ -3260,8 +3252,7 @@ SSLNetVConnection::_deliverWriteComplete()
   if (_signalAndReclaim(SignalSide::WRITE, VC_EVENT_WRITE_COMPLETE) == SignalOutcome::RECLAIMED) {
     return EVENT_DONE; // consumer closed/freed us from its handler
   }
-  if (!_is_terminal(_sslState) && _transport_state != TransportState::TRANSPORT_ERROR && _user_write_vio.op == VIO::WRITE &&
-      !_user_write_vio.is_disabled() && _user_write_vio.ntodo() > 0) {
+  if (!_is_terminal(_sslState) && _transport_write_usable() && _user_write_active()) {
     _scheduleWriteRearm();
   }
   return EVENT_DONE;
@@ -3297,7 +3288,7 @@ int
 SSLNetVConnection::_handle_transport_eos(VIO *vio)
 {
   ink_release_assert(vio == _transport_read_vio);
-  _transport_state = TransportState::TRANSPORT_CLOSED;
+  _transport_state = TransportState::READ_EOS;
   // The peer FIN'd. Schedule an out-of-line read drive so any remaining decrypted
   // bytes are delivered and EOS is propagated to a waiting reader; the MIOBuffer
   // rbio cannot surface EOF itself. Out of line so we don't free this VC while the
@@ -3327,7 +3318,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   // rather than freeing the VC out from under it.
   if (_isDraining()) {
     if (!_freeBlocked()) {
-      _sslState = SslState::RECLAIMABLE;
+      _authorizeReclaim();
       this->free_thread(this_ethread());
     }
     return EVENT_DONE;
@@ -3356,8 +3347,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   // write_signal_and_update on a write error. Safe on this stack (see the handshake exit above): a
   // close from the handler takes the deferred close-drain, so this does not free a VC the transport
   // still references. The fused reclaim only frees a severed/absent consumer, so return if it did.
-  if (!_is_terminal(_sslState) && _user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled() &&
-      _user_write_vio.ntodo() > 0) {
+  if (!_is_terminal(_sslState) && _user_write_active()) {
     if (lerrno == 0) {
       lerrno = EPIPE;
     }
@@ -3466,7 +3456,7 @@ SSLNetVConnection::_runDeferredWork()
     // transport reschedules itself), so wait for the next dispatch. A parked hook still holds a
     // live ref (_freeBlocked): hold off and let its reenable's read-drive complete the free.
     if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_freeBlocked()) {
-      _sslState = SslState::RECLAIMABLE;
+      _authorizeReclaim();
       this->free_thread(this_ethread());
     }
     return EVENT_DONE;
@@ -3478,11 +3468,9 @@ SSLNetVConnection::_runDeferredWork()
 
   // An armed fatal error (a handshake hook's reenable_with_event(TS_EVENT_ERROR), e.g. an
   // SNI/rate-limit reject) has no handshake driver on the stack to deliver it -- only this
-  // scheduled dispatch. Delivery is the transition to TERMINATED, so it happens EXACTLY ONCE
-  // (the consumer's do_io_close then drives the free); a severed/absent consumer hits
-  // _signal_user's null-cont owner-close.
-  if (_sslState == SslState::FATAL_PENDING) {
-    _sslState = SslState::TERMINATED;
+  // scheduled dispatch. The consumer's do_io_close then drives the free; a severed/absent
+  // consumer hits _signal_user's null-cont owner-close.
+  if (_consumeFatalFailure()) {
     (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     return EVENT_DONE;
   }
@@ -3507,8 +3495,7 @@ SSLNetVConnection::_runDeferredWork()
     // Re-validate the write VIO here rather than trusting it's still what it was when this
     // was armed: the consumer may have closed, redirected, or disabled it in the interim.
     _write_rearm_pending = false;
-    if (!_is_terminal(_sslState) && _transport_state != TransportState::TRANSPORT_ERROR && _user_write_vio.op == VIO::WRITE &&
-        !_user_write_vio.is_disabled() && _user_write_vio.ntodo() > 0) {
+    if (!_is_terminal(_sslState) && _transport_write_usable() && _user_write_active()) {
       ink_assert(_transport_write_vio != nullptr && _transport_write_vio->op == VIO::WRITE);
       _transport_write_vio->reenable();
     }
@@ -3518,7 +3505,7 @@ SSLNetVConnection::_runDeferredWork()
     // in the rbio; servicing the rearm above consumed the shared slot, so a co-pending
     // read drive would be dropped and the buffered response would strand -- the transport read
     // does not re-signal for data already in the rbio (INV-2/INV-4). Re-schedule the read drive.
-    if (_user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending()) {
+    if (_read_drive_warranted()) {
       _scheduleDeferredWork(this_ethread());
     }
     return EVENT_DONE;
@@ -3548,12 +3535,10 @@ SSLNetVConnection::mainEvent(int event, void *data)
   if (_is_terminal(_sslState)) {
     // A transport event reached us already in a terminal state. If a fatal error is still armed
     // (an async reenable_with_event(TS_EVENT_ERROR) raced this event ahead of the scheduled
-    // dispatch), deliver it to the waiter -- the transition to TERMINATED makes it exactly once --
-    // so the consumer can close us; otherwise the error was already delivered and the consumer
-    // owns the teardown -- do not re-signal. Either way, reap if the consumer has since closed
-    // (_reclaimIfClosed is a no-op until it has).
-    if (_sslState == SslState::FATAL_PENDING) {
-      _sslState = SslState::TERMINATED;
+    // dispatch), deliver it to the waiter so the consumer can close us; otherwise the error was
+    // already delivered and the consumer owns the teardown -- do not re-signal. Either way,
+    // reap if the consumer has since closed (_reclaimIfClosed is a no-op until it has).
+    if (_consumeFatalFailure()) {
       (void)_signalAndReclaim(_handshake_fail_side(), VC_EVENT_ERROR);
     } else {
       _reclaimIfClosed();
@@ -3575,7 +3560,7 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // unless a hook is still parked (_freeBlocked), where the plugin holds a live ref and will
       // reenable; defer the free to that reenable rather than freeing under the plugin.
       if (!_freeBlocked()) {
-        _sslState = SslState::RECLAIMABLE;
+        _authorizeReclaim();
         this->free_thread(this_ethread());
         return EVENT_DONE;
       }
@@ -3681,7 +3666,7 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
     // User wants to start a read
     _user_read_vio.set_writer(buf);
     _adoptConsumerMutex(c);
-    if (!isTerminated(_transport_state)) {
+    if (!_transport_read_ended()) {
       // Ask the transport for more socket data.
       _user_read_vio.reenable();
     }
@@ -3775,8 +3760,7 @@ SSLNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
     // close-notify into _write_buf (the wbio) via SSL_shutdown and let the transport drain it.
     // Keep the VC alive: the consumer half-closes to flush the response and wait for the peer
     // to close (avoiding a truncating RST); teardown happens later in do_io_close.
-    if (getSSLHandShakeComplete() && _ssl.get() != nullptr && !_is_terminal(_sslState) &&
-        _transport_state != TransportState::TRANSPORT_ERROR) {
+    if (getSSLHandShakeComplete() && _ssl.get() != nullptr && !_is_terminal(_sslState) && _transport_write_usable()) {
       if (!(SSL_get_shutdown(_ssl.get()) & SSL_SENT_SHUTDOWN)) {
         // May synchronously invoke a registered hook (session-ticket), which may itself call
         // back into us.
@@ -3794,8 +3778,7 @@ SSLNetVConnection::do_io_shutdown(ShutdownHowTo_t howto)
     // Re-arm the (now disabled) transport write so net_write_io flushes the close-notify.
     // _write_buf is non-empty here, so net_write_io reschedules itself until it drains and is
     // not subject to the empty-buffer write_disable race that forces off-stack WRITE_COMPLETE.
-    if (_write_buf_reader && _write_buf_reader->read_avail() > 0 && _transport_write_vio != nullptr &&
-        _transport_state != TransportState::TRANSPORT_ERROR) {
+    if (_write_buf_reader && _write_buf_reader->read_avail() > 0 && _transport_write_vio != nullptr && _transport_write_usable()) {
       _transport_write_vio->reenable();
     }
   }

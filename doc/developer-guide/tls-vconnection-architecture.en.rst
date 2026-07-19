@@ -94,7 +94,8 @@ Two enums in ``P_SSLNetVConnection.h`` track the connection:
   VC (or a terminal event found no consumer attached), and the VC frees itself
   once nothing else blocks it.
 * ``TransportState`` — the state of the inner ``_unvc``: ``TRANSPORT_LIVE``,
-  ``TRANSPORT_CLOSED``, ``TRANSPORT_ERROR``.
+  ``READ_EOS``, ``TRANSPORT_ERROR``. ``READ_EOS`` is a read-side fact only (the
+  peer FIN'd); the write side may still be usable.
 
 Event flow
 ==========

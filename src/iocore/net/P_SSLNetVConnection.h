@@ -55,6 +55,7 @@
 
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 // These are included here because older OpenSSL libraries don't have them.
@@ -134,14 +135,16 @@ private:
                               // owner-close). The outer VC is not NetHandler-managed, so it frees
                               // itself the moment _freeBlocked() clears. See _reclaimIfClosed.
   };
-  // Transition table: every store to _sslState, grouped by destination; sites are named by
-  // function. "Guarded" marks a conditional store whose condition is the FROM set; an
-  // unconditional store's FROM is the state reachable at that site. Start state: HANDSHAKING at
-  // construction; the destructor also resets to it, from whatever state the VC was freed in, for
+  // Transition table: every transition of _sslState, grouped by destination; sites are named by
+  // function. Each group is implemented by exactly one named mutator (defined below the enum),
+  // so the table is checkable against six small bodies instead of every assignment in the class.
+  // "Guarded" marks a mutator whose condition is the FROM set; for an unconditional mutator,
+  // FROM is the state reachable at its call sites. Start state: HANDSHAKING at construction; the
+  // destructor also resets to it directly, from whatever state the VC was freed in, for
   // allocator reuse. Terminal region (_is_terminal, below): FATAL_PENDING, TERMINATED,
   // RECLAIMABLE.
   //
-  //   HANDSHAKING -> HANDSHAKE_DONE
+  //   HANDSHAKING -> HANDSHAKE_DONE  -- _completeHandshakeIfActive()
   //     - Handshake completion on SSL_ERROR_NONE: sslServerHandShakeEvent /
   //       sslClientHandShakeEvent. Guarded (== HANDSHAKING): a state moved past HANDSHAKING
   //       mid-flight -- a hook's reject or a close during SSL_accept/SSL_connect -- outranks
@@ -154,12 +157,12 @@ private:
   //       currently sets that op, so this store is unreached.)
   //     - The DOWNGRADE_PLAIN executor (_propagateHandShakeBuffer), just before this VC hands its
   //       buffers to the plain successor and frees itself.
-  //   HANDSHAKING -> FATAL_PENDING
+  //   HANDSHAKING -> FATAL_PENDING  -- _armFatalFailure()
   //     - The state's only entry: a non-verify handshake hook's reenable_with_event(
   //       TS_EVENT_ERROR). Guarded (not terminal, not draining): a close that already happened
   //       outranks the reject. (The guard would also admit HANDSHAKE_DONE, but a handshake hook
   //       only reenables while the handshake is parked on it.)
-  //   HANDSHAKING -> TERMINATED
+  //   HANDSHAKING -> TERMINATED  -- _failHandshake()
   //     - The write-face handshake driver's EVENT_ERROR (_handle_transport_write_ready), stored
   //       unconditionally before the failure is signalled, so it also consumes an armed
   //       FATAL_PENDING. The store re-checks nothing, so an in-hook close during the
@@ -167,7 +170,7 @@ private:
   //       RECLAIMABLE, for an abort -- to be overwritten here; the same unwind's owner-close
   //       then re-enters RECLAIMABLE. (The read face's EVENT_ERROR (_trigger_ssl_read) leaves
   //       the state in place; the consumer's close or the owner-close below moves it.)
-  //   FATAL_PENDING -> TERMINATED     -- delivery IS this transition, so it happens exactly once
+  //   FATAL_PENDING -> TERMINATED  -- _consumeFatalFailure(): delivery IS this transition, exactly once
   //     - On the driver stack once sslStartHandShake has returned (outside any OpenSSL frame):
   //       _trigger_ssl_read (post-return terminal check, and its EVENT_ERROR case) and
   //       _handle_transport_write_ready (post-return terminal check; its EVENT_ERROR is the
@@ -175,36 +178,39 @@ private:
   //     - Off-stack, when the hook's reenable was asynchronous: _runDeferredWork's FATAL_PENDING
   //       rung, or mainEvent's terminal-state transport-event gate (a transport event raced
   //       ahead of that dispatch).
-  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS
+  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS  -- _beginGracefulShutdown()
   //     - do_io_close arming the graceful close-drain (lerrno == -1, transport wired and not in
   //       error). A close of an already-failed VC re-enters the drain from inside the terminal
   //       region (_is_terminal() goes back to false), and it erases an undelivered FATAL_PENDING:
   //       there is no consumer left to deliver to. The drain still gates all I/O (_isDraining)
   //       and every exit from it is RECLAIMABLE.
-  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> RECLAIMABLE
+  //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> RECLAIMABLE  -- _authorizeReclaim()
   //     - do_io_close when the drain is not warranted: an abort (lerrno != -1), or the transport
-  //       is absent/broken. (Both do_io_close stores are unconditional; a second close of the
-  //       same VC is not a designed path.)
-  //   {HANDSHAKING, HANDSHAKE_DONE, TERMINATED, SHUTDOWN_IN_PROGRESS} -> RECLAIMABLE
+  //       is absent/broken. (Both do_io_close transitions are unconditional; a second close of
+  //       the same VC is not a designed path.)
+  //   {HANDSHAKING, HANDSHAKE_DONE, TERMINATED, SHUTDOWN_IN_PROGRESS, RECLAIMABLE} -> RECLAIMABLE  -- _authorizeReclaim()
   //     - The null-cont owner-close (_signal_user): a terminal event (EOS/ERROR/timeout) with no
-  //       live consumer to deliver it to, so nobody will ever close us. The store is
-  //       unconditional -- FROM is whatever state the event was delivered in.
+  //       live consumer to deliver it to, so nobody will ever close us. The transition is
+  //       unconditional -- FROM is whatever state the event was delivered in, including a legal
+  //       self-loop from RECLAIMABLE (an in-hook close already authorized the reclaim, and the
+  //       unwinding drive's failure signal then finds no cont).
   //       SHUTDOWN_IN_PROGRESS is reached when a hook nested in a handshake drive closes the VC
   //       (legal on a plugin-owned outbound VC, e.g. TSVConnClose from a verify hook): the close
   //       severs the user VIOs and arms the drain, and the drive's unwinding failure signal then
   //       finds no cont -- a fourth drain exit, which forgoes the flush.
-  //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- each site frees the VC right after the store
+  //   SHUTDOWN_IN_PROGRESS -> RECLAIMABLE  -- _authorizeReclaim(); each site frees the VC right after it
   //     - Drain complete (_runDeferredWork); transport error mid-drain
   //       (_handle_transport_error); a drain stuck at an idle/active timeout (mainEvent). Each is
   //       held off while _freeBlocked(), then completed by a later dispatch or the parked hook's
   //       reenable. (A drain armed by an in-hook close can instead exit through the owner-close
   //       above, on the unwinding drive's stack.)
   //
-  // RECLAIMABLE is near-absorbing: no guarded store leaves it, every dispatch that sees it only
-  // reaps, and the one overwrite -- the write-face EVENT_ERROR above -- is undone by its own
-  // unwind. The VC frees itself (running the destructor's reuse reset) once _freeBlocked()
-  // clears. Nothing enters TERMINATED after the handshake: a data-phase failure is signalled to
-  // the consumer, and the state then moves only at its do_io_close or the owner-close.
+  // RECLAIMABLE is near-absorbing: no guarded mutator leaves it, every dispatch that sees it
+  // only reaps, and the one overwrite -- the write-face EVENT_ERROR above (_failHandshake) --
+  // is undone by its own unwind. The VC frees itself (running the destructor's reuse reset)
+  // once _freeBlocked() clears. Nothing enters TERMINATED after the handshake: a data-phase
+  // failure is signalled to the consumer, and the state then moves only at its do_io_close or
+  // the owner-close.
   enum SslState _sslState = SslState::HANDSHAKING;
   // The terminal region: no further SSL I/O of any kind. A terminal state gates I/O; only
   // RECLAIMABLE authorizes the free (consumer-driven teardown). SHUTDOWN_IN_PROGRESS is not
@@ -213,7 +219,86 @@ private:
   static bool
   _is_terminal(SslState state)
   {
-    return state >= SslState::FATAL_PENDING;
+    return state == SslState::FATAL_PENDING || state == SslState::TERMINATED || state == SslState::RECLAIMABLE;
+  }
+
+  // The named SslState mutators. Every transition of _sslState routes through exactly one of
+  // these (the destructor's allocator-reuse reset aside), so the transition table above is
+  // verifiable against these bodies rather than against every assignment in the class.
+
+  // Handshake completion, and the marks that stand in for it (the blind-tunnel marks, a
+  // hook-requested TERMINATE, the downgrade executor): HANDSHAKING -> HANDSHAKE_DONE, guarded.
+  // Completion must not exit the terminal region or the close-drain: an in-flight close
+  // (RECLAIMABLE / SHUTDOWN_IN_PROGRESS -- e.g. a TSVConnClose from a verify hook on a
+  // plugin-owned outbound VC) or an armed reject (FATAL_PENDING) outranks it, so the store is
+  // skipped -- the separate booleans this enum absorbed used to survive completion. Callers
+  // reachable only from HANDSHAKING share the guard vacuously.
+  void
+  _completeHandshakeIfActive()
+  {
+    if (_sslState == SslState::HANDSHAKING) {
+      _sslState = SslState::HANDSHAKE_DONE;
+    }
+  }
+
+  // Arm the handshake reject (a non-verify handshake hook's reenable_with_event(TS_EVENT_ERROR)):
+  // HANDSHAKING -> FATAL_PENDING, guarded. A close that already happened outranks the reject (a
+  // late reject from a parked hook's queue, e.g. rate_limit, after the waiter closed): arming
+  // would erase the close authorization, and there is no consumer left to deliver to.
+  void
+  _armFatalFailure()
+  {
+    if (!_is_terminal(_sslState) && !_isDraining()) {
+      _sslState = SslState::FATAL_PENDING;
+    }
+  }
+
+  // Consume the armed handshake reject: FATAL_PENDING -> TERMINATED. Delivering the reject to
+  // the waiter IS this transition, and this is its only implementation, so delivery happens
+  // exactly once by structure -- a later delivery site finds TERMINATED and nothing to consume.
+  // Returns whether this call consumed the reject; every site that signals the waiter calls
+  // this first, on the same stack as its _signalAndReclaim.
+  bool
+  _consumeFatalFailure()
+  {
+    if (_sslState == SslState::FATAL_PENDING) {
+      _sslState = SslState::TERMINATED;
+      return true;
+    }
+    return false;
+  }
+
+  // The write-face handshake driver's EVENT_ERROR: unconditional entry to TERMINATED, made
+  // before the failure is signalled, so it also consumes an armed FATAL_PENDING. Deliberately
+  // re-checks nothing: an in-hook close during the sslStartHandShake call leaves
+  // SHUTDOWN_IN_PROGRESS -- or RECLAIMABLE, for an abort -- to be overwritten here; the same
+  // unwind's owner-close then re-enters RECLAIMABLE.
+  void
+  _failHandshake()
+  {
+    _sslState = SslState::TERMINATED;
+  }
+
+  // do_io_close arming the graceful close-drain: -> SHUTDOWN_IN_PROGRESS (== draining, see
+  // _isDraining). Legal from anywhere except the drain itself and RECLAIMABLE (a second close
+  // of the same VC is not a designed path); entering from FATAL_PENDING/TERMINATED is normal --
+  // the close of an already-failed VC erases an undelivered reject, since no consumer is left
+  // to deliver it to.
+  void
+  _beginGracefulShutdown()
+  {
+    ink_assert(!_isDraining() && _sslState != SslState::RECLAIMABLE);
+    _sslState = SslState::SHUTDOWN_IN_PROGRESS;
+  }
+
+  // Authorize the free: -> RECLAIMABLE (master's `closed` latch). Every source state is legal,
+  // so there is no source assert: do_io_close/abort can arrive in any phase, the drain exits
+  // enter from SHUTDOWN_IN_PROGRESS, and the null-cont owner-close self-loops from RECLAIMABLE
+  // itself. The physical free still gates on _freeBlocked() (see _reclaimIfClosed).
+  void
+  _authorizeReclaim()
+  {
+    _sslState = SslState::RECLAIMABLE;
   }
   // A handshake hook has parked (the driver returned SSL_WAIT_FOR_HOOK): a plugin owns a live
   // reference and will reenable_with_event into this VC. Set at the park, cleared when the plugin
@@ -560,6 +645,25 @@ private:
   // are how the read-side stalls happened.
   bool _ssl_read_pending() const;
 
+  // The write dual of _ssl_read_pending(): the consumer has an attached, enabled write VIO with
+  // bytes still to encrypt -- a write genuinely in flight. Gates the paths that act on the
+  // consumer's write (the close-time final encrypt, write-error delivery, and the write-rearm).
+  bool
+  _user_write_active() const
+  {
+    return _user_write_vio.op == VIO::WRITE && !_user_write_vio.is_disabled() && _user_write_vio.ntodo() > 0;
+  }
+
+  // An out-of-line read drive would do useful work: SSL-side read work exists that no future
+  // transport signal will announce (_ssl_read_pending) AND an enabled reader with bytes still
+  // wanted is attached to receive it. Without the consumer half a drive would signal nobody;
+  // without the work half the transport read announces any future work itself.
+  bool
+  _read_drive_warranted() const
+  {
+    return _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending();
+  }
+
   void                _trigger_ssl_read();
   int64_t             _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
   void                _make_ssl_connection(SSL_CTX *ctx);
@@ -611,6 +715,9 @@ private:
   // See the contract at the definition; RECLAIMED means `this` was freed -- touch no member.
   [[nodiscard]] SignalOutcome _signalAndReclaim(SignalSide side, int event);
   SignalSide                  _handshake_fail_side() const;
+  // The completion mirror of _handshake_fail_side; empty when no completion waiter is attached.
+  // See the definition for who listens on which side.
+  std::optional<SignalSide> _handshake_done_side() const;
   // Deliver the user-facing WRITE_COMPLETE synchronously and, if that causes the consumer to
   // reentrantly queue a new write, self-schedule a clean-stack rearm (see the definition and
   // _write_rearm_pending).
@@ -665,11 +772,29 @@ private:
   // terminal status is orthogonal to _sslState -- after transport EOS the VC keeps delivering
   // ciphertext still buffered in the rbio while _sslState remains HANDSHAKE_DONE.
   enum class TransportState {
-    TRANSPORT_LIVE,   // Connecting or established -- not terminated
-    TRANSPORT_CLOSED, // TCP connection received EOS or normal close initiated
-    TRANSPORT_ERROR   // TCP connection encountered an error
+    TRANSPORT_LIVE, // Connecting or established -- not terminated
+    READ_EOS,       // read side ended: peer FIN or normal close initiated; the write side may
+                    // still be usable (see _transport_write_usable)
+    TRANSPORT_ERROR // TCP connection encountered an error
   };
   TransportState _transport_state = TransportState::TRANSPORT_LIVE;
+  // No more bytes will ever arrive from the peer (EOS or a broken transport) -- persistent
+  // state, not an edge. NOT "the connection is dead": after a peer half-close (READ_EOS) the
+  // write side stays open and we may still owe the response; write-path gates must use
+  // _transport_write_usable() instead.
+  bool
+  _transport_read_ended() const
+  {
+    return _transport_state == TransportState::READ_EOS || _transport_state == TransportState::TRANSPORT_ERROR;
+  }
+  // The transport can still take our bytes: only a broken transport (TRANSPORT_ERROR) is
+  // unwritable. A peer that half-closed (READ_EOS) still reads our response, and skipping the
+  // write path on it would truncate the response and the close-notify.
+  bool
+  _transport_write_usable() const
+  {
+    return _transport_state != TransportState::TRANSPORT_ERROR;
+  }
   // The pending self-targeted deferred-work event (schedule_imm), or nullptr when none is
   // outstanding -- we never queue more than one. This one slot multiplexes several purposes --
   // the rbio read-drive (do_io_read / _handle_transport_eos / _runDeferredWork), blind-tunnel handoff,
@@ -697,11 +822,6 @@ private:
   // undoing it. This flag arms a self-targeted, clean-stack re-issue of that reenable() once
   // net_write_io's current pass has fully unwound. See _deliverWriteComplete / _runDeferredWork.
   bool _write_rearm_pending = false;
-  static bool
-  isTerminated(TransportState state)
-  {
-    return state == TransportState::TRANSPORT_CLOSED || state == TransportState::TRANSPORT_ERROR;
-  }
 
   // Event handlers for transport (UnixNetVConnection)
   int _handle_transport_read_ready(VIO *vio);
