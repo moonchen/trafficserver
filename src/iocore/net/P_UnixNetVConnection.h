@@ -48,6 +48,14 @@ class UnixNetVConnection;
 class NetHandler;
 struct PollDescriptor;
 
+// Which allocator pool a NetVConnection came from; the free must return it to the same
+// pool. allocate_vc with t == nullptr draws from the global ClassAllocator pool, while
+// passing an EThread uses its per-thread ProxyAllocator freelist (THREAD_ALLOC/THREAD_FREE).
+// GLOBAL is not an accept-thread marker: besides the blocking accept threads, event-thread
+// callers also pass nullptr (every outbound TLS connect, new QUIC connections), so GLOBAL
+// VCs are routinely allocated and freed on event threads.
+enum class AllocationStorage { THREAD_LOCAL, GLOBAL };
+
 // WARNING:  many or most of the member functions of UnixNetVConnection should only be used when it is instantiated
 // directly.  They should not be used when UnixNetVConnection is a base class.
 class UnixNetVConnection : public NetVConnection, public NetEvent
@@ -179,10 +187,10 @@ public:
 
   unsigned int id = 0;
 
-  Connection con;
-  int        recursion          = 0;
-  bool       from_accept_thread = false;
-  NetAccept *accept_object      = nullptr;
+  Connection        con;
+  int               recursion          = 0;
+  AllocationStorage allocation_storage = AllocationStorage::THREAD_LOCAL;
+  NetAccept        *accept_object      = nullptr;
 
   int         startEvent(int event, Event *e);
   int         acceptEvent(int event, Event *e);

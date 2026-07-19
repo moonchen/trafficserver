@@ -1389,7 +1389,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 void
 SSLNetVConnection::free_thread(EThread *t)
 {
-  if (from_accept_thread) {
+  if (allocation_storage == AllocationStorage::GLOBAL) {
     sslNetVCAllocator.free(this);
   } else {
     THREAD_FREE(this, sslNetVCAllocator, t);

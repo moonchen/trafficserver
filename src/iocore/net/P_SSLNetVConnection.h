@@ -810,8 +810,8 @@ private:
   std::unique_ptr<IOBufferReader, std::function<void(IOBufferReader *)>> _write_buf_reader;
 
 public:
-  void mark_as_tunnel_endpoint() override;
-  bool from_accept_thread{false};
+  void              mark_as_tunnel_endpoint() override;
+  AllocationStorage allocation_storage{AllocationStorage::THREAD_LOCAL};
 
   // initial connect or accept event handler
   int startEvent(int event, void *data);

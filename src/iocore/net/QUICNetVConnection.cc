@@ -117,7 +117,7 @@ void
 QUICNetVConnection::destroy(EThread *t)
 {
   QUICConDebug("Destroy connection");
-  if (from_accept_thread) {
+  if (allocation_storage == AllocationStorage::GLOBAL) {
     quicNetVCAllocator.free(this);
   } else {
     THREAD_FREE(this, quicNetVCAllocator, t);

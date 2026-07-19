@@ -311,7 +311,7 @@ UnixNetProcessor::allocate_vc(EThread *t)
     vc = THREAD_ALLOC_INIT(netVCAllocator, t);
   } else {
     if (likely(vc = netVCAllocator.alloc())) {
-      vc->from_accept_thread = true;
+      vc->allocation_storage = AllocationStorage::GLOBAL;
     }
   }
 

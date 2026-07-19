@@ -139,7 +139,7 @@ QUICNetProcessor::allocate_vc(EThread *t)
   } else {
     if (likely(vc = quicNetVCAllocator.alloc())) {
       new (vc) QUICNetVConnection();
-      vc->from_accept_thread = true;
+      vc->allocation_storage = AllocationStorage::GLOBAL;
     }
   }
   vc->ep.syscall = false;

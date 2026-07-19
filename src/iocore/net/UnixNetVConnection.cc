@@ -1238,7 +1238,7 @@ UnixNetVConnection::free_thread(EThread *t)
   ink_assert(!con.sock.is_ok());
   ink_assert(t == this_ethread());
 
-  if (from_accept_thread) {
+  if (allocation_storage == AllocationStorage::GLOBAL) {
     netVCAllocator.free(this);
   } else {
     THREAD_FREE(this, netVCAllocator, t);
