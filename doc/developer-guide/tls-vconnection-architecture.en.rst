@@ -115,11 +115,12 @@ From then on ``mainEvent`` is the handler.
 
 ``mainEvent`` receives ``VC_EVENT_*`` from the inner connection and dispatches:
 
-* read-ready -> ``_handle_transport_read_ready`` -> ``_trigger_ssl_read``: run
+* read-ready -> ``_handle_transport_read_ready`` -> ``_drive_ssl_read``: run
   ``SSL_read`` and deliver ``READ_READY`` / ``READ_COMPLETE`` / ``EOS`` /
   ``VC_EVENT_ERROR`` to the user;
-* write-ready -> ``_handle_transport_write_ready``: continue the handshake, or
-  encrypt pending plaintext (``_encrypt_data_for_transport``);
+* write-ready -> ``_handle_transport_write_ready`` -> ``_drive_ssl_write``:
+  continue the handshake, or encrypt pending plaintext
+  (``_encrypt_data_for_transport``);
 * EOS / error -> update ``TransportState``.
 
 Events are delivered to the user's continuation through
@@ -143,7 +144,7 @@ encrypt the available plaintext. Encrypting ahead of the socket's ability to
 send would grow ``_write_buf`` toward the size of the whole response and break
 end-to-end backpressure (the user's write would "complete" at memory speed and
 keep producing). Instead the layer re-arms the transport write and waits for a
-transport ``WRITE_READY``, then encrypts in ``_handle_transport_write_ready``.
+transport ``WRITE_READY``, then encrypts in ``_drive_ssl_write``.
 This keeps ``_write_buf`` small and lets backpressure propagate to the data
 source. The amount of buffered ciphertext is bounded by
 :ts:cv:`proxy.config.ssl.write_buffer_water_mark`.

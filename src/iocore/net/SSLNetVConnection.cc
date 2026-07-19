@@ -215,12 +215,18 @@ debug_certificate_name(const char *msg, X509_NAME *name)
   BIO_free(bio);
 }
 
-int
-SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
+// The read pump, mirror of _encrypt_data_for_transport. Decrypts from the rbio into the user
+// buffer until the buffer/request bound is hit or SSL stops producing, and returns the whole
+// outcome as one ReadBatch. Never returns event == SSL_READ_ERROR_NONE: toread > 0 is
+// release-asserted, so the loop below runs at least once, every non-SSL_ERROR_NONE arm sets a
+// different event, and any produced bytes force SSL_READ_READY/SSL_READ_COMPLETE.
+SSLNetVConnection::ReadBatch
+SSLNetVConnection::_decrypt_data_from_transport()
 {
   MIOBufferAccessor &buf        = _user_read_vio.buffer;
   int                event      = SSL_READ_ERROR_NONE;
   int64_t            bytes_read = 0;
+  int                error      = 0;
   ssl_error_t        sslErr     = SSL_ERROR_NONE;
 
   // Find out the max we can read, based on buffer size and user's request size
@@ -229,7 +235,6 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
   int64_t read_available = _user_read_vio.ntodo();
   toread                 = std::min(toread, read_available);
 
-  bytes_read = 0;
   while (sslErr == SSL_ERROR_NONE && bytes_read < toread) {
     int64_t nread             = 0;
     int64_t block_write_avail = buf.writer()->block_write_avail();
@@ -283,7 +288,7 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
         // not EOF
         Metrics::Counter::increment(ssl_rsb.error_syscall);
         event = SSL_READ_ERROR;
-        ret   = errno;
+        error = errno;
         Dbg(dbg_ctl_ssl_error, "SSL_ERROR_SYSCALL, underlying IO error: %s", strerror(errno));
       } else {
         // then EOF observed, treat it as EOS
@@ -300,7 +305,7 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
       unsigned long e = ERR_peek_last_error();
       ERR_error_string_n(e, buf, sizeof(buf));
       event = SSL_READ_ERROR;
-      ret   = errno;
+      error = errno;
       SSLVCDebug(this, "errno=%d", errno);
       Metrics::Counter::increment(ssl_rsb.error_ssl);
     } break;
@@ -311,7 +316,6 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
     Dbg(dbg_ctl_ssl, "bytes_read=%" PRId64, bytes_read);
 
     _user_read_vio.ndone += bytes_read;
-    ret                   = bytes_read;
 
     // If we read it all, don't worry about the other events and just send read complete
     event = (_user_read_vio.ntodo() <= 0) ? SSL_READ_COMPLETE : SSL_READ_READY;
@@ -322,7 +326,10 @@ SSLNetVConnection::_ssl_read_from_net(int64_t &ret)
     }
 #endif
   }
-  return event;
+  // The never-SSL_READ_ERROR_NONE contract from the comment above; the caller runs one batch
+  // per drive on the strength of it.
+  ink_assert(event != SSL_READ_ERROR_NONE);
+  return {event, bytes_read, error};
 }
 
 /**
@@ -638,7 +645,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
   // hand the transport off to a dedicated pass-through VC -- deferred, since the handoff frees
   // this VC. Both faces must arm it: a fresh transparent accept is writable before the
   // ClientHello arrives, so its OPT_TUNNEL decision can surface on a WRITE_READY drive, and
-  // skipping the arming there would leave the later read drive to hit _trigger_ssl_read's
+  // skipping the arming there would leave the later read drive to hit _drive_ssl_read's
   // TRANSPORT_BLIND_TUNNEL assert. Check for a non-error return first: if TLS has already
   // failed with the CLIENT_HELLO, there is no need to continue toward the origin with the
   // blind tunnel.
@@ -720,11 +727,11 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       _commitInboundHandshake();
     }
     _transport_read_vio->reenable();
-    if (face == TransportFace::READ && _write_buf_reader->read_avail() > 0) {
+    if (face == TransportFace::READ) {
       // The round produced ciphertext to send (our flight answering this one). Read-face rounds
       // flush it here; write-face rounds never did -- the transport write drive that invoked
       // them drains _write_buf on its own.
-      _transport_write_vio->reenable();
+      _flushStagedCiphertext();
     }
     return HandshakeDriveOutcome::YIELD;
 
@@ -771,10 +778,7 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
         return HandshakeDriveOutcome::YIELD;
       }
     }
-    if (_write_buf_reader->read_avail() > 0) {
-      // handshake produced bytes to write
-      _transport_write_vio->reenable();
-    }
+    _flushStagedCiphertext();
     if (miobuffer_has_read_avail(SSL_get_rbio(this->_ssl.get()))) {
       // There is data in the read buffer, so continue reading
       Dbg(dbg_ctl_ssl, "data in read buffer after handshake for vc %p, continuing to read", this);
@@ -800,23 +804,17 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
       _hook_parked = true;
     }
     // Flush any handshake ciphertext already produced (the PROXY preamble, or a partial
-    // flight) so the transport drains it and re-drives; do not reenable on an empty buffer,
-    // which spins.
-    if (_write_buf_reader->read_avail() > 0) {
-      _transport_write_vio->reenable();
-    }
+    // flight) so the transport drains it and re-drives.
+    _flushStagedCiphertext();
     return HandshakeDriveOutcome::YIELD;
 
   case SSL_WAIT_FOR_ASYNC:
     Dbg(dbg_ctl_ssl, "ssl wait for async for vc %p", this);
     // Handshake suspended on the server private-key async op. The async wait-fd resume
-    // (handle_async_tls_ready -> _runDeferredWork -> _trigger_ssl_read) re-drives the
+    // (handle_async_tls_ready -> _runDeferredWork -> _drive_ssl_read) re-drives the
     // handshake. Flush any handshake ciphertext already produced into _write_buf -- a true
-    // reenable-with-bytes, so it respects the write-backpressure invariant -- but do not
-    // reenable on an empty buffer, which would spin.
-    if (_write_buf_reader->read_avail() > 0) {
-      _transport_write_vio->reenable();
-    }
+    // reenable-with-bytes, so it respects the write-backpressure invariant.
+    _flushStagedCiphertext();
     return HandshakeDriveOutcome::YIELD;
 
   default:
@@ -827,22 +825,19 @@ SSLNetVConnection::_drive_handshake(TransportFace face)
     // write unconditionally.
     if (face == TransportFace::WRITE) {
       _transport_write_vio->reenable();
-    } else if (_write_buf_reader->read_avail() > 0) {
-      _transport_write_vio->reenable();
+    } else {
+      _flushStagedCiphertext();
     }
     return HandshakeDriveOutcome::YIELD;
   }
 }
 
-// changed by YTS Team, yamsat
+// The read-face driver (mirror: _drive_ssl_write). May free `this` on any delivered signal;
+// callers must touch nothing afterwards.
 void
-SSLNetVConnection::_trigger_ssl_read()
+SSLNetVConnection::_drive_ssl_read()
 {
-  int     ret;
-  int64_t r     = 0;
-  int64_t bytes = 0;
-
-  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _trigger_ssl_read called", this);
+  Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _drive_ssl_read called", this);
   ink_release_assert(HttpProxyPort::TRANSPORT_BLIND_TUNNEL != this->attributes);
   _releaseHandshakeReader();
 
@@ -873,7 +868,7 @@ SSLNetVConnection::_trigger_ssl_read()
   // first would silently disable the transport read with the ServerHello stranded in the
   // rbio and freeze the handshake until an external timeout. The user-VIO gate governs
   // post-handshake data delivery only; the write face gates the same way before its
-  // user-write handling (_handle_transport_write_ready).
+  // user-write handling (_drive_ssl_write).
   if (!getSSLHandShakeComplete()) {
     if (_drive_handshake(TransportFace::READ) != HandshakeDriveOutcome::DATA_READY) {
       // The drive may have freed this VC (a delivered signal's consumer close); touch nothing.
@@ -901,19 +896,10 @@ SSLNetVConnection::_trigger_ssl_read()
     return;
   }
 
-  // At this point we are at the post-handshake SSL processing
-  //
-  // not sure if this do-while loop is really needed here, please replace
-  // this comment if you know
-  int ssl_read_errno = 0;
-  do {
-    ret = this->_ssl_read_from_net(r);
-    if (ret == SSL_READ_READY || ret == SSL_READ_ERROR_NONE) {
-      bytes += r;
-    }
-    ink_assert(bytes >= 0);
-  } while ((ret == SSL_READ_READY && bytes == 0) || ret == SSL_READ_ERROR_NONE);
-  ssl_read_errno = errno;
+  // At this point we are at the post-handshake SSL processing: one pump batch per drive. (An
+  // inherited do-while looped here on outcomes the pump cannot return -- see the never-
+  // SSL_READ_ERROR_NONE note on _decrypt_data_from_transport -- so its body only ever ran once.)
+  const ReadBatch batch = _decrypt_data_from_transport();
 
   // SSL_read can produce protocol output of its own, with no SSL_write in flight to carry it:
   // the no_renegotiation alert answering a client's renegotiation request (OpenSSL 3.x never
@@ -924,13 +910,21 @@ SSLNetVConnection::_trigger_ssl_read()
   // layered wbio only reaches the wire when the transport write drive runs, and with the user
   // write face idle nothing else re-arms it -- the peer would wait forever for bytes stranded
   // in the wbio (a renegotiating client hangs instead of receiving the prompt refusal master
-  // sent). Flush them before the user signals below, which may free this VC.
-  if (_write_buf_reader->read_avail() > 0) {
-    _transport_write_vio->reenable();
-  }
+  // sent). Flush them before the delivery below signals the user, which may free this VC.
+  _flushStagedCiphertext();
 
-  if (bytes > 0) {
-    if (ret == SSL_READ_WOULD_BLOCK || ret == SSL_READ_READY) {
+  _deliverReadResult(batch);
+}
+
+// The read-face delivery mirror of _deliverWriteComplete: route the pump batch's outcome to
+// the consumer -- READ_READY for delivered bytes, then the terminal/would-block arms. Any
+// delivered signal may free `this` (the fused reclaim, or a consumer's in-handler close), so
+// the caller must invoke this in tail position and touch nothing afterwards.
+void
+SSLNetVConnection::_deliverReadResult(const ReadBatch &batch)
+{
+  if (batch.bytes > 0) {
+    if (batch.event == SSL_READ_WOULD_BLOCK || batch.event == SSL_READ_READY) {
       if (_signalAndReclaim(SignalSide::READ, VC_EVENT_READ_READY) == SignalOutcome::RECLAIMED) {
         Dbg(dbg_ctl_ssl, "read signal reclaimed the vc");
         return;
@@ -940,24 +934,26 @@ SSLNetVConnection::_trigger_ssl_read()
 
   int wants = SSL_want(this->_ssl.get());
   Dbg(dbg_ctl_ssl, "SSL_want=%d", wants);
-  switch (ret) {
+  switch (batch.event) {
   case SSL_READ_READY:
-    // We delivered a buffer-full of plaintext and the consumer still wants more. _ssl_read_from_net
-    // stops at the downstream buffer's capacity (toread = write_avail), so SSL_READ_READY can mean
-    // the rbio STILL holds ciphertext we have not decrypted yet. The transport read will NOT
-    // re-signal us for ciphertext already buffered in the rbio -- net_read_io signals only when it
-    // reads fresh bytes off the socket -- so handing the continuation to it would strand those
-    // records until the peer happens to send more (the layered-VC read stall). Now that _signal_user
-    // has drained room downstream, if the rbio still has ciphertext keep draining it out of line (a
-    // clean stack, so we do not re-enter the consumer here); mainEvent clears _deferred_work_event.
+    // We delivered a buffer-full of plaintext and the consumer still wants more.
+    // _decrypt_data_from_transport stops at the downstream buffer's capacity (toread =
+    // write_avail), so SSL_READ_READY can mean the rbio STILL holds ciphertext we have not
+    // decrypted yet. The transport read will NOT re-signal us for ciphertext already buffered in
+    // the rbio -- net_read_io signals only when it reads fresh bytes off the socket -- so handing
+    // the continuation to it would strand those records until the peer happens to send more (the
+    // layered-VC read stall). Now that _signal_user has drained room downstream, if the rbio
+    // still has ciphertext keep draining it out of line (a clean stack, so we do not re-enter the
+    // consumer here); mainEvent clears _deferred_work_event.
     // Otherwise the rbio is dry: re-arm the transport read and wait for the next socket data --
     // unless the peer's close_notify was coalesced into the same fill as this final app data.
-    // _ssl_read_from_net records SSL_READ_EOS for the alert but then overwrites it with
+    // _decrypt_data_from_transport records SSL_READ_EOS for the alert but then overwrites it with
     // SSL_READ_READY here because plaintext was produced; SSL has already latched
     // SSL_RECEIVED_SHUTDOWN, so re-drive out of line to let the next read surface the pending EOS.
     // A TLS half-close leaves TCP open (no prompt FIN), so waiting on a transport read would strand
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
-    if (!_deferred_work_pending() && _read_drive_warranted() && buf.writer() != nullptr && buf.writer()->write_avail() > 0) {
+    if (!_deferred_work_pending() && _read_drive_warranted() && _user_read_vio.buffer.writer() != nullptr &&
+        _user_read_vio.buffer.writer()->write_avail() > 0) {
       _scheduleDeferredWork(this_ethread());
     } else {
       _transport_read_vio->reenable();
@@ -996,12 +992,12 @@ SSLNetVConnection::_trigger_ssl_read()
     break;
 
   case SSL_READ_EOS:
-    // close the connection if we have SSL_READ_EOS, this is the return value from ssl_read_from_net() if we get an
-    // SSL_ERROR_ZERO_RETURN from SSL_get_error()
+    // close the connection if we have SSL_READ_EOS, this is the return value from
+    // _decrypt_data_from_transport() if we get an SSL_ERROR_ZERO_RETURN from SSL_get_error()
     // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
     (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_EOS);
 
-    if (bytes > 0) {
+    if (batch.bytes > 0) {
       Dbg(dbg_ctl_ssl, "read finished - EOS");
     } else {
       Dbg(dbg_ctl_ssl, "read finished - 0 useful bytes read, bytes used by SSL layer");
@@ -1018,17 +1014,23 @@ SSLNetVConnection::_trigger_ssl_read()
     // may legitimately outlive this delivery (H2 with active streams keeps the VC until its
     // streams drain), and _transport_*_vio point into _unvc, so an early inner close leaves the
     // surviving outer holding dangling transport VIOs. Set lerrno before the signal, mapping an
-    // SSL-layer error (ssl_read_errno == 0) to -ENET_SSL_FAILED so HttpSM/ConnectingEntry does not
+    // SSL-layer error (batch.error == 0) to -ENET_SSL_FAILED so HttpSM/ConnectingEntry does not
     // read lerrno == 0 as "no error" (master _readSignalError parity).
-    this->lerrno = ssl_read_errno ? ssl_read_errno : -ENET_SSL_FAILED;
+    this->lerrno = batch.error ? batch.error : -ENET_SSL_FAILED;
     (void)_signalAndReclaim(SignalSide::READ, VC_EVENT_ERROR);
     break;
   }
 }
 
-int64_t
-SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs)
+// The write pump, mirror of _decrypt_data_from_transport. Encrypts plaintext from `buf` into
+// the wbio (_write_buf) until `towrite`, the record-size policy, or the ciphertext water mark
+// stops it, and returns the whole outcome as one EncryptBatch. The caller advances
+// _user_write_vio.ndone by plaintext_consumed (`buf` is not always the user write VIO's --
+// see do_io_close's final-plaintext encrypt).
+SSLNetVConnection::EncryptBatch
+SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf)
 {
+  int64_t     total_written = 0;
   int64_t     try_to_write;
   int64_t     num_really_written      = 0;
   int64_t     l                       = 0;
@@ -1112,16 +1114,19 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
     sslLastWriteTime   = now;
     sslTotalBytesSent += total_written;
   }
+
+  EncryptBatch batch;
+  batch.plaintext_consumed = total_written;
   if (num_really_written > 0) {
-    needs |= EVENTIO_WRITE;
+    batch.needs |= EVENTIO_WRITE;
   } else {
     switch (err) {
     case SSL_ERROR_NONE:
       Dbg(dbg_ctl_ssl, "SSL_write-SSL_ERROR_NONE");
       break;
     case SSL_ERROR_WANT_READ:
-      needs              |= EVENTIO_READ;
-      num_really_written  = -EAGAIN;
+      batch.needs |= EVENTIO_READ;
+      batch.error  = -EAGAIN;
       Dbg(dbg_ctl_ssl_error, "SSL_write-SSL_ERROR_WANT_READ");
       break;
     case SSL_ERROR_WANT_WRITE:
@@ -1136,33 +1141,33 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
     case SSL_ERROR_WANT_CLIENT_HELLO_CB:
 #endif
     case SSL_ERROR_WANT_X509_LOOKUP: {
-      needs              |= EVENTIO_WRITE;
-      num_really_written  = -EAGAIN;
+      batch.needs |= EVENTIO_WRITE;
+      batch.error  = -EAGAIN;
       Dbg(dbg_ctl_ssl_error, "SSL_write-SSL_ERROR_WANT_X509_LOOKUP/CLIENT_HELLO_CB");
       break;
     }
     case SSL_ERROR_SYSCALL:
       // SSL_ERROR_SYSCALL is an IO error. errno is likely 0, so set EPIPE, as
       // we do with SSL_ERROR_SSL below, to indicate a connection error.
-      num_really_written = -EPIPE;
+      batch.error = -EPIPE;
       Metrics::Counter::increment(ssl_rsb.error_syscall);
       Dbg(dbg_ctl_ssl_error, "SSL_write-SSL_ERROR_SYSCALL");
       break;
     // end of stream
     case SSL_ERROR_ZERO_RETURN:
-      num_really_written = -errno;
+      batch.error = -errno;
       Dbg(dbg_ctl_ssl_error, "SSL_write-SSL_ERROR_ZERO_RETURN");
       break;
     case SSL_ERROR_SSL:
     default: {
       // Treat SSL_ERROR_SSL as EPIPE error.
-      num_really_written = -EPIPE;
+      batch.error = -EPIPE;
       SSLVCDebug(this, "SSL_write-SSL_ERROR_SSL errno=%d", errno);
       Metrics::Counter::increment(ssl_rsb.error_ssl);
     } break;
     }
   }
-  return num_really_written;
+  return batch;
 }
 
 SSLNetVConnection::SSLNetVConnection()
@@ -1206,11 +1211,9 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
       getSSLHandShakeComplete() && _user_write_active()) {
     MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
     if (lock.is_locked()) {
-      int64_t total_plaintext_written = 0;
-      int     needs                   = 0;
-      _encrypt_data_for_transport(_user_write_vio.ntodo(), _user_write_vio.buffer, total_plaintext_written, needs);
-      if (total_plaintext_written > 0) {
-        _user_write_vio.ndone += total_plaintext_written;
+      const EncryptBatch batch = _encrypt_data_for_transport(_user_write_vio.ntodo(), _user_write_vio.buffer);
+      if (batch.plaintext_consumed > 0) {
+        _user_write_vio.ndone += batch.plaintext_consumed;
       }
     }
   }
@@ -3047,8 +3050,8 @@ SSLNetVConnection::_handle_transport_read_ready(VIO *vio) // vio is from _unvc
     return EVENT_CONT;
   }
 
-  _trigger_ssl_read();
-  // _trigger_ssl_read() may have freed this VC on a terminal signal's recursion-0 unwind (e.g. a
+  _drive_ssl_read();
+  // _drive_ssl_read() may have freed this VC on a terminal signal's recursion-0 unwind (e.g. a
   // hook-flagged handshake error), so do not read any member -- reading _sslState here was a
   // use-after-free. The transport read path (read_signal_and_update) ignores this return value
   // and drives the inner VC's teardown from its own state.
@@ -3082,6 +3085,14 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     return EVENT_CONT;
   }
 
+  return _drive_ssl_write();
+}
+
+// The write-face driver (mirror: _drive_ssl_read). May free `this` on any delivered signal;
+// callers must return the result without touching members.
+int
+SSLNetVConnection::_drive_ssl_write()
+{
   if (!this->getSSLHandShakeComplete()) {
     // The write face never proceeds into data delivery off a handshake drive: post-handshake
     // encryption starts when the consumer's write VIO drives it.
@@ -3147,28 +3158,16 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   if (ntodo <= 0) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: User write VIO ntodo <= 0, read_avail=%" PRId64, this,
         _write_buf_reader->read_avail());
-    // Do not signal WRITE_COMPLETE until the encrypted bytes have actually drained to the
-    // transport. The consumer (HttpSM/HttpTunnel) closes the connection from its
-    // WRITE_COMPLETE handler; if ciphertext is still buffered in _write_buf, that close
-    // races the flush and truncates the response on the wire. Keep the transport write
-    // enabled and re-enter here once it drains.
-    if (_write_buf_reader->read_avail() > 0) {
-      _transport_write_vio->reenable();
-      return EVENT_CONT;
-    }
-    // Plaintext done and ciphertext fully drained: deliver WRITE_COMPLETE now.
-    return _deliverWriteComplete();
+    return _completeWriteWhenDrained();
   }
 
-  int64_t total_plaintext_written = 0; // Bytes of *plaintext* consumed from user buffer
-  int     needs                   = 0; // Flags for transport read/write needed by SSL layer/BIOs
-  int64_t ret                     = _encrypt_data_for_transport(ntodo, _user_write_vio.buffer, total_plaintext_written, needs);
+  const EncryptBatch batch = _encrypt_data_for_transport(ntodo, _user_write_vio.buffer);
 
-  if (total_plaintext_written > 0) {
-    _user_write_vio.ndone += total_plaintext_written;
+  if (batch.plaintext_consumed > 0) {
+    _user_write_vio.ndone += batch.plaintext_consumed;
   }
 
-  if (ret == -EAGAIN) {
+  if (batch.error == -EAGAIN) {
     // _encrypt_data_for_transport maps SSL_write's WANT_READ / WANT_X509_LOOKUP /
     // WANT_CLIENT_HELLO_CB to -EAGAIN. On this post-handshake write path that return is
     // unreachable under ATS's configuration:
@@ -3181,7 +3180,7 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     //     TLS1.2 renegotiation (aborted by default -- ssl_allow_client_renegotiation=false drives
     //     sslClientRenegotiationAbort -- and absent from TLS1.3) or post-handshake auth (never
     //     enabled by ATS). TLS1.3 post-handshake messages that do require a read (KeyUpdate,
-    //     NewSessionTicket) are consumed by the separate read drive (_trigger_ssl_read ->
+    //     NewSessionTicket) are consumed by the separate read drive (_drive_ssl_read ->
     //     SSL_read on the rbio), never by SSL_write -- verified with a client issuing KeyUpdate
     //     mid-download (no WANT_READ, full body delivered).
     // The only residual opening is an operator opting into client renegotiation on a pre-3.0
@@ -3195,19 +3194,19 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
     Dbg(dbg_ctl_ssl_error,
         "SSLNetVConnection %p: SSL_write wants a transport read (needs=%d); the layered BIO model cannot "
         "service an in-write renegotiation/post-handshake read, closing",
-        this, needs);
+        this, batch.needs);
     this->lerrno = EIO;
     (void)_signalAndReclaim(SignalSide::WRITE, VC_EVENT_ERROR);
     return EVENT_DONE;
   }
 
-  if (ret < 0) {
+  if (batch.error < 0) {
     // A genuinely fatal SSL/transport error: -EPIPE for SSL_ERROR_SSL / SSL_ERROR_SYSCALL, or
-    // -errno for SSL_ERROR_ZERO_RETURN. The benign retry return (-EAGAIN) is handled above, so
+    // -errno for SSL_ERROR_ZERO_RETURN. The benign retry outcome (-EAGAIN) is handled above, so
     // everything reaching here is unrecoverable.
-    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _encrypt_data_for_transport failed: %" PRId64, this, ret);
-    // NOTE: lerrno is set to a generic EIO; a more specific mapping from ret / the SSL error would
-    // propagate to HttpSM::set_connect_fail() but is not currently distinguished.
+    Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: _encrypt_data_for_transport failed: %" PRId64, this, batch.error);
+    // NOTE: lerrno is set to a generic EIO; a more specific mapping from batch.error / the SSL
+    // error would propagate to HttpSM::set_connect_fail() but is not currently distinguished.
     this->lerrno = EIO;
     (void)_signalAndReclaim(SignalSide::WRITE, VC_EVENT_ERROR);
     return EVENT_DONE;
@@ -3217,34 +3216,39 @@ SSLNetVConnection::_handle_transport_write_ready(VIO *vio)
   // Test for ALL bits of the mask: under USE_EDGE_TRIGGER, EVENTIO_READ and EVENTIO_WRITE
   // share the EPOLLET bit, so a plain `needs & EVENTIO_READ` is true whenever
   // EVENTIO_WRITE was set (and vice versa) and would re-arm the other face spuriously.
-  if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
+  if ((batch.needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
     // Write buffer may have be previously emptied by the transport, which causes the transport to disable the write vio.
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: Re-enabling transport write to flush BIO after user complete.", this);
     _transport_write_vio->reenable();
   }
 
-  // _encrypt_data_for_transport only sets EVENTIO_READ together with a -EAGAIN return, which is
+  // _encrypt_data_for_transport only sets EVENTIO_READ together with a -EAGAIN error, which is
   // intercepted above, so EVENTIO_READ can never be set on this post-handshake write path.
-  ink_assert((needs & EVENTIO_READ) != EVENTIO_READ);
+  ink_assert((batch.needs & EVENTIO_READ) != EVENTIO_READ);
 
   if (_user_write_vio.ntodo() <= 0) {
     Dbg(dbg_ctl_ssl_io, "SSLNetVConnection %p: all plaintext encrypted, read_avail=%" PRId64, this,
         _write_buf_reader->read_avail());
-    // All plaintext has been encrypted, but the ciphertext may still be buffered in
-    // _write_buf. Defer WRITE_COMPLETE until it has drained to the transport: the consumer
-    // closes the connection from its WRITE_COMPLETE handler, and signalling before the
-    // bytes are on the wire lets that close truncate the response. Returning EVENT_CONT
-    // keeps the inner transport's write_to_net flushing _write_buf in this same pass; we
-    // re-enter once it drains and then signal completion.
-    if (_write_buf_reader->read_avail() > 0) {
-      _transport_write_vio->reenable();
-      return EVENT_CONT;
-    }
-    // Plaintext done and ciphertext fully drained: deliver WRITE_COMPLETE now.
-    return _deliverWriteComplete();
+    return _completeWriteWhenDrained();
   } else {
     return EVENT_CONT;
   }
+}
+
+// WRITE_COMPLETE must not be signalled while ciphertext is still staged in _write_buf: the
+// consumer (HttpSM/HttpTunnel) closes the connection from its WRITE_COMPLETE handler, and a
+// close racing the flush truncates the response on the wire. Keep the transport write enabled
+// until the buffer drains; the transport's next WRITE_READY re-enters the write drive and
+// completion is delivered then.
+int
+SSLNetVConnection::_completeWriteWhenDrained()
+{
+  if (_write_buf_reader->read_avail() > 0) {
+    _transport_write_vio->reenable();
+    return EVENT_CONT;
+  }
+  // Plaintext done and ciphertext fully drained: deliver WRITE_COMPLETE now.
+  return _deliverWriteComplete();
 }
 
 // Deliver the user-facing WRITE_COMPLETE synchronously -- deferring it (as earlier revisions
@@ -3274,6 +3278,19 @@ SSLNetVConnection::_deliverWriteComplete()
     _scheduleWriteRearm();
   }
   return EVENT_DONE;
+}
+
+// Re-arm the transport write only when ciphertext is actually staged in _write_buf. A reenable()
+// on an empty buffer is a false "I have bytes" promise: net_write_io finds nothing, disables the
+// write, and the cycle spins without progress. Every "flush whatever this round produced" site
+// (handshake flights, SSL_read's own protocol output) comes through here; the close/shutdown
+// drains keep their own guarded reenables (they also null-check the VIOs and log).
+void
+SSLNetVConnection::_flushStagedCiphertext()
+{
+  if (_write_buf_reader->read_avail() > 0) {
+    _transport_write_vio->reenable();
+  }
 }
 
 // The one arming point for _deferred_work_event (see its declaration for what the slot
@@ -3360,7 +3377,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   // Surface the failure to an active write face directly. The read drive below only reaches a
   // reader whose read VIO is enabled; a consumer that disabled its read VIO while a body write is
   // still in flight (HttpSM disables origin reads after an early response) would otherwise get
-  // neither ERROR nor completion -- the read drive bails at _trigger_ssl_read's disabled-read gate
+  // neither ERROR nor completion -- the read drive bails at _drive_ssl_read's disabled-read gate
   // and signals nobody, stranding the write to the inactivity timeout. Mirror master's
   // write_signal_and_update on a write error. Safe on this stack (see the handshake exit above): a
   // close from the handler takes the deferred close-drain, so this does not free a VC the transport
@@ -3529,7 +3546,7 @@ SSLNetVConnection::_runDeferredWork()
     return EVENT_DONE;
   }
   // Default rung: the rbio read-drive (deliver buffered plaintext/EOS, or resume the handshake).
-  _trigger_ssl_read();
+  _drive_ssl_read();
   return EVENT_DONE;
 }
 
@@ -3923,7 +3940,7 @@ SSLNetVConnection::reenable(VIO *vio)
     // memory speed, so it keeps producing). Instead we stay demand-driven -- we
     // just re-arm the transport write and wait for the socket to tell us it has
     // room (a transport WRITE_READY), and only then encrypt, in
-    // _handle_transport_write_ready. That keeps _write_buf to ~one TLS record and
+    // _drive_ssl_write. That keeps _write_buf to ~one TLS record and
     // lets backpressure propagate up to the origin/cache.
     //
     // The catch: reenable()ing the transport with an empty _write_buf is a false
@@ -4043,7 +4060,7 @@ SSLNetVConnection::handle_async_tls_ready()
   // (reenable_with_event), the peer's handshake bytes were already consumed into the SSL
   // read BIO, so reenabling the transport read VIO alone would not re-drive
   // SSL_do_handshake(). Schedule an out-of-line read-drive to re-enter the handshake
-  // (_runDeferredWork -> _trigger_ssl_read -> _ssl_accept), which resumes the suspended job.
+  // (_runDeferredWork -> _drive_ssl_read -> _ssl_accept), which resumes the suspended job.
   if (!getSSLHandShakeComplete()) {
     _scheduleDeferredWork(this->thread);
   }

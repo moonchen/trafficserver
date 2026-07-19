@@ -663,8 +663,29 @@ private:
     return _user_read_vio.op == VIO::READ && !_user_read_vio.is_disabled() && _user_read_vio.ntodo() > 0 && _ssl_read_pending();
   }
 
-  void                _trigger_ssl_read();
-  int64_t             _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf, int64_t &total_written, int &needs);
+  // Typed pump results: each face drive runs one pump batch and reads its outcome from one
+  // struct, instead of an int return with correlated out-params.
+  struct ReadBatch {
+    int     event = 0; // SSL_READ_* classification of how the batch ended (never SSL_READ_ERROR_NONE)
+    int64_t bytes = 0; // plaintext delivered to the user buffer; already counted into _user_read_vio.ndone
+    int     error = 0; // errno at the failing SSL_read (SSL_READ_ERROR only; mapped to -ENET_SSL_FAILED when 0)
+  };
+  struct EncryptBatch {
+    int64_t plaintext_consumed = 0; // plaintext consumed from the user buffer; the CALLER advances _user_write_vio.ndone
+    int64_t error              = 0; // 0 = batch ok; -EAGAIN = SSL wants a transport read; other negative = fatal
+    int     needs              = 0; // EVENTIO_* transport re-arms the batch requires
+  };
+
+  // The symmetric face drivers, called by the matching transport gates (_handle_transport_*_ready):
+  // advance the handshake if still in it, else pump one batch and deliver its outcome. Either may
+  // free `this` on any delivered signal -- the caller must touch nothing afterwards. The read
+  // driver is also the deferred read-drive (_runDeferredWork's default rung); the write driver
+  // never falls from a completed handshake into data delivery (post-handshake encryption starts
+  // when the consumer's write VIO drives it).
+  void _drive_ssl_read();
+  int  _drive_ssl_write();
+
+  EncryptBatch        _encrypt_data_for_transport(int64_t towrite, MIOBufferAccessor &buf);
   void                _make_ssl_connection(SSL_CTX *ctx);
   void                _bindSSLObject();
   UnixNetVConnection *_downgradeToPlain();
@@ -673,7 +694,7 @@ private:
   void                _armPendingHandoff(PendingHandoff which);
   void                _adoptConsumerMutex(Continuation *c);
 
-  int         _ssl_read_from_net(int64_t &ret);
+  ReadBatch   _decrypt_data_from_transport();
   ssl_error_t _ssl_read_buffer(void *buf, int64_t nbytes, int64_t &nread);
   ssl_error_t _ssl_write_buffer(const void *buf, int64_t nbytes, int64_t &nwritten);
   ssl_error_t _ssl_connect();
@@ -722,6 +743,13 @@ private:
   // _write_rearm_pending).
   int  _deliverWriteComplete();
   void _scheduleWriteRearm();
+  // The read-face delivery mirror of _deliverWriteComplete: route the batch outcome to the
+  // consumer. May free `this` (any delivered signal); call in tail position only.
+  void _deliverReadResult(const ReadBatch &batch);
+  // Gate WRITE_COMPLETE on _write_buf having drained to the transport; see the definition.
+  int _completeWriteWhenDrained();
+  // Re-arm the transport write iff ciphertext is staged; see the definition.
+  void _flushStagedCiphertext();
 
   // Re-entrancy depth covering two distinct hazards with the same fix: (1) _signal_user's own
   // synchronous re-entrancy (a consumer's handler drives more work on this same VC before

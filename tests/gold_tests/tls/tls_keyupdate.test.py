@@ -81,7 +81,7 @@ ts.Disk.records_config.update(
 
 ts.Disk.traffic_out.Content = Testers.ExcludesExpression("received signal|failed assertion", "ATS must not crash on a KeyUpdate")
 # Direct proof of the unreachability analysis: in the layered-BIO model the separate read
-# drive (_trigger_ssl_read -> SSL_read) consumes the client's KeyUpdate records, so the write
+# drive (_drive_ssl_read -> SSL_read) consumes the client's KeyUpdate records, so the write
 # path's SSL_write never has to read and never returns WANT_READ. If it ever did,
 # _encrypt_data_for_transport would log this (and the connection would be torn down).
 ts.Disk.traffic_out.Content += Testers.ExcludesExpression(
