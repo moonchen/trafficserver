@@ -1091,18 +1091,23 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
 
   Dbg(dbg_ctl_ssl, "towrite=%" PRId64, towrite);
 
+  // The caller passes the user write VIO's ntodo (its promised remaining byte count), which for a
+  // streaming write can exceed the plaintext staged so far. Bound the request to what is actually
+  // buffered so the cross-block coalesce below never gathers past the reader.
+  const int64_t buffered = buf.reader()->read_avail();
+  if (towrite > buffered) {
+    towrite = buffered;
+  }
+
+  // SSL_write takes one contiguous plaintext pointer, so a record that spans blocks must be
+  // gathered first. thread_local keeps it out of the hot path's allocations and gives SSL_write a
+  // stable address across WANT_WRITE retries.
+  static thread_local char gather_buf[SSL_MAX_TLS_RECORD_SIZE];
+
   ERR_clear_error();
   do {
-    // What is remaining left in the next block?
-    l                   = buf.reader()->block_read_avail();
-    char *current_block = buf.reader()->start();
-
-    // check if to amount to write exceeds that in this buffer
-    int64_t wavail = towrite - total_written;
-
-    if (l > wavail) {
-      l = wavail;
-    }
+    // Pull up to one record's worth of the remaining plaintext, spanning blocks if needed.
+    l = towrite - total_written;
 
     // TS-2365: If the SSL max record size is set and we have
     // more data than that, break this into smaller write
@@ -1126,10 +1131,27 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
       break;
     }
 
+    // Coalesce across blocks so a small response split into a header block and a cache-appended
+    // body block still ships as ONE TLS record -- the client would otherwise pay an extra AES-GCM
+    // decrypt per response. When the record already fits the current block, write in place with no
+    // copy (the common large-body case).
+    const char *write_block;
+    int64_t     block_avail = buf.reader()->block_read_avail();
+
+    if (block_avail < l && l <= static_cast<int64_t>(sizeof(gather_buf))) {
+      buf.reader()->memcpy(gather_buf, l, 0);
+      write_block = gather_buf;
+    } else {
+      if (l > block_avail) {
+        l = block_avail;
+      }
+      write_block = buf.reader()->start();
+    }
+
     try_to_write       = l;
     num_really_written = 0;
-    Dbg(dbg_ctl_v_ssl, "b=%p l=%" PRId64, current_block, l);
-    err = this->_ssl_write_buffer(current_block, l, num_really_written);
+    Dbg(dbg_ctl_v_ssl, "b=%p l=%" PRId64, write_block, l);
+    err = this->_ssl_write_buffer(write_block, l, num_really_written);
 
     // We wrote all that we thought we should
     if (num_really_written > 0) {

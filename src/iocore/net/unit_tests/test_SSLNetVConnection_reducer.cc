@@ -29,6 +29,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 namespace
 {
@@ -36,6 +38,24 @@ bool
 signals_contain(const std::vector<int> &signals, int event)
 {
   return std::find(signals.begin(), signals.end(), event) != signals.end();
+}
+
+// Count TLS records staged in a ciphertext reader, without consuming. Each record is a 5-byte
+// header (1-byte type, 2-byte version, 2-byte big-endian length) followed by `length` bytes.
+int
+count_tls_records(IOBufferReader *r)
+{
+  int64_t                    avail = r->read_avail();
+  std::vector<unsigned char> buf(avail);
+  r->memcpy(buf.data(), avail);
+  int     count = 0;
+  int64_t pos   = 0;
+  while (pos + 5 <= avail) {
+    int len  = (buf[pos + 3] << 8) | buf[pos + 4];
+    count   += 1;
+    pos     += 5 + len;
+  }
+  return count;
 }
 } // namespace
 
@@ -525,4 +545,82 @@ TEST_CASE("in-hook abort from an outbound-start hook: the free defers past the i
   fx.pump();
   CHECK(fx.mock()->closed());
   CHECK(fx.mock()->close_errno() == -1);
+}
+
+// A cache-hit response reaches the SSL VC as a header block followed by a body block that the cache
+// read appended zero-copy (CacheVC::openReadMain -> MIOBuffer::append_block); the two never share a
+// block. The encrypt loop must coalesce the two small blocks into a SINGLE TLS record -- as master's
+// gather_buf does -- rather than emit one record per block, which would double the client's
+// per-response AES-GCM decrypts.
+TEST_CASE("write coalescing: header block + body block emit one TLS record", "[SSLReducer]")
+{
+  std::string cert, key;
+  reducer_make_self_signed(cert, key);
+  reducer_install_server_cert(cert, key, "/tmp/claude-1000/reducer-certs");
+
+  ReducerFixture fx(/* inbound */ true);
+  fx.attach();
+  fx.drive_handshake();
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+  REQUIRE(fx.peer()->handshake_done());
+
+  // Flush lazily-emitted post-handshake records: BoringSSL queues its TLS 1.3 NewSessionTicket(s)
+  // and only writes them out on the first application write, so they would otherwise ride along as
+  // extra records on the measured write. Prime with a throwaway app write, drain it fully to the
+  // peer, and confirm the SUT has nothing staged before measuring.
+  auto prime = [&](char c) {
+    MIOBuffer      *p  = new_MIOBuffer(BUFFER_SIZE_INDEX_512);
+    IOBufferReader *pr = p->alloc_reader();
+    p->write(&c, 1);
+    fx.vc()->do_io_write(fx.consumer(), 1, pr, false);
+    fx.wake_sut(/* write_side */ true);
+    fx.pump_sut_to_peer();
+    char tmp[64];
+    while (fx.peer()->read_app(tmp, sizeof(tmp)) > 0) {}
+    free_MIOBuffer(p);
+  };
+  prime('a');
+  prime('b');
+  REQUIRE(fx.mock()->sut_write_reader()->read_avail() == 0);
+
+  // Reproduce the cache-hit plaintext layout: the response header copied into the first block, then
+  // the body appended as its OWN block. MIOBuffer::write(reader) clones + append_block, exactly like
+  // the cache read, so header and body never share a block.
+  constexpr int     hdr_len = 300, body_len = 256, total = hdr_len + body_len;
+  std::vector<char> hdr(hdr_len, 'H'), body(body_len, 'B');
+
+  MIOBuffer      *resp = new_MIOBuffer(BUFFER_SIZE_INDEX_4K);
+  IOBufferReader *rr   = resp->alloc_reader();
+  resp->write(hdr.data(), hdr_len); // block 1: header
+
+  MIOBuffer      *bodysrc = new_MIOBuffer(BUFFER_SIZE_INDEX_512);
+  IOBufferReader *brd     = bodysrc->alloc_reader();
+  bodysrc->write(body.data(), body_len);
+  resp->write(brd, body_len); // block 2: body, appended zero-copy like CacheVC::openReadMain
+
+  REQUIRE(rr->read_avail() == total);
+  REQUIRE(rr->block_read_avail() == hdr_len); // the two-block layout under test
+
+  fx.vc()->do_io_write(fx.consumer(), total, rr, false);
+  fx.wake_sut(/* write_side */ true);
+
+  CHECK(count_tls_records(fx.mock()->sut_write_reader()) == 1);
+
+  // Integrity: the peer decrypts the full response intact regardless of record framing.
+  fx.pump_sut_to_peer();
+  std::vector<char> got(total, 0);
+  int               nread = 0;
+  while (nread < total) {
+    int n = fx.peer()->read_app(got.data() + nread, total - nread);
+    if (n <= 0) {
+      break;
+    }
+    nread += n;
+  }
+  CHECK(nread == total);
+  CHECK(std::memcmp(got.data(), hdr.data(), hdr_len) == 0);
+  CHECK(std::memcmp(got.data() + hdr_len, body.data(), body_len) == 0);
+
+  free_MIOBuffer(bodysrc);
+  free_MIOBuffer(resp);
 }
