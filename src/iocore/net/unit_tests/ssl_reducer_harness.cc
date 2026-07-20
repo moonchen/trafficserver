@@ -144,6 +144,21 @@ reducer_ob_start_abort_hook_cb(TSCont /* contp */, TSEvent /* event */, void *ed
   vc->reenable_with_event(TS_EVENT_CONTINUE); // disarmed: pass through so unrelated handshakes finish
   return 0;
 }
+
+int              g_close_flag_observed = -1;      // -1 = hook never ran; else in_tls_close_hooks() as seen inside it
+INKContInternal *g_close_flag_cont     = nullptr; // process-global outbound-close observer; held so it stays reachable
+
+// Outbound-close hook (see the header): records in_tls_close_hooks() from inside the close-hook
+// callback, then passes through. It does NOT close the VC -- a reentrant close from here is the
+// incoherent case do_io_close release-asserts, which a unit test cannot catch cleanly.
+int
+reducer_close_flag_observer_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
+{
+  auto *vc              = static_cast<SSLNetVConnection *>(edata);
+  g_close_flag_observed = vc->in_tls_close_hooks() ? 1 : 0;
+  vc->reenable_with_event(TS_EVENT_CONTINUE);
+  return 0;
+}
 } // namespace
 
 void
@@ -201,6 +216,23 @@ bool
 reducer_outbound_start_abort_hook_fired()
 {
   return g_ob_start_abort_fired;
+}
+
+void
+reducer_install_close_flag_observer_hook()
+{
+  g_close_flag_observed = -1;
+  if (g_close_flag_cont == nullptr) {
+    // Register once for the whole process (same rationale and construction as the hooks above).
+    g_close_flag_cont = new INKContInternal(reducer_close_flag_observer_cb, reinterpret_cast<TSMutex>(new_ProxyMutex()));
+    SSLAPIHooks::instance()->append(TSSslHookInternalID{TS_VCONN_OUTBOUND_CLOSE_HOOK}, g_close_flag_cont);
+  }
+}
+
+int
+reducer_close_hook_saw_flag()
+{
+  return g_close_flag_observed;
 }
 
 bool

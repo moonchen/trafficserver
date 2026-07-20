@@ -1409,6 +1409,13 @@ SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
 void
 SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 {
+  // A plugin re-entering do_io_close from this VC's own TLS close hook would free the VC under
+  // the outer close's frames; closing from a close hook (a teardown notification, not a
+  // disposition point) is incoherent, so reject it loudly rather than make the reentrant free
+  // safe. Nothing internal closes from a close hook, so there is no legitimate caller to exempt.
+  ink_release_assert(!_in_tls_close_hooks && "Plugin closed a TLS connection from within its own close hook; the close "
+                                             "hook is a teardown notification, not a point to close the connection");
+
   // Captured before _run_tls_close_hooks: the close hook advances the hook FSM to
   // HANDSHAKE_HOOKS_DONE, destroying is_invoked_state()'s witness of a hook this close may be
   // nested inside (the same pitfall _hook_parked documents for the parked window).
@@ -1418,7 +1425,9 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   _detach_consumer_vios();
 
   if (this->_ssl.get() != nullptr) {
+    _in_tls_close_hooks = true;
     _run_tls_close_hooks();
+    _in_tls_close_hooks = false;
     if (getSSLHandShakeComplete()) {
       _queue_close_notify_or_quiet_shutdown();
     }

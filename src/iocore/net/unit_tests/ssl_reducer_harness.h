@@ -63,6 +63,13 @@ bool reducer_closing_verify_hook_fired();
 void reducer_install_outbound_start_abort_hook();
 bool reducer_outbound_start_abort_hook_fired();
 
+// Appends a process-global outbound-close hook that records in_tls_close_hooks() as seen from
+// inside the close-hook callback, so a test can assert do_io_close marks the flag while its own
+// close hook runs. Reenables (pass-through); never closes. reducer_close_hook_saw_flag() returns
+// the recorded value, or -1 if the hook never ran.
+void reducer_install_close_flag_observer_hook();
+int  reducer_close_hook_saw_flag();
+
 // Deliver the events queued on the harness thread (the SUT's schedule_imm dispatches). Tests
 // need this mid-scenario when a step's work was deferred -- e.g. a registered outbound-start
 // hook defers the first SSL_connect round to a scheduled re-drive.

@@ -314,6 +314,15 @@ private:
   // (a transport error/timeout) cannot free the VC out from under the plugin's pending reenable. A
   // synchronous TSVConnAbort fails the handshake instead of parking, so it never sets this.
   bool _hook_parked = false;
+  // do_io_close is running the VC's own TLS close hook (_run_tls_close_hooks). A plugin that
+  // closes or aborts this same VC from within that hook would re-enter do_io_close and free the
+  // VC under the outer close's frames -- and the close hook has already advanced the hook FSM to
+  // HANDSHAKE_HOOKS_DONE, so is_invoked_state()/_hook_parked no longer witness the frames below.
+  // Closing from a close hook is incoherent (the hook is the teardown notification, not a
+  // disposition point like the handshake hooks), so do_io_close release-asserts on re-entry
+  // rather than trying to make the reentrant free safe. Nothing internal closes from a close
+  // hook, so the assert has no legitimate caller to exempt.
+  bool _in_tls_close_hooks = false;
   // A verify hook (SSL_VERIFY_SERVER/CLIENT) is running. Such a hook reenabling with TS_EVENT_ERROR
   // is reporting a certificate verdict, NOT terminating the handshake: whether a failed check stops
   // the handshake is the verify policy's call, applied by the OpenSSL verify callback's return
@@ -381,6 +390,14 @@ public:
   getSSLHandShakeInProgress() const
   {
     return _sslState == SslState::HANDSHAKING;
+  }
+
+  // True while do_io_close is running this VC's own TLS close hook: a plugin re-entering
+  // do_io_close from that hook is the incoherent close the constructor's reject catches.
+  bool
+  in_tls_close_hooks() const
+  {
+    return _in_tls_close_hooks;
   }
 
   int sslServerHandShakeEvent(int &err);

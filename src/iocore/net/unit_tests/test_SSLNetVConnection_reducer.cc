@@ -466,6 +466,35 @@ TEST_CASE("in-hook abort during SSL_connect: the failing round yields to the def
   CHECK(fx.mock()->close_errno() == -1);
 }
 
+// do_io_close marks _in_tls_close_hooks while it runs the VC's own close hook. This is the flag
+// the constructor-side reject reads: a plugin re-entering do_io_close from its close hook would
+// see it set. The reject itself (a release-assert on re-entry) aborts the process, so it cannot
+// be exercised by a unit test; this pins the flag's semantics -- set exactly while the close hook
+// runs -- so the reject has a sound precondition, and the sibling cases (which all run
+// _run_tls_close_hooks on a single, non-reentrant close) are the regression guard that it does
+// not false-fire.
+TEST_CASE("do_io_close marks _in_tls_close_hooks while its close hook runs", "[SSLReducer]")
+{
+  ReducerFixture fx(/* inbound */ false);
+  reducer_install_close_flag_observer_hook();
+  fx.attach();
+  fx.drive_handshake();
+  REQUIRE(fx.vc()->getSSLHandShakeComplete());
+
+  // The flag is only set inside do_io_close; before it, the observer has not run.
+  REQUIRE(reducer_close_hook_saw_flag() == -1);
+  REQUIRE_FALSE(fx.vc()->in_tls_close_hooks());
+
+  fx.vc()->do_io_close();
+
+  // The outbound-close hook ran during do_io_close and saw the flag set.
+  REQUIRE(reducer_close_hook_saw_flag() != -1); // the hook actually ran ...
+  CHECK(reducer_close_hook_saw_flag() == 1);    // ... and observed _in_tls_close_hooks set.
+
+  fx.pump();
+  CHECK(fx.mock()->closed());
+}
+
 // in-hook abort from an outbound-start hook: unlike the verify flavor above, this hook runs on
 // the drive stack OUTSIDE any OpenSSL frame -- invoke_tls_event invokes it inline before the
 // first SSL_connect round. At do_io_close time the frames below are witnessed only by
