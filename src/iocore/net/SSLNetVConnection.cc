@@ -1242,13 +1242,12 @@ SSLNetVConnection::SSLNetVConnection(UnixNetVConnection *unvc) : SSLNetVConnecti
 // (_detach_consumer_vios) discards the plaintext, so that final write would otherwise be silently
 // dropped. Encrypt it now, synchronously and without signalling the consumer, before the sever
 // and before _queue_close_notify_or_quiet_shutdown (SSL_write() is invalid once SSL_shutdown() has
-// run). Only a graceful close (lerrno == -1) of an established session with a write in flight
-// and a usable transport has anything to save.
+// run). Only a graceful close of an established session with a write in flight and a usable
+// transport has anything to save.
 void
-SSLNetVConnection::_encrypt_final_plaintext(int lerrno)
+SSLNetVConnection::_encrypt_final_plaintext(CloseIntent intent)
 {
-  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable() &&
-      getSSLHandShakeComplete() && _user_write_active()) {
+  if (_graceful_drain_possible(intent) && getSSLHandShakeComplete() && _user_write_active()) {
     MUTEX_TRY_LOCK(lock, _user_write_vio.mutex, this_ethread());
     if (lock.is_locked()) {
       const EncryptBatch batch = _encrypt_data_for_transport(_user_write_vio.ntodo(), _user_write_vio.buffer);
@@ -1336,7 +1335,7 @@ SSLNetVConnection::_queue_close_notify_or_quiet_shutdown()
 // "which exit does a given close take" is checkable against this one body; _apply_close_plan
 // executes the choice.
 SSLNetVConnection::ClosePlan
-SSLNetVConnection::_select_close_plan(int lerrno, EThread *t, bool free_blocked_at_entry) const
+SSLNetVConnection::_select_close_plan(CloseIntent intent, EThread *t, bool free_blocked_at_entry) const
 {
   // Graceful close of a layered (TLS-terminated) connection. The consumer typically closes
   // us re-entrantly from its WRITE_COMPLETE handler, which runs on the inner transport's
@@ -1348,11 +1347,11 @@ SSLNetVConnection::_select_close_plan(int lerrno, EThread *t, bool free_blocked_
   // clean stack and let the transport flush any close-notify first. The peer may have
   // half-closed its write side (READ_EOS) while still reading our response; only a
   // truly broken transport (TRANSPORT_ERROR) skips the drain and tears down inline.
-  if (lerrno == -1 && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable()) {
+  if (_graceful_drain_possible(intent)) {
     return ClosePlan::DRAIN;
   }
 
-  // Whether it's safe to free this VC right now, rather than on `lerrno` (which only ever
+  // Whether it's safe to free this VC right now, rather than on the close intent (which only ever
   // reflects why the caller is closing us, not whether it's safe to act). _free_blocked() covers
   // the hazards that make an inline free unsafe: still nested in _signal_user's own call to a
   // consumer (its unwind will free us instead -- see _apply_close_plan's DEFER arm) or inside an
@@ -1379,7 +1378,7 @@ SSLNetVConnection::_select_close_plan(int lerrno, EThread *t, bool free_blocked_
 // _reclaim_if_closed) -- whether the free happens inline here, on a reclaim unwind, or at a
 // deferred dispatch, it happens because of the close, not an error state.
 void
-SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
+SSLNetVConnection::_apply_close_plan(ClosePlan plan, CloseIntent intent, EThread *t)
 {
   if (plan == ClosePlan::DRAIN) {
     _begin_graceful_shutdown();
@@ -1392,7 +1391,7 @@ SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
     return;
   }
 
-  Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: terminating (%s).", lerrno == -1 ? "close" : "abort");
+  Dbg(dbg_ctl_ssl, "SSLNetVConnection::do_io_close: terminating (%s).", intent == CloseIntent::GRACEFUL ? "close" : "abort");
   _authorize_reclaim();
 
   if (plan == ClosePlan::RECLAIM_NOW) {
@@ -1407,7 +1406,7 @@ SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
 }
 
 void
-SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
+SSLNetVConnection::do_io_close(int lerrno)
 {
   // A plugin re-entering do_io_close from this VC's own TLS close hook would free the VC under
   // the outer close's frames; closing from a close hook (a teardown notification, not a
@@ -1421,7 +1420,10 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
   // nested inside (the same pitfall _hook_parked documents for the parked window).
   const bool free_blocked_at_entry = _free_blocked();
 
-  _encrypt_final_plaintext(lerrno);
+  // Decode the public -1 == graceful sentinel once; the private pipeline carries CloseIntent.
+  const CloseIntent intent = (lerrno == -1) ? CloseIntent::GRACEFUL : CloseIntent::ABORTIVE;
+
+  _encrypt_final_plaintext(intent);
   _detach_consumer_vios();
 
   if (this->_ssl.get() != nullptr) {
@@ -1435,7 +1437,7 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 
   EThread *t = this_ethread();
 
-  _apply_close_plan(_select_close_plan(lerrno, t, free_blocked_at_entry), lerrno, t);
+  _apply_close_plan(_select_close_plan(intent, t, free_blocked_at_entry), intent, t);
 }
 
 void

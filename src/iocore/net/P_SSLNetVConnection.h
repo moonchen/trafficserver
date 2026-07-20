@@ -176,14 +176,14 @@ private:
   //       rung, or mainEvent's terminal-state transport-event gate (a transport event raced
   //       ahead of that dispatch).
   //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> SHUTDOWN_IN_PROGRESS  -- _begin_graceful_shutdown()
-  //     - do_io_close's DRAIN plan (_apply_close_plan; selected when lerrno == -1, transport wired
-  //       and not in error). A close of an already-failed VC re-enters the drain from inside the
+  //     - do_io_close's DRAIN plan (_apply_close_plan; selected on a graceful CloseIntent, transport
+  //       wired and not in error). A close of an already-failed VC re-enters the drain from inside the
   //       terminal region (_is_terminal() goes back to false), and it erases an undelivered
   //       FATAL_PENDING: there is no consumer left to deliver to. The drain still gates all I/O
   //       (_is_draining) and every exit from it is RECLAIMABLE.
   //   {HANDSHAKING, HANDSHAKE_DONE, FATAL_PENDING, TERMINATED} -> RECLAIMABLE  -- _authorize_reclaim()
   //     - do_io_close's RECLAIM_NOW/DEFER plans (_apply_close_plan): the drain is not warranted --
-  //       an abort (lerrno != -1), or the transport is absent/broken. (Both do_io_close
+  //       an abortive CloseIntent, or the transport is absent/broken. (Both do_io_close
   //       transitions are unconditional; a second close of the same VC is not a designed path.)
   //   {HANDSHAKING, HANDSHAKE_DONE, TERMINATED, SHUTDOWN_IN_PROGRESS, RECLAIMABLE} -> RECLAIMABLE  -- _authorize_reclaim()
   //     - The null-cont owner-close (_signal_user): a terminal event (EOS/ERROR/timeout) with no
@@ -792,12 +792,27 @@ private:
     DEFER,       // free authorized but not safe on this stack; completed at the blocking
                  // frame's unwind or _run_deferred_work's RECLAIMABLE rung
   };
-  void      _encrypt_final_plaintext(int lerrno);
+  // How do_io_close was called, decoded once from the public int lerrno at the override boundary
+  // (VConnection's -1 == graceful convention). The private close pipeline never needs the numeric
+  // abort errno -- only this classification -- so it carries CloseIntent, not a raw sentinel.
+  enum class CloseIntent { GRACEFUL, ABORTIVE };
+
+  // A graceful close whose transport can still take the drain: the precondition shared by the
+  // final-plaintext encrypt and the DRAIN close plan. Tying both to one predicate guarantees we
+  // only pre-encrypt the consumer's last write when the close will in fact drain it. Re-evaluated
+  // at each site (hooks / SSL_shutdown run between them), so it is a structural refinement, not a
+  // cached promise that an earlier encrypt "will" drain.
+  bool
+  _graceful_drain_possible(CloseIntent intent) const
+  {
+    return intent == CloseIntent::GRACEFUL && _unvc != nullptr && _transport_write_vio != nullptr && _transport_write_usable();
+  }
+  void      _encrypt_final_plaintext(CloseIntent intent);
   void      _detach_consumer_vios();
   void      _run_tls_close_hooks();
   void      _queue_close_notify_or_quiet_shutdown();
-  ClosePlan _select_close_plan(int lerrno, EThread *t, bool free_blocked_at_entry) const;
-  void      _apply_close_plan(ClosePlan plan, int lerrno, EThread *t);
+  ClosePlan _select_close_plan(CloseIntent intent, EThread *t, bool free_blocked_at_entry) const;
+  void      _apply_close_plan(ClosePlan plan, CloseIntent intent, EThread *t);
 
   // Re-entrancy depth covering two distinct hazards with the same fix: (1) _signal_user's own
   // synchronous re-entrancy (a consumer's handler drives more work on this same VC before
