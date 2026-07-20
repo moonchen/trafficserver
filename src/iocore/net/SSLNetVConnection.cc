@@ -2099,6 +2099,16 @@ SSLNetVConnection::_classify_server_handshake_error(ssl_error_t ssl_error)
     return SSL_HANDSHAKE_WANT_WRITE;
 
   case SSL_ERROR_WANT_READ:
+    // BoringSSL surfaces a parked select-certificate hook (ssl_select_cert_retry -- e.g. an async
+    // TS_SSL_CERT / TS_SSL_SERVERNAME hook) as WANT_READ, not OpenSSL's WANT_X509_LOOKUP. Route it
+    // to the parked-hook path (as master does) so _hook_parked latches the deferred-reclaim hold --
+    // a consumer-driven close cannot then free the VC before the plugin reenables -- and the
+    // premature _commit_inbound_handshake holder release, which would drop the ClientHello a
+    // still-undecided tunnel needs, is skipped. Only a WANT_READ with no hook invoked is a genuine
+    // "needs more client bytes."
+    if (is_invoked_state()) {
+      return SSL_WAIT_FOR_HOOK;
+    }
     return SSL_HANDSHAKE_WANT_READ;
 #ifdef SSL_ERROR_WANT_CLIENT_HELLO_CB
   case SSL_ERROR_WANT_CLIENT_HELLO_CB:
