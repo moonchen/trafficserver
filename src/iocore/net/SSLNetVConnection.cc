@@ -1427,9 +1427,10 @@ SSLNetVConnection::do_io_close(int lerrno)
   _detach_consumer_vios();
 
   if (this->_ssl.get() != nullptr) {
-    _in_tls_close_hooks = true;
-    _run_tls_close_hooks();
-    _in_tls_close_hooks = false;
+    {
+      ScopedFlag in_close_hooks(_in_tls_close_hooks);
+      _run_tls_close_hooks();
+    }
     if (getSSLHandShakeComplete()) {
       _queue_close_notify_or_quiet_shutdown();
     }
@@ -2309,13 +2310,13 @@ SSLNetVConnection::reenable_with_event(int event)
   }
 
   if (event == TS_EVENT_ERROR) {
-    if (_in_verify_hook) {
+    if (_verify_hook_state != VerifyHookState::INACTIVE) {
       // A verify hook (SSL_VERIFY_SERVER/CLIENT) reporting a bad certificate. This is a verdict,
       // not a handshake termination: the verify policy decides (the OpenSSL verify callback returns
       // !enforce_mode), so ENFORCED fails the handshake via SSL_ERROR_SSL while PERMISSIVE continues.
       // Record the verdict only; do NOT latch the terminal FATAL_PENDING state, or the
       // terminated-state teardown paths would abort even a PERMISSIVE handshake that must complete.
-      _verify_hook_failed = true;
+      _verify_hook_state = VerifyHookState::RUNNING_REJECTED;
     } else {
       // A hook failed the handshake: arm the reject and keep iterating hooks (the remaining
       // hooks of the chain must still see their event). The failure reaches the consumer
@@ -2870,11 +2871,10 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
   // limited time.
   // A verify hook reenabling with TS_EVENT_ERROR is reporting a certificate verdict, not a handshake
   // termination -- enforcement is the verify policy's call, applied by the OpenSSL verify callback's
-  // return (!enforce_mode). While _in_verify_hook is set, reenable_with_event routes that error into
-  // _verify_hook_failed instead of the terminal FATAL_PENDING state, so a PERMISSIVE override
+  // return (!enforce_mode). While the scope is RUNNING, reenable_with_event records that error as the
+  // verdict (RUNNING_REJECTED) instead of the terminal FATAL_PENDING state, so a PERMISSIVE override
   // still completes the handshake. Report the verdict; enforcement flows through the verify return.
-  _verify_hook_failed = false;
-  _in_verify_hook     = true;
+  VerifyHookScope scope(_verify_hook_state);
 
   if (get_context() == NET_VCONNECTION_IN) {
     this->callHooks(TS_EVENT_SSL_VERIFY_CLIENT /* , ctx */);
@@ -2882,9 +2882,7 @@ SSLNetVConnection::_verify_certificate(X509_STORE_CTX * /* ctx ATS_UNUSED */)
     this->callHooks(TS_EVENT_SSL_VERIFY_SERVER /* , ctx */);
   }
 
-  _in_verify_hook = false;
-
-  return _verify_hook_failed ? 1 : 0;
+  return scope.rejected() ? 1 : 0;
 }
 
 #if TS_HAS_TLS_EARLY_DATA

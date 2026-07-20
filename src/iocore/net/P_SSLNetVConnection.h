@@ -327,11 +327,12 @@ private:
   // is reporting a certificate verdict, NOT terminating the handshake: whether a failed check stops
   // the handshake is the verify policy's call, applied by the OpenSSL verify callback's return
   // (SSLClientUtils: !enforce_mode) -- ENFORCED fails via SSL_ERROR_SSL, PERMISSIVE continues. While
-  // this is set, reenable_with_event routes the error into _verify_hook_failed (read once by
-  // _verify_certificate) instead of the terminal FATAL_PENDING state, so a PERMISSIVE override
-  // still completes the handshake instead of being torn down.
-  bool _in_verify_hook     = false;
-  bool _verify_hook_failed = false;
+  // a hook is RUNNING, reenable_with_event records a TS_EVENT_ERROR as the verdict (-> RUNNING_REJECTED)
+  // instead of latching the terminal FATAL_PENDING state, so a PERMISSIVE override still completes the
+  // handshake. One three-state value (driven by VerifyHookScope) replaces the old bool pair, whose
+  // (not-running, failed) combination was representable but meaningless.
+  enum class VerifyHookState { INACTIVE, RUNNING, RUNNING_REJECTED };
+  VerifyHookState _verify_hook_state = VerifyHookState::INACTIVE;
   // In the graceful close-drain (do_io_close's lingering close): user VIOs are severed and the
   // transport is flushing the final ciphertext before teardown. SHUTDOWN_IN_PROGRESS is reached
   // from exactly one site (do_io_close) and the VC is freed the instant it leaves the state, so
@@ -840,6 +841,42 @@ private:
     ~RecursionGuard() { --r; }
     RecursionGuard(const RecursionGuard &)            = delete;
     RecursionGuard &operator=(const RecursionGuard &) = delete;
+  };
+
+  // RAII guard for a bool flag that must track the dynamic scope of a call whose body other frames
+  // read during the call (same rationale as RecursionGuard: no missed clear on an early return).
+  // Asserts the flag is clear on entry, so an illegal nesting crashes rather than silently
+  // corrupting the flag.
+  struct ScopedFlag {
+    bool &f;
+    explicit ScopedFlag(bool &flag) : f(flag)
+    {
+      ink_assert(!f);
+      f = true;
+    }
+    ~ScopedFlag() { f = false; }
+    ScopedFlag(const ScopedFlag &)            = delete;
+    ScopedFlag &operator=(const ScopedFlag &) = delete;
+  };
+
+  // RAII scope for a running verify hook: enters RUNNING (from INACTIVE only) and restores INACTIVE
+  // on exit; rejected() reports whether a hook recorded a bad-certificate verdict while running.
+  // Read rejected() before the scope ends.
+  struct VerifyHookScope {
+    VerifyHookState &s;
+    explicit VerifyHookScope(VerifyHookState &state) : s(state)
+    {
+      ink_assert(s == VerifyHookState::INACTIVE);
+      s = VerifyHookState::RUNNING;
+    }
+    ~VerifyHookScope() { s = VerifyHookState::INACTIVE; }
+    bool
+    rejected() const
+    {
+      return s == VerifyHookState::RUNNING_REJECTED;
+    }
+    VerifyHookScope(const VerifyHookScope &)            = delete;
+    VerifyHookScope &operator=(const VerifyHookScope &) = delete;
   };
 
   std::unique_ptr<SSL, decltype(&SSL_free)>                              _ssl{nullptr, &SSL_free};
