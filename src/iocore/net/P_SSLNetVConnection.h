@@ -689,10 +689,21 @@ private:
 
   // Typed pump results: each face drive runs one pump batch and reads its outcome from one
   // struct, instead of an int return with correlated out-params.
+  // How one read-pump batch ended. A closed set, separate from the handshake-result ints, so the
+  // delivery switch is exhaustive (compiler-checked) and no "not yet classified" value is
+  // representable in a finished batch -- the producer uses a std::optional tripwire instead.
+  enum class ReadPumpOutcome {
+    READY,      // plaintext delivered, consumer wants more
+    COMPLETE,   // the read VIO's request is satisfied
+    NEED_READ,  // SSL wants more transport bytes (WANT_READ / X509 / client-hello cb)
+    NEED_WRITE, // SSL wants to write before it can read (WANT_WRITE)
+    EOS,        // clean TLS close (close-notify / zero-return / EOF)
+    ERROR,      // SSL or syscall error; see ReadBatch::error
+  };
   struct ReadBatch {
-    int     event = 0; // SSL_READ_* classification of how the batch ended (never SSL_READ_ERROR_NONE)
-    int64_t bytes = 0; // plaintext delivered to the user buffer; already counted into _user_read_vio.ndone
-    int     error = 0; // errno at the failing SSL_read (SSL_READ_ERROR only; mapped to -ENET_SSL_FAILED when 0)
+    ReadPumpOutcome event;     // how the batch ended
+    int64_t         bytes = 0; // plaintext delivered to the user buffer; already counted into _user_read_vio.ndone
+    int             error = 0; // errno at the failing SSL_read (ERROR only; mapped to -ENET_SSL_FAILED when 0)
   };
   struct EncryptBatch {
     int64_t plaintext_consumed = 0; // plaintext consumed from the user buffer; the CALLER advances _user_write_vio.ndone

@@ -71,17 +71,12 @@ using namespace std::literals;
 #define BIO_eof(b) (int)BIO_ctrl(b, BIO_CTRL_EOF, 0, nullptr)
 #endif
 
-#define SSL_READ_ERROR_NONE        0
-#define SSL_READ_ERROR             1
-#define SSL_READ_READY             2
-#define SSL_READ_COMPLETE          3
-#define SSL_READ_WOULD_BLOCK       4
-#define SSL_READ_EOS               5
+// Handshake-driver result codes. (The read pump's own outcomes are the typed ReadPumpOutcome
+// enum, not these ints.)
 #define SSL_HANDSHAKE_WANT_READ    6
 #define SSL_HANDSHAKE_WANT_WRITE   7
 #define SSL_HANDSHAKE_WANT_ACCEPT  8
 #define SSL_HANDSHAKE_WANT_CONNECT 9
-#define SSL_WRITE_WOULD_BLOCK      10
 #define SSL_WAIT_FOR_HOOK          11
 #define SSL_WAIT_FOR_ASYNC         12
 #define SSL_RESTART                13
@@ -218,17 +213,17 @@ debug_certificate_name(const char *msg, X509_NAME *name)
 
 // The read pump, mirror of _encrypt_data_for_transport. Decrypts from the rbio into the user
 // buffer until the buffer/request bound is hit or SSL stops producing, and returns the whole
-// outcome as one ReadBatch. Never returns event == SSL_READ_ERROR_NONE: toread > 0 is
-// release-asserted, so the loop below runs at least once, every non-SSL_ERROR_NONE arm sets a
-// different event, and any produced bytes force SSL_READ_READY/SSL_READ_COMPLETE.
+// outcome as one ReadBatch. Always yields an outcome: toread > 0 is release-asserted, so the loop
+// below runs at least once, every non-SSL_ERROR_NONE arm sets one, and any produced bytes force
+// READY/COMPLETE -- the std::optional tripwire at the tail asserts it.
 SSLNetVConnection::ReadBatch
 SSLNetVConnection::_decrypt_data_from_transport()
 {
-  MIOBufferAccessor &buf        = _user_read_vio.buffer;
-  int                event      = SSL_READ_ERROR_NONE;
-  int64_t            bytes_read = 0;
-  int                error      = 0;
-  ssl_error_t        sslErr     = SSL_ERROR_NONE;
+  MIOBufferAccessor             &buf = _user_read_vio.buffer;
+  std::optional<ReadPumpOutcome> event;
+  int64_t                        bytes_read = 0;
+  int                            error      = 0;
+  ssl_error_t                    sslErr     = SSL_ERROR_NONE;
 
   // Find out the max we can read, based on buffer size and user's request size
   int64_t toread = buf.writer()->write_avail();
@@ -267,37 +262,37 @@ SSLNetVConnection::_decrypt_data_from_transport()
       }
       break;
     case SSL_ERROR_WANT_WRITE:
-      event = SSL_WRITE_WOULD_BLOCK;
+      event = ReadPumpOutcome::NEED_WRITE;
       Dbg(dbg_ctl_ssl_error, "SSL_ERROR_WOULD_BLOCK(write)");
       break;
     case SSL_ERROR_WANT_READ:
-      event = SSL_READ_WOULD_BLOCK;
+      event = ReadPumpOutcome::NEED_READ;
       Dbg(dbg_ctl_ssl_error, "SSL_ERROR_WOULD_BLOCK(read)");
       break;
 #ifdef SSL_ERROR_WANT_CLIENT_HELLO_CB
     case SSL_ERROR_WANT_CLIENT_HELLO_CB:
-      event = SSL_READ_WOULD_BLOCK;
+      event = ReadPumpOutcome::NEED_READ;
       Dbg(dbg_ctl_ssl_error, "SSL_ERROR_WOULD_BLOCK(read/client hello cb)");
       break;
 #endif
     case SSL_ERROR_WANT_X509_LOOKUP:
-      event = SSL_READ_WOULD_BLOCK;
+      event = ReadPumpOutcome::NEED_READ;
       Dbg(dbg_ctl_ssl_error, "SSL_ERROR_WOULD_BLOCK(read/x509 lookup)");
       break;
     case SSL_ERROR_SYSCALL:
       if (nread != 0) {
         // not EOF
         Metrics::Counter::increment(ssl_rsb.error_syscall);
-        event = SSL_READ_ERROR;
+        event = ReadPumpOutcome::ERROR;
         error = errno;
         Dbg(dbg_ctl_ssl_error, "SSL_ERROR_SYSCALL, underlying IO error: %s", strerror(errno));
       } else {
         // then EOF observed, treat it as EOS
-        event = SSL_READ_EOS;
+        event = ReadPumpOutcome::EOS;
       }
       break;
     case SSL_ERROR_ZERO_RETURN:
-      event = SSL_READ_EOS;
+      event = ReadPumpOutcome::EOS;
       Dbg(dbg_ctl_ssl_error, "SSL_ERROR_ZERO_RETURN");
       break;
     case SSL_ERROR_SSL:
@@ -305,7 +300,7 @@ SSLNetVConnection::_decrypt_data_from_transport()
       char          buf[512];
       unsigned long e = ERR_peek_last_error();
       ERR_error_string_n(e, buf, sizeof(buf));
-      event = SSL_READ_ERROR;
+      event = ReadPumpOutcome::ERROR;
       error = errno;
       SSLVCDebug(this, "errno=%d", errno);
       Metrics::Counter::increment(ssl_rsb.error_ssl);
@@ -319,7 +314,7 @@ SSLNetVConnection::_decrypt_data_from_transport()
     _user_read_vio.ndone += bytes_read;
 
     // If we read it all, don't worry about the other events and just send read complete
-    event = (_user_read_vio.ntodo() <= 0) ? SSL_READ_COMPLETE : SSL_READ_READY;
+    event = (_user_read_vio.ntodo() <= 0) ? ReadPumpOutcome::COMPLETE : ReadPumpOutcome::READY;
   } else { // if( bytes_read > 0 )
 #if defined(_DEBUG)
     if (bytes_read == 0) {
@@ -327,10 +322,10 @@ SSLNetVConnection::_decrypt_data_from_transport()
     }
 #endif
   }
-  // The never-SSL_READ_ERROR_NONE contract from the comment above; the caller runs one batch
-  // per drive on the strength of it.
-  ink_assert(event != SSL_READ_ERROR_NONE);
-  return {event, bytes_read, error};
+  // Every finished batch has an outcome (toread > 0, so either bytes flowed or a non-NONE SSL
+  // error was recorded); the caller runs one batch per drive on the strength of it.
+  ink_release_assert(event.has_value());
+  return {*event, bytes_read, error};
 }
 
 /**
@@ -935,8 +930,8 @@ SSLNetVConnection::_drive_ssl_read()
   }
 
   // At this point we are at the post-handshake SSL processing: one pump batch per drive. (An
-  // inherited do-while looped here on outcomes the pump cannot return -- see the never-
-  // SSL_READ_ERROR_NONE note on _decrypt_data_from_transport -- so its body only ever ran once.)
+  // inherited do-while looped here on outcomes the pump cannot return -- see the always-yields-an-
+  // outcome note on _decrypt_data_from_transport -- so its body only ever ran once.)
   const ReadBatch batch = _decrypt_data_from_transport();
 
   // SSL_read can produce protocol output of its own, with no SSL_write in flight to carry it:
@@ -962,7 +957,7 @@ void
 SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
 {
   if (batch.bytes > 0) {
-    if (batch.event == SSL_READ_WOULD_BLOCK || batch.event == SSL_READ_READY) {
+    if (batch.event == ReadPumpOutcome::NEED_READ || batch.event == ReadPumpOutcome::READY) {
       if (_signal_and_reclaim(SignalSide::READ, VC_EVENT_READ_READY) == SignalOutcome::RECLAIMED) {
         Dbg(dbg_ctl_ssl, "read signal reclaimed the vc");
         return;
@@ -973,10 +968,10 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
   int wants = SSL_want(this->_ssl.get());
   Dbg(dbg_ctl_ssl, "SSL_want=%d", wants);
   switch (batch.event) {
-  case SSL_READ_READY:
+  case ReadPumpOutcome::READY:
     // We delivered a buffer-full of plaintext and the consumer still wants more.
     // _decrypt_data_from_transport stops at the downstream buffer's capacity (toread =
-    // write_avail), so SSL_READ_READY can mean the rbio STILL holds ciphertext we have not
+    // write_avail), so READY can mean the rbio STILL holds ciphertext we have not
     // decrypted yet. The transport read will NOT re-signal us for ciphertext already buffered in
     // the rbio -- net_read_io signals only when it reads fresh bytes off the socket -- so handing
     // the continuation to it would strand those records until the peer happens to send more (the
@@ -985,8 +980,8 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
     // consumer here); mainEvent clears _deferred_work_event.
     // Otherwise the rbio is dry: re-arm the transport read and wait for the next socket data --
     // unless the peer's close_notify was coalesced into the same fill as this final app data.
-    // _decrypt_data_from_transport records SSL_READ_EOS for the alert but then overwrites it with
-    // SSL_READ_READY here because plaintext was produced; SSL has already latched
+    // _decrypt_data_from_transport records EOS for the alert but then overwrites it with
+    // READY here because plaintext was produced; SSL has already latched
     // SSL_RECEIVED_SHUTDOWN, so re-drive out of line to let the next read surface the pending EOS.
     // A TLS half-close leaves TCP open (no prompt FIN), so waiting on a transport read would strand
     // the EOS until the inactivity timeout (INV-8: EOS is persistent state, not a socket edge).
@@ -998,11 +993,11 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
     }
     return;
     break;
-  case SSL_WRITE_WOULD_BLOCK:
+  case ReadPumpOutcome::NEED_WRITE:
     _transport_write_vio->reenable();
     Dbg(dbg_ctl_ssl, "read finished - would block - need write");
     break;
-  case SSL_READ_WOULD_BLOCK:
+  case ReadPumpOutcome::NEED_READ:
     if (_transport_read_ended()) {
       // The transport is gone (FIN or error) and the rbio is drained: no more bytes will
       // ever arrive, so surface the close to the enabled reader now -- master re-reads the
@@ -1029,8 +1024,8 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
     }
     break;
 
-  case SSL_READ_EOS:
-    // close the connection if we have SSL_READ_EOS, this is the return value from
+  case ReadPumpOutcome::EOS:
+    // close the connection if we have EOS, this is the outcome from
     // _decrypt_data_from_transport() if we get an SSL_ERROR_ZERO_RETURN from SSL_get_error()
     // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
     (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_EOS);
@@ -1041,11 +1036,11 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
       Dbg(dbg_ctl_ssl, "read finished - 0 useful bytes read, bytes used by SSL layer");
     }
     break;
-  case SSL_READ_COMPLETE:
+  case ReadPumpOutcome::COMPLETE:
     Dbg(dbg_ctl_ssl, "read finished - signal done");
     (void)_signal_and_reclaim(SignalSide::READ, VC_EVENT_READ_COMPLETE);
     break;
-  case SSL_READ_ERROR:
+  case ReadPumpOutcome::ERROR:
     Dbg(dbg_ctl_ssl, "read finished - read error");
     // Consumer-driven: record the error and deliver VC_EVENT_ERROR; the consumer's do_io_close
     // frees the outer (and, via the destructor, the inner). Do NOT close _unvc here -- the outer
