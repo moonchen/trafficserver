@@ -1396,7 +1396,7 @@ SSLNetVConnection::_apply_close_plan(ClosePlan plan, int lerrno, EThread *t)
   _authorize_reclaim();
 
   if (plan == ClosePlan::RECLAIM_NOW) {
-    this->free_thread(t);
+    _reclaim_if_closed();
   } else {
     // Not safe to free inline. If we're nested in _signal_user's own reentrancy, its unwind's
     // _reclaim_if_closed will free us first and the destructor will harmlessly cancel this scheduled
@@ -3606,7 +3606,7 @@ SSLNetVConnection::_handle_transport_error(VIO *vio, int err)
   if (_is_draining()) {
     if (!_free_blocked()) {
       _authorize_reclaim();
-      this->free_thread(this_ethread());
+      _reclaim_if_closed();
     }
     return EVENT_DONE;
   }
@@ -3746,7 +3746,7 @@ SSLNetVConnection::_run_deferred_work()
     // live ref (_free_blocked): hold off and let its reenable's read-drive complete the free.
     if ((!_write_buf_reader || _write_buf_reader->read_avail() == 0) && !_free_blocked()) {
       _authorize_reclaim();
-      this->free_thread(this_ethread());
+      _reclaim_if_closed();
     }
     return EVENT_DONE;
   }
@@ -3850,7 +3850,7 @@ SSLNetVConnection::mainEvent(int event, void *data)
       // reenable; defer the free to that reenable rather than freeing under the plugin.
       if (!_free_blocked()) {
         _authorize_reclaim();
-        this->free_thread(this_ethread());
+        _reclaim_if_closed();
         return EVENT_DONE;
       }
       return EVENT_CONT;
