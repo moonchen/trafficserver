@@ -109,7 +109,7 @@ INKContInternal *g_verify_close_cont   = nullptr; // process-global closing veri
 // One-shot verify-server hook (see the header). Runs nested inside the failing SSL_connect frame:
 // the in-hook do_io_close severs the user VIOs and arms the graceful close-drain (lerrno -1) or
 // authorizes the reclaim (an abort lerrno), and the ERROR reenable records the verify verdict
-// (_verify_hook_failed) that makes the ENFORCED policy fail SSL_connect on this very round.
+// (VerifyHookState::RUNNING_REJECTED) that makes the ENFORCED policy fail SSL_connect on this round.
 int
 reducer_closing_verify_hook_cb(TSCont /* contp */, TSEvent /* event */, void *edata)
 {
