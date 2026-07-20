@@ -261,7 +261,9 @@ miobuffer_has_read_avail(BIO *bio)
   ink_assert(bio != nullptr);
   BIO_MIOBuffer_Context *ctx = static_cast<BIO_MIOBuffer_Context *>(BIO_get_data(bio));
   ink_assert(ctx && ctx->reader);
-  return ctx->reader->read_avail() > 0;
+  // Short-circuit at the first available byte instead of read_avail()'s full block-chain sum;
+  // this predicate is hot (_ssl_read_pending on every read drive / do_io_read / reenable).
+  return ctx->reader->is_read_avail_more_than(0);
 }
 
 static const BIO_METHOD *miobuffer_methods = [] {
