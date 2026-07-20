@@ -43,7 +43,6 @@ add_library(
   SSLConfig.cc
   SSLSecret.cc
   SSLDiags.cc
-  SSLNetAccept.cc
   SSLNetProcessor.cc
   SSLNetVConnection.cc
   SSLNextProtocolAccept.cc

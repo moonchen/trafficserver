@@ -64,9 +64,6 @@ public:
   SSLNetProcessor &operator=(const SSLNetProcessor &) = delete;
 
   Action *connect_re(Continuation *cont, sockaddr const *target, NetVCOptions const &options) override;
-
-protected:
-  NetAccept *createNetAccept(const NetProcessor::AcceptOptions &opt) override;
 };
 
 extern SSLNetProcessor ssl_NetProcessor;

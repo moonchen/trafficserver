@@ -294,8 +294,8 @@ UnixNetProcessor::init_socks()
   }
 }
 
-// Virtual function allows creation of an
-// SSLNetAccept or NetAccept transparent to NetProcessor.
+// Virtual so a processor subclass (e.g. QUIC) can substitute its own NetAccept
+// transparent to NetProcessor; the base creates a plain NetAccept.
 NetAccept *
 UnixNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
 {

@@ -26,7 +26,6 @@
 #include "P_UnixNetVConnection.h"
 #include "SSLStats.h"
 #include "P_SSLNetProcessor.h"
-#include "P_SSLNetAccept.h"
 #include "P_SSLNetVConnection.h"
 #include "P_SSLClientCoordinator.h"
 #include "P_SSLConfig.h"
@@ -82,12 +81,6 @@ SSLNetProcessor::start(int, size_t stacksize)
   // We have removed the difference between ET_SSL threads and ET_NET threads,
   // So just keep on chugging
   return 0;
-}
-
-NetAccept *
-SSLNetProcessor::createNetAccept(const NetProcessor::AcceptOptions &opt)
-{
-  return new SSLNetAccept(opt);
 }
 
 SSLNetVConnection *
