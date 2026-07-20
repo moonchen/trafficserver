@@ -1441,6 +1441,13 @@ SSLNetVConnection::do_io_close([[maybe_unused]] int lerrno)
 void
 SSLNetVConnection::free_thread(EThread *t)
 {
+  // The one physical-free primitive. A free is only ever legal when no frame or plugin still
+  // needs `this` (consumer-driven teardown); every caller establishes that before reaching here
+  // -- via _reclaim_if_closed's gate, the close plan's, the drain exits', or trivially pre-open
+  // (recursion 0, no hooks). Assert it centrally so any future free path that skips the gate
+  // crashes here instead of leaving a use-after-free.
+  ink_release_assert(!_free_blocked());
+
   if (allocation_storage == AllocationStorage::GLOBAL) {
     sslNetVCAllocator.free(this);
   } else {
