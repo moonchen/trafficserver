@@ -965,8 +965,10 @@ SSLNetVConnection::_deliver_read_result(const ReadBatch &batch)
     }
   }
 
-  int wants = SSL_want(this->_ssl.get());
-  Dbg(dbg_ctl_ssl, "SSL_want=%d", wants);
+  // SSL_want() is only used for this debug line; skip the call unless the tag is on.
+  if (dbg_ctl_ssl.on()) {
+    Dbg(dbg_ctl_ssl, "SSL_want=%d", SSL_want(this->_ssl.get()));
+  }
   switch (batch.event) {
   case ReadPumpOutcome::READY:
     // We delivered a buffer-full of plaintext and the consumer still wants more.
@@ -1137,7 +1139,10 @@ SSLNetVConnection::_encrypt_data_for_transport(int64_t towrite, MIOBufferAccesso
 
     Dbg(dbg_ctl_ssl, "try_to_write=%" PRId64 " written=%" PRId64 " total_written=%" PRId64, try_to_write, num_really_written,
         total_written);
-    Metrics::Counter::increment(net_rsb.calls_to_write);
+    // net_rsb.calls_to_write counts real write() syscalls; this SSL_write only stages ciphertext in
+    // the wbio (memory). The inner transport increments it for the actual sendmsg
+    // (UnixNetVConnection), so counting here double-counts -- and adds a per-record atomic to the
+    // encrypt hot loop. Left uncounted.
     // Stop pulling plaintext once enough ciphertext is queued for the transport. This
     // bounds _write_buf to ~the water mark plus one record and lets backpressure reach
     // the producer, instead of encrypting all staged plaintext into memory in one pull.
@@ -3376,16 +3381,19 @@ SSLNetVConnection::_drive_ssl_write()
     return EVENT_DONE;
   }
 
-  int64_t ntodo   = _user_write_vio.ntodo();
-  int64_t towrite = _write_buf_reader->read_avail();
-  if (towrite > ntodo) {
-    towrite = ntodo;
-  }
+  int64_t ntodo = _user_write_vio.ntodo();
 
-  // Give user a chance to fill buffer
-  // No high_water check here.  The user should do its own flow control for sending.  Only give backpressure when the
-  // SSL transport is unable to send.
-  if (towrite != ntodo && !_write_buf->high_water()) {
+  // Give the user a chance to add more plaintext, but only on a genuine producer underflow: when
+  // the write VIO's buffer does not yet hold all the plaintext it promised (ntodo). The prior test
+  // compared the staged CIPHERTEXT (_write_buf_reader) against ntodo -- different units -- so a
+  // fresh write whose wbio is empty always signalled WRITE_READY even when the whole response was
+  // already in the plaintext reader, firing a redundant user callback per write. Mirror the Unix VC
+  // producer semantics and _encrypt_data_for_transport's own min(ntodo, read_avail) bound below.
+  // No high_water check gates the encrypt itself: the user does its own flow control; only give
+  // backpressure when the SSL transport cannot send.
+  IOBufferReader *plaintext       = _user_write_vio.get_reader();
+  int64_t         plaintext_avail = plaintext ? plaintext->read_avail() : 0;
+  if (plaintext_avail < ntodo && !_write_buf->high_water()) {
     if (_signal_and_reclaim(SignalSide::WRITE, VC_EVENT_WRITE_READY) == SignalOutcome::RECLAIMED) {
       // User closed connection in the handler
       return EVENT_DONE;
@@ -3954,13 +3962,16 @@ SSLNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
       // Ask the transport for more socket data.
       _user_read_vio.reenable();
     }
-    // For a real (non-zero) read, also drive an SSL read out of line. The
-    // ciphertext for this read may already be buffered in the rbio (e.g. a request
-    // body that arrived in the same TLS record(s) as the headers), in which case no
-    // further transport read event will arrive to drive it. This also surfaces EOS
-    // when the transport is already closed. Out of line so we don't re-enter the
-    // caller and free this VC underneath it.
-    if (nbytes != 0) {
+    // Drive an SSL read out of line only when it would actually deliver something: the rbio already
+    // holds ciphertext for this read (e.g. a request body that arrived in the same TLS record(s) as
+    // the headers, for which no further transport read event will fire), or the transport has ended
+    // and its persistent EOS/error must be surfaced (the reenable above is skipped when
+    // _transport_read_ended()). When the rbio is empty and the transport is live, the transport read
+    // armed above drives the SSL read on the next socket data -- an immediate drive here would find
+    // nothing and just re-arm, one wasted dispatch per read. _read_drive_warranted() folds both
+    // deliverable cases (its _ssl_read_pending() includes _transport_read_ended()). Out of line so
+    // we don't re-enter the caller and free this VC underneath it.
+    if (_read_drive_warranted()) {
       _schedule_deferred_work(this_ethread());
     }
   } else {
