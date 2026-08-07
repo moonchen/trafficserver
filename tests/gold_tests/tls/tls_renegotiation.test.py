@@ -22,8 +22,14 @@ import os
 
 Test.Summary = __doc__
 
-# Renegotiation only exists in TLS 1.2 and earlier.
-Test.SkipUnless(Condition.HasOpenSSLVersion("1.1.1"), Condition.HasLegacyTLSSupport())
+# Renegotiation only exists in TLS 1.2 and earlier. BoringSSL offers renegotiation only
+# to a client, so as a server it refuses the renegotiation below ATS and the detection
+# this test asserts on never runs.
+Test.SkipUnless(
+    Condition.HasOpenSSLVersion("1.1.1"),
+    Condition.HasLegacyTLSSupport(),
+    Condition.IsOpenSSL(),
+)
 
 
 class TestRenegotiationRefused:
