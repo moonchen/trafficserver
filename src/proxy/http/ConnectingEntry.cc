@@ -28,6 +28,9 @@
 #include "proxy/http/ConnectingEntry.h"
 #include "proxy/http/HttpSM.h"
 
+#include <utility>
+#include <vector>
+
 namespace
 {
 
@@ -40,6 +43,16 @@ ConnectingEntry::~ConnectingEntry()
   if (_netvc_read_buffer != nullptr) {
     free_MIOBuffer(_netvc_read_buffer);
     _netvc_read_buffer = nullptr;
+  }
+  _release_conn_track_group();
+}
+
+void
+ConnectingEntry::_release_conn_track_group()
+{
+  if (conn_track_group) {
+    conn_track_group->release();
+    conn_track_group.reset();
   }
 }
 
@@ -84,37 +97,49 @@ ConnectingEntry::state_http_server_open(int event, void *data)
     if (!connect_sms.empty()) {
       auto prime_iter = connect_sms.rbegin();
       ink_release_assert(prime_iter != connect_sms.rend());
+      Dbg(dbg_ctl_http_connect, "ConnectingEntry create session for [%" PRId64 "]", (*prime_iter)->sm_id);
       PoolableSession *new_session = (*prime_iter)->create_server_session(*netvc, _netvc_read_buffer, _netvc_reader);
       netvc                        = nullptr;
       _netvc_read_buffer           = nullptr;
+      if (conn_track_group) {
+        new_session->enable_outbound_connection_tracking(std::move(conn_track_group));
+      }
 
       // Did we end up with a multiplexing session?
       int count = 0;
       if (new_session->is_multiplexing()) {
+        // Check every queued request before any of them runs. If none can use the session, close it first so that its
+        // count is given back before they connect on their own.
+        std::vector<std::pair<HttpSM *, bool>> handoffs;
+        bool                                   session_handed_off = false;
+        for (auto *sm : connect_sms) {
+          bool const name_ok =
+            validate_server_certificate_hostname(new_session->get_netvc(), sm->get_outbound_sni_for_cert_verification());
+
+          handoffs.emplace_back(sm, name_ok);
+          session_handed_off = session_handed_off || name_ok;
+        }
+        if (!session_handed_off) {
+          new_session->do_io_close();
+        }
+
         // Hand off to all queued up ConnectSM's.
-        bool session_handed_off = false;
-        while (!connect_sms.empty()) {
-          auto  entry      = connect_sms.begin();
+        for (auto [sm, name_ok] : handoffs) {
           auto  event      = CONNECT_EVENT_TXN;
           void *event_data = new_session;
 
-          if (!validate_server_certificate_hostname(new_session->get_netvc(), (*entry)->get_outbound_sni_for_cert_verification())) {
+          if (!name_ok) {
             // Retry without joining another multiplexed connect queue so this
             // transaction gets its own TLS handshake and certificate check.
             event      = CONNECT_EVENT_DIRECT;
             event_data = nullptr;
-          } else {
-            session_handed_off = true;
           }
 
           Dbg(dbg_ctl_http_connect, "ConnectingEntry Pass along %s %d",
               event == CONNECT_EVENT_TXN ? "CONNECT_EVENT_TXN" : "CONNECT_EVENT_DIRECT", count++);
-          SCOPED_MUTEX_LOCK(lock, (*entry)->mutex, this_ethread());
-          (*entry)->handleEvent(event, event_data);
-          connect_sms.erase(entry);
-        }
-        if (!session_handed_off) {
-          new_session->do_io_close();
+          SCOPED_MUTEX_LOCK(lock, sm->mutex, this_ethread());
+          sm->handleEvent(event, event_data);
+          connect_sms.erase(sm);
         }
       } else {
         // Hand off to one and tell all of the others to connect directly
@@ -146,6 +171,8 @@ ConnectingEntry::state_http_server_open(int event, void *data)
   case NET_EVENT_OPEN_FAILED: {
     Dbg(dbg_ctl_http_connect, "Stop %zd state machines waiting for failed origin", connect_sms.size());
     this->remove_entry();
+    // The queued requests can retry from inside handleEvent, so the failed connection must not count against them.
+    _release_conn_track_group();
     int vc_provided_cert = 0;
     int lerrno           = EIO;
     if (netvc != nullptr) {

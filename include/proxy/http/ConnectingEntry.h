@@ -22,8 +22,10 @@
 
  */
 
+#include "iocore/net/ConnectionTracker.h"
 #include "proxy/PoolableSession.h"
 
+#include <memory>
 #include <set>
 #include <string>
 
@@ -49,8 +51,13 @@ public:
   ProxyTransaction  *ua_txn              = nullptr;
   NetVConnection    *netvc               = nullptr;
   bool               is_no_plugin_tunnel = false;
+  /// The upstream connection count reserved for this connection. Any queued request can end up with the session, so
+  /// the entry keeps the count until it gives it to the session it creates, or releases it if it creates none.
+  std::shared_ptr<ConnectionTracker::Group> conn_track_group;
 
 private:
+  void _release_conn_track_group();
+
   MIOBuffer      *_netvc_read_buffer = nullptr;
   IOBufferReader *_netvc_reader      = nullptr;
   Action         *_pending_action    = nullptr;
