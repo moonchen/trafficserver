@@ -37,7 +37,6 @@ struct Config {
   static constexpr int64_t const blockbytesdefault = 1024 * 1024;       // 1MB
 
   static constexpr int const purgeprobeblocksdefault = 8;
-  static constexpr int const blockreadretriesdefault = 5;
 
   int64_t     m_blockbytes{blockbytesdefault};
   std::string m_remaphost; // remap host to use for loopback slice GET
@@ -55,9 +54,6 @@ struct Config {
 
   // consecutive uncached blocks a purge tolerates before giving up on the object
   int m_purge_probe_blocks{purgeprobeblocksdefault};
-
-  // cache read retries for a block request that loses the cache write lock; 0 leaves the cache settings alone
-  int m_block_read_retries{blockreadretriesdefault};
 
   std::string m_skip_header;
   std::string m_crr_ident_header;

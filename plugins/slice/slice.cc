@@ -69,47 +69,6 @@ should_skip_this_obj(TSHttpTxn txnp, Config *const config)
   return false;
 }
 
-// proxy.config.http.cache.open_write_fail_action values
-constexpr TSMgmtInt WRITE_FAIL_GO_TO_ORIGIN                   = 0;
-constexpr TSMgmtInt WRITE_FAIL_STALE_ON_REVALIDATE            = 2;
-constexpr TSMgmtInt WRITE_FAIL_READ_RETRY                     = 5;
-constexpr TSMgmtInt WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE = 6;
-
-/** Concurrent requests for an uncached block all miss until the first of them opens the cache write. With a write fail
-  action that then goes to the origin, every request that missed in that window fetches the whole block again, uncached.
-  A read retry instead looks the block up again and reads it from the request that is writing it.
- */
-void
-retry_block_reads(TSHttpTxn txnp, Config const *const config)
-{
-  if (config->m_block_read_retries <= 0) {
-    return;
-  }
-
-  TSMgmtInt action = 0;
-  if (TS_SUCCESS != TSHttpTxnConfigIntGet(txnp, TS_CONFIG_HTTP_CACHE_OPEN_WRITE_FAIL_ACTION, &action)) {
-    return;
-  }
-  // The actions that answer a lost write lock with an error are left alone.
-  if (WRITE_FAIL_GO_TO_ORIGIN == action) {
-    action = WRITE_FAIL_READ_RETRY;
-  } else if (WRITE_FAIL_STALE_ON_REVALIDATE == action) {
-    action = WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE;
-  } else if (WRITE_FAIL_READ_RETRY != action && WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE != action) {
-    return;
-  }
-  TSHttpTxnConfigIntSet(txnp, TS_CONFIG_HTTP_CACHE_OPEN_WRITE_FAIL_ACTION, action);
-
-  TSMgmtInt retries = 0;
-  if (TS_SUCCESS == TSHttpTxnConfigIntGet(txnp, TS_CONFIG_HTTP_CACHE_MAX_OPEN_READ_RETRIES, &retries) &&
-      retries < config->m_block_read_retries) {
-    retries = config->m_block_read_retries;
-    TSHttpTxnConfigIntSet(txnp, TS_CONFIG_HTTP_CACHE_MAX_OPEN_READ_RETRIES, retries);
-  }
-  DEBUG_LOG("Block request retries its cache read on a lost write lock: action %" PRId64 ", read retries %" PRId64, action,
-            retries);
-}
-
 bool
 read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, TSCont block_contp)
 {
@@ -155,7 +114,6 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, T
       if (config->m_inline_first_block) {
         HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
         if (inline_first_block(txnp, config, mutable_header)) {
-          retry_block_reads(txnp, config);
           mark_slice_block(txnp);
           return false;
         }
@@ -296,9 +254,6 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, T
     } else {
       DEBUG_LOG("slice passing GET or HEAD request through to next plugin");
       // A block request from slice, from an inline remainder or from a prefetch.
-      if (TS_HTTP_METHOD_GET == header.method()) {
-        retry_block_reads(txnp, config);
-      }
       HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
       watch_block_request(txnp, mutable_header, block_contp);
     }

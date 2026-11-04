@@ -154,29 +154,6 @@ The slice plugin supports the following options::
         can improve cache miss latency.
         -f for short
 
-    --block-read-retries=<int> (optional)
-        Default is 5
-        Concurrent requests for the same uncached block all miss in the
-        cache until the first of them opens the block's cache write.  With
-        :ts:cv:`proxy.config.http.cache.open_write_fail_action` ``0`` or ``2``,
-        each request that missed in that window fetches the whole block from
-        the origin again, without caching it.  Slice therefore makes its block
-        requests retry the cache read instead, and read the block from the
-        request that writes it: it sets the write fail action to ``5`` (from
-        ``0``) or ``6`` (from ``2``) for its block requests, and raises
-        :ts:cv:`proxy.config.http.cache.max_open_read_retries` to this value.
-        Each cache read waits for the writer's first fragment as long as
-        :ts:cv:`proxy.config.cache.read_while_writer.max_retries` allows, so a
-        block request waits for another request's fetch at most this many
-        times, and then fetches the block itself, uncached.  A block
-        request that finds the writer gone also fetches the block itself.  The
-        other write fail actions, which return an error, are left as they are.
-        This relies on :ts:cv:`proxy.config.cache.enable_read_while_writer`.
-        ``0`` leaves the cache settings of block requests alone.  With
-        ``--remap-host``, the block requests go through the loopback rule,
-        which slice is not part of; set the same values there with
-        `conf_remap`.
-
     --strip-range-for-head (optional)
         Enable slice plugin to strip Range header for HEAD requests.
         -h for short
@@ -442,6 +419,19 @@ response reaches the client unchanged.  For a later block it asks for the part
 of the block that the client needs.  So a request that is not stored costs
 upstream no more than it would without slice.  cache_promote counts slice's
 block requests per object.
+
+Concurrent Requests for a Block
+-------------------------------
+
+Concurrent requests for the same uncached block all miss in the cache until the
+first of them opens the block's cache write.  Slice's block requests share the
+block's cache key, so the others can read the block from that writer, but only
+when the rule allows read retries.  Otherwise each of them fetches the whole
+block from the origin again, without caching it.  Set
+:ts:cv:`proxy.config.http.cache.open_write_fail_action` to ``6`` (or ``5``) and
+:ts:cv:`proxy.config.http.cache.max_open_read_retries` above ``0`` with
+:ref:`admin-plugins-conf-remap` on the sliced rule, and also on the loopback rule
+with ``--remap-host``.
 
 Origins That Ignore Range
 -------------------------

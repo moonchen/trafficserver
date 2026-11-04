@@ -125,7 +125,6 @@ Config::fromArgs(int const argc, char const *const argv[])
     {const_cast<char *>("purge-probe-blocks"),   required_argument, nullptr, 'q'},
     {const_cast<char *>("purge-probe-header"),   required_argument, nullptr, 'H'},
     {const_cast<char *>("inline-first-block"),   no_argument,       nullptr, 'n'},
-    {const_cast<char *>("block-read-retries"),   required_argument, nullptr, 'R'},
     {nullptr,                                    0,                 nullptr, 0  },
   };
 
@@ -269,15 +268,6 @@ Config::fromArgs(int const argc, char const *const argv[])
     case 'H': {
       m_purge_probe_header.assign(optarg);
       DEBUG_LOG("Using purge probe header %s", optarg);
-    } break;
-    case 'R': {
-      int const retriesread = atoi(optarg);
-      if (0 <= retriesread) {
-        m_block_read_retries = retriesread;
-        DEBUG_LOG("Using block read retries %d", m_block_read_retries);
-      } else {
-        ERROR_LOG("Invalid block-read-retries: %s", optarg);
-      }
     } break;
     default:
       break;

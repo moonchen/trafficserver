@@ -13,7 +13,8 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-"""Concurrent slice block requests for the same uncached block fetch it from the origin once."""
+"""Concurrent slice block requests for the same uncached block fetch it from the origin once, when the rule allows read
+retries."""
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,7 @@ BLOCK = 1000
 SIZE = 3 * BLOCK
 ALPHABET = b"abcdefghijklmnopqrstuvwxyz0123456789"
 HOSTS = ("sliced", "inline")
+READ_RETRIES = 5
 
 
 def body_for(size: int) -> bytes:
@@ -46,21 +48,14 @@ def body_for(size: int) -> bytes:
 class Scenario:
     """An origin and a Traffic Server with a slice rule and an inline slice rule."""
 
-    def __init__(
-            self,
-            ats_factory: ATSFactory,
-            services: ServiceFactory,
-            curl: Curl,
-            *,
-            slice_extra: str = "",
-            records: dict[str, int] | None = None) -> None:
+    def __init__(self, ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, *, read_retry_action: int | None = 6) -> None:
         """Configure the origin and the remap rules.
 
         :param ats_factory: Factory for isolated Traffic Server instances.
         :param services: Factory owning support services and their cleanup.
         :param curl: Transport-aware curl command runner.
-        :param slice_extra: More slice parameters for both rules.
-        :param records: More records.yaml settings.
+        :param read_retry_action: The proxy.config.http.cache.open_write_fail_action that conf_remap sets on both rules,
+            with read retries, or None to leave the rules at the production settings.
         """
 
         self.curl = curl
@@ -73,9 +68,15 @@ class Scenario:
             ready_port=port,
         )
         self.ats: ATS = ats_factory.create("ts")
-        if not self.ats.plugin_exists("slice.so") or not self.ats.plugin_exists("cache_range_requests.so"):
-            pytest.skip("slice.so and cache_range_requests.so are required")
-        slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={BLOCK} {slice_extra}".rstrip()
+        for plugin in ("slice.so", "cache_range_requests.so", "conf_remap.so"):
+            if not self.ats.plugin_exists(plugin):
+                pytest.skip(f"{plugin} is required")
+        slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={BLOCK}"
+        if read_retry_action is not None:
+            slice_args = (
+                "@plugin=conf_remap.so "
+                f"@pparam=proxy.config.http.cache.open_write_fail_action={read_retry_action} "
+                f"@pparam=proxy.config.http.cache.max_open_read_retries={READ_RETRIES} {slice_args}")
         self.ats.remap_config.add_lines(
             (
                 f"map http://sliced/ http://127.0.0.1:{port}/ {slice_args} @plugin=cache_range_requests.so",
@@ -87,11 +88,10 @@ class Scenario:
                 "proxy.config.diags.debug.enabled": 1,
                 "proxy.config.diags.debug.tags": "slice|http_cache",
                 # Production settings: a request that loses the cache write lock goes to the origin without
-                # caching, unless slice makes it retry the read.
+                # caching, unless the rule allows read retries.
                 "proxy.config.cache.enable_read_while_writer": 2,
                 "proxy.config.http.cache.open_write_fail_action": 2,
                 "proxy.config.http.cache.max_open_read_retries": -1,
-                **(records or {}),
             })
         self.origin.start()
         self.ats.start()
@@ -158,22 +158,23 @@ def blocks(size: int) -> list[str]:
     return [f"bytes={beg}-{beg + BLOCK - 1}" for beg in range(0, size, BLOCK)]
 
 
-@pytest.mark.parametrize("action", (0, 2))
+@pytest.mark.parametrize("action", (5, 6))
 @pytest.mark.parametrize("host", HOSTS)
 def test_slice_collapse_slow_writer(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str, action: int) -> None:
-    """Requests that find a block's writer before its first bytes arrive wait for it instead of fetching the block.
+    """With read retries on the rule, requests that find a block's writer before its first bytes arrive wait for it
+    instead of fetching the block.
 
     The origin answers after 1.5 s, longer than one read-while-writer wait (0.9 s), so the followers need more than
-    one cache read. Write fail action 0 becomes 5 and 2 becomes 6.
+    one cache read.
 
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
     :param curl: Transport-aware curl command runner.
     :param host: Remap host.
-    :param action: Configured proxy.config.http.cache.open_write_fail_action.
+    :param action: The rule's proxy.config.http.cache.open_write_fail_action.
     """
 
-    scenario = Scenario(ats_factory, services, curl, records={"proxy.config.http.cache.open_write_fail_action": action})
+    scenario = Scenario(ats_factory, services, curl, read_retry_action=action)
     path = f"/1500/slow/{SIZE}"
     for returncode, body in scenario.get_all(host, path, 4, lead=0.3):
         assert returncode == 0
@@ -184,8 +185,8 @@ def test_slice_collapse_slow_writer(ats_factory: ATSFactory, services: ServiceFa
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_slice_collapse_slow_writer_off(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
-    """With --block-read-retries=0, a request that waited for a writer longer than one read-while-writer wait fetches
-    the block itself, as without slice's read retries.
+    """Without read retries on the rule, a request that waited for a writer longer than one read-while-writer wait
+    fetches the block itself.
 
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
@@ -193,7 +194,7 @@ def test_slice_collapse_slow_writer_off(ats_factory: ATSFactory, services: Servi
     :param host: Remap host.
     """
 
-    scenario = Scenario(ats_factory, services, curl, slice_extra="@pparam=--block-read-retries=0")
+    scenario = Scenario(ats_factory, services, curl, read_retry_action=None)
     path = f"/1500/slow/{SIZE}"
     for returncode, body in scenario.get_all(host, path, 4, lead=0.3):
         assert returncode == 0
