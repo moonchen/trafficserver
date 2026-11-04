@@ -110,6 +110,18 @@ retry_block_reads(TSHttpTxn txnp, Config const *const config)
             retries);
 }
 
+/** A client that reads a block slowly would pace the block's cache write, and with it every request that reads the block
+  while it is written.  Let the block's upstream read and cache write run up to a block ahead of the client instead.
+ */
+void
+lead_block_writes(TSHttpTxn txnp, Config const *const config)
+{
+  TSMgmtInt lead = 0;
+  if (TS_SUCCESS == TSHttpTxnConfigIntGet(txnp, TS_CONFIG_HTTP_CACHE_MAX_WRITE_LEAD, &lead) && lead < config->m_blockbytes) {
+    TSHttpTxnConfigIntSet(txnp, TS_CONFIG_HTTP_CACHE_MAX_WRITE_LEAD, config->m_blockbytes);
+  }
+}
+
 bool
 read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, TSCont first_block_contp)
 {
@@ -156,6 +168,7 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, T
         HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
         if (inline_first_block(txnp, config, mutable_header)) {
           retry_block_reads(txnp, config);
+          lead_block_writes(txnp, config);
           mark_slice_block(txnp);
           return false;
         }
@@ -298,6 +311,7 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, T
       // A block request from slice, from an inline remainder or from a prefetch.
       if (TS_HTTP_METHOD_GET == header.method()) {
         retry_block_reads(txnp, config);
+        lead_block_writes(txnp, config);
       }
       HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
       watch_block_request(txnp, mutable_header, first_block_contp);
