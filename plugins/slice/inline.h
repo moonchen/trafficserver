@@ -22,8 +22,12 @@
 
 #include "ts/ts.h"
 
+#include <cstdint>
+#include <string_view>
+
 struct Config;
 struct HttpHeader;
+struct Range;
 
 /** Serve a GET in the client transaction, starting with the block that holds its first byte.
 
@@ -35,3 +39,14 @@ struct HttpHeader;
   @return true if the transaction now takes the inline path; the remap chain must continue.
  */
 bool inline_first_block(TSHttpTxn txnp, Config *config, HttpHeader &header);
+
+/** Serve a range of a complete copy of the object (a cached 200 without Content-Range) that core cannot serve by
+  itself, because another transaction is still writing the copy or the request is not HTTP/1.1. A transform cuts the
+  range out of the copy as it arrives, and the response becomes a 206.
+
+  @param want the range, which starts before @a total
+  @param total the length of the copy
+  @param range the Range header value of @a want
+  @return false if the transform could not be added
+ */
+bool serve_window_from_copy(TSHttpTxn txnp, Config *config, Range const &want, int64_t total, std::string_view range);

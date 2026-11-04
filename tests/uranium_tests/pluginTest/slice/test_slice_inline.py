@@ -573,6 +573,58 @@ def test_slice_inline_range_while_writing(ats_factory: ATSFactory, services: Ser
     assert scenario.errors() == []
 
 
+@pytest.mark.parametrize("host", ("inline", "sliced"))
+def test_slice_range_while_copy_written(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
+    """A range that finds the complete copy of an object whose origin ignores Range while another request still writes
+    it gets its range as a 206, cut out of the copy as it arrives, without a request to the origin.
+
+    Core reads such a copy only as far as it is written; with read-while-writer mode 2 it would send a range past that
+    to the origin, uncached.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    :param host: ``inline`` for --inline-first-block, ``sliced`` for slice's intercept.
+    """
+
+    block = 4 << 20
+    scenario = Scenario(ats_factory, services, curl, block=block, records={"proxy.config.cache.enable_read_while_writer": 2})
+    size = 2 * block
+    path = f"/holdwhole/{size}"
+    # Past the part of the copy that the origin sends before it holds the rest.
+    beg = 6000000
+    with ThreadPoolExecutor(2) as pool:
+        writer = pool.submit(scenario.get, host, path, name="writer")
+        scenario.wait_for_origin_event(path, "held")
+        reader = pool.submit(scenario.get, host, path, "--range", f"{beg}-{beg + 99}", name="reader")
+        wait_for_file_lines(scenario.ats.traffic_out, "out of the complete copy", 1)
+        scenario.release_origin()
+        assert_whole(writer.result(), size)
+        assert_range(reader.result(), size, beg, beg + 100)
+    assert [r["range"] for r in scenario.origin_requests(path)] == [f"bytes=0-{block - 1}"]
+    assert scenario.errors() == []
+
+
+@pytest.mark.parametrize("host", ("inline", "sliced"))
+def test_slice_range_from_copy_http10(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
+    """Core serves ranges only to HTTP/1.1 requests, so an HTTP/1.0 range is cut out of the complete copy in the
+    client's transaction. Slice's intercept sends its block requests as HTTP/1.1, so core serves the range there.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    :param host: ``inline`` for --inline-first-block, ``sliced`` for slice's intercept.
+    """
+
+    scenario = Scenario(ats_factory, services, curl)
+    path = "/ignore/20"
+    assert_whole(scenario.get(host, path), 20)
+    assert_range(scenario.get(host, path, "--http1.0", "--range", "8-10"), 20, 8, 11)
+    assert len(scenario.origin_requests(path)) == 1
+    assert scenario.debug_lines("out of the complete copy") == (1 if host == "inline" else 0)
+    assert scenario.errors() == []
+
+
 def test_slice_inline_client_abort_first_block(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
     """A client that aborts while its first block arrives leaves that block's cache write to finish in the background.
 

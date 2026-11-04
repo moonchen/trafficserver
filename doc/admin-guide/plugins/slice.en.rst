@@ -446,8 +446,9 @@ request was for.
 Every block request that misses in the cache looks up the URL's own key once
 more.  A fresh complete copy there (a 200 without Content-Range) serves the
 request: the client's range as a 206, the whole object for a whole-object GET,
-or the block for a later block.  A range that starts at or past the end of the
-copy goes upstream.  So the object is fetched once, whichever range comes
+or the block for a later block.  When another request is still writing the
+copy, or the client uses HTTP/1.0, slice cuts the range out of the copy as it
+arrives.  A range that starts at or past the end of the copy goes upstream.  So the object is fetched once, whichever range comes
 first, and a complete copy that a request without slice stored serves sliced
 requests too.  For an upstream that honors Range the URL's own key holds
 nothing, and the second lookup finds nothing in the cache directory.  A stale

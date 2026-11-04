@@ -84,7 +84,8 @@ struct InlineTxn {
   bool        send_hook_added{false};
   bool        block_range{false}; // core serves the window from the cached block, by a Range within it
   int64_t     block_end{0};       // end of the cached block, with block_range
-  int64_t     total{0};           // length of the object, with block_range
+  int64_t     total{0};           // length of the object, with block_range or copy
+  bool        copy{false};        // the transform cuts the window out of a complete copy of the object
   // Upstream got the client's own request, because the block would not be stored.
   bool pass_through{false};
   // The first block missed, and the URL's own key is looked up for a complete copy.
@@ -107,7 +108,8 @@ struct Remainder {
   TSHttpTxn   txnp{nullptr};
   Config     *config{nullptr};
   Window      want;
-  int64_t     block_beg{0}; // start of the first block
+  int64_t     block_beg{0};   // start of the first block
+  int64_t     copy_total{-1}; // length of the object, if the first block is a complete copy of it
   Mode        mode{Mode::Undecided};
   int64_t     first_end{0};  // end of the first block in the object
   int64_t     total{-1};     // length of the object
@@ -392,9 +394,19 @@ choose_mode(TSCont contp, Remainder *const rem)
   TSHttpStatus const status = TSHttpHdrStatusGet(resp.m_buffer, resp.m_lochdr);
   std::string_view   cr     = field_value(resp.m_buffer, resp.m_lochdr, TS_MIME_FIELD_CONTENT_RANGE);
   int64_t            s = 0, e = 0, total = 0;
+  bool               block = false;
 
-  if ((TS_HTTP_STATUS_OK == status || TS_HTTP_STATUS_PARTIAL_CONTENT == status) && parse_content_range(cr, s, e, total) &&
-      s == rem->block_beg && in_bytes == e - s) {
+  if (0 <= rem->copy_total) {
+    // A complete copy holds the object from byte 0. While another transaction still writes it, core does not know its
+    // length yet.
+    block = TS_HTTP_STATUS_OK == status && cr.empty() && (in_bytes == rem->copy_total || INT64_MAX == in_bytes);
+    e     = rem->copy_total;
+    total = rem->copy_total;
+  } else {
+    block = (TS_HTTP_STATUS_OK == status || TS_HTTP_STATUS_PARTIAL_CONTENT == status) && parse_content_range(cr, s, e, total) &&
+            s == rem->block_beg && in_bytes == e - s;
+  }
+  if (block) {
     rem->total = total;
     if (!rem->want.satisfiable(total)) {
       // The send hook answers with a 416.
@@ -730,10 +742,11 @@ add_transform(TSHttpTxn txnp, InlineTxn *const state)
   if (state->transform_added) {
     return true;
   }
-  auto rem       = std::make_unique<Remainder>();
-  rem->txnp      = txnp;
-  rem->want      = state->want;
-  rem->block_beg = state->block_beg;
+  auto rem        = std::make_unique<Remainder>();
+  rem->txnp       = txnp;
+  rem->want       = state->want;
+  rem->block_beg  = state->block_beg;
+  rem->copy_total = state->copy ? state->total : -1;
   if (!build_remainder_request(txnp, state->config, rem.get())) {
     return false;
   }
@@ -841,12 +854,24 @@ serve_from_copy(TSHttpTxn txnp, InlineTxn *const state, int const status, TxnHdr
     return false;
   }
   DEBUG_LOG("Serving %s from the complete copy", state->want.range ? state->client_range.c_str() : "the whole object");
+  if (!state->want.range) {
+    return true;
+  }
   int64_t const block_beg = state->block_beg;
   state->block_beg        = 0;
-  if (!serve_from_block(txnp, state, 0, total, total)) {
-    state->block_beg = block_beg;
+  if (serve_from_block(txnp, state, 0, total, total)) {
+    return true;
   }
-  return true;
+  // Core cannot serve the range from the copy by itself, so the transform cuts it out.
+  state->copy  = true;
+  state->total = total;
+  if (add_transform(txnp, state)) {
+    DEBUG_LOG("Cutting %s out of the complete copy", state->client_range.c_str());
+    return true;
+  }
+  state->copy      = false;
+  state->block_beg = block_beg;
+  return false;
 }
 
 // A cached first block, fresh or stale, stored by cache_range_requests as a 200 that keeps the block's Content-Range.
@@ -1052,9 +1077,13 @@ on_send_response(TSHttpTxn txnp, InlineTxn *const state)
     }
   } else if (TS_HTTP_STATUS_PARTIAL_CONTENT == status || TS_HTTP_STATUS_OK == status) {
     if (cr.empty()) {
-      return TS_EVENT_HTTP_CONTINUE;
-    }
-    if (!parse_content_range(cr, s, e, total) || state->block_beg != s) {
+      if (!state->copy) {
+        return TS_EVENT_HTTP_CONTINUE;
+      }
+      // The transform cut the window out of a complete copy.
+      e     = state->total;
+      total = state->total;
+    } else if (!parse_content_range(cr, s, e, total) || state->block_beg != s) {
       return close("unusable Content-Range in the response");
     }
     if (!state->want.satisfiable(total)) {
@@ -1199,5 +1228,26 @@ inline_first_block(TSHttpTxn txnp, Config *const config, HttpHeader &header)
   TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
   TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, contp);
   DEBUG_LOG("Inline first block: %.*s", blocklen, blockstr);
+  return true;
+}
+
+bool
+serve_window_from_copy(TSHttpTxn txnp, Config *const config, Range const &want, int64_t const total, std::string_view const range)
+{
+  auto state          = std::make_unique<InlineTxn>();
+  state->config       = config;
+  state->want         = want.isEndBytes() ? Window{std::max<int64_t>(0, total + want.m_beg), Range::maxval, true} :
+                                            Window{want.m_beg, want.m_end, true};
+  state->client_range = range;
+  state->copy         = true;
+  state->total        = total;
+  if (!add_transform(txnp, state.get())) {
+    return false;
+  }
+  DEBUG_LOG("Cutting %.*s out of the complete copy", static_cast<int>(range.size()), range.data());
+  TSCont const contp = TSContCreate(inline_txn_handler, nullptr);
+  add_send_hook(txnp, contp, state.get());
+  TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, contp);
+  TSContDataSet(contp, state.release());
   return true;
 }

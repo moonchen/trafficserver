@@ -23,6 +23,7 @@
 #include "Config.h"
 #include "HttpHeader.h"
 #include "Range.h"
+#include "inline.h"
 #include "slice.h"
 
 #include <algorithm>
@@ -148,7 +149,7 @@ complete_copy(TSHttpTxn txnp, int64_t &total)
   @param blockbeg the first byte of the block, for a later block
  */
 bool
-serve_from_copy(TSHttpTxn txnp, Config const *const config, bool const first, int64_t const blockbeg)
+serve_from_copy(TSHttpTxn txnp, Config *const config, bool const first, int64_t const blockbeg)
 {
   int64_t total = 0;
   if (!complete_copy(txnp, total)) {
@@ -187,16 +188,19 @@ serve_from_copy(TSHttpTxn txnp, Config const *const config, bool const first, in
     DEBUG_LOG("%s starts past the end of the complete copy", range.c_str());
     return false;
   }
-  // Core serves ranges only to HTTP/1.1 requests.
-  if (TS_HTTP_VERSION(1, 1) != request.version()) {
-    return false;
-  }
   DEBUG_LOG("Serving %s from the complete copy", range.c_str());
-  return request.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, range.data(), range.size());
+  // Core serves ranges only to HTTP/1.1 requests. It reads a copy that another transaction still writes only as far as
+  // it is written, and with read_while_writer 2 sends a range past that to the origin, uncached.
+  TSMgmtInt rww = 0;
+  if (TS_HTTP_VERSION(1, 1) == request.version() &&
+      (TS_SUCCESS != TSHttpTxnInfoIntGet(txnp, TS_TXN_INFO_CACHE_HIT_RWW, &rww) || 0 == rww)) {
+    return request.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, range.data(), range.size());
+  }
+  return serve_window_from_copy(txnp, config, want, total, range);
 }
 
 void
-on_block_lookup(TSHttpTxn txnp, TSCont contp, Config const *const config)
+on_block_lookup(TSHttpTxn txnp, TSCont contp, Config *const config)
 {
   int status = 0;
   if (TS_SUCCESS != TSHttpTxnCacheLookupStatusGet(txnp, &status)) {
@@ -359,8 +363,8 @@ watch_block_request(TSHttpTxn txnp, HttpHeader &header, TSCont contp)
 int
 block_handler(TSCont contp, TSEvent event, void *edata)
 {
-  TSHttpTxn const     txnp   = static_cast<TSHttpTxn>(edata);
-  Config const *const config = static_cast<Config const *>(TSContDataGet(contp));
+  TSHttpTxn const txnp   = static_cast<TSHttpTxn>(edata);
+  Config *const   config = static_cast<Config *>(TSContDataGet(contp));
 
   switch (event) {
   case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE:

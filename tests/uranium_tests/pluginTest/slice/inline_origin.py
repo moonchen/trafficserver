@@ -3,8 +3,9 @@
 Origin for the slice inline first block test.
 
 Each path selects one server behavior: /<mode>/<size>. Every request is appended to the log file
-as a JSON line, so the test can see which ranges reached the origin. A held response also logs
-event lines, and resumes once the file <log file>.release exists.
+as a JSON line, so the test can see which ranges reached the origin. A held response ("hold" for a
+block, "holdwhole" for an origin that ignores Range) also logs event lines, and resumes once the
+file <log file>.release exists.
 
 usage: inline_origin.py <port> <log file>
 '''
@@ -69,9 +70,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != 'HEAD':
             self.wfile.write(body)
 
-    def _send_held(self, headers: dict[str, str], body: bytes) -> None:
-        '''Send the first 5/8 of a 206 body, then the rest once the release file exists.'''
-        self.send_response(206)
+    def _send_held(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        '''Send the first 5/8 of a body, then the rest once the release file exists.'''
+        self.send_response(status)
         for name, value in headers.items():
             self.send_header(name, value)
         self.send_header('Content-Length', str(len(body)))
@@ -142,8 +143,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(304, headers)
             return
 
+        if mode == 'holdwhole' and count == 1:
+            self._send_held(200, headers, body)
+            return
+
         wanted = self._range(size)
-        if wanted is None or mode == 'ignore':
+        if wanted is None or mode in ('ignore', 'holdwhole'):
             self._send(200, headers, body)
             return
 
@@ -165,7 +170,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if mode == 'wrongstart':
             beg = min(beg + 3, end - 1)
         if mode == 'hold' and count == 1 and beg == 0:
-            self._send_held({**headers, 'Content-Range': f'bytes {beg}-{end - 1}/{size}'}, body[beg:end])
+            self._send_held(206, {**headers, 'Content-Range': f'bytes {beg}-{end - 1}/{size}'}, body[beg:end])
             return
         self._send(206, {**headers, 'Content-Range': f'bytes {beg}-{end - 1}/{size}'}, body[beg:end])
 
