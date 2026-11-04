@@ -590,12 +590,30 @@ note_purge_block_result(Data *const data)
   }
 }
 
+/** After the blocks, purge the URL's own key, which holds the complete copy of an object whose upstream ignores Range,
+  and then answer the client.
+ */
+void
+end_purge_walk(TSCont const contp, Data *const data)
+{
+  if (!data->m_purge_url_key) {
+    data->m_purge_url_key = true;
+    data->m_blockstate    = BlockState::Pending;
+    DEBUG_LOG("Purging the URL's own key");
+    if (request_block(contp, data)) {
+      return;
+    }
+    note_purge_failure(data, TS_HTTP_STATUS_INTERNAL_SERVER_ERROR);
+  }
+  finish_purge(contp, data);
+}
+
 // Issue the next purge, or answer the client if the walk is over.
 void
 advance_purge(TSCont const contp, Data *const data)
 {
   // A block that could not be purged says nothing about the ones behind it
-  if (TS_HTTP_STATUS_NONE != data->m_purge_error) {
+  if (TS_HTTP_STATUS_NONE != data->m_purge_error || data->m_purge_url_key) {
     finish_purge(contp, data);
     return;
   }
@@ -611,14 +629,14 @@ advance_purge(TSCont const contp, Data *const data)
 
   // The requested range bounds the walk whether or not the extent is known yet
   if (!range.blockIsInside(blockbytes, data->m_blocknum)) {
-    finish_purge(contp, data);
+    end_purge_walk(contp, data);
     return;
   }
 
   // An open ended range has no such bound until some block reports an extent
   if (data->m_contentlen < 0 && data->m_purge_miss_bound <= data->m_purge_misses) {
     DEBUG_LOG("purge gave up after %d consecutive uncached block(s)", data->m_purge_misses);
-    finish_purge(contp, data);
+    end_purge_walk(contp, data);
     return;
   }
 

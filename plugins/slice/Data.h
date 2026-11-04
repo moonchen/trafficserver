@@ -82,6 +82,7 @@ struct Data {
   int          m_purge_misses{0};                  // consecutive uncached blocks the walk has seen
   int          m_purge_miss_bound{0};              // from the config or the request header
   TSHttpStatus m_purge_error{TS_HTTP_STATUS_NONE}; // block failure that ended the walk
+  bool         m_purge_url_key{false};             // the last purge, of the URL's own key, is sent
 
   BlockState m_blockstate{Pending}; // is there an active slice block
 

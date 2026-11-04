@@ -82,7 +82,8 @@ constexpr std::string_view SKIP_CRR_HDR_NAME  = {"X-Skip-Crr"};
 constexpr char const      *SLICE_BLOCK_ARG       = "slice.block";
 constexpr std::string_view SLICE_UNSTORED_HEADER = {"Slice-Crr-Unstored-Range"};
 int                        slice_block_arg_idx   = -1;
-// The argument points to this value when slice has the block request store a complete response under its cache key.
+// The argument points to this value when slice moved the block request's cache write to the URL's own key, to store
+// a complete response there.
 constexpr char SLICE_BLOCK_STORES_WHOLE = 'w';
 
 std::string_view const Etag(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG);
@@ -572,7 +573,8 @@ handle_server_read_response(TSHttpTxn txnp, txndata *const txn_state)
       TSHttpHdrStatusSet(resp_buf, resp_loc, TS_HTTP_STATUS_PARTIAL_CONTENT);
     }
   } else if (TS_HTTP_STATUS_OK == status) {
-    // Slice keeps one complete copy of an object: under block 0's key, or under the key of the block request it marks.
+    // Slice keeps one complete copy of an object, under the URL's own key, or under block 0's key when slice could not
+    // name the URL's own key.
     bool cacheable = txn_state->cache_complete_responses;
     if (txn_state->slice_block) {
       char const *const mark = static_cast<char const *>(TSUserArgGet(txnp, slice_block_arg_idx));

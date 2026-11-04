@@ -893,7 +893,8 @@ def test_slice_inline_range_unsatisfiable(ats_factory: ATSFactory, services: Ser
 
 
 def test_slice_inline_range_ignored(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
-    """An origin that ignores Range sends a 200, which reaches the client unchanged, as plain slicing sends it.
+    """An origin that ignores Range sends a 200, which reaches the client unchanged, as plain slicing sends it. It is
+    stored under the URL's own key, where both rules find it for the next ranges.
 
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
@@ -902,10 +903,13 @@ def test_slice_inline_range_ignored(ats_factory: ATSFactory, services: ServiceFa
 
     scenario = Scenario(ats_factory, services, curl)
     path = "/ignore/20"
+    sliced = scenario.get("sliced", "/ignore/21", "--range", "8-10")
     inline = scenario.get("inline", path, "--range", "8-10")
     assert_whole(inline, 20)
-    inline_parts, sliced_parts = same_response(inline, scenario.get("sliced", path, "--range", "8-10"))
-    assert inline_parts == sliced_parts
+    assert (inline.status, inline.headers.get("content-range")) == (sliced.status, sliced.headers.get("content-range"))
+    assert_range(scenario.get("sliced", path, "--range", "8-10"), 20, 8, 11)
+    assert_range(scenario.get("inline", path, "--range", "12-15"), 20, 12, 16)
+    assert len(scenario.origin_requests(path)) == 1
     assert scenario.errors() == []
 
 

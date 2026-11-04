@@ -14,7 +14,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """Slice asks upstream for no more than the client needs when a block would not be stored, and keeps one complete
-copy of an object whose upstream ignores Range."""
+copy of an object whose upstream ignores Range, under the URL's own key."""
 
 from dataclasses import dataclass
 import json
@@ -47,10 +47,32 @@ class Response:
     body: bytes
 
 
+CRR = "@plugin=cache_range_requests.so"
+CACHEKEY = "@plugin=cachekey.so @pparam=--include-headers=Range"
+# How a rule keys a block: cache_range_requests adds the Range to the URL, or cachekey adds a Range element.
+KEYINGS = {
+    "crr": {
+        "block": CRR,
+        "url": ""
+    },
+    "cachekey": {
+        "block": f"{CACHEKEY} {CRR} @pparam=--no-modify-cachekey",
+        "url": CACHEKEY
+    },
+}
+
+
 class Scenario:
     """An origin, remap rules under test, and two rules that only look into the cache."""
 
-    def __init__(self, ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, block: int, rules: dict[str, str]) -> None:
+    def __init__(
+            self,
+            ats_factory: ATSFactory,
+            services: ServiceFactory,
+            curl: Curl,
+            block: int,
+            rules: dict[str, str],
+            keying: str = "crr") -> None:
         """Configure the origin and the remap rules.
 
         :param ats_factory: Factory for isolated Traffic Server instances.
@@ -58,6 +80,7 @@ class Scenario:
         :param curl: Transport-aware curl command runner.
         :param block: Slice block size in bytes.
         :param rules: Plugin chain of each remap host under test.
+        :param keying: Key of KEYINGS, for the rules that only look into the cache.
         """
 
         self.curl = curl
@@ -71,14 +94,14 @@ class Scenario:
             ready_port=port,
         )
         self.ats: ATS = ats_factory.create("ts")
-        for plugin in ("slice.so", "cache_range_requests.so", "cache_promote.so"):
+        for plugin in ("slice.so", "cache_range_requests.so", "cache_promote.so", "cachekey.so"):
             if not self.ats.plugin_exists(plugin):
                 pytest.skip(f"{plugin} is required")
         target = f"http://127.0.0.1:{port}/"
         lines = [f"map http://{host}/ {target} {chain}" for host, chain in rules.items()]
-        # A block's key is the URL and the block's Range, as cache_range_requests forms it in every rule.
-        lines.append(f"map http://probe/ {target} @plugin=cache_range_requests.so")
-        lines.append(f"map http://plain/ {target}")
+        # probe looks up a block's key, as the rules under test form it; plain looks up the URL's own key.
+        lines.append(f"map http://probe/ {target} {KEYINGS[keying]['block']}")
+        lines.append(f"map http://plain/ {target} {KEYINGS[keying]['url']}".rstrip())
         self.ats.remap_config.add_lines(tuple(lines))
         self.ats.records.update(
             {
@@ -133,7 +156,7 @@ class Scenario:
         total = 0
         for i, request in enumerate(self.origin_requests(path)):
             m = re.fullmatch(r"bytes=(\d+)-(\d*)", request["range"] or "")
-            if m is None or mode == "ignore" or (mode == "ignorefirst" and i == 0):
+            if m is None or mode == "ignore":
                 total += int(size)
             else:
                 end = int(m.group(2)) + 1 if m.group(2) else int(size)
@@ -198,7 +221,6 @@ def assert_range(response: Response, size: int, beg: int, end: int) -> None:
 
 
 PROMOTE = "@plugin=cache_promote.so @pparam=--policy=lru @pparam=--hits=3 @pparam=--internal-enabled"
-CRR = "@plugin=cache_range_requests.so"
 PROMOTE_BLOCK = 100
 PROMOTE_SIZE = 350
 
@@ -299,118 +321,50 @@ def test_slice_promote_later_blocks(ats_factory: ATSFactory, services: ServiceFa
 
 
 WHOLE_BLOCK = 7
+# The existing slice reads block 0 first, or the block that holds the range's start (relative); inline serves that block
+# in the client's transaction.
+FIRST_BLOCKS = {"sliced": "", "relative": "@pparam=--ref-relative", "inline": "@pparam=--inline-first-block"}
 
 
-def whole_rules(host: str) -> dict[str, str]:
+def whole_rules(host: str, keying: str = "crr") -> dict[str, str]:
     """Return the remap rule for an upstream that may ignore Range.
 
-    :param host: ``sliced`` or ``inline``.
+    :param host: Key of FIRST_BLOCKS.
+    :param keying: Key of KEYINGS.
     """
 
-    slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={WHOLE_BLOCK}"
-    if host == "inline":
-        slice_args += " @pparam=--inline-first-block"
-    return {host: f"{slice_args} {CRR}"}
+    slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={WHOLE_BLOCK} {FIRST_BLOCKS[host]}".rstrip()
+    return {host: f"{slice_args} {KEYINGS[keying]['block']}"}
 
 
-@pytest.mark.parametrize("host", ("sliced", "inline"))
-def test_slice_whole_object_one_copy(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
-    """An upstream that ignores Range: the object is stored once, under block 0's key, and serves later ranges as 206s.
+def first_block_range(host: str, beg: int) -> str:
+    """Return the Range of the first block that a rule requests for a range that starts at beg.
 
-    The first range lies in block 2. Plain slicing requests block 0 first and stores the answer. The inline rule
-    requests block 2, does not store the answer under that key, and requests block 0 for the next range.
+    :param host: Key of FIRST_BLOCKS.
+    :param beg: First byte of the client's range.
+    """
+
+    b = 0 if host == "sliced" else beg // WHOLE_BLOCK * WHOLE_BLOCK
+    return f"bytes={b}-{b + WHOLE_BLOCK - 1}"
+
+
+@pytest.mark.parametrize("keying", KEYINGS)
+@pytest.mark.parametrize("host", FIRST_BLOCKS)
+def test_slice_whole_object_one_copy(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str, keying: str) -> None:
+    """An upstream that ignores Range, first asked for the block that holds byte 15: the object is stored once, under the
+    URL's own key, and every later request is served from it. A PURGE through slice removes it.
 
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
     :param curl: Transport-aware curl command runner.
-    :param host: ``sliced`` for slice's intercept, ``inline`` for --inline-first-block.
+    :param host: Key of FIRST_BLOCKS.
+    :param keying: Key of KEYINGS.
     """
 
-    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, whole_rules(host))
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, whole_rules(host, keying), keying)
     size = 31
     path = f"/ignore/{size}"
     # Without slice, a range miss gets the 200 too.
-    assert_whole(scenario.get(host, path, "15-20"), size)
-    second = scenario.get(host, path, "8-10")
-    if host == "inline":
-        assert_whole(second, size)
-    else:
-        assert_range(second, size, 8, 11)
-    assert_range(scenario.get(host, path, "22-24"), size, 22, 25)
-    assert_range(scenario.get(host, path, "28-"), size, 28, 31)
-    assert_whole(scenario.get(host, path), size)
-
-    expected = ["bytes=0-6"] if host == "sliced" else ["bytes=14-20", "bytes=0-6"]
-    assert [r["range"] for r in scenario.origin_requests(path)] == expected
-    assert scenario.origin_bytes(path) == size * len(expected)
-    assert [scenario.stored(path, k) for k in range(5)] == [200, 504, 504, 504, 504]
-    assert scenario.stored(path, None) == 504
-    assert scenario.errors() == []
-
-
-def test_slice_whole_object_honored_again(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
-    """An upstream that sent the whole object once and then honors Range: the next request for block 0 sees a 206,
-    forgets the object, and still gets its range from the blocks.
-
-    :param ats_factory: Factory for isolated Traffic Server instances.
-    :param services: Factory owning support services and their cleanup.
-    :param curl: Transport-aware curl command runner.
-    """
-
-    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, whole_rules("inline"))
-    size = 31
-    path = f"/ignorefirst/{size}"
-    assert_whole(scenario.get("inline", path, "15-20"), size)
-    # Requested by block 0, which upstream now sends as a block; the window comes from block 2.
-    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
-    # The object is forgotten: block 2, stored by the request before, serves the range.
-    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
-    assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20", "bytes=0-6", "bytes=14-20"]
-    assert [scenario.stored(path, k) for k in range(3)] == [206, 504, 206]
-    assert scenario.errors() == []
-
-
-DESIGNS = {
-    # Where the copy goes, and the slice options that select it.
-    "own": "@pparam=--whole-object-copy=own",
-    "move": "@pparam=--whole-object-copy=move",
-    "lookup": "@pparam=--whole-object-copy=move @pparam=--whole-object-lookup @pparam=--no-whole-object-table",
-}
-
-
-def design_rules(host: str, design: str) -> dict[str, str]:
-    """Return the remap rule for an upstream that may ignore Range, with one of the copy designs.
-
-    :param host: ``inline`` for --inline-first-block, ``relative`` for slice's intercept with --ref-relative.
-    :param design: Key of DESIGNS.
-    """
-
-    slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={WHOLE_BLOCK} {DESIGNS[design]}"
-    slice_args += " @pparam=--inline-first-block" if host == "inline" else " @pparam=--ref-relative"
-    return {host: f"{slice_args} {CRR}"}
-
-
-@pytest.mark.parametrize("design", DESIGNS)
-@pytest.mark.parametrize("host", ("inline", "relative"))
-def test_slice_whole_object_first_copy(
-        ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str, design: str) -> None:
-    """An upstream that ignores Range, first asked for block 2: the request that receives the object stores its one
-    copy, and every later range is a 206 from it. A PURGE through slice removes the copy.
-
-    own stores the copy under block 2's key and remembers that block. move moves the cache write to block 0's key and
-    remembers the object. lookup moves the write too, remembers nothing, and finds the copy by looking up block 0's key
-    when a later block misses.
-
-    :param ats_factory: Factory for isolated Traffic Server instances.
-    :param services: Factory owning support services and their cleanup.
-    :param curl: Transport-aware curl command runner.
-    :param host: ``inline`` for --inline-first-block, ``relative`` for slice's intercept with --ref-relative.
-    :param design: Key of DESIGNS.
-    """
-
-    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, design_rules(host, design))
-    size = 31
-    path = f"/ignore/{size}"
     assert_whole(scenario.get(host, path, "15-20"), size)
     assert_range(scenario.get(host, path, "8-10"), size, 8, 11)
     assert_range(scenario.get(host, path, "22-24"), size, 22, 25)
@@ -418,41 +372,91 @@ def test_slice_whole_object_first_copy(
     assert_range(scenario.get(host, path, "0-3"), size, 0, 4)
     assert_whole(scenario.get(host, path), size)
 
-    assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20"]
-    copy = 2 if design == "own" else 0
-    assert [scenario.stored(path, k) for k in range(5)] == [200 if k == copy else 504 for k in range(5)]
-    if design == "lookup":
-        # Each of the four later requests whose first block is not block 0 missed and looked up block 0's key.
-        assert scenario.debug_lines("looking for the complete copy under block 0's key") == 4
+    assert [r["range"] for r in scenario.origin_requests(path)] == [first_block_range(host, 15)]
+    assert scenario.origin_bytes(path) == size
+    assert [scenario.stored(path, k) for k in range(5)] == [504] * 5
+    assert scenario.stored(path, None) == 200
+    # Each request's first block missed and looked up the URL's own key; the five after the first found the copy.
+    assert scenario.debug_lines("looking up the URL's own key") == 6
+    assert scenario.debug_lines("from the complete copy") == 5
 
     purge = scenario._request(host, path, ("--request", "PURGE"))
     assert purge.status == 200, purge
-    assert [scenario.stored(path, k) for k in range(5)] == [504] * 5
+    assert scenario.stored(path, None) == 504
     assert scenario.errors() == []
 
 
-def test_slice_whole_object_lookup_normal(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
-    """An upstream that honors Range, with the lookup design: a block that misses looks up block 0's key, finds no copy
-    there (block 0 is a block, or nothing), and is fetched and stored as a block.
+@pytest.mark.parametrize("keying", KEYINGS)
+def test_slice_url_key_shared(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, keying: str) -> None:
+    """The URL's own key that slice derives from a block's key is the key of the same request without slice: a complete
+    copy stored by a rule without slice serves slice's requests, whatever the rule's first block.
 
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
     :param curl: Transport-aware curl command runner.
+    :param keying: Key of KEYINGS.
     """
 
-    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, design_rules("inline", "lookup"))
+    rules = {host: chain for name in FIRST_BLOCKS for host, chain in whole_rules(name, keying).items()}
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, rules, keying)
     size = 31
     path = f"/normal/{size}"
-    # Block 2 misses, and so does block 0's key. Then block 0 is stored, as a block.
-    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
-    assert_range(scenario.get("inline", path, "0-3"), size, 0, 4)
-    # Block 1 misses; block 0's key holds a block, not the copy.
-    assert_range(scenario.get("inline", path, "8-10"), size, 8, 11)
-    # A hit on block 2 needs no second lookup.
-    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
+    assert_whole(scenario.get("plain", path), size)
+    for host in FIRST_BLOCKS:
+        assert_range(scenario.get(host, path, "15-20"), size, 15, 21)
+        assert_range(scenario.get(host, path, "3-"), size, 3, size)
+        assert_whole(scenario.get(host, path), size)
+    assert [r["range"] for r in scenario.origin_requests(path)] == [None]
+    assert scenario.errors() == []
 
-    assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20", "bytes=0-6", "bytes=7-13"]
-    assert [scenario.stored(path, k) for k in range(3)] == [206] * 3
-    assert scenario.debug_lines("looking for the complete copy under block 0's key") == 2
-    assert scenario.debug_lines("No complete copy under block 0's key") == 1
+
+@pytest.mark.parametrize("host", ("sliced", "inline"))
+def test_slice_url_key_copy_too_short(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
+    """A range that starts past the end of the copy under the URL's own key goes upstream, and the object's new length
+    holds it.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    :param host: ``sliced`` or ``inline``.
+    """
+
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, whole_rules(host))
+    # 20 bytes for the first request, 40 after.
+    path = "/grow/20"
+    assert_whole(scenario.get("plain", path), 20)
+    assert_range(scenario.get(host, path, "5-8"), 20, 5, 9)
+    assert_range(scenario.get(host, path, "25-30"), 40, 25, 31)
+    first = ["bytes=0-6"] if host == "sliced" else []
+    assert [r["range"] for r in scenario.origin_requests(path)] == [None, *first, "bytes=21-27", "bytes=28-34"]
+    # The first block and every later block that missed found the copy too short.
+    assert scenario.debug_lines("starts past the end of the complete copy") == (3 if host == "sliced" else 2)
+    assert scenario.errors() == []
+
+
+@pytest.mark.parametrize("host", FIRST_BLOCKS)
+def test_slice_url_key_lookup_normal(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str) -> None:
+    """An upstream that honors Range: every block that misses looks up the URL's own key once, finds nothing there, and
+    is fetched and stored as a block.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    :param host: Key of FIRST_BLOCKS.
+    """
+
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, whole_rules(host))
+    size = 31
+    path = f"/normal/{size}"
+    assert_range(scenario.get(host, path, "15-20"), size, 15, 21)
+    assert_range(scenario.get(host, path, "8-17"), size, 8, 18)
+    assert_range(scenario.get(host, path, "15-20"), size, 15, 21)
+
+    requests = [r["range"] for r in scenario.origin_requests(path)]
+    blocks = {"sliced": [0, 2, 1], "relative": [2, 1], "inline": [2, 1]}[host]
+    assert requests == [f"bytes={k * WHOLE_BLOCK}-{(k + 1) * WHOLE_BLOCK - 1}" for k in blocks]
+    assert scenario.debug_lines("looking up the URL's own key") == len(blocks)
+    assert scenario.debug_lines("No complete copy") == 0
+    assert [scenario.stored(path, k) for k in sorted(blocks)] == [206] * len(blocks)
+    assert scenario.stored(path, None) == 504
     assert scenario.errors() == []

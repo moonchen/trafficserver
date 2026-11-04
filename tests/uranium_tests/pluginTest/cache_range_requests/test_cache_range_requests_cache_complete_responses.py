@@ -78,13 +78,6 @@ def configure_server(services: ServiceFactory) -> OriginServer:
     )
     add_response(
         origin,
-        "SMALL-INM",
-        status="304 Not Modified",
-        cache_control="max-age=10",
-        etag='"772102f4-56f4bc1e6d417"',
-    )
-    add_response(
-        origin,
         "SLICE",
         status="206 Partial Content",
         cache_control="max-age=1",
@@ -194,13 +187,15 @@ def assert_response(
 
 
 def run_small_object_round(*, _ats: ATS, _curl: Curl) -> None:
-    """Verify normalized ranges share a complete 200 response, which serves a fresh hit by the client's range.
+    """Verify normalized ranges share a complete 200 response under the URL's own key, which serves a fresh hit by the
+    client's range and is fetched again once it is stale.
 
     :param _ats: Test-local ats configured by the test.
     :param _curl: Test-local curl configured by the test.
     """
 
-    key = r"X-Cache-Key: /.*?/Range:bytes=0-4194303/obj"
+    # cachekey's key without the Range element, which is the key of the same request without slice.
+    key = r"X-Cache-Key: /[^/\s]+/\d+/obj\s"
     assert_response(request("/obj", "0-5000", "SMALL", _ats=_ats, _curl=_curl), status="200 OK", cache="miss, none", cache_key=key)
     assert_response(
         request("/obj", "5001-5999", "SMALL", _ats=_ats, _curl=_curl),
@@ -210,8 +205,7 @@ def run_small_object_round(*, _ats: ATS, _curl: Curl) -> None:
         content_range="5001-5999/10000",
     )
     time.sleep(2)
-    assert_response(
-        request("/obj", "0-403", "SMALL-INM", _ats=_ats, _curl=_curl), status="200 OK", cache="hit-stale, none", cache_key=key)
+    assert_response(request("/obj", "0-403", "SMALL", _ats=_ats, _curl=_curl), status="200 OK", cache="miss, none", cache_key=key)
     assert_response(
         request("/obj", "0-3999", "SMALL", _ats=_ats, _curl=_curl),
         status="206 Partial Content",

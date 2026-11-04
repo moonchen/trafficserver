@@ -25,21 +25,27 @@
 #include "Range.h"
 #include "slice.h"
 
+#include <algorithm>
+#include <charconv>
 #include <cinttypes>
-#include <memory>
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <strings.h>
 
 namespace
 {
 constexpr char const *SLICE_BLOCK_ARG = "slice.block";
 int                   slice_block_arg_idx{-1};
 // The argument points to one of these. cache_range_requests stores a complete response (a 200) of a block request
-// under the request's cache key only for slice_whole_mark, or when the request is for block 0.
-char slice_block_mark{'b'};
-char slice_whole_mark{'w'};
-// A first block request that looks for the complete copy under block 0's key.
-char slice_relookup_mark{'l'};
+// under the request's cache key only for whole_mark, or when the request is for block 0.
+char block_mark{'b'};
+char first_block_mark{'f'}; // the first block of a client request that slice serves through its intercept
+char whole_mark{'w'};
+
+// While a block request looks up the URL's own key, this argument holds the first byte of the block plus one.
+constexpr char const *SLICE_RELOOKUP_ARG = "slice.relookup";
+int                   slice_relookup_arg_idx{-1};
 
 void
 set_mark(TSHttpTxn txnp, char *const mark)
@@ -67,44 +73,8 @@ client_range_of(HttpHeader const &request, Config const *const config, char *con
   return "-" == range ? std::string_view{} : range;
 }
 
-/** A complete copy under the block's key (a 200 without Content-Range) holds the client's range at the range's own
-  offsets. Core serves that range from it, as it serves a range of an object that is not sliced.
- */
 bool
-serve_client_range_from_copy(TSHttpTxn txnp, Config const *const config)
-{
-  TxnHdrMgr cached;
-  if (!cached.populateFrom(txnp, TSHttpTxnCachedRespGet)) {
-    return false;
-  }
-  HttpHeader const copy(cached.m_buffer, cached.m_lochdr);
-  if (TS_HTTP_STATUS_OK != copy.status() || copy.hasKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE)) {
-    return false;
-  }
-
-  TxnHdrMgr req;
-  if (!req.populateFrom(txnp, TSHttpTxnClientReqGet)) {
-    return false;
-  }
-  HttpHeader request(req.m_buffer, req.m_lochdr);
-  // Core serves ranges only to HTTP/1.1 requests.
-  if (TS_HTTP_VERSION(1, 1) != request.version()) {
-    return false;
-  }
-  char                   rangestr[1024];
-  std::string_view const range = client_range_of(request, config, rangestr, sizeof(rangestr));
-  if (range.empty()) {
-    return false;
-  }
-  DEBUG_LOG("Serving %.*s from the complete copy", static_cast<int>(range.size()), range.data());
-  return request.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, range.data(), range.size());
-}
-
-/** cache_range_requests keys a block as <URL>-<the block's Range>. If the transaction's cache key is a block's key,
-  return that block's number and the key of block @a target of the same object.
- */
-bool
-block_key(TSHttpTxn txnp, Config const *const config, int64_t const target, int64_t &blocknum, std::string &key)
+lookup_url_string(TSHttpTxn txnp, std::string &key)
 {
   TSMBuffer const buf = TSMBufferCreate();
   TSMLoc          loc = TS_NULL_MLOC;
@@ -122,61 +92,151 @@ block_key(TSHttpTxn txnp, Config const *const config, int64_t const target, int6
     TSHandleMLocRelease(buf, TS_NULL_MLOC, loc);
   }
   TSMBufferDestroy(buf);
+  return got;
+}
 
-  int64_t const     blockbytes = config->m_blockbytes;
-  std::size_t const dash       = got ? key.rfind("-bytes=") : std::string::npos;
-  Range             block;
-  if (std::string::npos == dash || !block.fromStringClosed(key.c_str() + dash + 1) || 0 != block.m_beg % blockbytes ||
-      blockbytes != block.m_end - block.m_beg) {
+/** A block's Range, "bytes=<first>-<last>", at the start of @a sv.
+
+  @param[out] beg the first byte of the block
+  @param[out] len the length of the Range in @a sv
+ */
+bool
+parse_block_range(std::string_view const sv, int64_t const blockbytes, int64_t &beg, size_t &len)
+{
+  constexpr std::string_view bytes = "bytes=";
+  if (!sv.starts_with(bytes)) {
     return false;
   }
-  blocknum = block.m_beg / blockbytes;
-
-  char rangestr[64];
-  int  rangelen = sizeof(rangestr);
-  if (!Range(target * blockbytes, (target + 1) * blockbytes).toStringClosed(rangestr, &rangelen)) {
+  char const *const start = sv.data();
+  char const *const end   = sv.data() + sv.size();
+  int64_t           last  = 0;
+  auto const [dash, ec]   = std::from_chars(start + bytes.size(), end, beg);
+  if (std::errc() != ec || dash == end || '-' != *dash) {
     return false;
   }
-  key.resize(dash + 1);
-  key.append(rangestr, rangelen);
+  auto const [stop, lastec] = std::from_chars(dash + 1, end, last);
+  if (std::errc() != lastec || beg < 0 || 0 != beg % blockbytes || blockbytes != last - beg + 1) {
+    return false;
+  }
+  len = stop - start;
   return true;
 }
 
+// The cached response is a complete copy of the object (a 200 without Content-Range), of total bytes.
+bool
+complete_copy(TSHttpTxn txnp, int64_t &total)
+{
+  TxnHdrMgr cached;
+  if (!cached.populateFrom(txnp, TSHttpTxnCachedRespGet)) {
+    return false;
+  }
+  HttpHeader const copy(cached.m_buffer, cached.m_lochdr);
+  char             clstr[32];
+  int              cllen = sizeof(clstr);
+  if (TS_HTTP_STATUS_OK != copy.status() || copy.hasKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE) ||
+      !copy.valueForKey(TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH, clstr, &cllen)) {
+    return false;
+  }
+  auto const [ptr, ec] = std::from_chars(clstr, clstr + cllen, total);
+  return std::errc() == ec && ptr == clstr + cllen && 0 <= total;
+}
+
+/** A complete copy holds the request's range at the range's own offsets, so core serves that range from it, as it
+  serves a range of an object that is not sliced: the client's range for a first block, nothing for a whole-object
+  GET, and the block for a later block. A range that starts at or past the end of the copy is not served from it.
+
+  @param blockbeg the first byte of the block, for a later block
+ */
+bool
+serve_from_copy(TSHttpTxn txnp, Config const *const config, bool const first, int64_t const blockbeg)
+{
+  int64_t total = 0;
+  if (!complete_copy(txnp, total)) {
+    return false;
+  }
+
+  TxnHdrMgr req;
+  if (!req.populateFrom(txnp, TSHttpTxnClientReqGet)) {
+    return false;
+  }
+  HttpHeader request(req.m_buffer, req.m_lochdr);
+
+  std::string range;
+  if (first) {
+    char clientstr[1024];
+    range = client_range_of(request, config, clientstr, sizeof(clientstr));
+    if (range.empty()) {
+      DEBUG_LOG("Serving the whole object from the complete copy");
+      return true;
+    }
+  } else {
+    char rangestr[64];
+    int  rangelen = sizeof(rangestr);
+    if (!Range(blockbeg, blockbeg + config->m_blockbytes).toStringClosed(rangestr, &rangelen)) {
+      return false;
+    }
+    range.assign(rangestr, rangelen);
+  }
+
+  Range want;
+  if (!want.fromStringClosed(range.c_str())) {
+    return false;
+  }
+  int64_t const beg = want.isEndBytes() ? std::max<int64_t>(0, total + want.m_beg) : want.m_beg;
+  if (total <= beg) {
+    DEBUG_LOG("%s starts past the end of the complete copy", range.c_str());
+    return false;
+  }
+  // Core serves ranges only to HTTP/1.1 requests.
+  if (TS_HTTP_VERSION(1, 1) != request.version()) {
+    return false;
+  }
+  DEBUG_LOG("Serving %s from the complete copy", range.c_str());
+  return request.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, range.data(), range.size());
+}
+
 void
-on_first_block_lookup(TSHttpTxn txnp, TSCont contp, Config const *const config)
+on_block_lookup(TSHttpTxn txnp, TSCont contp, Config const *const config)
 {
   int status = 0;
   if (TS_SUCCESS != TSHttpTxnCacheLookupStatusGet(txnp, &status)) {
     return;
   }
+  bool const first = has_mark(txnp, &first_block_mark);
 
-  // The second lookup found an object under block 0's key. Unless it is the complete copy, the block request continues
-  // as the miss of its own block, with the hook that the miss added.
-  if (has_mark(txnp, &slice_relookup_mark)) {
-    set_mark(txnp, &slice_block_mark);
-    if (TS_CACHE_LOOKUP_HIT_FRESH != status || !serve_client_range_from_copy(txnp, config)) {
-      DEBUG_LOG("No complete copy under block 0's key");
+  // The second lookup found an object under the URL's own key. Unless it is a complete copy that holds the request's
+  // range, the block request continues as the miss of its own block, with the hook that the miss added.
+  intptr_t const relookup =
+    0 <= slice_relookup_arg_idx ? reinterpret_cast<intptr_t>(TSUserArgGet(txnp, slice_relookup_arg_idx)) : 0;
+  if (0 < relookup) {
+    TSUserArgSet(txnp, slice_relookup_arg_idx, nullptr);
+    if (TS_CACHE_LOOKUP_HIT_FRESH != status || !serve_from_copy(txnp, config, first, relookup - 1)) {
+      DEBUG_LOG("No complete copy under the URL's own key");
       TSHttpTxnCacheLookupStatusSet(txnp, TS_CACHE_LOOKUP_MISS);
     }
     return;
   }
 
   if (TS_CACHE_LOOKUP_MISS == status || TS_CACHE_LOOKUP_SKIPPED == status) {
-    if (config->firstBlockVaries()) {
-      TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
-      if (TS_CACHE_LOOKUP_MISS == status && look_up_whole_copy(txnp, config)) {
-        set_mark(txnp, &slice_relookup_mark);
-      }
+    TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
+    int64_t blockbeg = 0;
+    if (TS_CACHE_LOOKUP_MISS == status && 0 <= slice_relookup_arg_idx && look_up_url_key(txnp, config, blockbeg)) {
+      TSUserArgSet(txnp, slice_relookup_arg_idx, reinterpret_cast<void *>(static_cast<intptr_t>(blockbeg + 1)));
     }
-  } else if (TS_CACHE_LOOKUP_HIT_FRESH == status && serve_client_range_from_copy(txnp, config)) {
+  } else if (first && TS_CACHE_LOOKUP_HIT_FRESH == status && serve_from_copy(txnp, config, true, 0)) {
+    // A complete copy stored under the block's own key.
     TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
   }
 }
 
 void
-on_first_block_response(TSHttpTxn txnp, Config *const config)
+on_block_response(TSHttpTxn txnp, Config const *const config)
 {
+  bool const first = has_mark(txnp, &first_block_mark);
   note_block_answer(txnp, config);
+  if (!first) {
+    return;
+  }
 
   // A plugin that runs later at cache lookup made the copy stale. Only after a 304 does core serve the copy, by the
   // client's range; anything else upstream sends must reach slice as it is.
@@ -206,33 +266,61 @@ reserve_slice_block_arg()
   if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, SLICE_BLOCK_ARG, "slice block request", &slice_block_arg_idx)) {
     ERROR_LOG("Failed to reserve the %s transaction argument", SLICE_BLOCK_ARG);
   }
+  if (TS_SUCCESS !=
+      TSUserArgIndexReserve(TS_USER_ARGS_TXN, SLICE_RELOOKUP_ARG, "slice block lookup of the URL's key", &slice_relookup_arg_idx)) {
+    ERROR_LOG("Failed to reserve the %s transaction argument", SLICE_RELOOKUP_ARG);
+  }
 }
 
 void
 mark_slice_block(TSHttpTxn txnp)
 {
-  set_mark(txnp, &slice_block_mark);
+  set_mark(txnp, &block_mark);
 }
 
 bool
-look_up_whole_copy(TSHttpTxn txnp, Config const *const config)
+url_key_of_block(TSHttpTxn txnp, Config const *const config, std::string &key, int64_t &blockbeg)
 {
-  int64_t     blocknum = 0;
-  std::string key;
-  if (!config->m_whole_lookup || !block_key(txnp, config, 0, blocknum, key) || 0 == blocknum ||
-      TS_SUCCESS != TSHttpTxnCacheLookupAgain(txnp, key.data(), key.size())) {
+  if (!lookup_url_string(txnp, key)) {
     return false;
   }
-  DEBUG_LOG("Block %" PRId64 " is not cached, looking for the complete copy under block 0's key", blocknum);
+  constexpr std::string_view bytes = "bytes=";
+  constexpr std::string_view range = "Range:";
+  for (size_t pos = key.rfind(bytes); std::string::npos != pos; pos = 0 == pos ? std::string::npos : key.rfind(bytes, pos - 1)) {
+    size_t len = 0;
+    if (!parse_block_range(std::string_view{key}.substr(pos), config->m_blockbytes, blockbeg, len)) {
+      continue;
+    }
+    size_t const end = pos + len;
+    // cache_range_requests: <URL>-<Range>
+    if (end == key.size() && 0 < pos && '-' == key[pos - 1]) {
+      key.resize(pos - 1);
+      return true;
+    }
+    // cachekey: <separator>Range:<Range>, then the next element or the end
+    if (range.size() < pos && 0 == strncasecmp(key.data() + pos - range.size(), range.data(), range.size())) {
+      size_t const beg = pos - range.size() - 1;
+      key.erase(beg, end - beg);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool
+look_up_url_key(TSHttpTxn txnp, Config const *const config, int64_t &blockbeg)
+{
+  std::string key;
+  if (!url_key_of_block(txnp, config, key, blockbeg) || TS_SUCCESS != TSHttpTxnCacheLookupAgain(txnp, key.data(), key.size())) {
+    return false;
+  }
+  DEBUG_LOG("Block at %" PRId64 " is not cached, looking up the URL's own key: %s", blockbeg, key.c_str());
   return true;
 }
 
 void
-note_block_answer(TSHttpTxn txnp, Config *const config)
+note_block_answer(TSHttpTxn txnp, Config const *const config)
 {
-  if (!config->firstBlockVaries()) {
-    return;
-  }
   TxnHdrMgr req;
   TxnHdrMgr resp;
   if (!req.populateFrom(txnp, TSHttpTxnServerReqGet) || !resp.populateFrom(txnp, TSHttpTxnServerRespGet)) {
@@ -240,50 +328,17 @@ note_block_answer(TSHttpTxn txnp, Config *const config)
   }
   HttpHeader const request(req.m_buffer, req.m_lochdr);
   HttpHeader const response(resp.m_buffer, resp.m_lochdr);
-  char             rangestr[1024];
-  int              rangelen = sizeof(rangestr);
-  if (!request.valueForKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, &rangelen)) {
+  if (!request.hasKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE) || TS_HTTP_STATUS_OK != response.status() ||
+      response.hasKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE)) {
     return;
   }
 
-  TSHttpStatus const status = response.status();
-  bool const whole = TS_HTTP_STATUS_OK == status && !response.hasKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE);
-  if (!whole && (TS_HTTP_STATUS_PARTIAL_CONTENT != status || !config->hasWholeObjects())) {
-    return;
+  std::string key;
+  int64_t     blockbeg = 0;
+  if (url_key_of_block(txnp, config, key, blockbeg) && TS_SUCCESS == TSHttpTxnCacheWriteUrlSet(txnp, key.data(), key.size())) {
+    DEBUG_LOG("Upstream sent the whole object for the block at %" PRId64 ", storing it under the URL's own key", blockbeg);
+    set_mark(txnp, &whole_mark);
   }
-
-  int                                      urllen = 0;
-  std::unique_ptr<char, decltype(&TSfree)> url(TSHttpTxnEffectiveUrlStringGet(txnp, &urllen), TSfree);
-  if (nullptr == url) {
-    return;
-  }
-  std::string_view const urlkey{url.get(), static_cast<size_t>(urllen)};
-  if (!whole) {
-    config->wholeObjectRemove(urlkey);
-    return;
-  }
-
-  Range         range;
-  int64_t const blocknum  = range.fromStringClosed(rangestr) && 0 <= range.m_beg ? range.m_beg / config->m_blockbytes : 0;
-  int64_t       copyblock = 0;
-  switch (config->m_whole_copy) {
-  case Config::WholeCopy::Block0:
-    break;
-  case Config::WholeCopy::Own:
-    copyblock = blocknum;
-    set_mark(txnp, &slice_whole_mark);
-    break;
-  case Config::WholeCopy::Move: {
-    int64_t     keyblock = 0;
-    std::string block0;
-    if (0 < blocknum && block_key(txnp, config, 0, keyblock, block0) && keyblock == blocknum &&
-        TS_SUCCESS == TSHttpTxnCacheWriteUrlSet(txnp, block0.data(), block0.size())) {
-      DEBUG_LOG("Moving the cache write of the whole object from block %" PRId64 " to block 0's key", blocknum);
-      set_mark(txnp, &slice_whole_mark);
-    }
-  } break;
-  }
-  config->wholeObjectAdd(urlkey, copyblock);
 }
 
 void
@@ -292,25 +347,27 @@ watch_block_request(TSHttpTxn txnp, HttpHeader &header, TSCont contp)
   if (TS_HTTP_METHOD_GET != header.method()) {
     return;
   }
-  mark_slice_block(txnp);
   if (header.hasKey(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size())) {
     header.removeKey(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size());
-    TSHttpTxnHookAdd(txnp, TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK, contp);
+    set_mark(txnp, &first_block_mark);
+  } else {
+    mark_slice_block(txnp);
   }
+  TSHttpTxnHookAdd(txnp, TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK, contp);
 }
 
 int
-first_block_handler(TSCont contp, TSEvent event, void *edata)
+block_handler(TSCont contp, TSEvent event, void *edata)
 {
-  TSHttpTxn const txnp   = static_cast<TSHttpTxn>(edata);
-  Config *const   config = static_cast<Config *>(TSContDataGet(contp));
+  TSHttpTxn const     txnp   = static_cast<TSHttpTxn>(edata);
+  Config const *const config = static_cast<Config const *>(TSContDataGet(contp));
 
   switch (event) {
   case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE:
-    on_first_block_lookup(txnp, contp, config);
+    on_block_lookup(txnp, contp, config);
     break;
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
-    on_first_block_response(txnp, config);
+    on_block_response(txnp, config);
     break;
   default:
     break;

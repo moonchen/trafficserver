@@ -125,8 +125,9 @@ request_block(TSCont contp, Data *const data)
   // reuse the original client request header, just change the range
   HttpHeader header(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr);
 
-  // if configured, remove range header from head requests
-  if (data->m_method_type == TS_HTTP_METHOD_HEAD && data->m_config->m_head_strip_range) {
+  // if configured, remove range header from head requests. A purge without Range removes the copy of an object that
+  // is stored under the URL's own key.
+  if ((data->m_method_type == TS_HTTP_METHOD_HEAD && data->m_config->m_head_strip_range) || data->m_purge_url_key) {
     header.removeKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE);
   } else {
     // add/set sub range key and add slicer tag
@@ -176,11 +177,9 @@ request_block(TSCont contp, Data *const data)
   bool const get         = TS_HTTP_METHOD_GET == data->m_method_type;
   bool const first_block = get && !data->m_server_first_header_parsed && BlockState::Pending == data->m_blockstate &&
                            TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE != data->m_statustype;
-  // The marker makes the block transaction watch the first block (first_block.cc): for a client range, so that core
-  // serves the range from a complete copy, and for a rule whose first block can be another block, to learn which
-  // objects upstream sends whole.
-  bool const watch = first_block && (TS_HTTP_STATUS_PARTIAL_CONTENT == data->m_statustype || cfg->firstBlockVaries());
-  if (watch) {
+  // The marker tells the block transaction (first_block.cc) that a complete copy of the object serves the client's
+  // range rather than the block.
+  if (first_block) {
     header.setKeyVal(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size(), "1", 1);
   }
 
@@ -232,7 +231,7 @@ request_block(TSCont contp, Data *const data)
     DEBUG_LOG("Headers\n%s", headerstr.c_str());
   }
 
-  if (watch) {
+  if (first_block) {
     header.removeKey(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size());
   }
   if (0 < unstoredlen) {

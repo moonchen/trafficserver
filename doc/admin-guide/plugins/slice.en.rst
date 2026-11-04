@@ -447,13 +447,38 @@ Origins That Ignore Range
 -------------------------
 
 An upstream that ignores Range answers a block request with a 200 for the
-whole object.  The client gets that 200, as it would without slice.
-`cache_range_requests` stores it only for the request for block 0, which slice
-reads first without ``--inline-first-block`` or ``--ref-relative``.  A fresh copy
-there serves the client's range as a 206.  With those options the first block
-is the one that holds the start of the client's range, so slice remembers such
-objects, up to 4096 per remap rule, and requests block 0 for every later range
-of them.  A 206 for the object makes slice forget it again.
+whole object.  The client gets that 200, as it would without slice.  Slice
+stores the response once, under the URL's own key: the key that the same
+request has without slice and `cache_range_requests`.  It moves the block
+request's cache write there when the response arrives, whichever block the
+request was for.
+
+Every block request that misses in the cache looks up the URL's own key once
+more.  A fresh complete copy there (a 200 without Content-Range) serves the
+request: the client's range as a 206, the whole object for a whole-object GET,
+or the block for a later block.  A range that starts at or past the end of the
+copy goes upstream.  So the object is fetched once, whichever range comes
+first, and a complete copy that a request without slice stored serves sliced
+requests too.  For an upstream that honors Range the URL's own key holds
+nothing, and the second lookup finds nothing in the cache directory.  A stale
+copy is not revalidated: the block request goes upstream, and a new
+whole-object answer replaces the copy.
+
+Slice finds the URL's own key by removing the block's Range from the block's
+cache key: the ``-<Range>`` that `cache_range_requests` appends to the URL, or
+the ``Range:<Range>`` element, with the separator before it, that
+:ref:`admin-plugins-cachekey` adds with ``--include-headers=Range``.  That is
+the key of the same request without slice when `cache_range_requests` builds
+the key from the URL, and when cachekey runs before `cache_range_requests`
+with ``--include-headers=Range`` and its default separator.  It differs when
+the block's key holds the Range some other way, for example through
+cachekey's ``--capture-header`` or a separator of more than one character:
+slice then stores and finds its copy under a key of its own, which requests
+without slice do not share.  When a block's key holds no block Range at all,
+slice does not move the write or look up again, and `cache_range_requests`
+stores a complete response only for the request for block 0, under that
+block's key.  With ``--remap-host`` the block requests go through a rule
+without slice, which does neither.
 
 Purge Requests
 --------------
@@ -514,9 +539,12 @@ than guess at the start, such a purge is widened to the whole object: a superset
 what was asked for, so the named blocks certainly go. A ``GET`` with the same header
 is unaffected and still returns exactly the last *n* bytes.
 
-The response is sent once the walk is complete: ``200`` if at least one block was
-removed, ``404`` if none was found. This matches what Traffic Server reports for a
-PURGE of an object that is not sliced.
+After the blocks, slice sends one PURGE without a Range, which removes a complete
+copy stored under the URL's own key (see "Origins That Ignore Range" above).
+
+The response is sent once the walk is complete: ``200`` if at least one block, or
+the complete copy, was removed, ``404`` if none was found. This matches what
+Traffic Server reports for a PURGE of an object that is not sliced.
 
 A block whose PURGE returns neither ``200`` nor ``404`` — a ``403`` from
 :file:`ip_allow.yaml`, for instance, or a ``502`` — says nothing about whether that

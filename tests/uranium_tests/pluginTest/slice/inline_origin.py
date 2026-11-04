@@ -129,6 +129,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'ETag': etag,
             'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT'
         }
+        if mode == 'grow' and count > 1:
+            size *= 2
         body = body_for(size)
 
         if mode == 'status':
@@ -141,7 +143,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         wanted = self._range(size)
-        if wanted is None or mode == 'ignore' or (mode == 'ignorefirst' and count == 1):
+        if wanted is None or mode == 'ignore':
             self._send(200, headers, body)
             return
 

@@ -107,29 +107,26 @@ Config::fromArgs(int const argc, char const *const argv[])
 
   // standard parsing
   constexpr struct option longopts[] = {
-    {const_cast<char *>("blockbytes"),            required_argument, nullptr, 'b'},
-    {const_cast<char *>("disable-errorlog"),      no_argument,       nullptr, 'd'},
-    {const_cast<char *>("exclude-regex"),         required_argument, nullptr, 'e'},
-    {const_cast<char *>("crr-ident-header"),      required_argument, nullptr, 'g'},
-    {const_cast<char *>("include-regex"),         required_argument, nullptr, 'i'},
-    {const_cast<char *>("ref-relative"),          no_argument,       nullptr, 'l'},
-    {const_cast<char *>("pace-errorlog"),         required_argument, nullptr, 'p'},
-    {const_cast<char *>("remap-host"),            required_argument, nullptr, 'r'},
-    {const_cast<char *>("skip-header"),           required_argument, nullptr, 's'},
-    {const_cast<char *>("blockbytes-test"),       required_argument, nullptr, 't'},
-    {const_cast<char *>("prefetch-count"),        required_argument, nullptr, 'f'},
-    {const_cast<char *>("strip-range-for-head"),  no_argument,       nullptr, 'h'},
-    {const_cast<char *>("minimum-size"),          required_argument, nullptr, 'm'},
-    {const_cast<char *>("metadata-cache-size"),   required_argument, nullptr, 'z'},
-    {const_cast<char *>("stats-prefix"),          required_argument, nullptr, 'x'},
-    {const_cast<char *>("purge-probe-blocks"),    required_argument, nullptr, 'q'},
-    {const_cast<char *>("purge-probe-header"),    required_argument, nullptr, 'H'},
-    {const_cast<char *>("inline-first-block"),    no_argument,       nullptr, 'n'},
-    {const_cast<char *>("block-read-retries"),    required_argument, nullptr, 'R'},
-    {const_cast<char *>("whole-object-copy"),     required_argument, nullptr, 'W'},
-    {const_cast<char *>("whole-object-lookup"),   no_argument,       nullptr, 'L'},
-    {const_cast<char *>("no-whole-object-table"), no_argument,       nullptr, 'T'},
-    {nullptr,                                     0,                 nullptr, 0  },
+    {const_cast<char *>("blockbytes"),           required_argument, nullptr, 'b'},
+    {const_cast<char *>("disable-errorlog"),     no_argument,       nullptr, 'd'},
+    {const_cast<char *>("exclude-regex"),        required_argument, nullptr, 'e'},
+    {const_cast<char *>("crr-ident-header"),     required_argument, nullptr, 'g'},
+    {const_cast<char *>("include-regex"),        required_argument, nullptr, 'i'},
+    {const_cast<char *>("ref-relative"),         no_argument,       nullptr, 'l'},
+    {const_cast<char *>("pace-errorlog"),        required_argument, nullptr, 'p'},
+    {const_cast<char *>("remap-host"),           required_argument, nullptr, 'r'},
+    {const_cast<char *>("skip-header"),          required_argument, nullptr, 's'},
+    {const_cast<char *>("blockbytes-test"),      required_argument, nullptr, 't'},
+    {const_cast<char *>("prefetch-count"),       required_argument, nullptr, 'f'},
+    {const_cast<char *>("strip-range-for-head"), no_argument,       nullptr, 'h'},
+    {const_cast<char *>("minimum-size"),         required_argument, nullptr, 'm'},
+    {const_cast<char *>("metadata-cache-size"),  required_argument, nullptr, 'z'},
+    {const_cast<char *>("stats-prefix"),         required_argument, nullptr, 'x'},
+    {const_cast<char *>("purge-probe-blocks"),   required_argument, nullptr, 'q'},
+    {const_cast<char *>("purge-probe-header"),   required_argument, nullptr, 'H'},
+    {const_cast<char *>("inline-first-block"),   no_argument,       nullptr, 'n'},
+    {const_cast<char *>("block-read-retries"),   required_argument, nullptr, 'R'},
+    {nullptr,                                    0,                 nullptr, 0  },
   };
 
   // getopt assumes args start at '1' so this hack is needed
@@ -272,27 +269,6 @@ Config::fromArgs(int const argc, char const *const argv[])
     case 'H': {
       m_purge_probe_header.assign(optarg);
       DEBUG_LOG("Using purge probe header %s", optarg);
-    } break;
-    case 'W': {
-      std::string_view const copy{optarg};
-      if ("block0" == copy) {
-        m_whole_copy = WholeCopy::Block0;
-      } else if ("own" == copy) {
-        m_whole_copy = WholeCopy::Own;
-      } else if ("move" == copy) {
-        m_whole_copy = WholeCopy::Move;
-      } else {
-        ERROR_LOG("Invalid whole-object-copy: %s", optarg);
-      }
-      DEBUG_LOG("Whole object copy: %s", optarg);
-    } break;
-    case 'L': {
-      m_whole_lookup = true;
-      DEBUG_LOG("A first block other than block 0 that misses looks up block 0's key");
-    } break;
-    case 'T': {
-      m_whole_table = false;
-      DEBUG_LOG("Not remembering objects that upstream sends whole");
     } break;
     case 'R': {
       int const retriesread = atoi(optarg);
@@ -455,40 +431,6 @@ Config::sizeCacheRemove(std::string_view url)
     DEBUG_LOG("Removing url from cache: %.*s", static_cast<int>(url.size()), url.data());
     m_oscache->remove(url);
   }
-}
-
-void
-Config::wholeObjectAdd(std::string_view url, int64_t blocknum)
-{
-  if (!rememberWholeObjects()) {
-    return;
-  }
-  std::call_once(m_whole_objects_once, [this]() { m_whole_objects.emplace(wholeobjectsmax); });
-  DEBUG_LOG("Upstream sent the whole object, stored under block %" PRId64 ": %.*s", blocknum, static_cast<int>(url.size()),
-            url.data());
-  m_whole_objects->set(url, static_cast<uint64_t>(blocknum));
-  m_whole_objects_used.store(true, std::memory_order_release);
-}
-
-void
-Config::wholeObjectRemove(std::string_view url)
-{
-  if (hasWholeObjects()) {
-    m_whole_objects->remove(url);
-  }
-}
-
-std::optional<int64_t>
-Config::wholeObjectBlock(std::string_view url)
-{
-  if (!hasWholeObjects()) {
-    return std::nullopt;
-  }
-  std::optional<uint64_t> const block = m_whole_objects->get(url);
-  if (!block.has_value()) {
-    return std::nullopt;
-  }
-  return static_cast<int64_t>(*block);
 }
 
 std::pair<bool, BgBlockFetch *>

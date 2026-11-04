@@ -22,6 +22,7 @@
 
 #include "ts/ts.h"
 
+#include <string>
 #include <string_view>
 
 struct Config;
@@ -38,29 +39,37 @@ void reserve_slice_block_arg();
 // Mark the transaction as a request for one of slice's blocks.
 void mark_slice_block(TSHttpTxn txnp);
 
-/** At READ_RESPONSE_HDR of a block request, before cache_range_requests sees the response.
+/** The URL's own key: the key that the block request would have without slice and cache_range_requests, where the
+  complete copy of an object whose upstream ignores Range is stored.
 
-  For a rule whose first block can be other than block 0: a 200 without Content-Range to a Range is the whole object.
-  Its one complete copy goes under the key that Config::m_whole_copy names: block 0's (stored only by a request for
-  block 0), the block's own, or block 0's by moving this request's cache write there. The object and that block are
-  remembered, so that later requests ask for the block. A 206 means that upstream honors Range for the object again.
+  It is the block's cache key without the block's Range. cache_range_requests keys a block as <URL>-<the block's
+  Range>, and cachekey with --include-headers=Range keys it with a "Range:<the block's Range>" element, which is
+  removed with the separator before it.
+
+  @param[out] key the URL's own key
+  @param[out] blockbeg the first byte of the block whose key the transaction has
+  @return false if the transaction's cache key does not hold a block's Range
  */
-void note_block_answer(TSHttpTxn txnp, Config *config);
+bool url_key_of_block(TSHttpTxn txnp, Config const *config, std::string &key, int64_t &blockbeg);
 
-/** At CACHE_LOOKUP_COMPLETE of a miss of the first block of a client request, with --whole-object-lookup: look for
-  the object's complete copy under block 0's key, if the block is a later one. CACHE_LOOKUP_COMPLETE runs again if
-  that lookup finds an object.
+/** At CACHE_LOOKUP_COMPLETE of a block request that missed: look up the URL's own key once more.
+  CACHE_LOOKUP_COMPLETE runs again if that lookup finds an object.
 
+  @param[out] blockbeg the first byte of the block
   @return whether the second lookup will run
  */
-bool look_up_whole_copy(TSHttpTxn txnp, Config const *config);
+bool look_up_url_key(TSHttpTxn txnp, Config const *config, int64_t &blockbeg);
 
-/** For a block request, at remap: mark it, and watch the transaction if it is the first block of a client request
-  that slice serves through its intercept.
+/** At READ_RESPONSE_HDR of a block request, before cache_range_requests sees the response: a 200 without
+  Content-Range to a Range is the whole object, so its cache write moves to the URL's own key.
+ */
+void note_block_answer(TSHttpTxn txnp, Config const *config);
+
+/** For a block request, at remap: mark it, and watch its cache lookup.
 
   @param header the client request of the block transaction; the first block marker is removed from it
-  @param contp a continuation that runs first_block_handler, with the Config as its data
+  @param contp a continuation that runs block_handler, with the Config as its data
  */
 void watch_block_request(TSHttpTxn txnp, HttpHeader &header, TSCont contp);
 
-int first_block_handler(TSCont contp, TSEvent event, void *edata);
+int block_handler(TSCont contp, TSEvent event, void *edata);

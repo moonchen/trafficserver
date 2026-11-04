@@ -27,7 +27,6 @@
 #include <cctype>
 #include <cinttypes>
 #include <limits>
-#include <optional>
 
 namespace
 {
@@ -137,12 +136,6 @@ handle_client_req(TSCont contp, TSEvent event, Data *const data)
       data->m_blocknum = 0;
     } else {
       data->m_blocknum = rangebe.firstBlockFor(conf->m_blockbytes);
-      // The block whose key holds the object's complete copy. A purge walks the blocks from the start of its range.
-      if (!data->is_purge() && data->m_config->hasWholeObjects()) {
-        if (std::optional<int64_t> const copy = data->m_config->wholeObjectBlock(data->m_effective_url); copy.has_value()) {
-          data->m_blocknum = *copy;
-        }
-      }
     }
 
     data->m_req_range = rangebe;

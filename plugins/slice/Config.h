@@ -23,7 +23,6 @@
 #include "slice.h"
 #include "ObjectSizeCache.h"
 
-#include <atomic>
 #include <string>
 #include <mutex>
 #include <unordered_set>
@@ -59,16 +58,6 @@ struct Config {
 
   // cache read retries for a block request that loses the cache write lock; 0 leaves the cache settings alone
   int m_block_read_retries{blockreadretriesdefault};
-
-  /** Where the one complete copy of an object goes when upstream answers a block request with the whole object, for a
-    rule whose first block can be another block than block 0. Block0: only a request for block 0 stores it. Own: the
-    block request that receives it stores it under its block's key. Move: that request moves its cache write to block
-    0's key.
-   */
-  enum class WholeCopy { Block0, Own, Move };
-  WholeCopy m_whole_copy{WholeCopy::Block0};
-  bool      m_whole_lookup{false}; // a first block other than block 0 that misses looks for the copy under block 0's key
-  bool      m_whole_table{true};   // remember the objects that upstream sends whole, and the block that holds the copy
 
   std::string m_skip_header;
   std::string m_crr_ident_header;
@@ -114,32 +103,6 @@ struct Config {
   // The recorded size of an object, if the size table has it
   std::optional<uint64_t> sizeCacheGet(std::string_view url);
 
-  // Whether a client request's first block can be another block than block 0.
-  bool
-  firstBlockVaries() const
-  {
-    return m_inline_first_block || Relative == m_reftype;
-  }
-
-  /** Objects whose upstream answered a block request with the whole object, and the block whose key holds their one
-    complete copy. A rule whose first block can be another block requests that block for every range of them.
-   */
-  bool
-  rememberWholeObjects() const
-  {
-    return firstBlockVaries() && m_whole_table;
-  }
-  void                   wholeObjectAdd(std::string_view url, int64_t blocknum);
-  void                   wholeObjectRemove(std::string_view url);
-  std::optional<int64_t> wholeObjectBlock(std::string_view url);
-
-  // Whether any object was added; until then no request needs its URL looked up
-  bool
-  hasWholeObjects() const
-  {
-    return m_whole_objects_used.load(std::memory_order_acquire);
-  }
-
   // Prefetch dedup and freelist
   std::pair<bool, BgBlockFetch *> prefetchAcquire(const std::string &key);
   void                            prefetchRelease(BgBlockFetch *bg);
@@ -154,12 +117,6 @@ private:
   std::mutex                     m_mutex;
   std::optional<ObjectSizeCache> m_oscache;
   void                           setCacheSize(size_t entries);
-
-  // About 260 bytes each with a 150 byte URL, allocated when the first object is added.
-  static constexpr size_t        wholeobjectsmax = 4096;
-  std::once_flag                 m_whole_objects_once;
-  std::optional<ObjectSizeCache> m_whole_objects; // the value is unused
-  std::atomic<bool>              m_whole_objects_used{false};
 
   std::mutex                      m_prefetch_mutex;
   std::unordered_set<std::string> m_prefetch_active;

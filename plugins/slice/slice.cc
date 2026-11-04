@@ -46,12 +46,12 @@ constexpr std::string_view SKIP_CRR_HDR_VALUE = "-"sv;
 struct PluginInfo {
   Config config;
   TSCont read_resp_hdr_contp;
-  TSCont first_block_contp;
+  TSCont block_contp;
 };
 
 Config globalConfig;
 TSCont global_read_resp_hdr_contp;
-TSCont global_first_block_contp;
+TSCont global_block_contp;
 
 static bool
 should_skip_this_obj(TSHttpTxn txnp, Config *const config)
@@ -111,7 +111,7 @@ retry_block_reads(TSHttpTxn txnp, Config const *const config)
 }
 
 bool
-read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, TSCont first_block_contp)
+read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, TSCont block_contp)
 {
   DEBUG_LOG("slice read_request");
   TxnHdrMgr hdrmgr;
@@ -300,7 +300,7 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, T
         retry_block_reads(txnp, config);
       }
       HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
-      watch_block_request(txnp, mutable_header, first_block_contp);
+      watch_block_request(txnp, mutable_header, block_contp);
     }
   }
 
@@ -369,7 +369,7 @@ global_read_request_hook(TSCont // contp
                          void *edata)
 {
   TSHttpTxn const txnp = static_cast<TSHttpTxn>(edata);
-  read_request(txnp, &globalConfig, global_read_resp_hdr_contp, global_first_block_contp);
+  read_request(txnp, &globalConfig, global_read_resp_hdr_contp, global_block_contp);
   TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
   return 0;
 }
@@ -388,7 +388,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo * /* rri ATS_UNUSED 
 {
   PluginInfo *const info = static_cast<PluginInfo *>(ih);
 
-  if (read_request(txnp, &info->config, info->read_resp_hdr_contp, info->first_block_contp)) {
+  if (read_request(txnp, &info->config, info->read_resp_hdr_contp, info->block_contp)) {
     return TSREMAP_DID_REMAP_STOP;
   } else {
     return TSREMAP_NO_REMAP;
@@ -450,8 +450,8 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf */, int /
   TSContDataSet(read_resp_hdr_contp, static_cast<void *>(info));
   info->read_resp_hdr_contp = read_resp_hdr_contp;
 
-  info->first_block_contp = TSContCreate(first_block_handler, nullptr);
-  TSContDataSet(info->first_block_contp, static_cast<void *>(&info->config));
+  info->block_contp = TSContCreate(block_handler, nullptr);
+  TSContDataSet(info->block_contp, static_cast<void *>(&info->config));
 
   if (!info->config.stat_prefix.empty()) {
     init_stats(info->config, info->config.stat_prefix);
@@ -468,7 +468,7 @@ TSRemapDeleteInstance(void *ih)
   if (nullptr != ih) {
     PluginInfo *const info = static_cast<PluginInfo *>(ih);
     TSContDestroy(info->read_resp_hdr_contp);
-    TSContDestroy(info->first_block_contp);
+    TSContDestroy(info->block_contp);
     delete info;
   }
 }
@@ -501,8 +501,8 @@ TSPluginInit(int argc, char const *argv[])
 
   TSCont const global_read_request_contp(TSContCreate(global_read_request_hook, nullptr));
   global_read_resp_hdr_contp = TSContCreate(read_resp_hdr, nullptr);
-  global_first_block_contp   = TSContCreate(first_block_handler, nullptr);
-  TSContDataSet(global_first_block_contp, static_cast<void *>(&globalConfig));
+  global_block_contp         = TSContCreate(block_handler, nullptr);
+  TSContDataSet(global_block_contp, static_cast<void *>(&globalConfig));
 
   // Called immediately after the request header is read from the client
   TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, global_read_request_contp);
