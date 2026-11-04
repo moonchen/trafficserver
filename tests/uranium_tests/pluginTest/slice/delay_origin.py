@@ -4,7 +4,8 @@ Origin for the slice collapse and prefetch tests.
 
 Serves /<delay_ms>/<name>/<size> with Range support, after waiting delay_ms before the response header. A name
 that starts with "cut" makes the first response that starts at byte 0 send half of its body and then close the
-connection. Every request is appended to the log file as a JSON line.
+connection. A name that starts with "gate<n>" holds the first response that starts at byte 0 until n requests for
+that range have arrived, or 30 seconds have passed. Every request is appended to the log file as a JSON line.
 
 usage: delay_origin.py <port> <log file>
 '''
@@ -35,6 +36,7 @@ import time
 ALPHABET = b'abcdefghijklmnopqrstuvwxyz0123456789'
 
 lock = threading.Lock()
+arrived = threading.Condition(lock)
 counts: dict[tuple[str, str | None], int] = {}
 log_path = ''
 
@@ -63,6 +65,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             count = counts[(self.path, value)]
             with open(log_path, 'a') as f:
                 f.write(json.dumps({'path': self.path, 'range': value}) + '\n')
+            arrived.notify_all()
 
         time.sleep(delay / 1000)
         body = body_for(size)
@@ -72,6 +75,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             beg = int(r.group(1))
             end = min(int(r.group(2)) + 1 if r.group(2) else size, size)
             status = 206
+        gate = re.match(r'gate(\d+)', name)
+        if gate is not None and beg == 0 and count == 1:
+            with lock:
+                arrived.wait_for(lambda: counts[(self.path, value)] >= int(gate.group(1)), timeout=30)
         self.send_response(status)
         self.send_header('Cache-Control', 'max-age=3600')
         self.send_header('ETag', '"v1"')

@@ -212,6 +212,22 @@ class Scenario:
             assert time.monotonic() < deadline, self.origin_requests(path)
             time.sleep(0.05)
 
+    def wait_for_cache_writes(self, count: int) -> None:
+        """Wait until a number of cache writes completed and none is still open.
+
+        :param count: Number of completed cache writes.
+        """
+
+        def metric(name: str) -> int:
+            result = self.ats.traffic_ctl("metric", "get", name)
+            m = re.search(rf"{re.escape(name)}\s+(\d+)", result.stdout)
+            return int(m.group(1)) if m else -1
+
+        deadline = time.monotonic() + 10
+        while metric("proxy.process.cache.write.success") < count or metric("proxy.process.cache.write.active") != 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
     def release_origin(self) -> None:
         """Let a held origin response send the rest of its body."""
 
@@ -1016,6 +1032,8 @@ def test_slice_inline_range_made_stale(ats_factory: ATSFactory, services: Servic
     scenario = Scenario(ats_factory, services, curl, crr_extra="@pparam=--consider-ident")
     path = f"/{mode}/20"
     assert_range(scenario.get("inline", path, "--range", "8-10"), 20, 8, 11)
+    # The second request must find the block stored, not still being written.
+    scenario.wait_for_cache_writes(1)
     response = scenario.get("inline", path, "--range", "8-10", "--header", 'X-Crr-Ident: Etag "v0"')
     assert_range(response, 20, 8, 11)
     assert scenario.debug_lines("Serving bytes=1-3 of the cached block") == 1

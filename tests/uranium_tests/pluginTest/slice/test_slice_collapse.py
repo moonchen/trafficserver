@@ -114,22 +114,34 @@ class Scenario:
         result = self.curl.run_for(self.ats, shlex.join(arguments))
         return result.returncode, body_file.read_bytes() if body_file.exists() else b""
 
-    def get_all(self, host: str, path: str, count: int, *, lead: float | None = None) -> list[tuple[int, bytes]]:
-        """Send count GETs at once, or one first and the rest lead seconds later.
+    def get_all(self, host: str, path: str, count: int, *, writer_first: bool = False) -> list[tuple[int, bytes]]:
+        """Send count GETs at once, or one first and the rest once its first block request reached the origin.
 
         :param host: Remap host.
         :param path: Origin path.
         :param count: Number of requests.
-        :param lead: Seconds the first request runs alone, or None to send them all at once.
+        :param writer_first: Whether the first request takes the first block's cache write before the others start.
         """
 
         with ThreadPoolExecutor(count) as pool:
             futures = []
             for i in range(count):
                 futures.append(pool.submit(self.get, host, path, f"client{i}"))
-                if i == 0 and lead is not None:
-                    time.sleep(lead)
+                if i == 0 and writer_first:
+                    self.wait_for_origin_requests(path, 1)
             return [f.result() for f in futures]
+
+    def wait_for_origin_requests(self, path: str, count: int) -> None:
+        """Wait until the origin logged at least a number of requests for a path.
+
+        :param path: Origin path.
+        :param count: Number of requests.
+        """
+
+        deadline = time.monotonic() + 20
+        while sum(self.block_requests(path).values()) < count:
+            assert time.monotonic() < deadline, self.block_requests(path)
+            time.sleep(0.02)
 
     def block_requests(self, path: str) -> Counter:
         """Count the origin requests for a path by their Range.
@@ -176,7 +188,7 @@ def test_slice_collapse_slow_writer(ats_factory: ATSFactory, services: ServiceFa
 
     scenario = Scenario(ats_factory, services, curl, read_retry_action=action)
     path = f"/1500/slow/{SIZE}"
-    for returncode, body in scenario.get_all(host, path, 4, lead=0.3):
+    for returncode, body in scenario.get_all(host, path, 4, writer_first=True):
         assert returncode == 0
         assert body == body_for(SIZE)
     assert scenario.block_requests(path) == Counter(blocks(SIZE))
@@ -188,6 +200,9 @@ def test_slice_collapse_slow_writer_off(ats_factory: ATSFactory, services: Servi
     """Without read retries on the rule, a request that waited for a writer longer than one read-while-writer wait
     fetches the block itself.
 
+    The origin holds the first request's first block until the three others have asked for it too, so they find a
+    writer that has no data yet.
+
     :param ats_factory: Factory for isolated Traffic Server instances.
     :param services: Factory owning support services and their cleanup.
     :param curl: Transport-aware curl command runner.
@@ -195,8 +210,8 @@ def test_slice_collapse_slow_writer_off(ats_factory: ATSFactory, services: Servi
     """
 
     scenario = Scenario(ats_factory, services, curl, read_retry_action=None)
-    path = f"/1500/slow/{SIZE}"
-    for returncode, body in scenario.get_all(host, path, 4, lead=0.3):
+    path = f"/0/gate4/{SIZE}"
+    for returncode, body in scenario.get_all(host, path, 4, writer_first=True):
         assert returncode == 0
         assert body == body_for(SIZE)
     assert scenario.block_requests(path)[blocks(SIZE)[0]] == 4
@@ -234,7 +249,7 @@ def test_slice_collapse_writer_aborts(ats_factory: ATSFactory, services: Service
 
     scenario = Scenario(ats_factory, services, curl)
     path = f"/500/cut/{SIZE}"
-    results = scenario.get_all(host, path, 4, lead=0.2)
+    results = scenario.get_all(host, path, 4, writer_first=True)
     # The first request's own block was cut short; the followers waited for it and then fetched the block again.
     for returncode, body in results[1:]:
         assert returncode == 0
