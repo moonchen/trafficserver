@@ -1182,6 +1182,10 @@ CacheVC::openReadStartHead(int event, Event *e)
       }
       od = cod;
       MUTEX_RELEASE(lock);
+      // Cache::open_read reports a read from a writer only when it finds the writer without a lock retry.
+      if (frag_type == CACHE_FRAG_TYPE_HTTP) {
+        _action.continuation->handleEvent(CACHE_EVENT_OPEN_READ_RWW, nullptr);
+      }
       SET_HANDLER(&CacheVC::openReadFromWriter);
       return handleEvent(EVENT_IMMEDIATE, nullptr);
     }

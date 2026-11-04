@@ -76,6 +76,13 @@ constexpr std::string_view SLICE_CRR_HEADER   = {"Slice-Crr-Status"};
 constexpr std::string_view SLICE_CRR_VAL      = "1";
 constexpr std::string_view SKIP_CRR_HDR_NAME  = {"X-Skip-Crr"};
 
+// The slice plugin marks each of its block requests with this transaction argument. When the client may need less
+// than the block, the header holds what to request instead if the block will not be stored: a range, or "-" for the
+// whole object without a Range.
+constexpr char const      *SLICE_BLOCK_ARG       = "slice.block";
+constexpr std::string_view SLICE_UNSTORED_HEADER = {"Slice-Crr-Unstored-Range"};
+int                        slice_block_arg_idx   = -1;
+
 std::string_view const Etag(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG);
 std::string_view const LastModified(TS_MIME_FIELD_LAST_MODIFIED, TS_MIME_LEN_LAST_MODIFIED);
 std::string_view const Stale{"Stale"};
@@ -98,6 +105,8 @@ struct txndata {
   bool                cache_complete_responses{false};
   bool                slice_response{false};
   bool                slice_request{false};
+  bool                slice_block{false};
+  std::string         unstored_range;
 };
 
 // pluginconfig struct (global plugin only)
@@ -392,6 +401,20 @@ range_header_check(TSHttpTxn txnp, pluginconfig *const pc)
           TSHandleMLocRelease(hdr_buf, hdr_loc, locfield);
           txn_state->slice_request = true;
         }
+
+        txn_state->slice_block = 0 <= slice_block_arg_idx && nullptr != TSUserArgGet(txnp, slice_block_arg_idx);
+        if (txn_state->slice_block) {
+          TSMLoc const unstored(TSMimeHdrFieldFind(hdr_buf, hdr_loc, SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size()));
+          if (TS_NULL_MLOC != unstored) {
+            int               ulen = 0;
+            char const *const uval = TSMimeHdrFieldValueStringGet(hdr_buf, hdr_loc, unstored, -1, &ulen);
+            if (nullptr != uval && 0 < ulen) {
+              txn_state->unstored_range.assign(uval, ulen);
+            }
+            TSHandleMLocRelease(hdr_buf, hdr_loc, unstored);
+            remove_header(hdr_buf, hdr_loc, SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size());
+          }
+        }
       }
     } else {
       DEBUG_LOG("No range request header.");
@@ -420,7 +443,18 @@ handle_send_origin_request(TSCont contp, TSHttpTxn txnp, txndata *const txn_stat
     {
       TSHandleMLocRelease(hdr_buf, TS_NULL_MLOC, hdr_loc);
     };
-    if (!rv.empty() && set_header(hdr_buf, hdr_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rv.data(), rv.size())) {
+    // A slice block that will not be stored, for example because cache_promote did not promote it: upstream sends
+    // only what slice's client needs.
+    std::string const &unstored = txn_state->unstored_range;
+    if (!unstored.empty() && TSHttpTxnCntlGet(txnp, TS_HTTP_CNTL_SERVER_NO_STORE)) {
+      if ("-" == unstored) {
+        remove_header(hdr_buf, hdr_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE);
+      } else {
+        set_header(hdr_buf, hdr_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, unstored.data(), unstored.size());
+      }
+      DEBUG_LOG("Block will not be stored, requesting %s instead of %s", unstored.c_str(), rv.c_str());
+      TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
+    } else if (!rv.empty() && set_header(hdr_buf, hdr_loc, TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rv.data(), rv.size())) {
       DEBUG_LOG("Added range header: %s", rv.c_str());
       TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
     }
@@ -536,7 +570,8 @@ handle_server_read_response(TSHttpTxn txnp, txndata *const txn_state)
       TSHttpHdrStatusSet(resp_buf, resp_loc, TS_HTTP_STATUS_PARTIAL_CONTENT);
     }
   } else if (TS_HTTP_STATUS_OK == status) {
-    bool cacheable = txn_state->cache_complete_responses;
+    // Slice looks for an object's complete copy only under its block 0's key, so that it has one copy.
+    bool cacheable = txn_state->slice_block ? txn_state->range_value.starts_with("bytes=0-") : txn_state->cache_complete_responses;
 
     if (cacheable && txn_state->verify_cacheability) {
       DEBUG_LOG("Received a cacheable complete response from the origin; verifying cacheability");
@@ -819,6 +854,9 @@ TSReturnCode
 TSRemapInit(TSRemapInterface *api_info, char *errbuf, int errbuf_size)
 {
   CHECK_REMAP_API_COMPATIBILITY(api_info, errbuf, errbuf_size);
+  if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, SLICE_BLOCK_ARG, "slice block request", &slice_block_arg_idx)) {
+    ERROR_LOG("Failed to reserve the %s transaction argument", SLICE_BLOCK_ARG);
+  }
   DEBUG_LOG("cache_range_requests remap is successfully initialized.");
   return TS_SUCCESS;
 }
@@ -892,6 +930,10 @@ TSPluginInit(int argc, const char *argv[])
     ERROR_LOG("Plugin registration failed.\n");
     ERROR_LOG("Unable to initialize plugin (disabled).");
     return;
+  }
+
+  if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, SLICE_BLOCK_ARG, "slice block request", &slice_block_arg_idx)) {
+    ERROR_LOG("Failed to reserve the %s transaction argument", SLICE_BLOCK_ARG);
   }
 
   if (nullptr == gPluginConfig) {

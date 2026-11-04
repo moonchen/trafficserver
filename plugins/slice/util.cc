@@ -22,6 +22,7 @@
 
 #include "Config.h"
 #include "Data.h"
+#include "first_block.h"
 
 void
 shutdown(TSCont const contp, Data *const data)
@@ -172,6 +173,40 @@ request_block(TSCont contp, Data *const data)
     }
   }
 
+  bool const get         = TS_HTTP_METHOD_GET == data->m_method_type;
+  bool const first_block = get && !data->m_server_first_header_parsed && BlockState::Pending == data->m_blockstate &&
+                           TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE != data->m_statustype;
+  // The marker makes the block transaction watch the first block (first_block.cc): for a client range, so that core
+  // serves the range from a complete copy, and for a rule whose first block can be another block, to learn which
+  // objects upstream sends whole.
+  bool const watch = first_block && (TS_HTTP_STATUS_PARTIAL_CONTENT == data->m_statustype || cfg->rememberWholeObjects());
+  if (watch) {
+    header.setKeyVal(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size(), "1", 1);
+  }
+
+  // What cache_range_requests requests instead of the block if it will not be stored: the client's own request for
+  // the first block, and the client's part of a later block of which the client needs only part.
+  char unstoredstr[1024];
+  int  unstoredlen = 0;
+  if (first_block) {
+    unstoredlen = sizeof(unstoredstr);
+    if (!header.valueForKey(cfg->m_skip_header.data(), cfg->m_skip_header.size(), unstoredstr, &unstoredlen)) {
+      unstoredlen = 0;
+    }
+  } else if (get && data->m_server_first_header_parsed && BlockState::Pending == data->m_blockstate) {
+    Range const block(blockbeg, std::min(blockbeg + data->m_config->m_blockbytes, data->m_contentlen));
+    Range const need = block.intersectedWith(data->m_req_range);
+    if (need.isValid() && (block.m_beg < need.m_beg || need.m_end < block.m_end)) {
+      unstoredlen = sizeof(unstoredstr);
+      if (!need.toStringClosed(unstoredstr, &unstoredlen)) {
+        unstoredlen = 0;
+      }
+    }
+  }
+  if (0 < unstoredlen) {
+    header.setKeyVal(SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size(), unstoredstr, unstoredlen);
+  }
+
   // create virtual connection back into ATS
   TSHttpConnectOptions options = TSHttpConnectOptionsGet(TS_CONNECT_PLUGIN);
   options.addr                 = reinterpret_cast<sockaddr *>(&data->m_client_ip);
@@ -195,6 +230,13 @@ request_block(TSCont contp, Data *const data)
   if (dbg_ctl.on()) {
     std::string const headerstr(header.toString());
     DEBUG_LOG("Headers\n%s", headerstr.c_str());
+  }
+
+  if (watch) {
+    header.removeKey(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size());
+  }
+  if (0 < unstoredlen) {
+    header.removeKey(SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size());
   }
 
   // Extend prefetch sliding window past the initial burst

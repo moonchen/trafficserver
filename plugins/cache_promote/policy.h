@@ -24,6 +24,7 @@
 #include "ts/remap.h"
 
 extern int TXN_ARG_IDX;
+extern int SLICE_BLOCK_ARG_IDX; // set by the slice plugin on its block requests
 
 #define MAX_STAT_LENGTH (1 << 8)
 extern const char *PLUGIN_NAME;

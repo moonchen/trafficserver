@@ -3674,6 +3674,32 @@ HttpSM::tunnel_handler_100_continue_ua(int event, HttpTunnelConsumer *c)
   return 0;
 }
 
+namespace
+{
+/** The producer of a transform that only the client @a c reads, if that producer also feeds a cache write. The cache
+    write stores the untransformed response, so it can finish without the transform.
+ */
+HttpTunnelProducer *
+untransformed_cache_source(HttpTunnelConsumer const *c)
+{
+  HttpTunnelProducer const *const transform = c->producer;
+
+  if (transform->vc_type != HttpTunnelType_t::TRANSFORM || transform->num_consumers != 1 || transform->self_consumer == nullptr) {
+    return nullptr;
+  }
+  HttpTunnelProducer *const source = transform->self_consumer->producer;
+  if (!source->alive || source->vc_type != HttpTunnelType_t::HTTP_SERVER) {
+    return nullptr;
+  }
+  for (HttpTunnelConsumer const *sc = source->consumer_list.head; sc != nullptr; sc = sc->link.next) {
+    if (sc->alive && sc->vc_type == HttpTunnelType_t::CACHE_WRITE) {
+      return source;
+    }
+  }
+  return nullptr;
+}
+} // end anonymous namespace
+
 bool
 HttpSM::is_bg_fill_necessary(HttpTunnelConsumer *c)
 {
@@ -3718,6 +3744,24 @@ HttpSM::is_bg_fill_necessary(HttpTunnelConsumer *c)
               t_state.txn_conf->background_fill_threshold, ua_body_done, ua_cl);
       }
     }
+  } else if (HttpTunnelProducer const *const source = untransformed_cache_source(c); source != nullptr) {
+    // The client's bytes are transformed, so the server's progress is what the threshold measures.
+    if (t_state.txn_conf->background_fill_threshold <= 0.001) {
+      return true;
+    }
+
+    int64_t const server_cl = t_state.hdr_info.response_content_length;
+
+    if (server_cl > 0) {
+      int64_t const server_body_done = source->init_bytes_done + (source->read_vio ? source->read_vio->ndone : 0);
+      float const   pDone            = static_cast<float>(server_body_done) / server_cl;
+
+      if (pDone <= 1.0 && pDone > t_state.txn_conf->background_fill_threshold) {
+        return true;
+      }
+      SMDbg(dbg_ctl_http, "no background.  Only %%%f of %%%f done [%" PRId64 " / %" PRId64 " ]", pDone,
+            t_state.txn_conf->background_fill_threshold, server_body_done, server_cl);
+    }
   }
 
   return false;
@@ -3749,6 +3793,8 @@ HttpSM::tunnel_handler_ua(int event, HttpTunnelConsumer *c)
     set_ua_abort(HttpTransact::ABORTED, event);
 
     if (is_bg_fill_necessary(c)) {
+      bool const fill_without_transform = untransformed_cache_source(c) != nullptr;
+
       p = c->producer->self_consumer ? c->producer->self_consumer->producer : c->producer;
       SMDbg(dbg_ctl_http, "Initiating background fill");
       // check whether to finish the reading.
@@ -3773,6 +3819,10 @@ HttpSM::tunnel_handler_ua(int event, HttpTunnelConsumer *c)
       c->vc->do_io_close(EHTTP_ERROR);
       c->alive = false;
 
+      // Only the client read the transform, so it goes down too, and the server feeds just the cache write.
+      if (fill_without_transform) {
+        tunnel.abort_transform(c->producer);
+      }
     } else {
       // No background fill
       p = c->producer;

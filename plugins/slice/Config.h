@@ -23,6 +23,7 @@
 #include "slice.h"
 #include "ObjectSizeCache.h"
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <unordered_set>
@@ -37,6 +38,7 @@ struct Config {
   static constexpr int64_t const blockbytesdefault = 1024 * 1024;       // 1MB
 
   static constexpr int const purgeprobeblocksdefault = 8;
+  static constexpr int const blockreadretriesdefault = 5;
 
   int64_t     m_blockbytes{blockbytesdefault};
   std::string m_remaphost; // remap host to use for loopback slice GET
@@ -47,12 +49,16 @@ struct Config {
   int       m_paceerrsecs{0};   // -1 disable logging, 0 no pacing, max 60s
   int       m_prefetchcount{0}; // 0 disables prefetching
   enum RefType { First, Relative };
-  RefType  m_reftype{First};          // reference slice is relative to request
-  bool     m_head_strip_range{false}; // strip range header for head requests
-  uint64_t m_min_size_to_slice{0};    // Only strip objects larger than this
+  RefType  m_reftype{First};            // reference slice is relative to request
+  bool     m_head_strip_range{false};   // strip range header for head requests
+  uint64_t m_min_size_to_slice{0};      // Only strip objects larger than this
+  bool     m_inline_first_block{false}; // serve whole-object GETs from their first block in the client transaction
 
   // consecutive uncached blocks a purge tolerates before giving up on the object
   int m_purge_probe_blocks{purgeprobeblocksdefault};
+
+  // cache read retries for a block request that loses the cache write lock; 0 leaves the cache settings alone
+  int m_block_read_retries{blockreadretriesdefault};
 
   std::string m_skip_header;
   std::string m_crr_ident_header;
@@ -89,6 +95,34 @@ struct Config {
   // Did we cache this internally as a small object?
   bool isKnownLargeObj(std::string_view url);
 
+  bool
+  hasSizeCache() const
+  {
+    return m_oscache.has_value();
+  }
+
+  // The recorded size of an object, if the size table has it
+  std::optional<uint64_t> sizeCacheGet(std::string_view url);
+
+  /** Objects whose upstream answered a block request with the whole object. Their one complete copy is stored under
+    block 0's key, so a rule whose first block can be another block requests block 0 for every range of them.
+   */
+  bool
+  rememberWholeObjects() const
+  {
+    return m_inline_first_block || Relative == m_reftype;
+  }
+  void wholeObjectAdd(std::string_view url);
+  void wholeObjectRemove(std::string_view url);
+  bool isWholeObject(std::string_view url);
+
+  // Whether any object was added; until then no request needs its URL looked up
+  bool
+  hasWholeObjects() const
+  {
+    return m_whole_objects_used.load(std::memory_order_acquire);
+  }
+
   // Prefetch dedup and freelist
   std::pair<bool, BgBlockFetch *> prefetchAcquire(const std::string &key);
   void                            prefetchRelease(BgBlockFetch *bg);
@@ -103,6 +137,12 @@ private:
   std::mutex                     m_mutex;
   std::optional<ObjectSizeCache> m_oscache;
   void                           setCacheSize(size_t entries);
+
+  // About 260 bytes each with a 150 byte URL, allocated when the first object is added.
+  static constexpr size_t        wholeobjectsmax = 4096;
+  std::once_flag                 m_whole_objects_once;
+  std::optional<ObjectSizeCache> m_whole_objects; // the value is unused
+  std::atomic<bool>              m_whole_objects_used{false};
 
   std::mutex                      m_prefetch_mutex;
   std::unordered_set<std::string> m_prefetch_active;

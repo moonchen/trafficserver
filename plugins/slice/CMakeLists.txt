@@ -24,6 +24,8 @@ add_atsplugin(
   HttpHeader.cc
   Range.cc
   client.cc
+  first_block.cc
+  inline.cc
   intercept.cc
   prefetch.cc
   response.cc

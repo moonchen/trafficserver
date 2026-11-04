@@ -16,53 +16,93 @@
   limitations under the License.
 */
 #include <unistd.h>
+#include <cctype>
 #include <cinttypes>
+#include <string_view>
 
 #include "lru_policy.h"
 
 #define MINIMUM_BUCKET_SIZE 10
 static LRUEntry NULL_LRU_ENTRY; // Used to create an "empty" new LRUEntry
 
-// Initialize the LRU hash key from the TXN's URL
-bool
-LRUHash::initFromUrl(TSHttpTxn txnp)
+namespace
 {
-  bool      ret   = false;
-  TSMLoc    c_url = TS_NULL_MLOC;
+/** The cache key of a slice block names the block by its Range, "bytes=<first>-<last>", whether cache_range_requests or
+  cachekey built it. Without the Range, the key is the same for all blocks of an object, and keeps whatever
+  normalization built the key.
+ */
+int
+remove_block_range(char *const url, int const url_len)
+{
+  constexpr std::string_view bytes = "bytes=";
+  std::string_view const     key{url, static_cast<size_t>(url_len)};
+  auto                       skip_digits = [&key](size_t pos) {
+    while (pos < key.size() && isdigit(static_cast<unsigned char>(key[pos]))) {
+      ++pos;
+    }
+    return pos;
+  };
+
+  for (size_t pos = key.rfind(bytes); std::string_view::npos != pos;
+       pos        = 0 == pos ? std::string_view::npos : key.rfind(bytes, pos - 1)) {
+    size_t const first = pos + bytes.size();
+    size_t const dash  = skip_digits(first);
+    if (first < dash && dash < key.size() && '-' == key[dash]) {
+      size_t const end = skip_digits(dash + 1);
+      if (dash + 1 < end) {
+        memmove(url + pos, url + end, url_len - end);
+        return url_len - static_cast<int>(end - pos);
+      }
+    }
+  }
+  return url_len;
+}
+} // namespace
+
+// Initialize the LRU hash key from the TXN's cache lookup URL, without the block range for a slice block request
+bool
+LRUHash::initFromUrl(TSHttpTxn txnp, bool slice_block)
+{
+  bool      ret     = false;
+  TSMLoc    c_url   = TS_NULL_MLOC;
+  int       url_len = 0;
+  char     *url     = nullptr;
   TSMBuffer reqp;
   TSMLoc    req_hdr;
 
   if (TS_SUCCESS != TSHttpTxnClientReqGet(txnp, &reqp, &req_hdr)) {
     return false;
   }
-
   if (TS_SUCCESS == TSUrlCreate(reqp, &c_url)) {
     if (TS_SUCCESS == TSHttpTxnCacheLookupUrlGet(txnp, reqp, c_url)) {
-      int   url_len = 0;
-      char *url     = TSUrlStringGet(reqp, c_url, &url_len);
-
-      if (url && url_len > 0) {
-        // SHA1() is deprecated on OpenSSL 3, but it's faster than its replacement.
-#ifdef HAVE_SHA1
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        SHA_CTX sha;
-
-        SHA1_Init(&sha);
-        SHA1_Update(&sha, url, url_len);
-        SHA1_Final(_hash, &sha);
-#pragma GCC diagnostic pop
-#else
-        EVP_Digest(url, url_len, _hash, nullptr, EVP_sha1(), nullptr);
-#endif
-        DBG("LRUHash::initFromUrl(%.*s%s)", url_len > 100 ? 100 : url_len, url, url_len > 100 ? "..." : "");
-        TSfree(url);
-        ret = true;
-      }
+      url = TSUrlStringGet(reqp, c_url, &url_len);
     }
     TSHandleMLocRelease(reqp, TS_NULL_MLOC, c_url);
   }
   TSHandleMLocRelease(reqp, TS_NULL_MLOC, req_hdr);
+
+  if (url && slice_block) {
+    url_len = remove_block_range(url, url_len);
+  }
+
+  if (url && url_len > 0) {
+    // SHA1() is deprecated on OpenSSL 3, but it's faster than its replacement.
+#ifdef HAVE_SHA1
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    SHA_CTX sha;
+
+    SHA1_Init(&sha);
+    SHA1_Update(&sha, url, url_len);
+    SHA1_Final(_hash, &sha);
+#pragma GCC diagnostic pop
+#else
+    EVP_Digest(url, url_len, _hash, nullptr, EVP_sha1(), nullptr);
+#endif
+    DBG("LRUHash::initFromUrl(%.*s%s)", url_len > 100 ? 100 : url_len, url, url_len > 100 ? "..." : "");
+    ret = true;
+  }
+  TSfree(url);
 
   return ret;
 }
@@ -122,7 +162,10 @@ LRUPolicy::doPromote(TSHttpTxn txnp)
   LRUMap::iterator map_it;
   bool             ret = false;
 
-  if (!hash.initFromUrl(txnp)) {
+  // A request for one of slice's blocks counts for the object, and a promoted object stays promoted.
+  bool const slice_block = 0 <= SLICE_BLOCK_ARG_IDX && nullptr != TSUserArgGet(txnp, SLICE_BLOCK_ARG_IDX);
+
+  if (!hash.initFromUrl(txnp, slice_block)) {
     return false;
   }
 
@@ -131,9 +174,9 @@ LRUPolicy::doPromote(TSHttpTxn txnp)
 
   map_it = _map.find(&hash);
   if (_map.end() != map_it) {
-    auto &[map_key, map_val]             = *map_it;
-    auto &[val_key, val_hits, val_bytes] = *(map_it->second);
-    bool      cacheable                  = false;
+    auto &[map_key, map_val]                           = *map_it;
+    auto &[val_key, val_hits, val_bytes, val_promoted] = *(map_it->second);
+    bool      cacheable                                = false;
     TSMBuffer request;
     TSMLoc    req_hdr;
 
@@ -163,17 +206,28 @@ LRUPolicy::doPromote(TSHttpTxn txnp)
     TSAssert(_list_size > 0); // mismatch in the LRUs hash and list, shouldn't happen
     incrementStat(_lru_hit_id, 1);
     ++val_hits; // Increment hits, bytes are incremented elsewhere
-    if (cacheable && (val_hits >= _hits || (_bytes > 0 && val_bytes > _bytes))) {
-      // Promoted! Cleanup the LRU, and signal success. Save the promoted entry on the freelist.
-      DBG("saving the LRUEntry to the freelist");
-      _freelist.splice(_freelist.begin(), _list, map_val);
-      ++_freelist_size;
-      --_list_size;
-      _map.erase(map_key);
+    if (val_promoted) {
+      // Each block of a promoted object is stored by whichever request misses it first.
+      DBG("the object is promoted");
+      _list.splice(_list.begin(), _list, map_val);
+      ret = cacheable;
+    } else if (cacheable && (val_hits >= _hits || (_bytes > 0 && val_bytes > _bytes))) {
       incrementStat(_promoted_id, 1);
-      incrementStat(_freelist_size_id, 1);
-      decrementStat(_lru_size_id, 1);
       ret = true;
+      if (slice_block) {
+        DBG("promoting the object, keeping its LRUEntry");
+        val_promoted = true;
+        _list.splice(_list.begin(), _list, map_val);
+      } else {
+        // Promoted! Cleanup the LRU, and signal success. Save the promoted entry on the freelist.
+        DBG("saving the LRUEntry to the freelist");
+        _freelist.splice(_freelist.begin(), _list, map_val);
+        ++_freelist_size;
+        --_list_size;
+        _map.erase(map_key);
+        incrementStat(_freelist_size_id, 1);
+        decrementStat(_lru_size_id, 1);
+      }
     } else {
       // It's still not promoted, make sure it's moved to the front of the list
       DBG("still not promoted, got %d hits so far and %" PRId64 " bytes", val_hits, val_bytes);
@@ -201,7 +255,7 @@ LRUPolicy::doPromote(TSHttpTxn txnp)
       incrementStat(_lru_size_id, 1);
     }
     // Update the "new" LRUEntry and add it to the hash
-    *_list.begin()                       = {hash, 1, 0};
+    *_list.begin()                       = {hash, 1, 0, false};
     _map[&(std::get<0>(*_list.begin()))] = _list.begin();
   }
 
@@ -236,11 +290,11 @@ LRUPolicy::addBytes(TSHttpTxn txnp)
         TSMLoc field_loc = TSMimeHdrFieldFind(resp, resp_hdr, TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH);
 
         if (field_loc) {
-          auto &[val_key, val_hits, val_bytes] = *(map_it->second);
-          int64_t cl                           = TSMimeHdrFieldValueInt64Get(resp, resp_hdr, field_loc, -1);
+          auto &[val_key, val_hits, val_bytes, val_promoted] = *(map_it->second);
+          int64_t cl                                         = TSMimeHdrFieldValueInt64Get(resp, resp_hdr, field_loc, -1);
 
           // This is because compilers before gcc 8 aren't smart enough to ignore the unused structured bindings
-          (void)val_key, (void)val_hits;
+          (void)val_key, (void)val_hits, (void)val_promoted;
 
           val_bytes += cl;
           DBG("Added %" PRId64 " bytes for LRU entry", cl);

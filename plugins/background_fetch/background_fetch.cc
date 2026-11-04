@@ -43,6 +43,24 @@
 // Global config, if we don't have a remap specific config.
 static BgFetchConfig *gConfig = nullptr;
 
+// The slice plugin marks each of its block requests with this transaction argument, reserved under the same name.
+static int slice_block_arg_idx = -1;
+
+static void
+reserve_slice_block_arg()
+{
+  if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, "slice.block", "slice block request", &slice_block_arg_idx)) {
+    TSError("[%s] Failed to reserve the slice.block transaction argument", PLUGIN_NAME);
+  }
+}
+
+// Slice stores the blocks it requests. A background fetch of the whole object would make slice fetch every block.
+static bool
+is_slice_block(TSHttpTxn txnp)
+{
+  return 0 <= slice_block_arg_idx && nullptr != TSUserArgGet(txnp, slice_block_arg_idx);
+}
+
 // This is the list of all headers that must be removed when we make the actual background
 // fetch request.
 static const std::array<const std::string_view, 6> FILTER_HEADERS{
@@ -522,7 +540,9 @@ cont_handle_response(TSCont contp, TSEvent event, void *edata)
   } else {
     switch (event) {
     case TS_EVENT_HTTP_READ_RESPONSE_HDR:
-      if (config->bgFetchAllowed(txnp)) {
+      if (is_slice_block(txnp)) {
+        Dbg(Bg_dbg_ctl, "Skipping a slice block request");
+      } else if (config->bgFetchAllowed(txnp)) {
         TSMBuffer response;
         TSMLoc    resp_hdr;
 
@@ -571,6 +591,8 @@ TSPluginInit(int argc, const char *argv[])
     TSError("[%s] Plugin registration failed", PLUGIN_NAME);
   }
 
+  reserve_slice_block_arg();
+
   TSCont cont = TSContCreate(cont_handle_response, nullptr);
 
   gConfig = new BgFetchConfig(cont);
@@ -598,6 +620,7 @@ TSReturnCode
 TSRemapInit(TSRemapInterface *api_info, char *errbuf, int errbuf_size)
 {
   CHECK_REMAP_API_COMPATIBILITY(api_info, errbuf, errbuf_size);
+  reserve_slice_block_arg();
   Dbg(Bg_dbg_ctl, "background fetch remap is successfully initialized");
   return TS_SUCCESS;
 }

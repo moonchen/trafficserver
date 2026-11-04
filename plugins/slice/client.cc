@@ -136,6 +136,10 @@ handle_client_req(TSCont contp, TSEvent event, Data *const data)
       data->m_blocknum = 0;
     } else {
       data->m_blocknum = rangebe.firstBlockFor(conf->m_blockbytes);
+      // The object's complete copy is stored under block 0's key.
+      if (0 < data->m_blocknum && data->m_config->hasWholeObjects() && data->m_config->isWholeObject(data->m_effective_url)) {
+        data->m_blocknum = 0;
+      }
     }
 
     data->m_req_range = rangebe;

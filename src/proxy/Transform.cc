@@ -222,6 +222,19 @@ TransformTerminus::handle_event(int event, void *edata)
           towrite = m_read_vio.ntodo();
         }
 
+        // Like any producer, fill the reader's buffer only up to its water mark, at least a block of the
+        // transform's output at a time. The rest waits in the transform's output, where the transform can see
+        // how far the client is behind, until the consumer reenables the read.
+        if (towrite > 0) {
+          MIOBuffer *const out = m_read_vio.get_writer();
+          if (out->high_water()) {
+            towrite = 0;
+          } else {
+            towrite =
+              std::min(towrite, std::max(out->water_mark - out->max_read_avail(), m_write_vio.get_reader()->block_read_avail()));
+          }
+        }
+
         if (towrite > 0) {
           m_read_vio.get_writer()->write(m_write_vio.get_reader(), towrite);
           m_read_vio.ndone += towrite;

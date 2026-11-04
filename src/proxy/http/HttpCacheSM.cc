@@ -128,6 +128,12 @@ HttpCacheSM::state_cache_open_read(int event, void *data)
 {
   STATE_ENTER(&HttpCacheSM::state_cache_open_read, event);
   ink_assert(captive_action.cancelled == 0);
+
+  // A notice that the read is from a writer, which can come while the open read is still pending.
+  if (event == CACHE_EVENT_OPEN_READ_RWW) {
+    set_readwhilewrite_inprogress(true);
+    return VC_EVENT_CONT;
+  }
   pending_action = nullptr;
 
   if (captive_action.cancelled == 1) {
@@ -148,10 +154,6 @@ HttpCacheSM::state_cache_open_read(int event, void *data)
     }
     cache_read_vc = static_cast<CacheVConnection *>(data);
     master_sm->handleEvent(event, &captive_action);
-    break;
-
-  case CACHE_EVENT_OPEN_READ_RWW:
-    set_readwhilewrite_inprogress(true);
     break;
 
   case CACHE_EVENT_OPEN_READ_FAILED:

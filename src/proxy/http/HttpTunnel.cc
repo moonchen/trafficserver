@@ -1873,6 +1873,37 @@ HttpTunnel::chain_abort_all(HttpTunnelProducer *p)
   }
 }
 
+// void HttpTunnel::abort_transform(HttpTunnelProducer* p)
+//
+//    Abort the transform whose output is the producer p, and everyone
+//     still alive downstream of it, but not the producer that feeds the
+//     transform: that producer's other consumers go on
+//
+void
+HttpTunnel::abort_transform(HttpTunnelProducer *p)
+{
+  HttpTunnelConsumer *const c = p->self_consumer;
+
+  ink_assert(p->vc_type == HttpTunnelType_t::TRANSFORM && c != nullptr);
+  chain_abort_all(p);
+  if (c->alive) {
+    // The transform's output had already finished, so its vc is still open for this write side.
+    c->alive = false;
+    c->vc->do_io_close(EHTTP_ERROR);
+  }
+  c->write_vio = nullptr;
+
+  // The transform no longer holds back its producer's buffer.
+  if (c->buffer_reader) {
+    c->buffer_reader->mbuf->dealloc_reader(c->buffer_reader);
+    c->buffer_reader = nullptr;
+  }
+  HttpTunnelProducer *const source = c->producer;
+  if (source->alive && source->read_vio) {
+    source->read_vio->reenable();
+  }
+}
+
 //
 // Determine the number of bytes a consumer should read from a producer
 //

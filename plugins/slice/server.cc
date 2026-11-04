@@ -114,6 +114,25 @@ update_object_size(std::string_view const url, int64_t size, Config &config)
   }
 }
 
+/** Whether the first response is the client's range rather than the first block. The block transaction asks upstream
+  for the client's range when it will not store the block, and core serves that range from a complete copy of the
+  object (first_block.cc).
+ */
+bool
+answers_client_range(Data const *const data, ContentRange const &cr)
+{
+  int64_t const blockbytes = data->m_config->m_blockbytes;
+  int64_t const blockbeg   = data->m_blocknum * blockbytes;
+  if (TS_HTTP_STATUS_PARTIAL_CONTENT != data->m_statustype ||
+      (cr.m_beg == blockbeg && cr.m_end == std::min(blockbeg + blockbytes, cr.m_length))) {
+    return false;
+  }
+  Range const  &want = data->m_req_range;
+  int64_t const beg  = want.isEndBytes() ? std::max<int64_t>(0, cr.m_length + want.m_beg) : want.m_beg;
+  int64_t const end  = want.isEndBytes() ? cr.m_length : std::min(want.m_end, cr.m_length);
+  return cr.m_beg == beg && cr.m_end == end;
+}
+
 // This sets up the reference data with the content length and any
 // strong/weak identifiers for comparing against subsequent slices.
 HeaderState
@@ -171,6 +190,15 @@ handleFirstServerHeader(Data *const data, TSCont const contp)
   }
 
   update_object_size(data->m_effective_url, blockcr.m_length, *data->m_config);
+
+  if (answers_client_range(data, blockcr)) {
+    int64_t const hlen = TSHttpHdrLengthGet(header.m_buffer, header.m_lochdr);
+    int64_t const clen = contentLengthFrom(header);
+    DEBUG_LOG("First response is the client's range, passing it through");
+    TSVIONBytesSet(output_vio, INT64_MAX == clen ? clen : hlen + clen);
+    TSHttpHdrPrint(header.m_buffer, header.m_lochdr, output_buf);
+    return HeaderState::Passthru;
+  }
 
   // set the resource content length from block response
   data->m_contentlen = blockcr.m_length;
@@ -493,6 +521,7 @@ handleNextServerHeader(Data *const data)
   }
 
   data->m_blockexpected = blockcr.rangeSize();
+  data->m_blockoffset   = std::max<int64_t>(0, blockcr.m_beg - data->m_blocknum * data->m_config->m_blockbytes);
 
   if (data->m_config->m_prefetchcount > 0 && data->m_blocknum == data->m_req_range.firstBlockFor(data->m_config->m_blockbytes) &&
       header.hasKey(SLICE_CRR_HEADER.data(), SLICE_CRR_HEADER.size())) {
@@ -812,7 +841,8 @@ handle_server_resp(TSCont contp, TSEvent event, Data *const data)
       } break;
       default: {
         // how much to normally fast forward into this data block
-        data->m_blockskip = data->m_req_range.skipBytesForBlock(data->m_config->m_blockbytes, data->m_blocknum);
+        data->m_blockskip = std::max<int64_t>(
+          0, data->m_req_range.skipBytesForBlock(data->m_config->m_blockbytes, data->m_blocknum) - data->m_blockoffset);
       } break;
       }
 

@@ -21,6 +21,8 @@
 #include "Config.h"
 #include "Data.h"
 #include "HttpHeader.h"
+#include "first_block.h"
+#include "inline.h"
 #include "intercept.h"
 
 #include "ts/apidefs.h"
@@ -28,6 +30,7 @@
 #include "ts/ts.h"
 
 #include <charconv>
+#include <cinttypes>
 #include <memory>
 #include <netinet/in.h>
 #include <array>
@@ -43,10 +46,12 @@ constexpr std::string_view SKIP_CRR_HDR_VALUE = "-"sv;
 struct PluginInfo {
   Config config;
   TSCont read_resp_hdr_contp;
+  TSCont first_block_contp;
 };
 
 Config globalConfig;
 TSCont global_read_resp_hdr_contp;
+TSCont global_first_block_contp;
 
 static bool
 should_skip_this_obj(TSHttpTxn txnp, Config *const config)
@@ -64,8 +69,49 @@ should_skip_this_obj(TSHttpTxn txnp, Config *const config)
   return false;
 }
 
+// proxy.config.http.cache.open_write_fail_action values
+constexpr TSMgmtInt WRITE_FAIL_GO_TO_ORIGIN                   = 0;
+constexpr TSMgmtInt WRITE_FAIL_STALE_ON_REVALIDATE            = 2;
+constexpr TSMgmtInt WRITE_FAIL_READ_RETRY                     = 5;
+constexpr TSMgmtInt WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE = 6;
+
+/** Concurrent requests for an uncached block all miss until the first of them opens the cache write. With a write fail
+  action that then goes to the origin, every request that missed in that window fetches the whole block again, uncached.
+  A read retry instead looks the block up again and reads it from the request that is writing it.
+ */
+void
+retry_block_reads(TSHttpTxn txnp, Config const *const config)
+{
+  if (config->m_block_read_retries <= 0) {
+    return;
+  }
+
+  TSMgmtInt action = 0;
+  if (TS_SUCCESS != TSHttpTxnConfigIntGet(txnp, TS_CONFIG_HTTP_CACHE_OPEN_WRITE_FAIL_ACTION, &action)) {
+    return;
+  }
+  // The actions that answer a lost write lock with an error are left alone.
+  if (WRITE_FAIL_GO_TO_ORIGIN == action) {
+    action = WRITE_FAIL_READ_RETRY;
+  } else if (WRITE_FAIL_STALE_ON_REVALIDATE == action) {
+    action = WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE;
+  } else if (WRITE_FAIL_READ_RETRY != action && WRITE_FAIL_READ_RETRY_STALE_ON_REVALIDATE != action) {
+    return;
+  }
+  TSHttpTxnConfigIntSet(txnp, TS_CONFIG_HTTP_CACHE_OPEN_WRITE_FAIL_ACTION, action);
+
+  TSMgmtInt retries = 0;
+  if (TS_SUCCESS == TSHttpTxnConfigIntGet(txnp, TS_CONFIG_HTTP_CACHE_MAX_OPEN_READ_RETRIES, &retries) &&
+      retries < config->m_block_read_retries) {
+    retries = config->m_block_read_retries;
+    TSHttpTxnConfigIntSet(txnp, TS_CONFIG_HTTP_CACHE_MAX_OPEN_READ_RETRIES, retries);
+  }
+  DEBUG_LOG("Block request retries its cache read on a lost write lock: action %" PRId64 ", read retries %" PRId64, action,
+            retries);
+}
+
 bool
-read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp)
+read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp, TSCont first_block_contp)
 {
   DEBUG_LOG("slice read_request");
   TxnHdrMgr hdrmgr;
@@ -73,6 +119,15 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp)
   HttpHeader const header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
 
   if (TS_HTTP_METHOD_GET == header.method() || TS_HTTP_METHOD_HEAD == header.method() || TS_HTTP_METHOD_PURGE == header.method()) {
+    // Slice's block requests always carry a Range. A GET with the skip header but no Range is a copy of a block request
+    // that another plugin made to fetch the whole object (prefetch does, for the next objects): slice it, so that it is
+    // stored as the blocks that later requests look up.
+    if (TS_HTTP_METHOD_GET == header.method() && header.hasKey(config->m_skip_header.data(), config->m_skip_header.size()) &&
+        !header.hasKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE)) {
+      DEBUG_LOG("GET with the skip header but no Range, slicing it as a new request");
+      HttpHeader(hdrmgr.m_buffer, hdrmgr.m_lochdr).removeKey(config->m_skip_header.data(), config->m_skip_header.size());
+    }
+
     if (!header.hasKey(config->m_skip_header.data(), config->m_skip_header.size())) {
       // check if any previous plugin has monkeyed with the transaction status
       TSHttpStatus const txnstat = TSHttpTxnStatusGet(txnp);
@@ -94,6 +149,15 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp)
 
           DEBUG_LOG("request passed regex, slicing: '%.*s'", urllen, urlstr);
           TSfree(urlstr);
+        }
+      }
+
+      if (config->m_inline_first_block) {
+        HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
+        if (inline_first_block(txnp, config, mutable_header)) {
+          retry_block_reads(txnp, config);
+          mark_slice_block(txnp);
+          return false;
         }
       }
 
@@ -231,6 +295,12 @@ read_request(TSHttpTxn txnp, Config *const config, TSCont read_resp_hdr_contp)
       return true;
     } else {
       DEBUG_LOG("slice passing GET or HEAD request through to next plugin");
+      // A block request from slice, from an inline remainder or from a prefetch.
+      if (TS_HTTP_METHOD_GET == header.method()) {
+        retry_block_reads(txnp, config);
+      }
+      HttpHeader mutable_header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
+      watch_block_request(txnp, mutable_header, first_block_contp);
     }
   }
 
@@ -299,7 +369,7 @@ global_read_request_hook(TSCont // contp
                          void *edata)
 {
   TSHttpTxn const txnp = static_cast<TSHttpTxn>(edata);
-  read_request(txnp, &globalConfig, global_read_resp_hdr_contp);
+  read_request(txnp, &globalConfig, global_read_resp_hdr_contp, global_first_block_contp);
   TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
   return 0;
 }
@@ -318,7 +388,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo * /* rri ATS_UNUSED 
 {
   PluginInfo *const info = static_cast<PluginInfo *>(ih);
 
-  if (read_request(txnp, &info->config, info->read_resp_hdr_contp)) {
+  if (read_request(txnp, &info->config, info->read_resp_hdr_contp, info->first_block_contp)) {
     return TSREMAP_DID_REMAP_STOP;
   } else {
     return TSREMAP_NO_REMAP;
@@ -380,6 +450,9 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf */, int /
   TSContDataSet(read_resp_hdr_contp, static_cast<void *>(info));
   info->read_resp_hdr_contp = read_resp_hdr_contp;
 
+  info->first_block_contp = TSContCreate(first_block_handler, nullptr);
+  TSContDataSet(info->first_block_contp, static_cast<void *>(&info->config));
+
   if (!info->config.stat_prefix.empty()) {
     init_stats(info->config, info->config.stat_prefix);
   }
@@ -395,6 +468,7 @@ TSRemapDeleteInstance(void *ih)
   if (nullptr != ih) {
     PluginInfo *const info = static_cast<PluginInfo *>(ih);
     TSContDestroy(info->read_resp_hdr_contp);
+    TSContDestroy(info->first_block_contp);
     delete info;
   }
 }
@@ -403,6 +477,7 @@ TSReturnCode
 TSRemapInit(TSRemapInterface * /* api_info ATS_UNUSED */, char * /* errbug ATS_UNUSED */, int /* errbuf_size ATS_UNUSED */)
 {
   DEBUG_LOG("slice remap initializing.");
+  reserve_slice_block_arg();
   return TS_SUCCESS;
 }
 
@@ -422,9 +497,12 @@ TSPluginInit(int argc, char const *argv[])
   }
 
   globalConfig.fromArgs(argc - 1, argv + 1);
+  reserve_slice_block_arg();
 
   TSCont const global_read_request_contp(TSContCreate(global_read_request_hook, nullptr));
   global_read_resp_hdr_contp = TSContCreate(read_resp_hdr, nullptr);
+  global_first_block_contp   = TSContCreate(first_block_handler, nullptr);
+  TSContDataSet(global_first_block_contp, static_cast<void *>(&globalConfig));
 
   // Called immediately after the request header is read from the client
   TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, global_read_request_contp);

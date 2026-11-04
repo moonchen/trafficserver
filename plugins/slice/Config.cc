@@ -124,6 +124,8 @@ Config::fromArgs(int const argc, char const *const argv[])
     {const_cast<char *>("stats-prefix"),         required_argument, nullptr, 'x'},
     {const_cast<char *>("purge-probe-blocks"),   required_argument, nullptr, 'q'},
     {const_cast<char *>("purge-probe-header"),   required_argument, nullptr, 'H'},
+    {const_cast<char *>("inline-first-block"),   no_argument,       nullptr, 'n'},
+    {const_cast<char *>("block-read-retries"),   required_argument, nullptr, 'R'},
     {nullptr,                                    0,                 nullptr, 0  },
   };
 
@@ -236,6 +238,10 @@ Config::fromArgs(int const argc, char const *const argv[])
       m_min_size_to_slice = bytesread;
       DEBUG_LOG("Only slicing objects %" PRIu64 " bytes or larger", m_min_size_to_slice);
     } break;
+    case 'n': {
+      m_inline_first_block = true;
+      DEBUG_LOG("Serving GETs from the block that holds their first byte, in the client transaction");
+    } break;
     case 'z': {
       try {
         size_t size = std::stoul(optarg);
@@ -263,6 +269,15 @@ Config::fromArgs(int const argc, char const *const argv[])
     case 'H': {
       m_purge_probe_header.assign(optarg);
       DEBUG_LOG("Using purge probe header %s", optarg);
+    } break;
+    case 'R': {
+      int const retriesread = atoi(optarg);
+      if (0 <= retriesread) {
+        m_block_read_retries = retriesread;
+        DEBUG_LOG("Using block read retries %d", m_block_read_retries);
+      } else {
+        ERROR_LOG("Invalid block-read-retries: %s", optarg);
+      }
     } break;
     default:
       break;
@@ -391,6 +406,15 @@ Config::isKnownLargeObj(std::string_view url)
   return false;
 }
 
+std::optional<uint64_t>
+Config::sizeCacheGet(std::string_view url)
+{
+  if (!m_oscache) {
+    return std::nullopt;
+  }
+  return m_oscache->get(url);
+}
+
 void
 Config::sizeCacheAdd(std::string_view url, uint64_t size)
 {
@@ -407,6 +431,32 @@ Config::sizeCacheRemove(std::string_view url)
     DEBUG_LOG("Removing url from cache: %.*s", static_cast<int>(url.size()), url.data());
     m_oscache->remove(url);
   }
+}
+
+void
+Config::wholeObjectAdd(std::string_view url)
+{
+  if (!rememberWholeObjects()) {
+    return;
+  }
+  std::call_once(m_whole_objects_once, [this]() { m_whole_objects.emplace(wholeobjectsmax); });
+  DEBUG_LOG("Upstream sent the whole object: %.*s", static_cast<int>(url.size()), url.data());
+  m_whole_objects->set(url, 0);
+  m_whole_objects_used.store(true, std::memory_order_release);
+}
+
+void
+Config::wholeObjectRemove(std::string_view url)
+{
+  if (hasWholeObjects()) {
+    m_whole_objects->remove(url);
+  }
+}
+
+bool
+Config::isWholeObject(std::string_view url)
+{
+  return hasWholeObjects() && m_whole_objects->get(url).has_value();
 }
 
 std::pair<bool, BgBlockFetch *>

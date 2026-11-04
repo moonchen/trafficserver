@@ -54,6 +54,10 @@ Examining the responses from origin, we decide to trigger a background fetch of 
    response is cacheable. This uses the new API :func:`TSHttpTxnIsCacheable()`, which also implies
    honoring current Traffic Server configurations.
 
+*  The request is not one of the :ref:`admin-plugins-slice`'s block requests. Slice stores
+   the blocks it requests, and a background fetch of the whole object would make slice fetch
+   every block of it.
+
 
 Once deemed a good candidate to performance a background fetch, we'll replay the original client
 request through the Traffic Server proxy again, except this time eliminating the ``Range`` header.

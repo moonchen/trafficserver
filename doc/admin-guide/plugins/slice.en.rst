@@ -130,6 +130,11 @@ The slice plugin supports the following options::
     --skip-header=<header name> (default: X-Slicer-Info)
         Header name used by the slice plugin after the loopback
         to indicate that the slice plugin should be skipped.
+        Slice's own block requests always have a Range, so a GET that has
+        this header but no Range is sliced: it is a copy of a block request
+        that another plugin made for the whole object, as the prefetch
+        plugin does for the next objects.  Slicing it stores the object as
+        the blocks that later requests look up.
         -s for short
 
     --crr-ident-header=<header name> (default: X-Crr-Ident)
@@ -148,6 +153,29 @@ The slice plugin supports the following options::
         with miss or hit-stale status. Especially for large objects, prefetching
         can improve cache miss latency.
         -f for short
+
+    --block-read-retries=<int> (optional)
+        Default is 5
+        Concurrent requests for the same uncached block all miss in the
+        cache until the first of them opens the block's cache write.  With
+        :ts:cv:`proxy.config.http.cache.open_write_fail_action` ``0`` or ``2``,
+        each request that missed in that window fetches the whole block from
+        the origin again, without caching it.  Slice therefore makes its block
+        requests retry the cache read instead, and read the block from the
+        request that writes it: it sets the write fail action to ``5`` (from
+        ``0``) or ``6`` (from ``2``) for its block requests, and raises
+        :ts:cv:`proxy.config.http.cache.max_open_read_retries` to this value.
+        Each cache read waits for the writer's first fragment as long as
+        :ts:cv:`proxy.config.cache.read_while_writer.max_retries` allows, so a
+        block request waits for another request's fetch at most this many
+        times, and then fetches the block itself, uncached.  A block
+        request that finds the writer gone also fetches the block itself.  The
+        other write fail actions, which return an error, are left as they are.
+        This relies on :ts:cv:`proxy.config.cache.enable_read_while_writer`.
+        ``0`` leaves the cache settings of block requests alone.  With
+        ``--remap-host``, the block requests go through the loopback rule,
+        which slice is not part of; set the same values there with
+        `conf_remap`.
 
     --strip-range-for-head (optional)
         Enable slice plugin to strip Range header for HEAD requests.
@@ -185,6 +213,59 @@ The slice plugin supports the following options::
         will communicate with `cache_range_requests` using an internal header
         that causes `cache_range_requests` to be bypassed in such requests, and
         allow ATS to handle those range requests internally.
+
+    --inline-first-block (optional)
+        Serve a GET in the client's own transaction instead of intercepting
+        it.  Slice turns the request into the request for the block that holds
+        the first byte the client asked for (block 0 for a whole-object GET),
+        as it would send that block itself, and the rest of the remap chain
+        handles it like a block request.  The decision waits for the response:
+
+        - A block that already is the client's response (the whole object, or
+          exactly the requested range) is sent as a 200 or a 206.  It takes
+          one transaction and is stored as that block.
+        - Otherwise slice sends the client's part of the block, followed by
+          the rest of the requested bytes, which it requests block by block in
+          the client's transaction, without an intercept.  As when slicing,
+          these block requests carry the first block's identity,
+          ``--prefetch-count`` applies when the first block missed, and a
+          block from a newer version of the object ends the response and
+          requests block 0 again so that the next request is consistent.
+        - On a fresh cache hit, a range that lies inside one block is served
+          by ATS's own range support, which reads only the requested bytes
+          from the cache, unless another transaction is still writing the
+          block; then slice cuts the range out of the block as it arrives.
+          If the range ends inside a later block that is already cached,
+          slice stops reading that block at the end of the range.
+        - A range that starts at or past the end of the object gets a 416.
+        - A 200 from an origin that ignores Range reaches the client unchanged
+          (see "Origins That Ignore Range" below).
+        - A 416 for a zero-length object becomes an empty 200.
+        - A 206 without a usable Content-Range becomes a 502.
+        - Other statuses reach the client unchanged.
+
+        The decision follows the response that ATS actually serves, so a stale
+        block that ATS serves because revalidation failed is handled like a
+        fresh one.  A partial block is never sent as if it were the client's
+        whole response: if the rest cannot follow, the connection is closed.
+
+        As when slicing, each block is read as fast as it arrives, and the
+        next block is requested only while at most one block waits for the
+        client, so a slow client holds about two blocks.  If the client
+        aborts while the first block arrives, the cache write of that block
+        continues as a background fill, subject to
+        :ts:cv:`proxy.config.http.background_fill_completed_threshold`.
+
+        Suffix ranges (``bytes=-n``), multiple ranges, invalid ranges, HEAD,
+        PURGE and conditional requests are sliced as usual.  The rule must
+        include `cache_range_requests` after slice.  With
+        --metadata-cache-size, slice also remembers URLs found to be larger
+        than one block and slices whole-object GETs for them directly.
+
+        The first block is the client's own transaction, with the block's
+        Range, until `cache_range_requests` removes it.  `background_fetch`
+        recognizes it as one of slice's block requests and does not fetch
+        the whole object for it, wherever it runs.
 
     --purge-probe-blocks=<int> (optional)
         Default is 8
@@ -348,6 +429,31 @@ as the reference slice instead of the asset slice 0.  This option is
 faster as it does not visit any slices outside those needed to fulfill
 a request. This option may cause serious out of sync issues as range
 requests may end up being served from temporally different assets.
+
+Blocks That Are Not Stored
+--------------------------
+
+When the transaction for a block will not store it, for example because
+:ref:`admin-plugins-cache-promote` has not promoted the object yet,
+`cache_range_requests` asks upstream for less than the block.  For the first
+block of a client request it asks for the client's own request: the client's
+range, or the whole object without a Range for a whole-object GET, and the
+response reaches the client unchanged.  For a later block it asks for the part
+of the block that the client needs.  So a request that is not stored costs
+upstream no more than it would without slice.  cache_promote counts slice's
+block requests per object.
+
+Origins That Ignore Range
+-------------------------
+
+An upstream that ignores Range answers a block request with a 200 for the
+whole object.  The client gets that 200, as it would without slice.
+`cache_range_requests` stores it only for the request for block 0, which slice
+reads first without ``--inline-first-block`` or ``--ref-relative``.  A fresh copy
+there serves the client's range as a 206.  With those options the first block
+is the one that holds the start of the client's range, so slice remembers such
+objects, up to 4096 per remap rule, and requests block 0 for every later range
+of them.  A 206 for the object makes slice forget it again.
 
 Purge Requests
 --------------

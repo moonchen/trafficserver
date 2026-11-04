@@ -25,10 +25,10 @@
 #include "prefetch.h"
 
 bool
-BgBlockFetch::schedule(Data *const data, int blocknum, std::string_view url)
+BgBlockFetch::schedule(BlockSource const &source, int blocknum, std::string_view url)
 {
   std::string key     = std::string(url) + ':' + std::to_string(blocknum);
-  auto [acquired, bg] = data->m_config->prefetchAcquire(key);
+  auto [acquired, bg] = source.config->prefetchAcquire(key);
 
   if (!acquired) {
     DEBUG_LOG("Prefetch already in flight for block %d, skipping", blocknum);
@@ -41,10 +41,10 @@ BgBlockFetch::schedule(Data *const data, int blocknum, std::string_view url)
   }
 
   bg->m_blocknum = blocknum;
-  bg->m_config   = data->m_config;
+  bg->m_config   = source.config;
   bg->m_key      = std::move(key);
 
-  if (bg->fetch(data)) {
+  if (bg->fetch(source)) {
     return true;
   } else {
     bg->m_config->prefetchRelease(bg);
@@ -86,7 +86,7 @@ Config::prefetchCleanup()
  * Initialize and schedule the background fetch
  */
 bool
-BgBlockFetch::fetch(Data *const data)
+BgBlockFetch::fetch(BlockSource const &source)
 {
   if (m_stream.m_read.isOpen()) {
     // should never happen since the connection was just initialized
@@ -94,8 +94,8 @@ BgBlockFetch::fetch(Data *const data)
     return false;
   }
 
-  int64_t const blockbeg = (data->m_config->m_blockbytes * m_blocknum);
-  Range         blockbe(blockbeg, blockbeg + data->m_config->m_blockbytes);
+  int64_t const blockbeg = (source.config->m_blockbytes * m_blocknum);
+  Range         blockbe(blockbeg, blockbeg + source.config->m_blockbytes);
 
   char       rangestr[1024];
   int        rangelen = sizeof(rangestr);
@@ -105,7 +105,7 @@ BgBlockFetch::fetch(Data *const data)
   DEBUG_LOG("Request background block: %s", rangestr);
 
   // reuse the incoming client header, just change the range
-  HttpHeader header(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr);
+  HttpHeader header = source.header;
 
   // add/set sub range key and add slicer tag
   bool const rangestat = header.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, rangelen);
@@ -122,11 +122,11 @@ BgBlockFetch::fetch(Data *const data)
 
   // create virtual connection back into ATS
   TSHttpConnectOptions options = TSHttpConnectOptionsGet(TS_CONNECT_PLUGIN);
-  options.addr                 = reinterpret_cast<sockaddr *>(&data->m_client_ip);
+  options.addr                 = reinterpret_cast<sockaddr const *>(source.client_ip);
   options.tag                  = PLUGIN_NAME;
   options.id                   = 0;
-  options.buffer_index         = data->m_buffer_index;
-  options.buffer_water_mark    = data->m_buffer_water_mark;
+  options.buffer_index         = source.buffer_index;
+  options.buffer_water_mark    = source.buffer_water_mark;
 
   TSVConn const upvc = TSHttpConnectPlugin(&options);
 

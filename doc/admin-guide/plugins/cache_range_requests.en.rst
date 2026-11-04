@@ -237,6 +237,10 @@ The preferred means of using this plugin option is with the following plugins:
 - cachekey to control the cache key, including the `Range` header normalized by slice
 - cache range requests with `--no-modify-cachekey` and `--cache-complete-responses`
 
+Requests that the :ref:`admin-plugins-slice` sends for its blocks do not depend on
+this option: a complete response is stored for the request for block 0, and for no
+other block, so that an object has one complete copy, where slice looks for it.
+
 Configuration examples
 ======================
 

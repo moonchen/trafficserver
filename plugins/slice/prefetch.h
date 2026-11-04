@@ -31,14 +31,38 @@
 #include "Config.h"
 
 /**
+ * @brief What a background block request is built from.
+ */
+struct BlockSource {
+  Config                 *config;
+  HttpHeader              header; // request template; the fetch sets its Range
+  sockaddr_storage const *client_ip;
+  TSIOBufferSizeIndex     buffer_index;
+  TSIOBufferWaterMark     buffer_water_mark;
+
+  static BlockSource
+  from(Data *const data)
+  {
+    return {data->m_config, HttpHeader(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr), &data->m_client_ip,
+            data->m_buffer_index, data->m_buffer_water_mark};
+  }
+};
+
+/**
  * @brief Represents a single background fetch.
  */
 struct BgBlockFetch {
-  static bool schedule(Data *const data, int blocknum, std::string_view url);
+  static bool schedule(BlockSource const &source, int blocknum, std::string_view url);
+
+  static bool
+  schedule(Data *const data, int blocknum, std::string_view url)
+  {
+    return schedule(BlockSource::from(data), blocknum, url);
+  }
 
   BgBlockFetch() = default;
 
-  bool       fetch(Data *const data);
+  bool       fetch(BlockSource const &source);
   static int handler(TSCont contp, TSEvent event, void * /* edata ATS_UNUSED */);
   void       clear();
 

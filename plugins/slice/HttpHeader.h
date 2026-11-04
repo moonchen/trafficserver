@@ -39,6 +39,9 @@
 constexpr std::string_view SLICE_CRR_HEADER = {"Slice-Crr-Status"};
 constexpr std::string_view SLICE_CRR_VAL    = "1";
 
+// cache_range_requests requests this instead of a block that will not be stored: a range, or "-" for the whole object.
+constexpr std::string_view SLICE_UNSTORED_HEADER = {"Slice-Crr-Unstored-Range"};
+
 // extent of the object a PURGE removed, reported by ATS on a successful purge.
 // Emitted by HttpTransact::delete_all_document_alternates_and_return.
 constexpr std::string_view PURGED_CONTENT_RANGE = {"X-Purged-Content-Range"};

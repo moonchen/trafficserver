@@ -194,7 +194,7 @@ def assert_response(
 
 
 def run_small_object_round(*, _ats: ATS, _curl: Curl) -> None:
-    """Verify normalized ranges share a complete 200 response.
+    """Verify normalized ranges share a complete 200 response, which serves a fresh hit by the client's range.
 
     :param _ats: Test-local ats configured by the test.
     :param _curl: Test-local curl configured by the test.
@@ -203,12 +203,22 @@ def run_small_object_round(*, _ats: ATS, _curl: Curl) -> None:
     key = r"X-Cache-Key: /.*?/Range:bytes=0-4194303/obj"
     assert_response(request("/obj", "0-5000", "SMALL", _ats=_ats, _curl=_curl), status="200 OK", cache="miss, none", cache_key=key)
     assert_response(
-        request("/obj", "5001-5999", "SMALL", _ats=_ats, _curl=_curl), status="200 OK", cache="hit-fresh, none", cache_key=key)
+        request("/obj", "5001-5999", "SMALL", _ats=_ats, _curl=_curl),
+        status="206 Partial Content",
+        cache="hit-fresh, none",
+        cache_key=key,
+        content_range="5001-5999/10000",
+    )
     time.sleep(2)
     assert_response(
         request("/obj", "0-403", "SMALL-INM", _ats=_ats, _curl=_curl), status="200 OK", cache="hit-stale, none", cache_key=key)
     assert_response(
-        request("/obj", "0-3999", "SMALL", _ats=_ats, _curl=_curl), status="200 OK", cache="hit-fresh, none", cache_key=key)
+        request("/obj", "0-3999", "SMALL", _ats=_ats, _curl=_curl),
+        status="206 Partial Content",
+        cache="hit-fresh, none",
+        cache_key=key,
+        content_range="0-3999/10000",
+    )
 
 
 def run_sliced_object_round(*, _ats: ATS, _curl: Curl) -> None:

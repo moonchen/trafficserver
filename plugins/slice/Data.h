@@ -75,6 +75,7 @@ struct Data {
   int64_t m_blocknum{-1};     // block number to work on, -1 bad/stop
   int64_t m_blockexpected{0}; // body bytes expected
   int64_t m_blockskip{0};     // number of bytes to skip in this block
+  int64_t m_blockoffset{0};   // start of the response in the block: only the client's part of an unstored block
   int64_t m_blockconsumed{0}; // body bytes consumed
 
   int64_t      m_purge_hits{0};                    // blocks a purge actually removed

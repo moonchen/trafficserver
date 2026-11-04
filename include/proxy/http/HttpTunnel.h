@@ -440,6 +440,7 @@ public:
   void    chain_finish_all(HttpTunnelProducer *p);
   void    chain_abort_cache_write(HttpTunnelProducer *p);
   void    chain_abort_all(HttpTunnelProducer *p);
+  void    abort_transform(HttpTunnelProducer *p);
   void    abort_cache_write_finish_others(HttpTunnelProducer *p);
   void    append_message_to_producer_buffer(HttpTunnelProducer *p, const char *msg, int64_t msg_len);
   int64_t final_consumer_bytes_to_write(HttpTunnelProducer *p, HttpTunnelConsumer *c);

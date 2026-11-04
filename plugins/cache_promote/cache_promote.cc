@@ -27,6 +27,7 @@
 
 const char *PLUGIN_NAME = "cache_promote";
 int         TXN_ARG_IDX;
+int         SLICE_BLOCK_ARG_IDX = -1;
 DbgCtl      cache_promote_dbg_ctl{PLUGIN_NAME};
 
 // This has to be a global here. I tried doing a classic singleton (with a getInstance()) in the PolicyManager,
@@ -128,6 +129,11 @@ TSRemapInit(TSRemapInterface *api_info, char *errbuf, int errbuf_size)
   if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, PLUGIN_NAME, "cache_promote URL hash key", &TXN_ARG_IDX)) {
     strncpy(errbuf, "[tsremap_init] - Failed to reserve the TXN user argument slot", errbuf_size - 1);
     return TS_ERROR;
+  }
+
+  // Reserved under the same name by slice, whichever plugin loads first.
+  if (TS_SUCCESS != TSUserArgIndexReserve(TS_USER_ARGS_TXN, "slice.block", "slice block request", &SLICE_BLOCK_ARG_IDX)) {
+    TSError("[%s] Failed to reserve the slice.block transaction argument", PLUGIN_NAME);
   }
 
   DBG("remap plugin is successfully initialized, TXN_IDX = %d", TXN_ARG_IDX);

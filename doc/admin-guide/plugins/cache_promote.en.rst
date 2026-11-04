@@ -89,6 +89,13 @@ If :option:`--policy` is set to ``lru`` the following options are also available
 These options combined with your usage patterns will control how likely a
 URL is to become promoted to enter the cache.
 
+The LRU policy counts the requests that the :ref:`admin-plugins-slice` sends for
+the blocks of an object as requests for the object: their cache key without the
+block's ``bytes=<first>-<last>`` range. A promoted object stays promoted while it
+remains in the LRU, so that each of its blocks is stored by whichever request
+first misses it. Slice's intercept sends its block requests as internal requests,
+so they are counted only with :option:`--internal-enabled`.
+
 Examples
 --------
 

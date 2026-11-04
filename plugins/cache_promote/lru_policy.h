@@ -62,8 +62,8 @@ public:
     return *this;
   }
 
-  // Initialize the hash key from the TXN's URL
-  bool initFromUrl(TSHttpTxn txnp);
+  // Initialize the hash key from the TXN's cache lookup URL, without the block range for a slice block request
+  bool initFromUrl(TSHttpTxn txnp, bool slice_block);
 
 private:
   u_char _hash[SHA_DIGEST_LENGTH];
@@ -83,7 +83,8 @@ struct LRUHashHasher {
   }
 };
 
-using LRUEntry = std::tuple<LRUHash, unsigned, int64_t>;
+// The hash, the hits and bytes so far, and whether the entry stays promoted (only for slice blocks)
+using LRUEntry = std::tuple<LRUHash, unsigned, int64_t, bool>;
 using LRUList  = std::list<LRUEntry>;
 using LRUMap   = std::unordered_map<const LRUHash *, LRUList::iterator, LRUHashHasher, LRUHashHasher>;
 
