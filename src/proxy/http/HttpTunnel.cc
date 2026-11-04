@@ -985,6 +985,11 @@ HttpTunnel::producer_run(HttpTunnelProducer *p)
     }
   }
 
+  // Before the chunked handler copies the read buffer's water mark into its own buffers.
+  if (cache_write_consumer != nullptr) {
+    _start_cache_write_lead(p);
+  }
+
   // Determine whether the producer is to perform chunking,
   // dechunking, or chunked-passthough of the incoming response.
   TunnelChunkingAction_t action = p->chunking_action;
@@ -1647,17 +1652,21 @@ HttpTunnel::_should_reenable_for_tunnel_chain_fc(HttpTunnelConsumer *c)
   HttpTunnelProducer *p = c->producer;
 
   if (p && p->alive) {
+    HttpTunnelProducer *srcp = p->flow_control_source;
+    // A cache write lead lets the source run that far ahead of its slowest consumer, so the water marks move up with it.
+    uint64_t const lead       = (srcp != nullptr ? srcp : p)->cache_write_lead;
+    uint64_t const high_water = std::max<uint64_t>(flow_state.high_water, lead);
+    uint64_t const low_water  = flow_state.low_water + (high_water - flow_state.high_water);
+
     // Only do flow control if enabled and the producer is an external
     // source.  Otherwise disable by making the backlog zero. Because
     // the backlog short cuts quit when the value is equal (or
     // greater) to the target, we use strict comparison only for
     // checking low water, otherwise the flow control can stall out.
-    uint64_t            backlog = (flow_state.enabled_p && p->is_source()) ? p->backlog(flow_state.high_water) : 0;
-    HttpTunnelProducer *srcp    = p->flow_control_source;
+    uint64_t backlog = (flow_state.enabled_p && p->is_source()) ? p->backlog(high_water) : 0;
 
-    ATS_PROBE5(tunnel_flow_control, sm->sm_id, static_cast<int>(c->vc_type), backlog, flow_state.high_water,
-               p->is_throttled() ? 1 : 0);
-    if (backlog >= flow_state.high_water) {
+    ATS_PROBE5(tunnel_flow_control, sm->sm_id, static_cast<int>(c->vc_type), backlog, high_water, p->is_throttled() ? 1 : 0);
+    if (backlog >= high_water) {
       if (dbg_ctl_http_tunnel.on()) {
         Dbg(dbg_ctl_http_tunnel, "[%" PRId64 "] Throttle   %p %" PRId64 " / %" PRId64, sm->sm_id, p, backlog, p->backlog());
       }
@@ -1671,9 +1680,9 @@ HttpTunnel::_should_reenable_for_tunnel_chain_fc(HttpTunnelConsumer *c)
         // if they are the same because we know low water <= high
         // water so the value is sufficiently accurate.
         if (srcp != p) {
-          backlog = srcp->backlog(flow_state.low_water);
+          backlog = srcp->backlog(low_water);
         }
-        if (backlog < flow_state.low_water) {
+        if (backlog < low_water) {
           if (dbg_ctl_http_tunnel.on()) {
             Dbg(dbg_ctl_http_tunnel, "[%" PRId64 "] Unthrottle %p %" PRId64 " / %" PRId64, sm->sm_id, p, backlog, p->backlog());
           }
@@ -1701,6 +1710,57 @@ HttpTunnel::_should_reenable_for_tunnel_chain_fc(HttpTunnelConsumer *c)
   }
 
   return false;
+}
+
+namespace
+{
+void
+set_producer_water_mark(HttpTunnelProducer *p, int64_t water_mark)
+{
+  for (MIOBuffer *buffer : {p->read_buffer, p->chunked_handler.chunked_buffer, p->chunked_handler.dechunked_buffer}) {
+    if (buffer != nullptr) {
+      buffer->water_mark = water_mark;
+    }
+  }
+}
+} // end anonymous namespace
+
+/**
+  A consumer that reads slower than the server, usually the client, holds back the server read, and with it the cache
+  write and every request that reads the object while it is written.  With a cache write lead the read runs up to that
+  many bytes ahead of the slowest consumer before it waits, so a slow client paces the cache write only past the lead.
+ */
+void
+HttpTunnel::_start_cache_write_lead(HttpTunnelProducer *p)
+{
+  int64_t const lead = sm->t_state.txn_conf->cache_max_write_lead;
+
+  // Without another consumer the cache write itself is the slowest one.
+  if (p->vc_type != HttpTunnelType_t::HTTP_SERVER || p->num_consumers < 2 || lead <= p->read_buffer->water_mark) {
+    return;
+  }
+  Dbg(dbg_ctl_http_tunnel, "[%" PRId64 "] %s reads up to %" PRId64 " bytes ahead of its slowest consumer", sm->sm_id, p->name,
+      lead);
+  p->cache_write_lead        = lead;
+  p->water_mark_without_lead = p->read_buffer->water_mark;
+  set_producer_water_mark(p, lead);
+}
+
+/// Once no cache write is left, the lead buffers only for the other consumers, so the read waits for them again.
+void
+HttpTunnel::_end_cache_write_lead(HttpTunnelProducer *p)
+{
+  if (p->cache_write_lead == 0) {
+    return;
+  }
+  for (HttpTunnelConsumer const *c = p->consumer_list.head; c != nullptr; c = c->link.next) {
+    if (c->alive && c->vc_type == HttpTunnelType_t::CACHE_WRITE) {
+      return;
+    }
+  }
+  Dbg(dbg_ctl_http_tunnel, "[%" PRId64 "] %s no longer reads ahead of its slowest consumer", sm->sm_id, p->name);
+  p->cache_write_lead = 0;
+  set_producer_water_mark(p, p->water_mark_without_lead);
 }
 
 //
@@ -1781,6 +1841,10 @@ HttpTunnel::consumer_handler(int event, HttpTunnelConsumer *c)
       }
     }
     sm_callback = true;
+
+    if (c->vc_type == HttpTunnelType_t::CACHE_WRITE) {
+      _end_cache_write_lead(p);
+    }
 
     // Deallocate the reader after calling back the sm
     //  because buffer problems are easier to debug
@@ -2030,6 +2094,7 @@ HttpTunnel::chain_abort_cache_write(HttpTunnelProducer *p)
     }
     c = c->link.next;
   }
+  _end_cache_write_lead(p);
 }
 
 // void HttpTunnel::close_vc(HttpTunnelProducer* p)

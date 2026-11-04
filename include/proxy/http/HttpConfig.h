@@ -759,6 +759,9 @@ struct OverridableHttpConfigParams {
   MgmtInt max_cache_open_write_retries       = 1;
   MgmtInt max_cache_open_write_retry_timeout = 0; // time in mseconds
 
+  /// How many bytes the server read that feeds a cache write may run ahead of the transaction's slowest other reader.
+  MgmtInt cache_max_write_lead = 0;
+
   MgmtInt background_fill_active_timeout = 60;
 
   MgmtInt  http_chunking_size         = 4096; ///< Maximum chunk size for chunked output.
