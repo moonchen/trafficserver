@@ -369,6 +369,13 @@ Any extra bytes at the end of the last block are consumed by the
 Slice plugin to allow cache_range_requests to finish the block fetch to
 ensure the block is cached.
 
+Slice raises :ts:cv:`proxy.config.http.cache.max_write_lead` to the block
+size for its block requests, including the first block of
+``--inline-first-block``.  A block is then read from upstream and written to
+cache at upstream speed even when its client reads slowly, so the requests that
+read the block while it is written do not wait for that client.  With
+``--remap-host``, set the same value on the loopback rule with `conf_remap`.
+
 Self Healing
 ------------
 
