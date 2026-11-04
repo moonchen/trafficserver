@@ -284,6 +284,14 @@ public:
     READ_RETRY,
   };
 
+  // A plugin's second cache lookup after a miss (TSHttpTxnCacheLookupAgain)
+  enum class CacheRelookup_t {
+    NONE,
+    REQUESTED,
+    IN_PROGRESS,
+    DONE,
+  };
+
   enum class ClientTransactionResult_t {
     UNDEFINED,
     HIT_FRESH,
@@ -497,6 +505,21 @@ public:
     SquidHitMissCode hit_miss_code        = SQUID_MISS_NONE;
     URL             *parent_selection_url = nullptr;
     URL              parent_selection_url_storage;
+
+    // The key a plugin named at READ_RESPONSE_HDR for the cache write (TSHttpTxnCacheWriteUrlSet).
+    URL write_url;
+
+    // A second lookup after a miss. relookup_url holds the key to look up, and then the first lookup's key, so that a
+    // miss can return to it with the first lookup's cache action, write lock state, request time and return point.
+    CacheRelookup_t  relookup_state = CacheRelookup_t::NONE;
+    URL              relookup_url;
+    URL             *relookup_first                       = nullptr;
+    CacheAction_t    relookup_action                      = CacheAction_t::UNDEFINED;
+    CacheWriteLock_t relookup_lock                        = CacheWriteLock_t::INIT;
+    SquidHitMissCode relookup_hit_miss_code               = SQUID_MISS_NONE;
+    ink_time_t       relookup_request_sent_time           = 0;
+    MgmtByte         relookup_write_fail_action           = 0;
+    void (*relookup_return_point)(HttpTransact::State *s) = nullptr;
 
     const CacheHostRecord *volume_host_rec = nullptr;
 
@@ -897,6 +920,8 @@ public:
       cache_info.lookup_url_storage.destroy();
       cache_info.parent_selection_url_storage.destroy();
       cache_info.original_url.destroy();
+      cache_info.write_url.destroy();
+      cache_info.relookup_url.destroy();
       cache_info.object_store.destroy();
       cache_info.transform_store.destroy();
       redirect_info.original_url.destroy();

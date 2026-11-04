@@ -4927,6 +4927,58 @@ TSHttpTxnCacheLookupUrlSet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc obj)
 }
 
 TSReturnCode
+TSHttpTxnCacheWriteUrlSet(TSHttpTxn txnp, const char *url, int length)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)url) == TS_SUCCESS);
+
+  HttpSM              *sm = reinterpret_cast<HttpSM *>(txnp);
+  HttpTransact::State &s  = sm->t_state;
+
+  if (s.api_next_action != HttpTransact::StateMachineAction_t::API_READ_RESPONSE_HDR ||
+      sm->get_cache_sm().cache_write_vc == nullptr || s.cache_info.object_read != nullptr || s.redirect_info.redirect_in_process) {
+    return TS_ERROR;
+  }
+  if (length < 0) {
+    length = strlen(url);
+  }
+  s.cache_info.write_url.create(nullptr);
+  if (s.cache_info.write_url.parse(url, length) != ParseResult::DONE) {
+    s.cache_info.write_url.destroy();
+    return TS_ERROR;
+  }
+  Dbg(dbg_ctl_cache_url, "[TSHttpTxnCacheWriteUrlSet] moving the cache write to: %.*s", length, url);
+  return TS_SUCCESS;
+}
+
+TSReturnCode
+TSHttpTxnCacheLookupAgain(TSHttpTxn txnp, const char *url, int length)
+{
+  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+  sdk_assert(sdk_sanity_check_null_ptr((void *)url) == TS_SUCCESS);
+
+  HttpSM              *sm = reinterpret_cast<HttpSM *>(txnp);
+  HttpTransact::State &s  = sm->t_state;
+
+  if (s.api_next_action != HttpTransact::StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE ||
+      s.cache_lookup_result != HttpTransact::CacheLookupResult_t::MISS ||
+      s.cache_info.relookup_state != HttpTransact::CacheRelookup_t::NONE || s.redirect_info.redirect_in_process) {
+    return TS_ERROR;
+  }
+  if (length < 0) {
+    length = strlen(url);
+  }
+  s.cache_info.relookup_url.create(nullptr);
+  if (s.cache_info.relookup_url.parse(url, length) != ParseResult::DONE) {
+    s.cache_info.relookup_url.destroy();
+    return TS_ERROR;
+  }
+  s.cache_info.relookup_state = HttpTransact::CacheRelookup_t::REQUESTED;
+  Dbg(dbg_ctl_cache_url, "[TSHttpTxnCacheLookupAgain] looking up: %.*s", length, url);
+  return TS_SUCCESS;
+}
+
+TSReturnCode
 TSHttpTxnCacheKeyDigestGet(TSHttpTxn txnp, char *buffer, int *length)
 {
   sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);

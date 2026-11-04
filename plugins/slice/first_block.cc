@@ -22,16 +22,38 @@
 
 #include "Config.h"
 #include "HttpHeader.h"
+#include "Range.h"
 #include "slice.h"
 
+#include <cinttypes>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace
 {
 constexpr char const *SLICE_BLOCK_ARG = "slice.block";
 int                   slice_block_arg_idx{-1};
-char                  slice_block_mark{0};
+// The argument points to one of these. cache_range_requests stores a complete response (a 200) of a block request
+// under the request's cache key only for slice_whole_mark, or when the request is for block 0.
+char slice_block_mark{'b'};
+char slice_whole_mark{'w'};
+// A first block request that looks for the complete copy under block 0's key.
+char slice_relookup_mark{'l'};
+
+void
+set_mark(TSHttpTxn txnp, char *const mark)
+{
+  if (0 <= slice_block_arg_idx) {
+    TSUserArgSet(txnp, slice_block_arg_idx, mark);
+  }
+}
+
+bool
+has_mark(TSHttpTxn txnp, char const *const mark)
+{
+  return 0 <= slice_block_arg_idx && mark == TSUserArgGet(txnp, slice_block_arg_idx);
+}
 
 // The client's Range, which the skip header carries to the block transaction, or empty for a whole-object GET.
 std::string_view
@@ -78,6 +100,48 @@ serve_client_range_from_copy(TSHttpTxn txnp, Config const *const config)
   return request.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, range.data(), range.size());
 }
 
+/** cache_range_requests keys a block as <URL>-<the block's Range>. If the transaction's cache key is a block's key,
+  return that block's number and the key of block @a target of the same object.
+ */
+bool
+block_key(TSHttpTxn txnp, Config const *const config, int64_t const target, int64_t &blocknum, std::string &key)
+{
+  TSMBuffer const buf = TSMBufferCreate();
+  TSMLoc          loc = TS_NULL_MLOC;
+  bool            got = false;
+  if (TS_SUCCESS == TSUrlCreate(buf, &loc) && TS_SUCCESS == TSHttpTxnCacheLookupUrlGet(txnp, buf, loc)) {
+    int         len = 0;
+    char *const str = TSUrlStringGet(buf, loc, &len);
+    if (nullptr != str) {
+      key.assign(str, len);
+      got = true;
+      TSfree(str);
+    }
+  }
+  if (TS_NULL_MLOC != loc) {
+    TSHandleMLocRelease(buf, TS_NULL_MLOC, loc);
+  }
+  TSMBufferDestroy(buf);
+
+  int64_t const     blockbytes = config->m_blockbytes;
+  std::size_t const dash       = got ? key.rfind("-bytes=") : std::string::npos;
+  Range             block;
+  if (std::string::npos == dash || !block.fromStringClosed(key.c_str() + dash + 1) || 0 != block.m_beg % blockbytes ||
+      blockbytes != block.m_end - block.m_beg) {
+    return false;
+  }
+  blocknum = block.m_beg / blockbytes;
+
+  char rangestr[64];
+  int  rangelen = sizeof(rangestr);
+  if (!Range(target * blockbytes, (target + 1) * blockbytes).toStringClosed(rangestr, &rangelen)) {
+    return false;
+  }
+  key.resize(dash + 1);
+  key.append(rangestr, rangelen);
+  return true;
+}
+
 void
 on_first_block_lookup(TSHttpTxn txnp, TSCont contp, Config const *const config)
 {
@@ -85,9 +149,24 @@ on_first_block_lookup(TSHttpTxn txnp, TSCont contp, Config const *const config)
   if (TS_SUCCESS != TSHttpTxnCacheLookupStatusGet(txnp, &status)) {
     return;
   }
+
+  // The second lookup found an object under block 0's key. Unless it is the complete copy, the block request continues
+  // as the miss of its own block, with the hook that the miss added.
+  if (has_mark(txnp, &slice_relookup_mark)) {
+    set_mark(txnp, &slice_block_mark);
+    if (TS_CACHE_LOOKUP_HIT_FRESH != status || !serve_client_range_from_copy(txnp, config)) {
+      DEBUG_LOG("No complete copy under block 0's key");
+      TSHttpTxnCacheLookupStatusSet(txnp, TS_CACHE_LOOKUP_MISS);
+    }
+    return;
+  }
+
   if (TS_CACHE_LOOKUP_MISS == status || TS_CACHE_LOOKUP_SKIPPED == status) {
-    if (config->rememberWholeObjects()) {
+    if (config->firstBlockVaries()) {
       TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
+      if (TS_CACHE_LOOKUP_MISS == status && look_up_whole_copy(txnp, config)) {
+        set_mark(txnp, &slice_relookup_mark);
+      }
     }
   } else if (TS_CACHE_LOOKUP_HIT_FRESH == status && serve_client_range_from_copy(txnp, config)) {
     TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
@@ -132,15 +211,26 @@ reserve_slice_block_arg()
 void
 mark_slice_block(TSHttpTxn txnp)
 {
-  if (0 <= slice_block_arg_idx) {
-    TSUserArgSet(txnp, slice_block_arg_idx, &slice_block_mark);
+  set_mark(txnp, &slice_block_mark);
+}
+
+bool
+look_up_whole_copy(TSHttpTxn txnp, Config const *const config)
+{
+  int64_t     blocknum = 0;
+  std::string key;
+  if (!config->m_whole_lookup || !block_key(txnp, config, 0, blocknum, key) || 0 == blocknum ||
+      TS_SUCCESS != TSHttpTxnCacheLookupAgain(txnp, key.data(), key.size())) {
+    return false;
   }
+  DEBUG_LOG("Block %" PRId64 " is not cached, looking for the complete copy under block 0's key", blocknum);
+  return true;
 }
 
 void
 note_block_answer(TSHttpTxn txnp, Config *const config)
 {
-  if (!config->rememberWholeObjects()) {
+  if (!config->firstBlockVaries()) {
     return;
   }
   TxnHdrMgr req;
@@ -150,7 +240,9 @@ note_block_answer(TSHttpTxn txnp, Config *const config)
   }
   HttpHeader const request(req.m_buffer, req.m_lochdr);
   HttpHeader const response(resp.m_buffer, resp.m_lochdr);
-  if (!request.hasKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE)) {
+  char             rangestr[1024];
+  int              rangelen = sizeof(rangestr);
+  if (!request.valueForKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, &rangelen)) {
     return;
   }
 
@@ -165,12 +257,33 @@ note_block_answer(TSHttpTxn txnp, Config *const config)
   if (nullptr == url) {
     return;
   }
-  std::string_view const key{url.get(), static_cast<size_t>(urllen)};
-  if (whole) {
-    config->wholeObjectAdd(key);
-  } else {
-    config->wholeObjectRemove(key);
+  std::string_view const urlkey{url.get(), static_cast<size_t>(urllen)};
+  if (!whole) {
+    config->wholeObjectRemove(urlkey);
+    return;
   }
+
+  Range         range;
+  int64_t const blocknum  = range.fromStringClosed(rangestr) && 0 <= range.m_beg ? range.m_beg / config->m_blockbytes : 0;
+  int64_t       copyblock = 0;
+  switch (config->m_whole_copy) {
+  case Config::WholeCopy::Block0:
+    break;
+  case Config::WholeCopy::Own:
+    copyblock = blocknum;
+    set_mark(txnp, &slice_whole_mark);
+    break;
+  case Config::WholeCopy::Move: {
+    int64_t     keyblock = 0;
+    std::string block0;
+    if (0 < blocknum && block_key(txnp, config, 0, keyblock, block0) && keyblock == blocknum &&
+        TS_SUCCESS == TSHttpTxnCacheWriteUrlSet(txnp, block0.data(), block0.size())) {
+      DEBUG_LOG("Moving the cache write of the whole object from block %" PRId64 " to block 0's key", blocknum);
+      set_mark(txnp, &slice_whole_mark);
+    }
+  } break;
+  }
+  config->wholeObjectAdd(urlkey, copyblock);
 }
 
 void

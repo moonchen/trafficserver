@@ -228,10 +228,17 @@ HttpCacheSM::state_cache_open_write(int event, void *data)
     Metrics::Gauge::increment(http_rsb.current_cache_connections);
     ink_assert(cache_write_vc == nullptr);
     cache_write_vc = static_cast<CacheVConnection *>(data);
+    write_once     = false;
     master_sm->handleEvent(event, &captive_action);
     break;
 
   case CACHE_EVENT_OPEN_WRITE_FAILED: {
+    if (write_once) {
+      write_once = false;
+      err_code   = reinterpret_cast<intptr_t>(data);
+      master_sm->handleEvent(event, &captive_action);
+      break;
+    }
     if (is_read_retry_write_fail_action(master_sm->t_state.txn_conf->cache_open_write_fail_action)) {
       // fall back to open_read_tries
       // Note that when READ_RETRY actions are configured, max_cache_open_write_retries
@@ -406,6 +413,15 @@ HttpCacheSM::open_read(const HttpCacheKey *key, URL *url, HTTPHdr *hdr, const Ov
 }
 
 Action *
+HttpCacheSM::open_write_once(const HttpCacheKey *key, URL *url, HTTPHdr *request, time_t pin_in_cache)
+{
+  write_once       = true;
+  open_write_tries = 0;
+  open_write_start = 0;
+  return open_write(key, url, request, nullptr, pin_in_cache, false, false);
+}
+
+Action *
 HttpCacheSM::open_write(const HttpCacheKey *key, URL *url, HTTPHdr *request, CacheHTTPInfo *old_info, time_t pin_in_cache,
                         bool retry, bool allow_multiple)
 {
@@ -434,7 +450,7 @@ HttpCacheSM::open_write(const HttpCacheKey *key, URL *url, HTTPHdr *request, Cac
   //  that must be revalidated every time)
   // Changed by YTS Team, yamsat Plugin
   // two criteria, either write retries over the amount OR timeout
-  if (open_write_tries > master_sm->redirection_tries && write_retry_done()) {
+  if (!write_once && open_write_tries > master_sm->redirection_tries && write_retry_done()) {
     err_code = -ECACHE_DOC_BUSY;
     master_sm->handleEvent(CACHE_EVENT_OPEN_WRITE_FAILED, &captive_action);
     return ACTION_RESULT_DONE;

@@ -397,6 +397,7 @@ private:
   // Cache Handlers
   int state_cache_open_read(int event, void *data);
   int state_cache_open_write(int event, void *data);
+  int state_cache_open_moved_write(int event, void *data);
 
   // Http Server Handlers
   int state_http_server_open(int event, void *data);
@@ -443,6 +444,9 @@ private:
   void do_cache_prepare_write_transform();
   void do_cache_prepare_update();
   void do_cache_prepare_action(HttpCacheSM *c_sm, CacheHTTPInfo *object_read_info, bool retry, bool allow_multiple = false);
+  void do_cache_move_write();
+  bool do_cache_relookup_after_api();
+  void cache_relookup_return_to_first();
   void do_cache_delete_all_alts();
   void do_cache_delete_compat_alts();
   void do_auth_callout();

@@ -368,3 +368,91 @@ def test_slice_whole_object_honored_again(ats_factory: ATSFactory, services: Ser
     assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20", "bytes=0-6", "bytes=14-20"]
     assert [scenario.stored(path, k) for k in range(3)] == [206, 504, 206]
     assert scenario.errors() == []
+
+
+DESIGNS = {
+    # Where the copy goes, and the slice options that select it.
+    "own": "@pparam=--whole-object-copy=own",
+    "move": "@pparam=--whole-object-copy=move",
+    "lookup": "@pparam=--whole-object-copy=move @pparam=--whole-object-lookup @pparam=--no-whole-object-table",
+}
+
+
+def design_rules(host: str, design: str) -> dict[str, str]:
+    """Return the remap rule for an upstream that may ignore Range, with one of the copy designs.
+
+    :param host: ``inline`` for --inline-first-block, ``relative`` for slice's intercept with --ref-relative.
+    :param design: Key of DESIGNS.
+    """
+
+    slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={WHOLE_BLOCK} {DESIGNS[design]}"
+    slice_args += " @pparam=--inline-first-block" if host == "inline" else " @pparam=--ref-relative"
+    return {host: f"{slice_args} {CRR}"}
+
+
+@pytest.mark.parametrize("design", DESIGNS)
+@pytest.mark.parametrize("host", ("inline", "relative"))
+def test_slice_whole_object_first_copy(
+        ats_factory: ATSFactory, services: ServiceFactory, curl: Curl, host: str, design: str) -> None:
+    """An upstream that ignores Range, first asked for block 2: the request that receives the object stores its one
+    copy, and every later range is a 206 from it. A PURGE through slice removes the copy.
+
+    own stores the copy under block 2's key and remembers that block. move moves the cache write to block 0's key and
+    remembers the object. lookup moves the write too, remembers nothing, and finds the copy by looking up block 0's key
+    when a later block misses.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    :param host: ``inline`` for --inline-first-block, ``relative`` for slice's intercept with --ref-relative.
+    :param design: Key of DESIGNS.
+    """
+
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, design_rules(host, design))
+    size = 31
+    path = f"/ignore/{size}"
+    assert_whole(scenario.get(host, path, "15-20"), size)
+    assert_range(scenario.get(host, path, "8-10"), size, 8, 11)
+    assert_range(scenario.get(host, path, "22-24"), size, 22, 25)
+    assert_range(scenario.get(host, path, "28-"), size, 28, 31)
+    assert_range(scenario.get(host, path, "0-3"), size, 0, 4)
+    assert_whole(scenario.get(host, path), size)
+
+    assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20"]
+    copy = 2 if design == "own" else 0
+    assert [scenario.stored(path, k) for k in range(5)] == [200 if k == copy else 504 for k in range(5)]
+    if design == "lookup":
+        # Each of the four later requests whose first block is not block 0 missed and looked up block 0's key.
+        assert scenario.debug_lines("looking for the complete copy under block 0's key") == 4
+
+    purge = scenario._request(host, path, ("--request", "PURGE"))
+    assert purge.status == 200, purge
+    assert [scenario.stored(path, k) for k in range(5)] == [504] * 5
+    assert scenario.errors() == []
+
+
+def test_slice_whole_object_lookup_normal(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
+    """An upstream that honors Range, with the lookup design: a block that misses looks up block 0's key, finds no copy
+    there (block 0 is a block, or nothing), and is fetched and stored as a block.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    """
+
+    scenario = Scenario(ats_factory, services, curl, WHOLE_BLOCK, design_rules("inline", "lookup"))
+    size = 31
+    path = f"/normal/{size}"
+    # Block 2 misses, and so does block 0's key. Then block 0 is stored, as a block.
+    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
+    assert_range(scenario.get("inline", path, "0-3"), size, 0, 4)
+    # Block 1 misses; block 0's key holds a block, not the copy.
+    assert_range(scenario.get("inline", path, "8-10"), size, 8, 11)
+    # A hit on block 2 needs no second lookup.
+    assert_range(scenario.get("inline", path, "15-20"), size, 15, 21)
+
+    assert [r["range"] for r in scenario.origin_requests(path)] == ["bytes=14-20", "bytes=0-6", "bytes=7-13"]
+    assert [scenario.stored(path, k) for k in range(3)] == [206] * 3
+    assert scenario.debug_lines("looking for the complete copy under block 0's key") == 2
+    assert scenario.debug_lines("No complete copy under block 0's key") == 1
+    assert scenario.errors() == []

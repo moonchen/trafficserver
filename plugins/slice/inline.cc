@@ -87,8 +87,10 @@ struct InlineTxn {
   int64_t     total{0};           // length of the object, with block_range
   // Upstream got the client's own request, because the block would not be stored.
   bool pass_through{false};
-  // Block 0 instead of the block that holds want.beg, because block 0's key holds the complete copy.
+  // Another block than the one that holds want.beg, because that block's key holds the complete copy.
   bool whole_object{false};
+  // The first block missed, and block 0's key is looked up for the complete copy.
+  bool relookup{false};
 };
 
 /** Response body producer for a transaction whose first block is not already the client's response.
@@ -825,16 +827,24 @@ requested_block(TSHttpTxn txnp, InlineTxn const *const state)
          field_value(req.m_buffer, req.m_lochdr, TS_MIME_FIELD_RANGE) == std::string_view{blockstr, static_cast<size_t>(blocklen)};
 }
 
-// A fresh complete copy of the object under block 0's key holds the window at the window's own offsets.
-void
+/** A fresh complete copy of the object holds the window at the window's own offsets: core serves the window from it
+  as from a block that starts at byte 0. Returns whether the cached response is such a copy.
+ */
+bool
 serve_from_copy(TSHttpTxn txnp, InlineTxn *const state, int const status, TxnHdrMgr const &cached)
 {
   int64_t          total = -1;
   std::string_view cl    = field_value(cached.m_buffer, cached.m_lochdr, TS_MIME_FIELD_CONTENT_LENGTH);
-  if (0 != state->block_beg || TS_CACHE_LOOKUP_HIT_FRESH != status || !parse_count(cl, total) || !cl.empty()) {
-    return;
+  if (TS_CACHE_LOOKUP_HIT_FRESH != status || !parse_count(cl, total) || !cl.empty() ||
+      !field_value(cached.m_buffer, cached.m_lochdr, TS_MIME_FIELD_CONTENT_RANGE).empty()) {
+    return false;
   }
-  serve_from_block(txnp, state, 0, total, total);
+  int64_t const block_beg = state->block_beg;
+  state->block_beg        = 0;
+  if (!serve_from_block(txnp, state, 0, total, total)) {
+    state->block_beg = block_beg;
+  }
+  return true;
 }
 
 // A cached first block, fresh or stale, stored by cache_range_requests as a 200 that keeps the block's Content-Range.
@@ -844,8 +854,26 @@ on_cache_lookup(TSHttpTxn txnp, TSCont contp, InlineTxn *const state)
   add_send_hook(txnp, contp, state);
 
   int status = 0;
-  if (TS_SUCCESS != TSHttpTxnCacheLookupStatusGet(txnp, &status) ||
-      (TS_CACHE_LOOKUP_HIT_FRESH != status && TS_CACHE_LOOKUP_HIT_STALE != status)) {
+  if (TS_SUCCESS != TSHttpTxnCacheLookupStatusGet(txnp, &status)) {
+    return;
+  }
+
+  // The second lookup found an object under block 0's key. Unless it is the complete copy, the request continues as
+  // the miss of its first block.
+  if (state->relookup) {
+    state->relookup = false;
+    TxnHdrMgr cached;
+    if (!cached.populateFrom(txnp, TSHttpTxnCachedRespGet) || !serve_from_copy(txnp, state, status, cached)) {
+      DEBUG_LOG("No complete copy under block 0's key, fetching the block at %" PRId64, state->block_beg);
+      TSHttpTxnCacheLookupStatusSet(txnp, TS_CACHE_LOOKUP_MISS);
+    }
+    return;
+  }
+  if (TS_CACHE_LOOKUP_MISS == status && 0 < state->block_beg && !state->whole_object && look_up_whole_copy(txnp, state->config)) {
+    state->relookup = true;
+    return;
+  }
+  if (TS_CACHE_LOOKUP_HIT_FRESH != status && TS_CACHE_LOOKUP_HIT_STALE != status) {
     return;
   }
 
@@ -1139,12 +1167,14 @@ inline_first_block(TSHttpTxn txnp, Config *const config, HttpHeader &header)
   // The request for the block that holds the window's first byte, as request_block() forms it, with the skip header
   // that handle_client_req() sets.
   state->block_beg = state->want.beg / config->m_blockbytes * config->m_blockbytes;
-  if (0 < state->block_beg && config->hasWholeObjects()) {
+  if (config->hasWholeObjects()) {
     int                                      len = 0;
     std::unique_ptr<char, decltype(&TSfree)> urlstr(TSHttpTxnEffectiveUrlStringGet(txnp, &len), TSfree);
-    if (nullptr != urlstr && config->isWholeObject({urlstr.get(), static_cast<size_t>(len)})) {
-      DEBUG_LOG("Upstream sends the whole object, which is stored under block 0's key");
-      state->block_beg    = 0;
+    std::optional<int64_t> const             copy =
+      nullptr == urlstr ? std::nullopt : config->wholeObjectBlock({urlstr.get(), static_cast<size_t>(len)});
+    if (copy.has_value() && *copy * config->m_blockbytes != state->block_beg) {
+      DEBUG_LOG("Upstream sends the whole object, which is stored under block %" PRId64 "'s key", *copy);
+      state->block_beg    = *copy * config->m_blockbytes;
       state->whole_object = true;
     }
   }

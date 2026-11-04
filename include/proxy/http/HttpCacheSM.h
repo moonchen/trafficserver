@@ -94,6 +94,11 @@ public:
   Action *open_write(const HttpCacheKey *key, URL *url, HTTPHdr *request, CacheHTTPInfo *old_info, time_t pin_in_cache, bool retry,
                      bool allow_multiple);
 
+  /** Open a write that reports a taken write lock at once, without retrying the write or the read. For a write that
+    replaces one this transaction already had, which owes no other request a read.
+   */
+  Action *open_write_once(const HttpCacheKey *key, URL *url, HTTPHdr *request, time_t pin_in_cache);
+
   CacheVConnection *cache_read_vc  = nullptr;
   CacheVConnection *cache_write_vc = nullptr;
 
@@ -298,6 +303,7 @@ private:
 
   // Open write parameters
   bool       retry_write      = true;
+  bool       write_once       = false;
   int        open_write_tries = 0;
   ink_hrtime open_write_start = 0; // overrides open_write_tries
 

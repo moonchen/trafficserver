@@ -179,7 +179,7 @@ request_block(TSCont contp, Data *const data)
   // The marker makes the block transaction watch the first block (first_block.cc): for a client range, so that core
   // serves the range from a complete copy, and for a rule whose first block can be another block, to learn which
   // objects upstream sends whole.
-  bool const watch = first_block && (TS_HTTP_STATUS_PARTIAL_CONTENT == data->m_statustype || cfg->rememberWholeObjects());
+  bool const watch = first_block && (TS_HTTP_STATUS_PARTIAL_CONTENT == data->m_statustype || cfg->firstBlockVaries());
   if (watch) {
     header.setKeyVal(SLICE_FIRST_BLOCK_HEADER.data(), SLICE_FIRST_BLOCK_HEADER.size(), "1", 1);
   }

@@ -2927,6 +2927,35 @@ TSReturnCode TSHttpTxnCacheLookupUrlGet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc o
 TSReturnCode TSHttpTxnCacheLookupUrlSet(TSHttpTxn txnp, TSMBuffer bufp, TSMLoc obj);
 
 /**
+    Moves the transaction's cache write to another key. Call it from a TS_HTTP_READ_RESPONSE_HDR_HOOK hook, when the
+    transaction would store a new object under its lookup key (a cache miss). After the hooks, Traffic Server releases
+    the write lock on the lookup key and opens a write under @a url instead. If another request holds that key's write
+    lock, the response is not stored. The transaction's cache key is @a url from then on.
+
+    @param txnp the transaction
+    @param url the URL whose key the response is stored under
+    @param length length of @a url, or -1 if it is nul terminated
+    @return TS_SUCCESS if the write will move; TS_ERROR outside the hook, without a write of a new object, during a
+      redirect, or for a URL that does not parse
+ */
+TSReturnCode TSHttpTxnCacheWriteUrlSet(TSHttpTxn txnp, const char *url, int length);
+
+/**
+    Looks the transaction up again in the cache, under another key. Call it from a TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK
+    hook after a miss, once per transaction. TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK runs again if the second lookup finds an
+    object, and TSHttpTxnCacheLookupCountGet() then counts two lookups. If that object stands, the transaction serves
+    it, and its cache key is @a url. If the second lookup misses, or a hook makes its hit a miss, the transaction returns
+    to its first key and continues as that key's miss, with any write lock it held for it.
+
+    @param txnp the transaction
+    @param url the URL whose key is looked up
+    @param length length of @a url, or -1 if it is nul terminated
+    @return TS_SUCCESS if the second lookup will run; TS_ERROR outside the hook, after a hit, after a second lookup,
+      during a redirect, or for a URL that does not parse
+ */
+TSReturnCode TSHttpTxnCacheLookupAgain(TSHttpTxn txnp, const char *url, int length);
+
+/**
     Gets the effective cache key digest (cryptographic hash) that was
     used for cache lookup or storage on this transaction.  The digest
     is returned as raw bytes — 16 bytes for MD5 (default) or 32 bytes

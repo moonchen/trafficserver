@@ -40,11 +40,20 @@ void mark_slice_block(TSHttpTxn txnp);
 
 /** At READ_RESPONSE_HDR of a block request, before cache_range_requests sees the response.
 
-  For a rule whose first block can be other than block 0: a 200 without Content-Range to a Range is the whole object,
-  and the object is remembered, so that later requests ask for block 0, under whose key cache_range_requests stores
-  the object's one complete copy. A 206 means that upstream honors Range for the object again.
+  For a rule whose first block can be other than block 0: a 200 without Content-Range to a Range is the whole object.
+  Its one complete copy goes under the key that Config::m_whole_copy names: block 0's (stored only by a request for
+  block 0), the block's own, or block 0's by moving this request's cache write there. The object and that block are
+  remembered, so that later requests ask for the block. A 206 means that upstream honors Range for the object again.
  */
 void note_block_answer(TSHttpTxn txnp, Config *config);
+
+/** At CACHE_LOOKUP_COMPLETE of a miss of the first block of a client request, with --whole-object-lookup: look for
+  the object's complete copy under block 0's key, if the block is a later one. CACHE_LOOKUP_COMPLETE runs again if
+  that lookup finds an object.
+
+  @return whether the second lookup will run
+ */
+bool look_up_whole_copy(TSHttpTxn txnp, Config const *config);
 
 /** For a block request, at remap: mark it, and watch the transaction if it is the first block of a client request
   that slice serves through its intercept.

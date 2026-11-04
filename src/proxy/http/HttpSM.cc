@@ -1696,6 +1696,9 @@ HttpSM::handle_api_return()
       cache_sm.close_read();
       transform_cache_sm.close_read();
     }
+    if (t_state.api_next_action == HttpTransact::StateMachineAction_t::API_CACHE_LOOKUP_COMPLETE && do_cache_relookup_after_api()) {
+      return;
+    }
     // fallthrough
 
   case HttpTransact::StateMachineAction_t::API_PRE_REMAP:
@@ -1713,6 +1716,13 @@ HttpSM::handle_api_return()
       t_state.hdr_info.server_response.m_mime->recompute_cooked_stuff(
         nullptr, t_state.txn_conf->targeted_cache_control_headers.get_headers(),
         t_state.txn_conf->targeted_cache_control_headers.get_count());
+    }
+    if (t_state.cache_info.write_url.valid()) {
+      if (!t_state.api_server_response_no_store) {
+        do_cache_move_write();
+        return;
+      }
+      t_state.cache_info.write_url.destroy();
     }
     call_transact_and_set_next_state(nullptr);
     return;
@@ -2708,6 +2718,46 @@ HttpSM::state_cache_open_write(int event, void *data)
   return 0;
 }
 
+// The open of a cache write that a plugin moved to another key at READ_RESPONSE_HDR (do_cache_move_write).
+int
+HttpSM::state_cache_open_moved_write(int event, void *data)
+{
+  STATE_ENTER(state_cache_open_moved_write, event);
+
+  pending_action.clear_if_action_is(reinterpret_cast<Action *>(data));
+
+  if (_ua.get_txn()) {
+    pending_action = _ua.get_txn()->adjust_thread(this, event, data);
+    if (!pending_action.empty()) {
+      Metrics::Counter::increment(http_rsb.cache_open_write_adjust_thread);
+      return 0;
+    }
+    NetVConnection *vc = _ua.get_txn()->get_netvc();
+    ink_release_assert(vc && vc->thread == this_ethread());
+  }
+  pending_action = nullptr;
+
+  switch (event) {
+  case CACHE_EVENT_OPEN_WRITE:
+    t_state.cache_info.write_lock_state = HttpTransact::CacheWriteLock_t::SUCCESS;
+    break;
+  case CACHE_EVENT_OPEN_WRITE_FAILED:
+    // Another request writes that key, so this one stores nothing.
+    SMDbg(dbg_ctl_http_cache_write, "the moved cache write did not get its lock, not storing the response");
+    Metrics::Counter::increment(http_rsb.cache_open_write_fail_count);
+    t_state.cache_info.write_lock_state  = HttpTransact::CacheWriteLock_t::FAIL;
+    t_state.api_server_response_no_store = true;
+    break;
+  default:
+    ink_release_assert(!"Unexpected event for a moved cache write");
+  }
+
+  // The response continues as after the READ_RESPONSE_HDR hooks.
+  call_transact_and_set_next_state(nullptr);
+
+  return 0;
+}
+
 inline void
 HttpSM::setup_cache_lookup_complete_api()
 {
@@ -2788,6 +2838,16 @@ HttpSM::state_cache_open_read(int event, void *data)
     // object is in play past this point. The reset follows the retry decision
     // so that it cannot re-arm the retry.
     compatibility_cache_lookup = CompatibilityCacheLookup::COMPAT_CACHE_LOOKUP_NORMAL;
+    // A plugin's second lookup missed too: the transaction goes on with the first lookup's miss. CACHE_LOOKUP_COMPLETE
+    // does not run again, so that plugins see one miss.
+    if (t_state.cache_info.relookup_state == HttpTransact::CacheRelookup_t::IN_PROGRESS) {
+      SMDbg(dbg_ctl_http, "second cache lookup missed, returning to the first key");
+      ATS_PROBE1(milestone_cache_open_read_end, sm_id);
+      milestones[TS_MILESTONE_CACHE_OPEN_READ_END] = ink_get_hrtime();
+      cache_relookup_return_to_first();
+      call_transact_and_set_next_state(nullptr);
+      break;
+    }
     if (cache_sm.get_last_error() == -ECACHE_DOC_BUSY) {
       // Inform HttpTransact somebody else is updating the document
       // HttpCacheSM already waited so transact should go ahead.
@@ -5653,6 +5713,138 @@ HttpSM::do_cache_prepare_action(HttpCacheSM *c_sm, CacheHTTPInfo *object_read_in
     c_sm->open_write(&key, s_url, &t_state.hdr_info.cache_request, write_object_read_info,
                      static_cast<time_t>((t_state.cache_control.pin_in_cache_for < 0) ? 0 : t_state.cache_control.pin_in_cache_for),
                      retry, allow_multiple);
+}
+
+/** Move the cache write of a new object to the key a plugin named at READ_RESPONSE_HDR (TSHttpTxnCacheWriteUrlSet).
+
+  The write under the lookup key is aborted before anything is written to it, so requests that wait on its lock miss
+  when they look that key up again. If another request holds the new key's write lock, the response is not stored.
+ */
+void
+HttpSM::do_cache_move_write()
+{
+  HttpTransact::CacheLookupInfo &ci = t_state.cache_info;
+
+  SMDbg(dbg_ctl_http_cache_write, "moving the cache write to %s", ci.write_url.string_get(&t_state.arena));
+  cache_sm.abort_write();
+
+  // The key written is the transaction's cache key from now on, for the log and for a delete of the stored object.
+  if (ci.lookup_url != &ci.lookup_url_storage) {
+    ci.lookup_url_storage.create(nullptr);
+    ci.lookup_url = &ci.lookup_url_storage;
+  }
+  ci.lookup_url_storage.copy(&ci.write_url);
+  ci.write_url.destroy();
+  ci.write_lock_state = HttpTransact::CacheWriteLock_t::INIT;
+
+  HttpCacheKey key;
+  generate_cache_key(&key, ci.lookup_url);
+
+  HTTP_SM_SET_DEFAULT_HANDLER(&HttpSM::state_cache_open_moved_write);
+  pending_action = cache_sm.open_write_once(
+    &key, ci.lookup_url, &t_state.hdr_info.cache_request,
+    static_cast<time_t>((t_state.cache_control.pin_in_cache_for < 0) ? 0 : t_state.cache_control.pin_in_cache_for));
+}
+
+/** After CACHE_LOOKUP_COMPLETE, start the second lookup that a plugin asked for after a miss (TSHttpTxnCacheLookupAgain),
+  or settle the result of that lookup.
+
+  The first lookup's key, cache action, write lock and return point are kept. If the second lookup misses, or a hook
+  turns its hit into a miss, the transaction returns to them; a write lock taken for the first key is kept until then.
+  If the hit stands, that write lock is released.
+
+  @return whether the second lookup took over the transaction
+ */
+bool
+HttpSM::do_cache_relookup_after_api()
+{
+  HttpTransact::CacheLookupInfo &ci = t_state.cache_info;
+
+  switch (ci.relookup_state) {
+  case HttpTransact::CacheRelookup_t::REQUESTED: {
+    if (t_state.cache_lookup_result != HttpTransact::CacheLookupResult_t::MISS) {
+      ci.relookup_state = HttpTransact::CacheRelookup_t::DONE;
+      return false;
+    }
+
+    // relookup_url swaps with the first key, which it keeps.
+    URL *const first  = ci.lookup_url;
+    ci.relookup_first = first;
+    if (first == &ci.lookup_url_storage) {
+      URL saved;
+      saved.create(nullptr);
+      saved.copy(first);
+      first->copy(&ci.relookup_url);
+      ci.relookup_url.copy(&saved);
+      saved.destroy();
+    } else {
+      ci.lookup_url_storage.create(nullptr);
+      ci.lookup_url_storage.copy(&ci.relookup_url);
+      ci.lookup_url = &ci.lookup_url_storage;
+    }
+
+    ci.relookup_action            = ci.action;
+    ci.relookup_lock              = ci.write_lock_state;
+    ci.relookup_hit_miss_code     = ci.hit_miss_code;
+    ci.relookup_request_sent_time = t_state.request_sent_time;
+    ci.relookup_write_fail_action = t_state.cache_open_write_fail_action;
+    ci.relookup_return_point      = t_state.transact_return_point;
+    ci.relookup_state             = HttpTransact::CacheRelookup_t::IN_PROGRESS;
+    ci.action                     = HttpTransact::CacheAction_t::LOOKUP;
+    ci.write_lock_state           = HttpTransact::CacheWriteLock_t::INIT;
+    t_state.transact_return_point = nullptr;
+    // A write lock lost on the first key would make the second key's fresh hit count as stale content served for that
+    // lost lock (what_is_document_freshness).
+    t_state.cache_open_write_fail_action    = 0;
+    t_state.serving_stale_due_to_write_lock = false;
+
+    SMDbg(dbg_ctl_http_seq, "second cache lookup, for %s", ci.lookup_url->string_get(&t_state.arena));
+    HTTP_SM_SET_DEFAULT_HANDLER(&HttpSM::state_cache_open_read);
+    do_cache_lookup_and_read();
+    return true;
+  }
+
+  case HttpTransact::CacheRelookup_t::IN_PROGRESS:
+    // Only a hit runs CACHE_LOOKUP_COMPLETE for the second lookup.
+    if (t_state.cache_lookup_result == HttpTransact::CacheLookupResult_t::MISS) {
+      SMDbg(dbg_ctl_http_seq, "second cache lookup's hit was turned into a miss, returning to the first key");
+      cache_relookup_return_to_first();
+      call_transact_and_set_next_state(nullptr);
+      return true;
+    }
+    SMDbg(dbg_ctl_http_seq, "serving the second cache lookup's hit");
+    cache_sm.abort_write();
+    t_state.hdr_info.server_request.destroy();
+    ci.relookup_state = HttpTransact::CacheRelookup_t::DONE;
+    return false;
+
+  default:
+    return false;
+  }
+}
+
+// Undo a plugin's second cache lookup: the transaction continues as the first lookup's miss.
+void
+HttpSM::cache_relookup_return_to_first()
+{
+  HttpTransact::CacheLookupInfo &ci = t_state.cache_info;
+
+  if (ci.relookup_first == &ci.lookup_url_storage) {
+    ci.lookup_url_storage.copy(&ci.relookup_url);
+  }
+  ci.lookup_url       = ci.relookup_first;
+  ci.action           = ci.relookup_action;
+  ci.write_lock_state = ci.relookup_lock;
+  ci.hit_miss_code    = ci.relookup_hit_miss_code;
+  ci.object_read      = nullptr;
+  // A request already built for the first key's miss keeps its time.
+  t_state.request_sent_time               = ci.relookup_request_sent_time;
+  t_state.response_received_time          = UNDEFINED_TIME;
+  t_state.cache_open_write_fail_action    = ci.relookup_write_fail_action;
+  t_state.serving_stale_due_to_write_lock = false;
+  ci.relookup_state                       = HttpTransact::CacheRelookup_t::DONE;
+  t_state.cache_lookup_result             = HttpTransact::CacheLookupResult_t::MISS;
+  t_state.transact_return_point           = ci.relookup_return_point;
 }
 
 void
