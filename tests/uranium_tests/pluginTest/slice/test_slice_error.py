@@ -33,6 +33,7 @@ def add_block(
     last_modified: str | None = None,
     total_length: int = 19,
     status: str = "206 Partial Content",
+    shift: int = 0,
 ) -> None:
     """Add one internal range response for a malformed object.
 
@@ -43,18 +44,19 @@ def add_block(
     :param last_modified: Last modified used by this test step.
     :param total_length: Total length used by this test step.
     :param status: Status used by this test step.
+    :param shift: Bytes by which the response starts after the requested block.
     """
 
     begin = index * SLICE_ERROR_BLOCK_BYTES
     end = begin + SLICE_ERROR_BLOCK_BYTES - 1
-    body = SLICE_ERROR_BODY[begin:end + 1]
+    body = SLICE_ERROR_BODY[begin + shift:end + 1]
     fields = [f"HTTP/1.1 {status}", "Connection: close"]
     if etag is not None:
         fields.append(f"Etag: {etag}")
     if last_modified is not None:
         fields.append(f"Last-Modified: {last_modified}")
     if status.startswith("206"):
-        fields.extend((f"Content-Range: bytes {begin}-{end}/{total_length}", "Cache-Control: max-age=500"))
+        fields.extend((f"Content-Range: bytes {begin + shift}-{end}/{total_length}", "Cache-Control: max-age=500"))
     origin.add_response(
         {
             "headers":
@@ -70,7 +72,7 @@ def add_block(
 
 
 def configure_server(services: ServiceFactory) -> OriginServer:
-    """Create ETag, Last-Modified, Content-Range, and 404 failures.
+    """Create ETag, Last-Modified, Content-Range, block start, and 404 failures.
 
     :param services: Factory owning support services and their cleanup.
     """
@@ -82,6 +84,9 @@ def configure_server(services: ServiceFactory) -> OriginServer:
     add_block(origin, "lastmodified", 1, last_modified="Tue, 08 Apr 2019 18:00:00 GMT")
     add_block(origin, "crr", 0, etag="crr")
     add_block(origin, "crr", 1, etag="crr", total_length=18)
+    add_block(origin, "laterstart", 0, etag="start")
+    add_block(origin, "laterstart", 1, etag="start", shift=1)
+    add_block(origin, "firststart", 0, etag="start", shift=1)
     add_block(
         origin,
         "internal404",
@@ -142,8 +147,15 @@ def test_slice_error(ats_factory: ATSFactory, services: ServiceFactory) -> None:
         ("etag", "Mismatch block Etag"),
         ("lastmodified", "Mismatch block Last-Modified"),
         ("crr", "Mismatch/Bad block Content-Range"),
+        ("laterstart", "Block Content-Range does not start at the block"),
         ("internal404", "404 internal block response"),
     )
     for path, diagnostic in cases:
-        request(path, _ats=_ats, _curl=_curl)
+        output = request(path, _ats=_ats, _curl=_curl)
+        # Block 1 one byte late would join the blocks one byte off.
+        assert "the quickbrown" not in output, output
         wait_for_file_lines(_ats.diags_log, diagnostic, 1)
+
+    # A first block that starts after the block, and is not the client's range, cannot start the response.
+    result = _curl.get(_ats, "/firststart", headers={"Host": "ats"}, options="--silent --show-error --dump-header -")
+    assert "HTTP/1.1 502" in result.stdout, result.output

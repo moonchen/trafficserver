@@ -51,38 +51,42 @@ def add_range_response(origin: OriginServer, uid: str, byte_range: str, etag: st
 
 
 def configure_server(services: ServiceFactory) -> OriginServer:
-    """Create old, new, non-range, missing, and custom-identity responses.
+    """Create old, new, non-range, missing, and custom-identity responses, one for each request and block.
 
     :param services: Factory owning support services and their cleanup.
     """
 
-    origin = services.origin("origin", lookup_key="{%uuid}")
+    origin = services.origin("origin", lookup_key="{%uuid}{%Range}")
     for uid, byte_range, etag, body in (
         ("etagold-1", "3-5", "etagold", "aa"),
         ("etagnew-0", "0-2", "etagnew", "bbb"),
+        ("etagnew-0", "3-5", "etagnew", "bb"),
         ("etagnew-1", "3-5", "etagnew", "bb"),
         ("etagold-0", "0-2", "etagold", "aaa"),
         ("assetgone-0", "0-2", "etag", "aaa"),
         ("etagold-custom-1", "3-5", "etagold-custom", "aa"),
-        ("etagnew-custom-0", "0-2", "etagnew-custom", "bbb"),
+        ("etagnew-custom-1", "0-2", "etagnew-custom", "bbb"),
         ("etagnew-custom-1", "3-5", "etagnew-custom", "bb"),
     ):
         add_range_response(origin, uid, byte_range, etag, body)
     origin.add_response(
         {"headers": ("GET /code200 HTTP/1.1\r\nHost: www.example.com\r\nuuid: code200\r\n"
-                     "Range: bytes=3-5\r\n\r\n")},
+                     "Range: bytes=0-2\r\n\r\n")},
         {
             "headers": ("HTTP/1.1 200 OK\r\nCache-Control: max-age=5000\r\nConnection: close\r\nEtag: \"etag\"\r\n\r\n"),
             "body": "ccccc",
         },
     )
-    origin.add_response(
-        {"headers": "GET {PATH} HTTP/1.1\r\nHost: www.example.com\r\n\r\n"},
-        {
-            "headers": "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n",
-            "body": "Not Found"
-        },
-    )
+    # Requests without a uuid: the asset is gone.
+    for byte_range in (None, "0-2", "3-5"):
+        range_field = "" if byte_range is None else f"Range: bytes={byte_range}\r\n"
+        origin.add_response(
+            {"headers": f"GET {{PATH}} HTTP/1.1\r\nHost: www.example.com\r\n{range_field}\r\n"},
+            {
+                "headers": "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n",
+                "body": "Not Found"
+            },
+        )
     return origin
 
 

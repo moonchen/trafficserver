@@ -178,10 +178,12 @@ handleFirstServerHeader(Data *const data, TSCont const contp)
     return HeaderState::Passthru;
   }
 
-  ContentRange const blockcr = contentRangeFrom(header);
+  ContentRange const blockcr      = contentRangeFrom(header);
+  bool const         client_range = blockcr.isValid() && answers_client_range(data, blockcr);
 
-  // 206 with bad content range -- should NEVER happen.
-  if (!blockcr.isValid()) {
+  // 206 with bad content range -- should NEVER happen. Unless it is the client's range, it starts at the block.
+  if (!blockcr.isValid() || (!client_range && blockcr.m_beg != data->m_blocknum * data->m_config->m_blockbytes)) {
+    DEBUG_LOG("Unusable first block Content-Range");
     std::string const msg502 = string502(header.version());
     TSVIONBytesSet(output_vio, msg502.size());
     TSIOBufferWrite(output_buf, msg502.data(), msg502.size());
@@ -191,7 +193,7 @@ handleFirstServerHeader(Data *const data, TSCont const contp)
 
   update_object_size(data->m_effective_url, blockcr.m_length, *data->m_config);
 
-  if (answers_client_range(data, blockcr)) {
+  if (client_range) {
     int64_t const hlen = TSHttpHdrLengthGet(header.m_buffer, header.m_lochdr);
     int64_t const clen = contentLengthFrom(header);
     DEBUG_LOG("First response is the client's range, passing it through");
@@ -440,11 +442,15 @@ handleNextServerHeader(Data *const data)
   // can't parse the content range header, abort -- might be too strict
   ContentRange blockcr;
 
-  // check the content range (offset and size)
+  // check the content range (offset and size). A block that is not stored starts where the client's part of it starts.
   if (same) {
-    blockcr = contentRangeFrom(header);
+    blockcr                = contentRangeFrom(header);
+    int64_t const blockbeg = data->m_blocknum * data->m_config->m_blockbytes;
     if (!blockcr.isValid() || blockcr.m_length != data->m_contentlen) {
       logSliceError("Mismatch/Bad block Content-Range", data, header);
+      same = false;
+    } else if (blockcr.m_beg != blockbeg && blockcr.m_beg != std::max(blockbeg, data->m_req_range.m_beg)) {
+      logSliceError("Block Content-Range does not start at the block", data, header);
       same = false;
     }
   }
