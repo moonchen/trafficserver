@@ -417,8 +417,10 @@ block of a client request it asks for the client's own request: the client's
 range, or the whole object without a Range for a whole-object GET, and the
 response reaches the client unchanged.  For a later block it asks for the part
 of the block that the client needs.  So a request that is not stored costs
-upstream no more than it would without slice.  cache_promote counts slice's
-block requests per object.
+upstream no more than it would without slice.  Slice removes its own headers
+from such a request, so an upstream proxy that runs slice treats it as an
+ordinary client request, not as one of slice's block requests.  cache_promote
+counts slice's block requests per object.
 
 Concurrent Requests for a Block
 -------------------------------

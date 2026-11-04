@@ -222,6 +222,7 @@ on_block_lookup(TSHttpTxn txnp, TSCont contp, Config *const config)
   }
 
   if (TS_CACHE_LOOKUP_MISS == status || TS_CACHE_LOOKUP_SKIPPED == status) {
+    TSHttpTxnHookAdd(txnp, TS_HTTP_SEND_REQUEST_HDR_HOOK, contp);
     TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
     int64_t blockbeg = 0;
     if (TS_CACHE_LOOKUP_MISS == status && 0 <= slice_relookup_arg_idx && look_up_url_key(txnp, config, blockbeg)) {
@@ -346,6 +347,28 @@ note_block_answer(TSHttpTxn txnp, Config const *const config)
 }
 
 void
+unmark_unstored_request(TSHttpTxn txnp, Config const *const config)
+{
+  TxnHdrMgr req;
+  if (!req.populateFrom(txnp, TSHttpTxnServerReqGet)) {
+    return;
+  }
+  HttpHeader request(req.m_buffer, req.m_lochdr);
+  char       rangestr[1024];
+  int        rangelen = sizeof(rangestr);
+  int64_t    blockbeg = 0;
+  size_t     len      = 0;
+  if (request.valueForKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, &rangelen) &&
+      parse_block_range({rangestr, static_cast<size_t>(rangelen)}, config->m_blockbytes, blockbeg, len) &&
+      len == static_cast<size_t>(rangelen)) {
+    return;
+  }
+  DEBUG_LOG("Upstream gets the client's request, without slice's headers");
+  request.removeKey(config->m_skip_header.data(), config->m_skip_header.size());
+  request.removeKey(SLICE_CRR_HEADER.data(), SLICE_CRR_HEADER.size());
+}
+
+void
 watch_block_request(TSHttpTxn txnp, HttpHeader &header, TSCont contp)
 {
   if (TS_HTTP_METHOD_GET != header.method()) {
@@ -369,6 +392,9 @@ block_handler(TSCont contp, TSEvent event, void *edata)
   switch (event) {
   case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE:
     on_block_lookup(txnp, contp, config);
+    break;
+  case TS_EVENT_HTTP_SEND_REQUEST_HDR:
+    unmark_unstored_request(txnp, config);
     break;
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
     on_block_response(txnp, config);

@@ -65,6 +65,12 @@ bool look_up_url_key(TSHttpTxn txnp, Config const *config, int64_t &blockbeg);
  */
 void note_block_answer(TSHttpTxn txnp, Config const *config);
 
+/** At SEND_REQUEST_HDR of a block request that missed, after cache_range_requests set the upstream Range: a block that
+  will not be stored goes upstream as the client's own request, or the client's part of the block. An upstream proxy
+  must treat it as an ordinary request, not as one of slice's block requests, so slice's headers are removed.
+ */
+void unmark_unstored_request(TSHttpTxn txnp, Config const *config);
+
 /** For a block request, at remap: mark it, and watch its cache lookup.
 
   @param header the client request of the block transaction; the first block marker is removed from it

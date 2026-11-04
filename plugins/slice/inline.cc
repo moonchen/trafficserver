@@ -896,6 +896,9 @@ on_cache_lookup(TSHttpTxn txnp, TSCont contp, InlineTxn *const state)
     }
     return;
   }
+  if (TS_CACHE_LOOKUP_MISS == status || TS_CACHE_LOOKUP_SKIPPED == status) {
+    TSHttpTxnHookAdd(txnp, TS_HTTP_SEND_REQUEST_HDR_HOOK, contp);
+  }
   int64_t blockbeg = 0;
   if (TS_CACHE_LOOKUP_MISS == status && look_up_url_key(txnp, state->config, blockbeg)) {
     state->relookup = true;
@@ -1131,6 +1134,9 @@ inline_txn_handler(TSCont contp, TSEvent event, void *edata)
   switch (event) {
   case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE:
     on_cache_lookup(txnp, contp, state);
+    break;
+  case TS_EVENT_HTTP_SEND_REQUEST_HDR:
+    unmark_unstored_request(txnp, state->config);
     break;
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
     reenable = on_server_response(txnp, contp, state);
