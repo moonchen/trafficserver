@@ -3792,7 +3792,11 @@ HttpSM::is_bg_fill_necessary(HttpTunnelConsumer *c)
 
     if (ua_cl > 0) {
       int64_t ua_body_done = c->bytes_written - client_response_hdr_bytes;
-      float   pDone        = static_cast<float>(ua_body_done) / ua_cl;
+      // With a cache write lead the server read can be well ahead of the client, and the fill reads only the rest.
+      if (HttpTunnelProducer const *const server = c->producer; server->cache_write_lead > 0 && server->read_vio != nullptr) {
+        ua_body_done = std::max(ua_body_done, server->init_bytes_done + server->read_vio->ndone - client_response_hdr_bytes);
+      }
+      float pDone = static_cast<float>(ua_body_done) / ua_cl;
 
       // If we got a good content length.  Check to make sure that we haven't already
       //  done more the content length since that would indicate the content-length

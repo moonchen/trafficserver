@@ -1495,6 +1495,28 @@ uds-group
    While this setting is reloadable, dramatic changes can cause bigger memory usage than expected
    and is thus not recommended.
 
+.. ts:cv:: CONFIG proxy.config.http.cache.max_write_lead INT 0
+   :reloadable:
+   :overridable:
+   :units: bytes
+
+   Number of bytes |TS| may read from the origin ahead of the client while it writes the response
+   to cache.  With the default ``0``, the client paces the origin read and the cache write, as
+   described for :ts:cv:`proxy.config.http.default_buffer_water_mark`.  The clients that
+   :ref:`read the object while it is written <admin-configuration-reducing-origin-requests>` then
+   move at that client's pace, and they stall when it stalls.
+
+   A larger value lets the origin read and the cache write go on at the origin's pace until the
+   client is this many bytes behind.  Past that, the client paces them again.  The bytes that the
+   client has not read yet use memory, up to this value for each such transaction.  A client behind
+   a transform counts as the transform.  A value up to
+   :ts:cv:`proxy.config.http.default_buffer_water_mark` changes nothing for a client without a
+   transform, and the setting has no effect when only the transformed response is cached.  With
+   :ts:cv:`proxy.config.http.flow_control.enabled`, the flow control water marks of such a
+   transaction rise by the same amount.  When the client aborts,
+   :ts:cv:`proxy.config.http.background_fill_completed_threshold` compares the bytes read from the
+   origin, not the bytes sent to the client.
+
 .. ts:cv:: CONFIG proxy.config.http.request_buffer_enabled INT 0
    :overridable:
 

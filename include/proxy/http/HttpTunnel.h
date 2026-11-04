@@ -317,6 +317,12 @@ struct HttpTunnelProducer {
 
   int num_consumers = 0;
 
+  /** How far the read may run ahead of the slowest consumer while the producer feeds a cache write, or 0.
+      The producer's buffers use it as their water mark, in place of @a water_mark_without_lead.
+   */
+  int64_t cache_write_lead        = 0;
+  int64_t water_mark_without_lead = 0;
+
   bool alive        = false;
   bool read_success = false;
   /// Flag and pointer for active flow control throttling.
@@ -469,6 +475,9 @@ private:
 
   bool _should_reenable_for_chunk_handler_fc(HttpTunnelConsumer *c);
   bool _should_reenable_for_tunnel_chain_fc(HttpTunnelConsumer *c);
+
+  void _start_cache_write_lead(HttpTunnelProducer *p);
+  void _end_cache_write_lead(HttpTunnelProducer *p);
 
   HttpTunnelConsumer *_throttle_chunked_producer(HttpTunnelProducer *p);
 
