@@ -320,6 +320,30 @@ def test_slice_promote_later_blocks(ats_factory: ATSFactory, services: ServiceFa
     assert scenario.errors() == []
 
 
+def test_slice_promote_later_blocks_inline(ats_factory: ATSFactory, services: ServiceFactory, curl: Curl) -> None:
+    """--inline-first-block, with the first block already stored: a later block that is not promoted costs upstream only
+    the part of it that the client needs, and is stored whole once the object is promoted.
+
+    :param ats_factory: Factory for isolated Traffic Server instances.
+    :param services: Factory owning support services and their cleanup.
+    :param curl: Transport-aware curl command runner.
+    """
+
+    slice_args = f"@plugin=slice.so @pparam=--blockbytes-test={PROMOTE_BLOCK} @pparam=--inline-first-block"
+    rules = {"warm": f"{slice_args} {CRR}", "inline": f"{slice_args} {PROMOTE} {CRR}"}
+    scenario = Scenario(ats_factory, services, curl, PROMOTE_BLOCK, rules)
+    path = f"/normal/{PROMOTE_SIZE}"
+    # Stores block 1 without cache_promote.
+    assert_range(scenario.get("warm", path, "110-119"), PROMOTE_SIZE, 110, 120)
+    for _ in range(3):
+        assert_range(scenario.get("inline", path, "150-249"), PROMOTE_SIZE, 150, 250)
+    # Block 2 is not promoted twice, then promoted and stored by the third block request.
+    assert [r["range"] for r in scenario.origin_requests(path)
+           ] == ["bytes=100-199", "bytes=200-249", "bytes=200-249", "bytes=200-299"]
+    assert [scenario.stored(path, k) for k in range(4)] == [504, 206, 206, 504]
+    assert scenario.errors() == []
+
+
 WHOLE_BLOCK = 7
 # The existing slice reads block 0 first, or the block that holds the range's start (relative); inline serves that block
 # in the client's transaction.

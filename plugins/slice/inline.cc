@@ -264,11 +264,15 @@ start_fetch(TSCont contp, Remainder *const rem)
   req.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, rangelen);
   req.setKeyVal(rem->config->m_skip_header.data(), rem->config->m_skip_header.size(), "-", 1);
   // If the window ends inside this block, cache_range_requests reports whether it stores the block: the rest of a
-  // block that is not being stored is not needed.
-  if (rem->target < rem->fetch_end) {
+  // block that is not being stored is not needed, and upstream is asked only for the window's part of it.
+  char needstr[64];
+  int  needlen = sizeof(needstr);
+  if (rem->target < rem->fetch_end && Range(rem->fetch_beg, rem->target).toStringClosed(needstr, &needlen)) {
     req.setKeyVal(SLICE_CRR_HEADER.data(), SLICE_CRR_HEADER.size(), "1", 1);
+    req.setKeyVal(SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size(), needstr, needlen);
   } else {
     req.removeKey(SLICE_CRR_HEADER.data(), SLICE_CRR_HEADER.size());
+    req.removeKey(SLICE_UNSTORED_HEADER.data(), SLICE_UNSTORED_HEADER.size());
   }
   std::string_view const ident = rem->config->m_crr_ident_header;
   if (!ident.empty()) {
@@ -337,8 +341,15 @@ check_block(Remainder *const rem)
   int64_t beg = 0, end = 0, total = 0;
   if (!parse_content_range(field_value(rem->response.m_buffer, rem->response.m_lochdr, TS_MIME_FIELD_CONTENT_RANGE), beg, end,
                            total) ||
-      beg != rem->fetch_beg || end != std::min(rem->fetch_end, total)) {
+      beg != rem->fetch_beg) {
     DEBUG_LOG("Block content range does not continue the first block");
+    return BlockCheck::Unusable;
+  }
+  // A block that is not being stored ends with the window (start_fetch).
+  bool const narrowed =
+    rem->target < rem->fetch_end && end == rem->target && !resp.hasKey(SLICE_CRR_HEADER.data(), SLICE_CRR_HEADER.size());
+  if (end != std::min(rem->fetch_end, total) && !narrowed) {
+    DEBUG_LOG("Block content range does not cover the block");
     return BlockCheck::Unusable;
   }
 
