@@ -140,6 +140,14 @@ struct SSLNextProtocolTrampoline : public Continuation {
 int
 SSLNextProtocolAccept::mainEvent(int event, void *edata)
 {
+  // NetAccept reports a failed accept() as EVENT_ERROR (== VC_EVENT_ERROR) with the negated errno
+  // as edata, which ssl_netvc_cast would dereference as a VIO.
+  if (event == EVENT_ERROR) {
+    Dbg(dbg_ctl_ssl, "[SSLNextProtocolAccept:mainEvent] accept error: errno %d",
+        -static_cast<int>(reinterpret_cast<intptr_t>(edata)));
+    return EVENT_DONE;
+  }
+
   SSLNetVConnection *netvc = ssl_netvc_cast(event, edata);
 
   Dbg(dbg_ctl_ssl, "[SSLNextProtocolAccept:mainEvent] event %d netvc %p", event, netvc);
